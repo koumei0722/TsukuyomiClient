@@ -8,4 +8,6 @@ bool isReadable(const void* address, size_t size);
 
 bool isWritable(const void* address, size_t size);
 
+void* ripTarget(const std::byte* at, std::size_t dispOffset);
+
 }

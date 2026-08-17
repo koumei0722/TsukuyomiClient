@@ -2,12 +2,6 @@
 
 #include <Windows.h>
 
-#include <memory>
-
-namespace tsukuyomi {
-struct ConsoleSnapshot;
-}
-
 namespace tsukuyomi::render {
 
 bool installOverlayHooks();
@@ -15,8 +9,6 @@ bool installOverlayHooks();
 void shutdownOverlay();
 
 void setGameModeSelection(bool visible, int selectedMode);
-
-void setConsoleSnapshot(std::shared_ptr<const ConsoleSnapshot> snapshot);
 
 struct Viewport {
     HWND window = nullptr;

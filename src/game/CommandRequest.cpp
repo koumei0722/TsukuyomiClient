@@ -1,5 +1,7 @@
 #include "game/CommandRequest.h"
 
+#include "game/GameData.h"
+
 #include <Windows.h>
 
 #include <cstring>
@@ -12,9 +14,18 @@ namespace tsukuyomi {
 
 namespace {
 
-constexpr std::size_t kSenderVtableRva = 0xDD88D00;
+constexpr std::size_t kSenderVtableDisp = 3;
 
-constexpr std::size_t kPlayerVtableRva = 0xDDA8420;
+constexpr std::size_t kPlayerVtableDisp = 3;
+
+const std::byte* vtableFrom(Target target, std::size_t disp)
+{
+    std::byte* const ref = Scanner::instance().address(target);
+    if (ref == nullptr) {
+        return nullptr;
+    }
+    return static_cast<const std::byte*>(memory::ripTarget(ref, disp));
+}
 
 constexpr std::ptrdiff_t kEntityContextOffset = 0x08;
 
@@ -119,14 +130,14 @@ const ModuleRange& mainModule()
     return range;
 }
 
-bool hasVtable(const void* address, std::size_t rva)
+bool hasVtable(const void* address, Target target, std::size_t disp)
 {
-    const ModuleRange& module = mainModule();
-    if (address == nullptr || module.base == nullptr) {
+    const std::byte* const vtable = vtableFrom(target, disp);
+    if (address == nullptr || vtable == nullptr) {
         return false;
     }
     void* head = nullptr;
-    return readPointerGuarded(address, head) && head == module.base + rva;
+    return readPointerGuarded(address, head) && head == vtable;
 }
 
 }
@@ -158,7 +169,7 @@ void CommandRequest::onEntityContext(void* entityContext)
         return;
     }
     auto* const player = static_cast<std::byte*>(entityContext) - kEntityContextOffset;
-    if (!hasVtable(player, kPlayerVtableRva)) {
+    if (!hasVtable(player, Target::PlayerVtableRef, kPlayerVtableDisp)) {
 
         if (!m_warnedBadPlayer.exchange(true, std::memory_order_acq_rel)) {
             void* head = nullptr;
@@ -169,6 +180,8 @@ void CommandRequest::onEntityContext(void* entityContext)
         }
         return;
     }
+
+    GameData::instance().setPlayer(player);
 
     if (m_player.exchange(player, std::memory_order_acq_rel) != player) {
 
@@ -226,7 +239,10 @@ void* CommandRequest::findSender(int& survivors)
     if (module.base == nullptr) {
         return nullptr;
     }
-    const auto* const vtable = module.base + kSenderVtableRva;
+    const auto* const vtable = vtableFrom(Target::SenderVtableRef, kSenderVtableDisp);
+    if (vtable == nullptr) {
+        return nullptr;
+    }
 
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
@@ -281,7 +297,7 @@ void* CommandRequest::sender()
     void* cached = m_sender.load(std::memory_order_acquire);
     if (cached != nullptr) {
 
-        if (hasVtable(cached, kSenderVtableRva)) {
+        if (hasVtable(cached, Target::SenderVtableRef, kSenderVtableDisp)) {
             return cached;
         }
         m_sender.store(nullptr, std::memory_order_release);
@@ -315,7 +331,8 @@ const void* CommandRequest::makeOrigin()
     }
     void* const player = m_player.load(std::memory_order_acquire);
 
-    if (player == nullptr || !hasVtable(player, kPlayerVtableRva)) {
+    if (player == nullptr
+        || !hasVtable(player, Target::PlayerVtableRef, kPlayerVtableDisp)) {
         m_player.store(nullptr, std::memory_order_release);
 
         m_warnedNoPlayer.store(false, std::memory_order_release);

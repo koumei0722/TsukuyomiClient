@@ -2,8 +2,10 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
-#include "input/Capture.h"
+#include "game/GameData.h"
+#include "game/UiSound.h"
 #include "input/Foreground.h"
+#include "input/Keys.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -11,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <atomic>
+#include <cstring>
 #include <numbers>
 
 namespace tsukuyomi {
@@ -150,6 +154,46 @@ void FreeCamera::onScansReady()
                    L"the body will turn with the camera");
     }
 
+    const auto looksMovss = [](const std::byte* at) {
+        if (at == nullptr || !memory::isReadable(at, 4)) {
+            return false;
+        }
+        const auto* const b = reinterpret_cast<const unsigned char*>(at);
+        return (b[0] == 0xF3 && b[1] == 0x0F && b[2] == 0x11)
+               || (b[0] == 0xF3 && b[1] == 0x44 && b[2] == 0x0F && b[3] == 0x11);
+    };
+    const auto nopIfMovss = [&](std::byte* at, size_t size, const wchar_t* what) {
+        if (!looksMovss(at)) {
+            log().warn(L"FreeCamera: {} does not look like a movss; leaving it alone", what);
+            return Patch{};
+        }
+        return makeNopPatch(at, size);
+    };
+
+    if (std::byte* const head = Scanner::instance().address(Target::PlayerHeadRotation);
+        head != nullptr) {
+        m_patchHead = nopIfMovss(head + kWriteHead, kWriteHeadSize, L"the head write");
+        m_patchHeadPair = nopIfMovss(head + kWriteHeadPair, kWriteHeadPairSize,
+                                     L"the head write (second half)");
+
+        m_patchHeadAlt = nopIfMovss(head + kWriteHeadAlt, kWriteHeadAltSize,
+                                    L"the other head write");
+        m_patchHeadAltPair = nopIfMovss(head + kWriteHeadAltPair, kWriteHeadAltPairSize,
+                                        L"the other head write (second half)");
+    } else {
+        log().warn(L"FreeCamera: the player head rotation site was not found; "
+                   L"the face will turn with the camera");
+    }
+    if (std::byte* const head = Scanner::instance().address(Target::PlayerHeadRotationInput);
+        head != nullptr) {
+        m_patchHeadInput = nopIfMovss(head + kWriteHead, kWriteHeadSize, L"the input head write");
+        m_patchHeadInputPair = nopIfMovss(head + kWriteHeadPair, kWriteHeadInputPairSize,
+                                          L"the input head write (second half)");
+    } else {
+        log().warn(L"FreeCamera: the other player head rotation site was not found; "
+                   L"the face will turn with the camera");
+    }
+
     if (std::byte* const view = Scanner::instance().address(Target::ViewPerspective);
         view != nullptr) {
 
@@ -169,7 +213,8 @@ MenuItem FreeCamera::buildMenu()
     children.push_back(toggleKeyItem());
     children.push_back(menu::number(
         L"Speed", [this] { return m_speed; },
-        [this](float value) { m_speed = (std::max)(0.0f, value); }, false));
+        [this](float value) { m_speed = std::clamp(value, kMinSpeed, kMaxSpeed); }, false,
+        kMinSpeed, kMaxSpeed));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
@@ -181,7 +226,7 @@ void FreeCamera::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
 
-    m_speed = (std::max)(0.0f, Config::getFloat(section, "speed", kDefaultSpeed));
+    m_speed = std::clamp(Config::getFloat(section, "speed", kDefaultSpeed), kMinSpeed, kMaxSpeed);
 }
 
 void FreeCamera::saveConfig(nlohmann::json& section) const
@@ -194,6 +239,54 @@ void FreeCamera::clearHeldKeys()
 {
     for (std::atomic<bool>& flag : m_held) {
         flag.store(false, std::memory_order_relaxed);
+    }
+}
+
+bool FreeCamera::comboKeyOf(const std::vector<int>& combo, DWORD virtualKey)
+{
+    if (combo.empty()) {
+        return false;
+    }
+    const int vk = keys::normalize(static_cast<int>(virtualKey));
+    if (keys::isModifier(vk)) {
+        return false;
+    }
+    bool isMain = false;
+    for (const int key : combo) {
+        if (!keys::isModifier(key) && key == vk) {
+            isMain = true;
+            break;
+        }
+    }
+    if (!isMain) {
+        return false;
+    }
+
+    for (const int key : combo) {
+        if (keys::isModifier(key) && (GetAsyncKeyState(key) & 0x8000) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool FreeCamera::consumeToggle()
+{
+    return m_togglePressed.exchange(false, std::memory_order_relaxed);
+}
+
+void FreeCamera::onUpdate()
+{
+
+    if (m_keyHook == nullptr && available()) {
+        installKeyHook();
+    }
+    if (m_keyHook == nullptr) {
+        return;
+    }
+    if (consumeToggle() && input::isInGameplay()) {
+        toggle();
+        UiSound::instance().request();
     }
 }
 
@@ -232,9 +325,22 @@ LRESULT CALLBACK FreeCamera::keyboardHookProc(int code, WPARAM wParam, LPARAM lP
         const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
         const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
 
-        if ((down || up) && s_hookOwner->enabled() && input::isGameForeground()
-            && !input::consoleCapturing()) {
-            const MoveKey key = moveKeyFor(reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam)->vkCode);
+        const DWORD vkCode = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam)->vkCode;
+
+        if ((down || up) && input::isInGameplay()
+            && comboKeyOf(s_hookOwner->toggleKey().combo(), vkCode)) {
+            if (down) {
+                if (!s_hookOwner->m_toggleDown.exchange(true, std::memory_order_relaxed)) {
+                    s_hookOwner->m_togglePressed.store(true, std::memory_order_relaxed);
+                }
+            } else {
+                s_hookOwner->m_toggleDown.store(false, std::memory_order_relaxed);
+            }
+            return 1;
+        }
+
+        if ((down || up) && s_hookOwner->enabled() && input::isInGameplay()) {
+            const MoveKey key = moveKeyFor(vkCode);
             if (key != MoveKey::Count) {
                 s_hookOwner->m_held[static_cast<size_t>(key)].store(down,
                                                                     std::memory_order_relaxed);
@@ -250,6 +356,7 @@ void FreeCamera::onEnabledChanged(bool enabled)
     if (enabled) {
 
         m_synced = false;
+        m_hasFrozenView = false;
         m_patchX.apply();
         m_patchY.apply();
         m_patchZ.apply();
@@ -258,11 +365,18 @@ void FreeCamera::onEnabledChanged(bool enabled)
         m_patchPitch.apply();
         m_patchYawFollow.apply();
 
+        m_patchHead.apply();
+        m_patchHeadPair.apply();
+        m_patchHeadAlt.apply();
+        m_patchHeadAltPair.apply();
+        m_patchHeadInput.apply();
+        m_patchHeadInputPair.apply();
+
         m_patchPerspective.apply();
 
-        installKeyHook();
+        clearHeldKeys();
     } else {
-        removeKeyHook();
+        clearHeldKeys();
 
         m_patchX.restore();
         m_patchY.restore();
@@ -271,9 +385,37 @@ void FreeCamera::onEnabledChanged(bool enabled)
         m_patchYaw.restore();
         m_patchPitch.restore();
         m_patchYawFollow.restore();
+        m_patchHead.restore();
+        m_patchHeadPair.restore();
+        m_patchHeadAlt.restore();
+        m_patchHeadAltPair.restore();
+        m_patchHeadInput.restore();
+        m_patchHeadInputPair.restore();
 
         m_patchPerspective.restore();
+
     }
+}
+
+bool FreeCamera::freezeViewVector(float* out)
+{
+    if (!enabled()) {
+        m_hasFrozenView = false;
+        return false;
+    }
+    if (out == nullptr || !memory::isReadable(out, sizeof(m_frozenView))) {
+        return false;
+    }
+    if (!m_hasFrozenView) {
+
+        std::memcpy(m_frozenView, out, sizeof(m_frozenView));
+        m_hasFrozenView = true;
+        log().info(L"FreeCamera: froze the aim direction at ({:.3f}, {:.3f}, {:.3f})",
+                   m_frozenView[0], m_frozenView[1], m_frozenView[2]);
+        return false;
+    }
+    std::memcpy(out, m_frozenView, sizeof(m_frozenView));
+    return true;
 }
 
 void FreeCamera::onCameraWrite(void* cameraBase)
@@ -282,7 +424,7 @@ void FreeCamera::onCameraWrite(void* cameraBase)
         return;
     }
 
-    if (!input::isGameForeground() || input::consoleCapturing()) {
+    if (!input::isInGameplay()) {
         clearHeldKeys();
         return;
     }
@@ -340,6 +482,8 @@ void FreeCamera::shutdown()
     m_patchYaw.restore();
     m_patchPitch.restore();
     m_patchYawFollow.restore();
+    m_patchHead.restore();
+    m_patchHeadInput.restore();
     m_patchPerspective.restore();
 }
 

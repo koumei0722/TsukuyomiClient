@@ -3,10 +3,9 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <chrono>
 
 #include "input/Hotkey.h"
-#include "ui/Console.h"
-#include "ui/Menu.h"
 
 namespace tsukuyomi {
 
@@ -19,8 +18,6 @@ public:
     void requestUnload();
     bool unloadRequested() const;
 
-    Console& window() { return m_console; }
-
 private:
     Client() = default;
 
@@ -31,15 +28,14 @@ private:
     void registerModules();
     void loadHotkeys();
     void saveHotkeys();
-    MenuItem buildRootMenu();
 
     HMODULE m_self = nullptr;
+
+    bool m_settingsSavePending = false;
+    std::chrono::steady_clock::time_point m_settingsSaveAt{};
+
     std::atomic<bool> m_unloadRequested{false};
 
-    Console m_console;
-
-    Hotkey m_consoleKey;
-    Hotkey m_forceShowKey;
     Hotkey m_unloadKey;
 };
 

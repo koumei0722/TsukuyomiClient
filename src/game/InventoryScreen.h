@@ -61,7 +61,7 @@ private:
     static std::uint64_t pack(const Hovered& value);
     static Hovered unpack(std::uint64_t value);
 
-    static constexpr std::size_t kOwnControllerVtableRva = 0xDDD94F0;
+    static constexpr std::size_t kOwnControllerVtableDisp = 6;
 
     std::atomic<std::uint64_t> m_hovered{0};
     std::atomic<unsigned long long> m_seenAtMs{0};

@@ -1,5 +1,7 @@
 #include "modules/Module.h"
 
+#include "game/UiSound.h"
+
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "input/Foreground.h"
@@ -34,8 +36,11 @@ void Module::update()
 {
 
     const bool toggleRequested = m_toggleKey.triggered();
-    if (toggleRequested && input::isGameForeground()) {
+
+    if (toggleRequested && input::isInGameplay()) {
         toggle();
+
+        UiSound::instance().request();
     }
 
     onUpdate();
@@ -49,12 +54,14 @@ MenuItem Module::enabledItem()
 
 MenuItem Module::toggleKeyItem()
 {
+
     return menu::keybind(
         L"Toggle key", [this] { return m_toggleKey.combo(); },
         [this](std::vector<int> combo) {
             m_toggleKey.set(std::move(combo));
             log().info(L"{}: toggle key set to {}", name(), m_toggleKey.name());
-        });
+        },
+        {});
 }
 
 MenuItem Module::buildMenu()

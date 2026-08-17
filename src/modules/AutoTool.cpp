@@ -353,7 +353,8 @@ void AutoTool::onUpdate()
 
     const bool idle = (Clock::now() - lastQuery) > std::chrono::milliseconds(kIdleRestoreMs);
     const bool released = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0;
-    const bool unfocused = !input::isGameForeground();
+
+    const bool unfocused = !input::isInGameplay();
 
     if (idle || released || unfocused) {
         restoreSlot();

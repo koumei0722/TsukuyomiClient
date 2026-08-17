@@ -1,6 +1,7 @@
 #include "game/InventoryScreen.h"
 
 #include "memory/Memory.h"
+#include "memory/Scanner.h"
 
 #include <Windows.h>
 
@@ -144,11 +145,11 @@ bool InventoryScreen::ownScreenOpen() const
     if (vtable == nullptr) {
         return false;
     }
-    const auto* const base = reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
-    if (base == nullptr) {
+    std::byte* const ref = Scanner::instance().address(Target::OwnControllerVtableRef);
+    if (ref == nullptr) {
         return false;
     }
-    return vtable == static_cast<const void*>(base + kOwnControllerVtableRva);
+    return vtable == memory::ripTarget(ref, kOwnControllerVtableDisp);
 }
 
 const void* InventoryScreen::controller() const

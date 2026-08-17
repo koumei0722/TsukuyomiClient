@@ -1,6 +1,5 @@
 #pragma once
 
-#include <chrono>
 #include <functional>
 #include <string>
 #include <vector>
@@ -29,9 +28,18 @@ struct MenuItem {
     std::function<std::vector<int>()> getKeys;
     std::function<void(std::vector<int>)> setKeys;
 
+    std::vector<int> defaultKeys;
+
     std::function<float()> getNumber;
     std::function<void(float)> setNumber;
     bool numberIsInteger = false;
+
+    float numberMin = 0.0f;
+    float numberMax = 0.0f;
+
+    std::vector<std::wstring> choices;
+    std::function<int()> getChoice;
+    std::function<void(int)> setChoice;
 
     std::vector<MenuItem> children;
 
@@ -49,87 +57,16 @@ MenuItem toggle(std::wstring title, std::function<bool()> isOn, std::function<vo
 MenuItem action(std::wstring title, std::function<void()> run);
 MenuItem cycle(std::wstring title, std::function<std::wstring()> valueText,
                std::function<void()> next);
+
+MenuItem choice(std::wstring title, std::vector<std::wstring> choices, std::function<int()> get,
+                std::function<void(int)> set);
+
 MenuItem keybind(std::wstring title, std::function<std::vector<int>()> get,
-                 std::function<void(std::vector<int>)> set);
-MenuItem number(std::wstring title, std::function<float()> get,
-                std::function<void(float)> set, bool integer);
+                 std::function<void(std::vector<int>)> set, std::vector<int> defaults = {});
+
+MenuItem number(std::wstring title, std::function<float()> get, std::function<void(float)> set,
+                bool integer, float min = 0.0f, float max = 0.0f);
 
 }
-
-class Menu {
-public:
-    enum class Mode {
-        Normal,
-        AwaitingKeybind,
-        NumberEntry,
-    };
-
-    void setRoot(MenuItem root);
-    void resetToRoot();
-
-    const MenuItem& node() const;
-    const std::vector<MenuItem>& items() const;
-    std::wstring title() const;
-    bool atRoot() const { return m_path.empty(); }
-
-    size_t selected() const { return m_selected; }
-
-    size_t visibleBegin() const;
-    size_t visibleEnd() const;
-
-    void moveUp();
-    void moveDown();
-
-    void scrollView(int lines);
-
-    void select(size_t index);
-    void activate();
-
-    bool toggleSelected();
-
-    void back();
-
-    Mode mode() const { return m_mode; }
-    const MenuItem* editingItem() const;
-    const std::wstring& numberBuffer() const { return m_numberBuffer; }
-    std::wstring capturedKeysText() const;
-
-    void captureKey(int virtualKey, std::vector<int> held);
-
-    void appendNumberChar(wchar_t ch);
-    void backspaceNumber();
-    void commitNumber();
-    void cancelInput();
-
-    bool inCooldown() const;
-
-private:
-    using Clock = std::chrono::steady_clock;
-
-    const MenuItem* editingItemMutable() const;
-    void startCooldown();
-    void clampSelection();
-
-    size_t maxViewTop() const;
-
-    void ensureSelectionVisible();
-
-    static constexpr int kCooldownMs = 300;
-
-    MenuItem m_root;
-    std::vector<size_t> m_path;
-    size_t m_selected = 0;
-
-    size_t m_viewTop = 0;
-
-    Mode m_mode = Mode::Normal;
-    size_t m_editingIndex = 0;
-
-    std::vector<int> m_capturedKeys;
-
-    std::wstring m_numberBuffer;
-
-    Clock::time_point m_cooldownUntil{};
-};
 
 }

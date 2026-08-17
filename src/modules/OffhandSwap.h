@@ -153,8 +153,6 @@ private:
 
     static constexpr unsigned long long kQueueWaitMs = 500;
 
-    bool m_hadEnabledSetting = false;
-
     bool m_screenSwap = false;
     bool m_legacyBridge = false;
 

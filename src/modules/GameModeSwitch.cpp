@@ -24,6 +24,9 @@ long long nowMs()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
+std::vector<int> defaultSwitchKeys() { return {VK_F3, VK_F4}; }
+std::vector<int> defaultSpectatorKeys() { return {VK_F3, 'N'}; }
+
 }
 
 GameModeSwitch& GameModeSwitch::instance()
@@ -45,6 +48,8 @@ const wchar_t* GameModeSwitch::modeName(int mode)
 void GameModeSwitch::onSetGameMode(void* self, int mode, int extra)
 {
 
+    (void)extra;
+
     if (self != nullptr) {
         const long long now = nowMs();
         void* const previous = m_self.exchange(self, std::memory_order_acq_rel);
@@ -57,7 +62,6 @@ void GameModeSwitch::onSetGameMode(void* self, int mode, int extra)
 
         m_selfCapturedMs.store(now, std::memory_order_relaxed);
     }
-    m_extra.store(extra, std::memory_order_relaxed);
 
     if (!gamemode::isSelectable(mode) && !m_warnedUnusualMode) {
         m_warnedUnusualMode = true;
@@ -151,7 +155,7 @@ void GameModeSwitch::onUpdate()
     const bool wantsSpectator = m_spectatorKey.triggered();
     const bool modifiers = modifiersDown(m_switchKey);
 
-    if (!enabled() || !input::isGameForeground()) {
+    if (!enabled() || !input::isInGameplay()) {
 
         m_selecting.store(false, std::memory_order_relaxed);
         publishSelection();
@@ -248,26 +252,10 @@ void GameModeSwitch::applyRequest(Request wanted)
     }
 }
 
-int GameModeSwitch::countTargets() const
-{
-    void* const targets[] = {m_self.load(std::memory_order_acquire),
-                             m_selfAlt.load(std::memory_order_acquire)};
-    int count = 0;
-    for (size_t i = 0; i < std::size(targets); ++i) {
-        if (targets[i] == nullptr || (i > 0 && targets[i] == targets[0])) {
-            continue;
-        }
-        ++count;
-    }
-    return count;
-}
-
 void GameModeSwitch::apply(int mode)
 {
 
-    void* const targets[] = {m_self.load(std::memory_order_acquire),
-                             m_selfAlt.load(std::memory_order_acquire)};
-    if (targets[0] == nullptr) {
+    if (m_self.load(std::memory_order_acquire) == nullptr) {
         return;
     }
 
@@ -278,49 +266,15 @@ void GameModeSwitch::apply(int mode)
         return;
     }
 
-    if (countTargets() <= 1) {
-        if (CommandRequest::instance().run(gamemode::command(mode))) {
-
-            log().success(L"GameModeSwitch: {} -> {} (asked the server with {})",
-                          modeName(current), modeName(mode), gamemode::commandW(mode));
-            return;
-        }
-
-        log().warn(L"GameModeSwitch: this looks like a server world, "
-                   L"so {} needs the /gamemode command and it could not be sent",
-                   modeName(mode));
+    if (!CommandRequest::instance().run(gamemode::command(mode))) {
+        log().warn(L"GameModeSwitch: could not send {} (cheats off, or the command "
+                   L"path is not ready yet)",
+                   gamemode::commandW(mode));
         return;
     }
 
-    const int extra = m_extra.load(std::memory_order_relaxed);
-    int applied = 0;
-    for (size_t i = 0; i < std::size(targets); ++i) {
-        void* const target = targets[i];
-        if (target == nullptr || (i > 0 && target == targets[0])) {
-            continue;
-        }
-        if (!hooks::callSetGameMode(target, mode, extra)) {
-
-            (i == 0 ? m_self : m_selfAlt).store(nullptr, std::memory_order_release);
-            continue;
-        }
-        ++applied;
-    }
-
-    if (applied == 0) {
-
-        log().warn(L"GameModeSwitch: no usable target for {}, re-enter the world",
-                   modeName(mode));
-        return;
-    }
-
-    if (current != kUnknown) {
-        m_previous.store(current, std::memory_order_relaxed);
-    }
-    m_current.store(mode, std::memory_order_relaxed);
-
-    log().success(L"GameModeSwitch: {} -> {} ({} target{})", modeName(current), modeName(mode),
-                  applied, (applied == 1) ? L"" : L"s");
+    log().success(L"GameModeSwitch: {} -> {} (asked the server with {})", modeName(current),
+                  modeName(mode), gamemode::commandW(mode));
 }
 
 MenuItem GameModeSwitch::buildMenu()
@@ -334,13 +288,15 @@ MenuItem GameModeSwitch::buildMenu()
         [this](std::vector<int> combo) {
             m_switchKey.set(std::move(combo));
             log().info(L"GameModeSwitch: switch key set to {}", m_switchKey.name());
-        }));
+        },
+        defaultSwitchKeys()));
     children.push_back(menu::keybind(
         L"Spectator key", [this] { return m_spectatorKey.combo(); },
         [this](std::vector<int> combo) {
             m_spectatorKey.set(std::move(combo));
             log().info(L"GameModeSwitch: spectator key set to {}", m_spectatorKey.name());
-        }));
+        },
+        defaultSpectatorKeys()));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
@@ -351,7 +307,6 @@ MenuItem GameModeSwitch::buildMenu()
 void GameModeSwitch::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
-    m_hadEnabledSetting = section.find("enabled") != section.end();
 
     const auto readCombo = [&section](const char* key, std::vector<int> fallback) {
         const auto it = section.find(key);
@@ -367,8 +322,8 @@ void GameModeSwitch::loadConfig(const nlohmann::json& section)
         return combo;
     };
 
-    m_switchKey.set(readCombo("switchKeys", {VK_F3, VK_F4}));
-    m_spectatorKey.set(readCombo("spectatorKeys", {VK_F3, 'N'}));
+    m_switchKey.set(readCombo("switchKeys", defaultSwitchKeys()));
+    m_spectatorKey.set(readCombo("spectatorKeys", defaultSpectatorKeys()));
 }
 
 void GameModeSwitch::saveConfig(nlohmann::json& section) const
@@ -383,9 +338,6 @@ void GameModeSwitch::onScansReady()
 
     CommandRequest::instance().onScansReady();
 
-    if (!m_hadEnabledSetting) {
-        setEnabled(true);
-    }
 }
 
 }

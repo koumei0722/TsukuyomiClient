@@ -99,8 +99,11 @@ void Scaffold::captureHeight()
         return;
     }
 
-    const PlayerView view = data.playerView();
-    m_capturedY = static_cast<int>(std::floor(view.y - GameData::kEyeHeight)) - 1;
+    float footY = 0.0f;
+    if (!data.playerFeetY(footY)) {
+        footY = data.playerView().y - GameData::kEyeHeight;
+    }
+    m_capturedY = static_cast<int>(std::floor(footY)) - 1;
     m_hasCapturedY = true;
     log().info(L"Scaffold: height locked to Y {}", m_capturedY);
 }
@@ -178,12 +181,20 @@ void Scaffold::placeAll()
         return;
     }
 
-    if (!data.hasPlayerView() || !input::isGameForeground()) {
+    if (!data.hasPlayerView() || !input::isInGameplay()) {
         return;
     }
 
     const PlayerView view = data.playerView();
-    const float footY = view.y - GameData::kEyeHeight;
+
+    float footX = view.x;
+    float footY = view.y - GameData::kEyeHeight;
+    float footZ = view.z;
+    if (!data.playerFeet(footX, footY, footZ)) {
+        footX = view.x;
+        footY = view.y - GameData::kEyeHeight;
+        footZ = view.z;
+    }
 
     int planeY = 0;
     if (!resolveY(footY, planeY)) {
@@ -193,8 +204,8 @@ void Scaffold::placeAll()
         return;
     }
 
-    const BlockPos center{static_cast<int>(std::floor(view.x)), planeY,
-                          static_cast<int>(std::floor(view.z))};
+    const BlockPos center{static_cast<int>(std::floor(footX)), planeY,
+                          static_cast<int>(std::floor(footZ))};
 
     const bool moved = !m_hasLastCenter || center.x != m_lastCenter.x
                        || center.y != m_lastCenter.y || center.z != m_lastCenter.z;
@@ -252,10 +263,22 @@ MenuItem Scaffold::buildMenu()
     children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
-    children.push_back(menu::cycle(
-        L"Pattern", [this] { return std::wstring(patternName()); }, [this] { cyclePattern(); }));
-    children.push_back(menu::cycle(
-        L"Height", [this] { return std::wstring(heightName()); }, [this] { cycleHeight(); }));
+
+    children.push_back(menu::choice(
+        L"Pattern", {L"Cross (5)", L"Square 3x3", L"Square 5x5", L"Square 7x7"},
+        [this] { return static_cast<int>(m_pattern); },
+        [this](int at) { m_pattern = static_cast<Pattern>(std::clamp(at, 0, 3)); }));
+    children.push_back(menu::choice(
+        L"Height", {L"Follow", L"Manual", L"On enable"},
+        [this] { return static_cast<int>(m_height); }, [this](int at) {
+            m_height = static_cast<Height>(std::clamp(at, 0, 2));
+
+            if (enabled()) {
+                captureHeight();
+            } else {
+                m_hasCapturedY = false;
+            }
+        }));
 
     MenuItem fixedY = menu::number(
         L"Fixed Y", [this] { return static_cast<float>(m_manualY); },
@@ -263,7 +286,7 @@ MenuItem Scaffold::buildMenu()
             m_manualY = std::clamp(static_cast<int>(value), kMinY, kMaxY);
             log().info(L"Scaffold: fixed Y set to {}", m_manualY);
         },
-        true);
+        true, static_cast<float>(kMinY), static_cast<float>(kMaxY));
 
     fixedY.available = [this] { return m_height == Height::Manual; };
     children.push_back(std::move(fixedY));

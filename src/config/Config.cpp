@@ -77,6 +77,11 @@ nlohmann::json& Config::section(std::string_view name)
     return m_root[key];
 }
 
+void Config::eraseSection(std::string_view name)
+{
+    m_root.erase(std::string(name));
+}
+
 int Config::getInt(const nlohmann::json& node, std::string_view key, int fallback)
 {
     const auto it = node.find(std::string(key));

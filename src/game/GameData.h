@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 
 namespace tsukuyomi {
@@ -26,7 +27,20 @@ public:
     void setGameMode(void* gameMode);
     void* gameMode() const;
 
+    void setPlayer(void* player);
+    void* player() const;
+
+    bool playerFeetY(float& outY) const;
+
+    bool playerFeet(float& outX, float& outY, float& outZ) const;
+
     static constexpr float kEyeHeight = 1.62f;
+
+    void* playerComponent(unsigned int typeId, std::size_t stride) const;
+
+    bool isPlayerEntity(const void* entityContext) const;
+
+    static constexpr std::ptrdiff_t kPlayerPositionOffset = 0x594;
 
 private:
     GameData() = default;
@@ -36,6 +50,8 @@ private:
     bool m_valid = false;
 
     std::atomic<void*> m_gameMode{nullptr};
+
+    std::atomic<void*> m_player{nullptr};
 };
 
 }

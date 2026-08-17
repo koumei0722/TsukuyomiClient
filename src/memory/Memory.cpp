@@ -1,5 +1,8 @@
 #include "memory/Memory.h"
 
+#include <cstdint>
+#include <cstring>
+
 #include <Windows.h>
 
 namespace tsukuyomi::memory {
@@ -47,6 +50,17 @@ bool isWritable(const void* address, size_t size)
     constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE
                                 | PAGE_EXECUTE_WRITECOPY;
     return checkAccess(address, size, kWritable);
+}
+
+void* ripTarget(const std::byte* at, std::size_t dispOffset)
+{
+    if (at == nullptr || !isReadable(at + dispOffset, sizeof(std::int32_t))) {
+        return nullptr;
+    }
+    std::int32_t displacement = 0;
+    std::memcpy(&displacement, at + dispOffset, sizeof(displacement));
+    const auto* const next = at + dispOffset + sizeof(displacement);
+    return const_cast<std::byte*>(next) + displacement;
 }
 
 }

@@ -4,6 +4,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "memory/Signatures.h"
+
 namespace tsukuyomi {
 
 class ItemStackRequest {
@@ -54,6 +56,10 @@ public:
     void onNotifyInventoryOpen(void* client);
 
     static std::byte* findContainerOpenHandle();
+
+    static std::byte* resolvePacketHandle(Target getIdTarget, const wchar_t* what);
+
+    static std::byte* resolvePacketReader(Target getIdTarget, const wchar_t* what);
 
     static std::byte* findInventoryContentReader();
 
@@ -129,7 +135,7 @@ private:
     using MakeSwapActionFn = void(__fastcall*)(void** outAction, const void* src, const void* dst);
     using AddRequestActionFn = void(__fastcall*)(void** clientHolder, void** action);
 
-    using EndRequestFn = void(__fastcall*)(void* client);
+    using EndRequestFn = void(__fastcall*)(void* guard);
 
     static constexpr std::uint64_t kContainerHotbar = 28;
     static constexpr std::uint64_t kContainerInventory = 29;
@@ -148,7 +154,7 @@ private:
     static constexpr std::ptrdiff_t kStackNetAltOffset = 0x88;
     static constexpr std::ptrdiff_t kStackNetTagOffset = 0x90;
 
-    static constexpr std::size_t kNetManagerVtableRva = 0xDD03CD0;
+    static constexpr std::size_t kNetManagerVtableDisp = 16;
 
     static constexpr std::ptrdiff_t kValidFlagOffset = 0x09;
     static constexpr std::ptrdiff_t kPendingOffset = 0x60;
@@ -204,9 +210,8 @@ private:
     std::atomic<int> m_suppressOpens{0};
     std::atomic<unsigned long long> m_suppressUntilMs{0};
 
-    std::byte m_openResult[0x48]{};
-    std::atomic<bool> m_hasOpenResult{false};
-    std::atomic<bool> m_warnedNoOpenResult{false};
+    static constexpr std::size_t kOpenResultSize = 0x48;
+    static constexpr std::ptrdiff_t kOpenResultTagOffset = 0x40;
 
     std::atomic<bool> m_loggedOpenResult{false};
 

@@ -111,6 +111,8 @@ bool looksLikeHeapObject(const void* value)
            && !mainModule().contains(value);
 }
 
+std::vector<int> defaultSwapKeys() { return {'F'}; }
+
 }
 
 OffhandSwap& OffhandSwap::instance()
@@ -135,9 +137,6 @@ void OffhandSwap::onScansReady()
 
     LegacyTransaction::instance().onScansReady();
 
-    if (!m_hadEnabledSetting) {
-        setEnabled(true);
-    }
 }
 
 void OffhandSwap::onSetSelectedSlot(void* holder)
@@ -158,7 +157,8 @@ void OffhandSwap::onUpdate()
 {
 
     const bool wants = m_swapKey.triggered();
-    if (!enabled() || !input::isGameForeground()) {
+
+    if (!enabled() || !input::isInGameplay()) {
         return;
     }
     if (wants) {
@@ -729,7 +729,8 @@ MenuItem OffhandSwap::buildMenu()
         [this](std::vector<int> combo) {
             m_swapKey.set(std::move(combo));
             log().info(L"OffhandSwap: swap key set to {}", m_swapKey.name());
-        }));
+        },
+        defaultSwapKeys()));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
@@ -740,14 +741,13 @@ MenuItem OffhandSwap::buildMenu()
 void OffhandSwap::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
-    m_hadEnabledSetting = section.find("enabled") != section.end();
 
     m_screenSwap = Config::getBool(section, "screenSwap", false);
     m_legacyBridge = Config::getBool(section, "legacyBridge", false);
 
     const auto it = section.find("swapKeys");
     if (it == section.end() || !it->is_array()) {
-        m_swapKey.set({'F'});
+        m_swapKey.set(defaultSwapKeys());
         return;
     }
     std::vector<int> combo;

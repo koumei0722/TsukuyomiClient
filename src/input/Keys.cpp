@@ -70,6 +70,27 @@ std::wstring name(int virtualKey)
     case VK_OEM_PLUS:  return L"+";
     case VK_OEM_COMMA: return L",";
     case VK_OEM_PERIOD:return L".";
+
+    case VK_PAUSE:     return L"PAUSE";
+    case VK_SNAPSHOT:  return L"PRINTSCREEN";
+    case VK_SCROLL:    return L"SCROLLLOCK";
+    case VK_NUMLOCK:   return L"NUMLOCK";
+    case VK_APPS:      return L"MENU";
+    case VK_LWIN:      return L"WIN";
+    case VK_RWIN:      return L"WIN";
+    case VK_MULTIPLY:  return L"NUM*";
+    case VK_ADD:       return L"NUM+";
+    case VK_SUBTRACT:  return L"NUM-";
+    case VK_DECIMAL:   return L"NUM.";
+    case VK_DIVIDE:    return L"NUM/";
+    case VK_OEM_1:     return L";";
+    case VK_OEM_2:     return L"/";
+    case VK_OEM_3:     return L"@";
+    case VK_OEM_4:     return L"[";
+    case VK_OEM_5:     return L"\\";
+    case VK_OEM_6:     return L"]";
+    case VK_OEM_7:     return L"^";
+    case VK_OEM_102:   return L"_";
     default:
         break;
     }

@@ -1,6 +1,7 @@
 #include "memory/Scanner.h"
 
 #include "core/Logger.h"
+#include "game/GameVersion.h"
 
 #include <libhat/process.hpp>
 #include <libhat/scanner.hpp>
@@ -59,6 +60,7 @@ Scanner& Scanner::instance()
 
 size_t Scanner::scanAll()
 {
+    gameVersion::logOnce();
     const auto mod = hat::process::get_process_module();
     const auto text = mod.get_section_data(".text");
     if (text.empty()) {

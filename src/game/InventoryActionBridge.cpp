@@ -349,9 +349,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
 
     const bool trace = m_traceLeft.fetch_sub(1, std::memory_order_relaxed) > 0;
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] controller {:#x} resolver {:#x}",
-                   reinterpret_cast<std::uintptr_t>(controller),
-                   reinterpret_cast<std::uintptr_t>(resolver));
     }
 
     static constexpr char kContainerName[] = "container_items";
@@ -369,8 +366,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
 
     std::byte* const first = callGetItemGuarded(fn, resolver, query);
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] container_items[0] -> {:#x}",
-                   reinterpret_cast<std::uintptr_t>(first));
     }
     if (first == nullptr || !memory::isReadable(first, kStackSize)) {
         return false;
@@ -380,8 +375,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     const bool gotScreen =
         readPointer(resolver, kResolverScreenOffset, screenObject) && screenObject != nullptr;
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] screen {:#x} (ok {})",
-                   reinterpret_cast<std::uintptr_t>(screenObject), gotScreen ? 1 : 0);
     }
     if (!gotScreen) {
         return false;
@@ -391,8 +384,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     const bool gotPlaces = resolve(places) && places.container != nullptr
                            && memory::isReadable(places.container, sizeof(void*));
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] player container {:#x} (ok {})",
-                   reinterpret_cast<std::uintptr_t>(places.container), gotPlaces ? 1 : 0);
     }
     if (!gotPlaces) {
         return false;
@@ -430,7 +421,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     }
 
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] the copy holds {} slots", copyCount);
     }
 
     const unsigned long long now = GetTickCount64();
@@ -451,11 +441,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
                 return false;
             }
             if (trace) {
-                log().info(L"InventoryActionBridge: [8-A1] via the screen: model {:#x} "
-                           L"-> container {:#x} ({} slots at {:#x})",
-                           reinterpret_cast<std::uintptr_t>(model),
-                           reinterpret_cast<std::uintptr_t>(box), copyCount,
-                           reinterpret_cast<std::uintptr_t>(slots));
             }
             out.container = box;
             out.slots = slots;
@@ -504,9 +489,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     if (collection == nullptr) {
         m_nextScanMs.store(now + kScanRetryMs, std::memory_order_relaxed);
         if (trace) {
-            log().info(L"InventoryActionBridge: [8-A1] could not find the collection that owns "
-                       L"{:#x}",
-                       reinterpret_cast<std::uintptr_t>(first));
         }
         return false;
     }
@@ -517,24 +499,12 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
         gotModel && containerFrom(candidate, ownNotify, places.container, found);
     std::byte* const slots = gotContainer ? findSlots(found, copyCount, first) : nullptr;
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] collection {:#x} model {:#x} container {:#x} "
-                   L"slots {:#x}",
-                   reinterpret_cast<std::uintptr_t>(collection),
-                   reinterpret_cast<std::uintptr_t>(candidate),
-                   reinterpret_cast<std::uintptr_t>(found),
-                   reinterpret_cast<std::uintptr_t>(slots));
     }
     if (slots == nullptr) {
         m_nextScanMs.store(now + kScanRetryMs, std::memory_order_relaxed);
         return false;
     }
     if (trace) {
-        log().info(L"InventoryActionBridge: [8-A1] collection {:#x} -> model {:#x} "
-                   L"-> container {:#x} ({} slots at {:#x})",
-                   reinterpret_cast<std::uintptr_t>(collection),
-                   reinterpret_cast<std::uintptr_t>(candidate),
-                   reinterpret_cast<std::uintptr_t>(found), copyCount,
-                   reinterpret_cast<std::uintptr_t>(slots));
     }
     out.container = found;
     out.slots = slots;

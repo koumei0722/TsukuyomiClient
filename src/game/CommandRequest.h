@@ -41,7 +41,7 @@ private:
     };
     static_assert(sizeof(Args) == 0x30, "コマンド引数のレイアウトが実測と合っていません");
 
-    static constexpr std::int32_t kCommandVersion = 49;
+    static constexpr std::int32_t kCommandVersion = 50;
 
     static constexpr int kMaxSenderCandidates = 32;
 

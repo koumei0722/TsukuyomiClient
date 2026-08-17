@@ -87,6 +87,8 @@ private:
 
     bool predictRefill(const Inventory& inventory, Spot spot, int destSlot, int sourceSlot);
 
+    void notifyRefilled(void* container, int destSlot, int sourceSlot);
+
     void serveOutstanding();
 
     bool rollbackOutstanding();
@@ -108,7 +110,7 @@ private:
     static constexpr ptrdiff_t kOffhandOffset = 0xD90;
     static constexpr ptrdiff_t kMainhandOffset = 0xE28;
 
-    static constexpr std::size_t kLocalPlayerVtableRva = 0xDDA8420;
+    static constexpr std::size_t kLocalPlayerVtableDisp = 3;
 
     static constexpr ptrdiff_t kUiSlotsFirstOffset = 0xA58;
     static constexpr ptrdiff_t kUiSlotsLastOffset = 0xA60;

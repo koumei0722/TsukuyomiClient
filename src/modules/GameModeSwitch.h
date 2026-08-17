@@ -56,8 +56,6 @@ private:
     void applyRequest(Request wanted);
     void apply(int mode);
 
-    int countTargets() const;
-
     void publishSelection() const;
 
     static const wchar_t* modeName(int mode);
@@ -67,7 +65,6 @@ private:
 
     std::atomic<void*> m_self{nullptr};
     std::atomic<void*> m_selfAlt{nullptr};
-    std::atomic<int> m_extra{0};
     std::atomic<int> m_current{kUnknown};
     std::atomic<int> m_previous{kUnknown};
     std::atomic<Request> m_request{Request::None};
@@ -81,8 +78,6 @@ private:
     std::atomic<long long> m_lastViewMs{0};
 
     static constexpr long long kViewGapMs = 1500;
-
-    bool m_hadEnabledSetting = false;
 
     bool m_warnedNoSelf = false;
 

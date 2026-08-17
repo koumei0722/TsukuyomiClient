@@ -5,6 +5,7 @@
 #include "core/Logger.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
+#include "memory/Memory.h"
 #include "memory/Scanner.h"
 
 namespace tsukuyomi {
@@ -636,12 +637,11 @@ bool HandRestock::isClientSidePlayer(void* player) const
     if (!readPointerGuarded(player, vtable) || vtable == nullptr) {
         return false;
     }
-    const ModuleRange& module = mainModule();
-    if (!module.contains(vtable)) {
+    std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
+    if (ref == nullptr) {
         return false;
     }
-    const auto rva = static_cast<std::size_t>(static_cast<const std::byte*>(vtable) - module.base);
-    return rva == kLocalPlayerVtableRva;
+    return vtable == memory::ripTarget(ref, kLocalPlayerVtableDisp);
 }
 
 bool HandRestock::resolveClient(Inventory& out) const
@@ -683,8 +683,13 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
         if (inventory.offhand == nullptr) {
             return false;
         }
-        return ItemStackOps::instance().swap(inventory.slots + kSlotStride * sourceSlot,
-                                             inventory.offhand);
+        if (!ItemStackOps::instance().swap(inventory.slots + kSlotStride * sourceSlot,
+                                           inventory.offhand)) {
+            return false;
+        }
+
+        notifyRefilled(inventory.container, -1, sourceSlot);
+        return true;
     }
 
     if (m_swapSlots == nullptr) {
@@ -695,6 +700,8 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
     const void* faultAddress = nullptr;
     if (callSwapGuarded(reinterpret_cast<SwapSlotsRaw>(m_swapSlots), inventory.container, destSlot,
                         sourceSlot, &faultPc, &faultAddress)) {
+
+        notifyRefilled(inventory.container, destSlot, sourceSlot);
         return true;
     }
 
@@ -743,15 +750,37 @@ bool HandRestock::rollbackOutstanding()
         }
         const void* faultPc = nullptr;
         const void* faultAddress = nullptr;
-        return callSwapGuarded(reinterpret_cast<SwapSlotsRaw>(m_swapSlots),
-                               m_outstanding.container, m_outstanding.destSlot,
-                               m_outstanding.sourceSlot, &faultPc, &faultAddress);
+        if (!callSwapGuarded(reinterpret_cast<SwapSlotsRaw>(m_swapSlots), m_outstanding.container,
+                             m_outstanding.destSlot, m_outstanding.sourceSlot, &faultPc,
+                             &faultAddress)) {
+            return false;
+        }
+
+        notifyRefilled(m_outstanding.container, m_outstanding.destSlot, m_outstanding.sourceSlot);
+        return true;
     }
 
     if (!m_outstanding.hasBefore) {
         return false;
     }
-    return ItemStackOps::instance().assignFrom(m_outstanding.source, m_before);
+    if (!ItemStackOps::instance().assignFrom(m_outstanding.source, m_before)) {
+        return false;
+    }
+    notifyRefilled(m_outstanding.container, -1, m_outstanding.sourceSlot);
+    return true;
+}
+
+void HandRestock::notifyRefilled(void* container, int destSlot, int sourceSlot)
+{
+    if (container == nullptr) {
+        return;
+    }
+    if (destSlot >= 0) {
+        ItemStackOps::instance().notifySlotChanged(container, destSlot);
+    }
+    if (sourceSlot >= 0) {
+        ItemStackOps::instance().notifySlotChanged(container, sourceSlot);
+    }
 }
 
 void HandRestock::clearOutstanding()

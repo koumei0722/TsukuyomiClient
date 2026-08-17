@@ -135,7 +135,7 @@ MenuItem FlySpeed::buildMenu()
             log().info(L"FlySpeed: horizontal set to {:g} (default {:g})", clamped,
                        abilities::kDefaultFlySpeed);
         },
-        false));
+        false, kMinSpeed, kMaxHorizontal));
     children.push_back(menu::number(
         L"Vertical", [this] { return m_vertical.load(std::memory_order_relaxed); },
         [this](float value) {
@@ -144,7 +144,7 @@ MenuItem FlySpeed::buildMenu()
             log().info(L"FlySpeed: vertical set to {:g} (default {:g})", clamped,
                        abilities::kDefaultVerticalFlySpeed);
         },
-        false));
+        false, kMinSpeed, kMaxVertical));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };

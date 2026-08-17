@@ -4,8 +4,6 @@
 #include "game/GameModeIds.h"
 #include "hooks/HookManager.h"
 #include "render/GameModeOverlay.h"
-#include "ui/ConsoleSnapshot.h"
-#include "ui/Renderer.h"
 #include "ui/Theme.h"
 
 #include <Windows.h>
@@ -52,11 +50,6 @@ std::atomic<int> g_drawing{0};
 std::atomic<bool> g_selectionVisible{false};
 std::atomic<int> g_selectionMode{gamemode::kUnknown};
 
-std::mutex g_consoleMutex;
-std::shared_ptr<const ConsoleSnapshot> g_consoleSnapshot;
-
-std::atomic<bool> g_consoleVisible{false};
-
 std::atomic<HWND> g_outputWindow{nullptr};
 std::atomic<float> g_viewWidth{0.0f};
 std::atomic<float> g_viewHeight{0.0f};
@@ -92,8 +85,6 @@ struct Resources {
     ComPtr<IDWriteTextFormat> hintFormat;
     UINT fontHeight = 0;
 
-    Renderer consoleRenderer;
-
     bool deviceReady = false;
 };
 
@@ -102,6 +93,12 @@ Resources g_res;
 std::atomic<WNDPROC> g_originalProc{nullptr};
 HWND g_hookedWindow = nullptr;
 
+std::atomic<unsigned int> g_frameIndex{0};
+
+constexpr unsigned int kFramesAfterResize = 30;
+
+std::atomic<unsigned int> g_resumeAtFrame{0};
+
 void releaseAll();
 
 LRESULT CALLBACK subclassProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
@@ -109,9 +106,15 @@ LRESULT CALLBACK subclassProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     switch (message) {
     case WM_SIZE:
     case WM_ENTERSIZEMOVE:
+    case WM_EXITSIZEMOVE:
     case WM_DISPLAYCHANGE:
 
         {
+
+            g_resumeAtFrame.store(g_frameIndex.load(std::memory_order_relaxed)
+                                      + kFramesAfterResize,
+                                  std::memory_order_release);
+
             const std::lock_guard<std::mutex> lock(g_resourceMutex);
             releaseAll();
         }
@@ -186,9 +189,6 @@ bool isGameSwapChain(IDXGISwapChain* swapChain, DXGI_SWAP_CHAIN_DESC& descOut)
 
 void releaseAll()
 {
-
-    g_res.consoleRenderer.releaseResources();
-
     if (g_res.d2dContext) {
         g_res.d2dContext->SetTarget(nullptr);
     }
@@ -309,12 +309,6 @@ bool createDevice()
         return failDevice(L"creating the brush", result);
     }
 
-    if (!g_res.consoleRenderer.createResources(g_res.d2dContext.Get(), g_res.writeFactory.Get(),
-                                               g_res.brush.Get())) {
-        log().warn(L"Overlay: could not prepare the console renderer. "
-                   L"The console will not show in-game");
-    }
-
     g_res.deviceReady = true;
     g_deviceLive.store(true, std::memory_order_relaxed);
     g_idleFrames = 0;
@@ -379,14 +373,6 @@ void drawContents(float width, float height)
                              g_selectionMode.load(std::memory_order_relaxed));
     }
 
-    std::shared_ptr<const ConsoleSnapshot> console;
-    {
-        const std::lock_guard<std::mutex> lock(g_consoleMutex);
-        console = g_consoleSnapshot;
-    }
-    if (console && g_res.consoleRenderer.ready()) {
-        g_res.consoleRenderer.render(*console, overlayScale(height));
-    }
 }
 
 void drawOverlay(IDXGISwapChain* swapChain)
@@ -479,12 +465,29 @@ void drawOverlay(IDXGISwapChain* swapChain)
 
 void tryDraw(IDXGISwapChain* swapChain)
 {
+
+    const unsigned int frame = g_frameIndex.fetch_add(1, std::memory_order_relaxed) + 1;
+
     if (!g_active.load(std::memory_order_acquire)) {
         return;
     }
 
-    if (!g_selectionVisible.load(std::memory_order_acquire)
-        && !g_consoleVisible.load(std::memory_order_acquire)) {
+    if (const unsigned int resumeAt = g_resumeAtFrame.load(std::memory_order_acquire);
+        resumeAt != 0) {
+        if (frame < resumeAt) {
+
+            if (g_deviceLive.load(std::memory_order_relaxed)) {
+                const std::lock_guard<std::mutex> lock(g_resourceMutex);
+                releaseAll();
+            }
+            return;
+        }
+
+        g_resumeAtFrame.store(0, std::memory_order_relaxed);
+        g_idleFrames = 0;
+    }
+
+    if (!g_selectionVisible.load(std::memory_order_acquire)) {
         if (g_deviceLive.load(std::memory_order_relaxed)
             && ++g_idleFrames > kIdleFramesBeforeRelease) {
             const std::lock_guard<std::mutex> lock(g_resourceMutex);
@@ -724,14 +727,6 @@ void setGameModeSelection(bool visible, int selectedMode)
     g_selectionVisible.store(visible, std::memory_order_release);
 }
 
-void setConsoleSnapshot(std::shared_ptr<const ConsoleSnapshot> snapshot)
-{
-    const std::lock_guard<std::mutex> lock(g_consoleMutex);
-    g_consoleSnapshot = std::move(snapshot);
-
-    g_consoleVisible.store(g_consoleSnapshot != nullptr, std::memory_order_release);
-}
-
 Viewport overlayViewport()
 {
     Viewport view;
@@ -746,7 +741,6 @@ Viewport overlayViewport()
 void shutdownOverlay()
 {
     g_selectionVisible.store(false, std::memory_order_release);
-    setConsoleSnapshot(nullptr);
 
     g_active.store(false, std::memory_order_release);
 

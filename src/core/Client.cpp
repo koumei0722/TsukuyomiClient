@@ -1,9 +1,12 @@
 #include "core/Client.h"
 
+#include "game/UiSound.h"
+
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "core/Version.h"
+#include "game/UiProbe.h"
 #include "hooks/Detours.h"
 #include "hooks/HookManager.h"
 #include "input/Foreground.h"
@@ -22,6 +25,7 @@
 #include "modules/Scaffold.h"
 #include "render/Overlay.h"
 
+#include <chrono>
 #include <utility>
 
 namespace tsukuyomi {
@@ -72,121 +76,67 @@ void Client::startup()
     ModuleManager::instance().loadConfig();
     loadHotkeys();
 
+    uiprobe::installCrashProbe();
+
+    UiSound::instance().onScansReady();
+
     hooks::installAll();
 
     ModuleManager::instance().onScansReady();
 
-    if (!m_console.create()) {
-        log().error(L"Could not open the console. Hotkeys still work");
-        return;
-    }
-
-    m_console.menu().setRoot(buildRootMenu());
-
-    if (m_consoleKey.empty()) {
-        log().warn(L"No console key is set. Press INSERT to show the console");
-    } else {
-        log().info(L"Press {} to toggle the console", m_consoleKey.name());
-    }
+    log().info(L"Settings are in Minecraft's settings screen under Tsukuyomi (END to unload)");
 }
 
 void Client::loadHotkeys()
 {
-    const nlohmann::json& section = Config::instance().section("console");
 
-    std::vector<int> combo;
-    if (const auto it = section.find("keys"); it != section.end() && it->is_array()) {
-        for (const auto& value : *it) {
-            if (value.is_number_integer()) {
-                combo.push_back(value.get<int>());
-            }
-        }
-    }
-    m_consoleKey.set(std::move(combo));
-
-    m_console.setReservedKeys(m_consoleKey.combo());
-
-    m_forceShowKey.set({VK_INSERT});
     m_unloadKey.set({VK_END});
 
-    m_console.setLogVisible(Config::getBool(section, "log", false));
-
-    const auto x = section.find("ox");
-    const auto y = section.find("oy");
-    if (x != section.end() && x->is_number() && y != section.end() && y->is_number()) {
-        m_console.setOrigin(x->get<float>(), y->get<float>());
-    }
+    Config::instance().eraseSection("console");
 }
 
 void Client::saveHotkeys()
 {
-    nlohmann::json& section = Config::instance().section("console");
-    section["keys"] = m_consoleKey.combo();
-    section["log"] = m_console.logVisible();
 
-    if (m_console.hasOrigin()) {
-        section["ox"] = m_console.originX();
-        section["oy"] = m_console.originY();
-    }
-
-    section.erase("x");
-    section.erase("y");
-    section.erase("overlay");
 }
 
-MenuItem Client::buildRootMenu()
+namespace {
+
+void pumpThreadMessages()
 {
-    std::vector<MenuItem> items = ModuleManager::instance().buildMenuItems();
+    MSG message{};
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE) != 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
 
-    items.push_back(menu::submenu(
-        L"Settings",
-        {
-            menu::back(),
-            menu::keybind(
-                L"Console key", [this] { return m_consoleKey.combo(); },
-                [this](std::vector<int> combo) {
-                    m_consoleKey.set(std::move(combo));
-
-                    m_console.setReservedKeys(m_consoleKey.combo());
-                    log().info(L"Console key set to {}", m_consoleKey.name());
-                }),
-            menu::toggle(
-                L"Show log", [this] { return m_console.logVisible(); },
-                [this] { m_console.setLogVisible(!m_console.logVisible()); }),
-            menu::action(L"Save settings", [this] {
-                saveHotkeys();
-                ModuleManager::instance().saveConfig();
-                if (Config::instance().save()) {
-                    log().success(L"Settings saved");
-                }
-            }),
-        }));
-
-    items.push_back(menu::action(L"Unload (END)", [this] { requestUnload(); }));
-
-    return menu::submenu(L"Tsukuyomi", std::move(items));
 }
 
 void Client::mainLoop()
 {
     while (!unloadRequested()) {
-        m_console.pump();
+
+        pumpThreadMessages();
         ModuleManager::instance().update();
 
-        const bool toggleConsole = m_consoleKey.triggered();
-        const bool forceShow = m_forceShowKey.triggered();
-        const bool unload = m_unloadKey.triggered();
+        uiprobe::pumpSettingsToggle();
 
-        if (input::isGameForeground()) {
-            if (toggleConsole) {
-                m_console.toggle();
+        if (uiprobe::takeSettingsDirty()) {
+            m_settingsSaveAt = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            m_settingsSavePending = true;
+        }
+        if (m_settingsSavePending && std::chrono::steady_clock::now() >= m_settingsSaveAt) {
+            m_settingsSavePending = false;
+            ModuleManager::instance().saveConfig();
+            if (Config::instance().save()) {
+                log().info(L"Saved the values changed in the settings screen");
             }
-            if (forceShow) {
-                m_console.show();
-            }
-            if (unload) {
-                requestUnload();
-            }
+        }
+
+        const bool unload = m_unloadKey.triggered();
+        if (unload && input::isGameForeground()) {
+            requestUnload();
         }
 
         Sleep(10);
@@ -200,9 +150,13 @@ void Client::shutdown()
     log().setNotifier(nullptr);
 
     ModuleManager::instance().shutdown();
-    m_console.destroy();
     render::shutdownOverlay();
+
+    uiprobe::restoreKeyRows();
+
     HookManager::instance().shutdown();
+
+    uiprobe::removeCrashProbe();
 
     saveHotkeys();
     ModuleManager::instance().saveConfig();

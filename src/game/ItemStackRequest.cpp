@@ -71,6 +71,11 @@ struct SendPayload {
     void (__fastcall* makeSwap)(void**, const void*, const void*);
     void (__fastcall* addAction)(void**, void**);
     void (__fastcall* end)(void*);
+
+    struct EndGuard {
+        void* client = nullptr;
+        unsigned char engaged = 0;
+    } endGuard;
     void* client;
 
     bool useSwap = false;
@@ -130,7 +135,9 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
             p.requestId = *reinterpret_cast<std::int32_t*>(req + 0x08);
         }
 
-        p.end(p.client);
+        p.endGuard.client = p.client;
+        p.endGuard.engaged = 1;
+        p.end(&p.endGuard);
         p.pendingAfterEnd = *reinterpret_cast<void**>(bytes + 0x60);
         return true;
     } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
@@ -149,7 +156,7 @@ bool notifyGuarded(void (*fn)(void*), void* client, const void** faultPc,
     }
 }
 
-constexpr std::size_t kSenderVtableOffset = 0x930;
+constexpr std::size_t kSenderVtableOffset = 0x920;
 constexpr std::size_t kSendVtableIndex = 2;
 
 bool sendPacketGuarded(void* client, void* packet, const std::byte* moduleBase,
@@ -334,7 +341,6 @@ bool ItemStackRequest::notifyServerInventoryOpen()
     void* const client = m_clientInstance.load(std::memory_order_acquire);
 
     if (client == nullptr || !hooks::hasNotifyInventoryOpen()
-        || !m_hasOpenResult.load(std::memory_order_acquire)
         || !m_hasCloseCopy.load(std::memory_order_acquire)) {
         if (!m_warnedNoClient.exchange(true, std::memory_order_acq_rel)) {
             log().warn(L"ItemStackRequest: open and close your inventory once (E) so the mod "
@@ -391,6 +397,16 @@ std::byte* ItemStackRequest::findContainerOpenHandle()
 {
     return findPacketHandle(Scanner::instance().address(Target::ContainerOpenGetId),
                             L"container-open", kHandleVtableOffset);
+}
+
+std::byte* ItemStackRequest::resolvePacketHandle(Target getIdTarget, const wchar_t* what)
+{
+    return findPacketHandle(Scanner::instance().address(getIdTarget), what, kHandleVtableOffset);
+}
+
+std::byte* ItemStackRequest::resolvePacketReader(Target getIdTarget, const wchar_t* what)
+{
+    return findPacketHandle(Scanner::instance().address(getIdTarget), what, kReadVtableOffset);
 }
 
 std::byte* ItemStackRequest::findContainerOpenReader()
@@ -461,26 +477,20 @@ bool ItemStackRequest::onContainerOpenHandle(void* packet, void* result)
         m_suppressOpens.store(0, std::memory_order_release);
         return false;
     }
-
-    if (!m_hasOpenResult.load(std::memory_order_acquire)) {
-        if (!m_warnedNoOpenResult.exchange(true, std::memory_order_acq_rel)) {
-            log().warn(L"ItemStackRequest: open your inventory once (E) so the mod can learn "
-                       L"what a successful container-open looks like");
-        }
-        return false;
-    }
-
     m_suppressOpens.fetch_sub(1, std::memory_order_acq_rel);
-    std::memcpy(result, m_openResult, sizeof(m_openResult));
+
+    std::memset(result, 0, kOpenResultSize);
+    static_cast<std::byte*>(result)[kOpenResultTagOffset] = std::byte{1};
     return true;
 }
 
 void ItemStackRequest::rememberContainerOpenResult(const void* result)
 {
-    if (result == nullptr || m_hasOpenResult.load(std::memory_order_acquire)) {
+
+    if (result == nullptr || m_loggedOpenResult.load(std::memory_order_acquire)) {
         return;
     }
-    std::byte copy[sizeof(m_openResult)];
+    std::byte copy[kOpenResultSize];
     if (!readBytesGuarded(result, copy, sizeof(copy))) {
         return;
     }
@@ -494,18 +504,6 @@ void ItemStackRequest::rememberContainerOpenResult(const void* result)
                    words[7], words[8]);
     }
 
-    constexpr std::size_t kPayloadSize = 0x40;
-    bool payloadIsZero = true;
-    for (std::size_t i = 0; i < kPayloadSize; ++i) {
-        payloadIsZero = payloadIsZero && copy[i] == std::byte{0};
-    }
-    if (!payloadIsZero || static_cast<std::uint8_t>(copy[kPayloadSize]) != 1) {
-        return;
-    }
-    std::memcpy(m_openResult, copy, sizeof(copy));
-    m_hasOpenResult.store(true, std::memory_order_release);
-    log().info(L"ItemStackRequest: container-open result captured, "
-               L"the screen can now be kept closed during a move");
 }
 
 void ItemStackRequest::onFrame()
@@ -551,7 +549,14 @@ bool ItemStackRequest::closeServerInventory()
         return false;
     }
 
-    return !m_serverInventoryOpen.load(std::memory_order_acquire);
+    const bool stillOpen = m_serverInventoryOpen.load(std::memory_order_acquire);
+    if (stillOpen) {
+        log().warn(L"ItemStackRequest: sent the close but the server still looks open; "
+                   L"the inventory screen may not open with E");
+    } else {
+        log().info(L"ItemStackRequest: told the server the inventory closed");
+    }
+    return !stillOpen;
 }
 
 ItemStackRequest::SlotRef ItemStackRequest::inventorySlot(const void* slots, int index)
@@ -617,11 +622,15 @@ bool ItemStackRequest::readStackAt(const void* stack, NetId& net, std::uint8_t& 
 
 void* ItemStackRequest::findNetManager()
 {
-    const ModuleRange& module = mainModule();
-    if (module.base == nullptr) {
+    std::byte* const ref = Scanner::instance().address(Target::NetManagerVtableRef);
+    if (ref == nullptr) {
         return nullptr;
     }
-    const auto* const vtable = module.base + kNetManagerVtableRva;
+    const auto* const vtable = static_cast<const std::byte*>(
+        memory::ripTarget(ref, kNetManagerVtableDisp));
+    if (vtable == nullptr) {
+        return nullptr;
+    }
 
     SYSTEM_INFO info{};
     GetSystemInfo(&info);
@@ -662,9 +671,9 @@ void* ItemStackRequest::netManager()
     if (cached != nullptr) {
 
         void* head = nullptr;
-        const ModuleRange& module = mainModule();
-        if (readPointerGuarded(cached, head)
-            && head == module.base + kNetManagerVtableRva) {
+        std::byte* const ref = Scanner::instance().address(Target::NetManagerVtableRef);
+        if (ref != nullptr && readPointerGuarded(cached, head)
+            && head == memory::ripTarget(ref, kNetManagerVtableDisp)) {
             return cached;
         }
         m_client.store(nullptr, std::memory_order_release);

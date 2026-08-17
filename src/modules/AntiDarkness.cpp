@@ -1,6 +1,10 @@
 #include "modules/AntiDarkness.h"
 
+#include <cstring>
+
 #include "core/Logger.h"
+#include "game/ItemStackRequest.h"
+#include "memory/Memory.h"
 #include "memory/Scanner.h"
 
 namespace tsukuyomi {
@@ -13,43 +17,48 @@ AntiDarkness& AntiDarkness::instance()
 
 bool AntiDarkness::available() const
 {
-    return Scanner::instance().found(Target::AntiDarkness);
+    return Scanner::instance().found(Target::MobEffectGetId);
 }
 
-void AntiDarkness::onScansReady()
+std::byte* AntiDarkness::findReader()
 {
-    std::byte* const address = Scanner::instance().address(Target::AntiDarkness);
-    if (address == nullptr) {
-        if (enabled()) {
-            log().warn(L"AntiDarkness: patch site not found, disabling");
-            setEnabled(false);
-        }
+
+    return ItemStackRequest::resolvePacketReader(Target::MobEffectGetId, L"mob-effect reader");
+}
+
+void AntiDarkness::onMobEffectRead(void* packet)
+{
+    if (packet == nullptr || !memory::isReadable(packet, kPacketSize)) {
         return;
     }
 
-    m_patch = makeNopPatch(address + kPatchOffset, kPatchSize);
+    auto* const bytes = static_cast<std::byte*>(packet);
+    std::int32_t effectId = 0;
+    std::memcpy(&effectId, bytes + kEffectIdOffset, sizeof(effectId));
 
-    if (enabled() && !m_patch.apply()) {
-        log().error(L"AntiDarkness: failed to apply the patch");
-        setEnabled(false);
+    std::uint8_t event = 0;
+    std::int32_t duration = 0;
+    std::int32_t amplifier = 0;
+    std::memcpy(&event, bytes + kEventOffset, sizeof(event));
+    std::memcpy(&duration, bytes + kDurationOffset, sizeof(duration));
+    std::memcpy(&amplifier, bytes + kAmplifierOffset, sizeof(amplifier));
+
+    if (m_logged.fetch_add(1, std::memory_order_acq_rel) < 3) {
+
+        log().info(L"AntiDarkness: mob-effect packet (effect {}, event {}, "
+                   L"duration {}, amplifier {})",
+                   effectId, event, duration, amplifier);
     }
-}
 
-void AntiDarkness::onEnabledChanged(bool enabled)
-{
-    if (!m_patch.valid()) {
+    if (!enabled() || effectId != kDarknessEffectId) {
+        return;
+    }
+    if (event != kEventAdd && event != kEventModify) {
         return;
     }
 
-    if (!m_patch.setEnabled(enabled)) {
-        log().error(L"AntiDarkness: failed to {} the patch", enabled ? L"apply" : L"restore");
-    }
-}
-
-void AntiDarkness::shutdown()
-{
-
-    m_patch.restore();
+    const std::uint8_t remove = kEventRemove;
+    std::memcpy(bytes + kEventOffset, &remove, sizeof(remove));
 }
 
 }

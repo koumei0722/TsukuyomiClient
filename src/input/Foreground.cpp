@@ -36,4 +36,19 @@ bool isGameForeground(HWND ownWindow)
     return belongsToThisProcess(core);
 }
 
+bool isInGameplay()
+{
+
+    if (!isGameForeground()) {
+        return false;
+    }
+
+    CURSORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetCursorInfo(&info) == 0) {
+        return false;
+    }
+    return (info.flags & CURSOR_SHOWING) == 0;
+}
+
 }

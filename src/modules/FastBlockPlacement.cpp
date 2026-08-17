@@ -155,14 +155,16 @@ MenuItem FastBlockPlacement::buildMenu()
     children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
-    children.push_back(menu::cycle(
-        L"Locked axis", [this] { return std::wstring(axisName()); }, [this] { cycleAxis(); }));
+
+    children.push_back(menu::choice(
+        L"Locked axis", {L"X", L"Y", L"Z"}, [this] { return static_cast<int>(m_axis); },
+        [this](int at) { m_axis = static_cast<Axis>(std::clamp(at, 0, 2)); }));
     children.push_back(menu::number(
         L"Range", [this] { return static_cast<float>(m_range); },
         [this](float value) {
             m_range = std::clamp(static_cast<int>(value), kMinRange, kMaxRange);
         },
-        true));
+        true, static_cast<float>(kMinRange), static_cast<float>(kMaxRange)));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
@@ -261,8 +263,9 @@ void FastBlockPlacement::onPlayerViewUpdate()
 
 void FastBlockPlacement::placeRange()
 {
+
     if (!enabled() || m_placing || m_gameMode == nullptr || !m_hasBase
-        || !input::isGameForeground()) {
+        || !input::isInGameplay()) {
         return;
     }
 
