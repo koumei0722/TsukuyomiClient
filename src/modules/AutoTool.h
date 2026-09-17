@@ -22,6 +22,8 @@ public:
     float onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9);
     void onSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9);
 
+    void onPlayerViewUpdate();
+
 protected:
     void onEnabledChanged(bool enabled) override;
     void onUpdate() override;
@@ -42,14 +44,20 @@ private:
     void forgetSwitch();
     void noteHolderChange(void* previous, void* current);
 
+    static bool looksLikeSlotArray(const std::byte* slotZero, ptrdiff_t stride, int slotCount);
+
     static constexpr int kSlotCount = 9;
     static constexpr ptrdiff_t kSelectedSlotOffset = 0x10;
+
+    static constexpr ptrdiff_t kContainerOffset = 0xB8;
+    static constexpr ptrdiff_t kSlotsOffset = 0x198;
+
+    bool resolveHotbar(std::byte*& out);
 
     static constexpr ptrdiff_t kItemPointerOffset = 0x10;
     static constexpr ptrdiff_t kSlotStride = 0x98;
 
     static constexpr int kIdleRestoreMs = 250;
-
     static constexpr int kGuardMs = 250;
 
     static constexpr int kHolderLogLimit = 64;
@@ -59,10 +67,11 @@ private:
     std::atomic<int> m_holderChanges{0};
     std::atomic<Clock::rep> m_lastSpeedQuery{0};
 
+    std::atomic<bool> m_restoreWanted{false};
+
     std::mutex m_stateMutex;
     int m_manualSlot = -1;
     int m_originalSlot = -1;
-
     void* m_switchedA = nullptr;
     void* m_switchedB = nullptr;
     bool m_switched = false;

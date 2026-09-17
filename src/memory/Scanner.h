@@ -11,7 +11,6 @@ namespace tsukuyomi {
 
 struct ScanHit {
     std::byte* address = nullptr;
-
     size_t count = 0;
 };
 

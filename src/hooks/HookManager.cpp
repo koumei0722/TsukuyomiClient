@@ -36,6 +36,7 @@ HookManager& HookManager::instance()
 
 bool HookManager::initialize()
 {
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
     if (m_initialized) {
         return true;
     }
@@ -52,6 +53,7 @@ bool HookManager::initialize()
 
 bool HookManager::create(void* target, void* detour, void** original, const wchar_t* name)
 {
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
     if (!m_initialized) {
         log().error(L"Cannot hook {} (MinHook not initialized)", name);
         return false;
@@ -81,6 +83,7 @@ bool HookManager::create(void* target, void* detour, void** original, const wcha
 
 bool HookManager::applyQueued()
 {
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
     if (!m_initialized) {
         return false;
     }
@@ -97,6 +100,7 @@ bool HookManager::applyQueued()
 
 void HookManager::shutdown()
 {
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
     if (!m_initialized) {
         return;
     }

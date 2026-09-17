@@ -18,7 +18,6 @@ D2D1_COLOR_F toColorF(const theme::Color& color)
 void drawCreativeIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, float centerX,
                       float centerY, float size)
 {
-
     const float unit = size * 0.40f;
     const float gap = size * 0.14f;
     const float origin = -(unit + gap * 0.5f);
@@ -35,7 +34,6 @@ void drawCreativeIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, 
 void drawSurvivalIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, float centerX,
                       float centerY, float size)
 {
-
     const float half = size * 0.42f;
     const D2D1_POINT_2F center = D2D1::Point2F(centerX, centerY);
 
@@ -53,9 +51,7 @@ void drawSurvivalIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, 
 void drawAdventureIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, float centerX,
                        float centerY, float size)
 {
-
     const float radius = size * 0.52f;
-
     const float stroke = std::max(2.0f, size * 0.16f);
     const D2D1_POINT_2F center = D2D1::Point2F(centerX, centerY);
 
@@ -76,7 +72,6 @@ void drawAdventureIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush,
 void drawSpectatorIcon(ID2D1DeviceContext* context, ID2D1SolidColorBrush* brush, float centerX,
                        float centerY, float size)
 {
-
     const float stroke = std::max(2.0f, size * 0.16f);
     const D2D1_POINT_2F center = D2D1::Point2F(centerX, centerY);
 

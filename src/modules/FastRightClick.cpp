@@ -21,10 +21,10 @@ int accessViolationFilter(unsigned long code)
                : EXCEPTION_CONTINUE_SEARCH;
 }
 
-bool callTransactionGuarded(void* gameMode, void* itemStack)
+bool callTransactionGuarded(void* gameMode, void* itemStack, int extra)
 {
     __try {
-        hooks::callUseItemTransaction(gameMode, itemStack);
+        hooks::callUseItemTransaction(gameMode, itemStack, extra);
         return true;
     } __except (accessViolationFilter(GetExceptionCode())) {
         return false;
@@ -41,7 +41,6 @@ FastRightClick& FastRightClick::instance()
 
 bool FastRightClick::available() const
 {
-
     return Scanner::instance().found(Target::UseItem)
            || Scanner::instance().found(Target::UseItemTransaction);
 }
@@ -56,7 +55,6 @@ void FastRightClick::saveConfig(nlohmann::json& section) const
 
 bool FastRightClick::shouldRepeat() const
 {
-
     return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 && input::isInGameplay();
 }
 
@@ -70,16 +68,14 @@ void FastRightClick::noteExtra(int extra)
     const Clock::time_point now = Clock::now();
     if (now >= m_nextLog) {
         m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-
         log().info(L"FastRightClick: {} extra uses since last report", m_extraSinceLog);
         m_extraSinceLog = 0;
     }
 }
 
-int FastRightClick::onUseItem(void* gameMode, void* itemStack)
+int FastRightClick::onUseItem(void* gameMode, void* itemStack, int extra)
 {
-
-    const int result = hooks::callUseItem(gameMode, itemStack);
+    const int result = hooks::callUseItem(gameMode, itemStack, extra);
 
     if (m_repeating || m_inTransaction || !enabled() || !shouldRepeat()) {
         return result;
@@ -89,7 +85,7 @@ int FastRightClick::onUseItem(void* gameMode, void* itemStack)
 
     m_repeating = true;
     for (int i = 0; i < kExtra; ++i) {
-        hooks::callUseItem(gameMode, itemStack);
+        hooks::callUseItem(gameMode, itemStack, extra);
     }
     m_repeating = false;
 
@@ -98,13 +94,12 @@ int FastRightClick::onUseItem(void* gameMode, void* itemStack)
     return result;
 }
 
-int FastRightClick::onUseItemTransaction(void* gameMode, void* itemStack)
+int FastRightClick::onUseItemTransaction(void* gameMode, void* itemStack, int extra)
 {
-
     const bool wasInTransaction = m_inTransaction;
     m_inTransaction = true;
 
-    const int result = hooks::callUseItemTransaction(gameMode, itemStack);
+    const int result = hooks::callUseItemTransaction(gameMode, itemStack, extra);
 
     if (m_repeating || !enabled() || !shouldRepeat()) {
         m_inTransaction = wasInTransaction;
@@ -131,18 +126,16 @@ int FastRightClick::onUseItemTransaction(void* gameMode, void* itemStack)
     int done = 0;
     for (; done < limit; ++done) {
         *countByte = static_cast<std::uint8_t>(original - (done + 1));
-        if (!callTransactionGuarded(gameMode, itemStack)) {
+        if (!callTransactionGuarded(gameMode, itemStack, extra)) {
             faulted = true;
             break;
         }
     }
-
     *countByte = original;
     m_repeating = false;
     m_inTransaction = wasInTransaction;
 
     if (faulted) {
-
         log().warn(L"FastRightClick: the game faulted on extra use {}; stopped this burst",
                    done + 1);
     }

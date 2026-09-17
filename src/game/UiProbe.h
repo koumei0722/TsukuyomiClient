@@ -25,6 +25,10 @@ void onResolveVarEnd(void* saved);
 
 void onBindingRead(void* bag);
 
+bool onSliderPublish(void* self, float value, float& reseed);
+
+void onPageBag(void* bag);
+
 void onKeybindListBuilt(void* self);
 
 void onControlsBindingName(void* self, void* arg3);
@@ -36,8 +40,6 @@ void onControlsSectionSetup(void* self, void* arg2);
 void onOreFacetBind(void* out, void* rdx, void* name, unsigned flag);
 
 void onOreKeyboardInputGroup(void* self, void* out);
-
-void onKeyActionName(void* out, int index);
 
 bool overrideKeyActionName(void* out, int index);
 
@@ -54,8 +56,6 @@ void onOreKeyNameToIndex(void* arg1);
 void onTranslate(const void* key);
 
 void onOreKeyRowsConsume(void* rcx, void* rdx, bool after);
-
-void onKeyRowListBuild(void* array, void* rdx, bool after);
 
 int bumpKeyRowLimit(void* container, int delta);
 
@@ -85,6 +85,7 @@ void onUiEvent(void* self, const void* event);
 void pumpMenuSelection();
 
 void onSettingsGroupRegister(void* registry, const void* idView, void* provider);
+void afterSettingsTabList(void* out);
 
 void afterSettingsGroupRegister(void* registry, const void* idView, void* provider);
 
@@ -94,6 +95,10 @@ bool beforeSettingsGroupInfoUpdate(void* self);
 void afterSettingsGroupInfoUpdate(void* self, bool swapped);
 
 void onSettingsFindComponent(void* registry, void* out, const void* idView);
+
+bool openOwnPage(bool force = false);
+
+bool refreshOwnPage();
 
 void pumpSettingsToggle();
 

@@ -28,7 +28,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 
         tsukuyomi::oreui::installEarlyFileHook();
         tsukuyomi::oreui::buildPatchedBundle();
-
         tsukuyomi::oreui::buildPatchedStartScreen();
 
         const HANDLE thread = CreateThread(nullptr, 0, &bootstrap, module, 0, nullptr);

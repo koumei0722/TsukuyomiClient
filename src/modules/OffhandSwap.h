@@ -76,11 +76,8 @@ private:
 
     struct NetIdFix {
         bool active = false;
-
         std::byte* hand = nullptr;
-
         std::byte* mainhand = nullptr;
-
         std::byte* offhand = nullptr;
         int slot = -1;
 
@@ -112,7 +109,6 @@ private:
     struct Pending {
         bool active = false;
         std::int32_t requestId = 0;
-
         std::byte* hand[2] = {};
         std::byte* offhand[2] = {};
         int count = 0;

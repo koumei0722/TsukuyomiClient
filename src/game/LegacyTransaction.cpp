@@ -31,14 +31,58 @@ struct RawSource {
     std::int32_t flags;
 };
 
+struct EmptyTransaction {
+    static constexpr std::size_t kBucketCount = 8;
+    static constexpr std::size_t kBucketSlots = kBucketCount * 2;
+    static constexpr std::size_t kBucketMask = kBucketCount - 1;
+
+    float maxLoadFactor;
+    std::uint32_t pad;
+    void* listHead;
+    std::size_t listSize;
+    void* bucketsFirst;
+    void* bucketsLast;
+    void* bucketsEnd;
+    std::size_t mask;
+    std::size_t bucketCount;
+    void* balanceFirst;
+    void* balanceLast;
+    void* balanceEnd;
+
+    void* sentinel[2];
+    void* buckets[kBucketSlots];
+};
+
+static_assert(offsetof(EmptyTransaction, listHead) == 0x08);
+static_assert(offsetof(EmptyTransaction, bucketsFirst) == 0x18);
+static_assert(offsetof(EmptyTransaction, mask) == 0x30);
+static_assert(offsetof(EmptyTransaction, bucketCount) == 0x38);
+static_assert(offsetof(EmptyTransaction, balanceFirst) == 0x40);
+
+void fillEmptyTransaction(EmptyTransaction& out)
+{
+    out = EmptyTransaction{};
+    out.maxLoadFactor = 1.0f;
+    out.sentinel[0] = out.sentinel;
+    out.sentinel[1] = out.sentinel;
+    out.listHead = out.sentinel;
+    out.bucketsFirst = out.buckets;
+    out.bucketsLast = out.buckets + EmptyTransaction::kBucketSlots;
+    out.bucketsEnd = out.buckets + EmptyTransaction::kBucketSlots;
+    out.mask = EmptyTransaction::kBucketMask;
+    out.bucketCount = EmptyTransaction::kBucketCount;
+}
+
 struct SendPayload {
-    void** (__fastcall* makeTransaction)(void**, std::uint32_t);
+    void** (__fastcall* makeTransaction)(void**, std::uint32_t, const void*);
     void(__fastcall* makeAction)(void*, const RawSource*, std::int32_t, const void*, const void*);
     void(__fastcall* destroyAction)(void*);
     void(__fastcall* addAction)(void*, const void*);
     void(__fastcall* send)(void*, void**);
 
     void* player;
+
+    EmptyTransaction empty;
 
     RawSource sourceA;
     RawSource sourceB;
@@ -58,7 +102,7 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
 {
     __try {
         void* transaction = nullptr;
-        p.makeTransaction(&transaction, p.transactionType);
+        p.makeTransaction(&transaction, p.transactionType, &p.empty);
         if (transaction == nullptr) {
             return false;
         }
@@ -162,7 +206,6 @@ bool LegacyTransaction::available() const
 
 bool LegacyTransaction::playerLooksUsable(const void* player) const
 {
-
     if (player == nullptr || mainModule().contains(player)) {
         return false;
     }
@@ -199,7 +242,6 @@ bool LegacyTransaction::swap(void* player, const SlotRef& a, const SlotRef& b)
     if (a.stack == nullptr || b.stack == nullptr) {
         return false;
     }
-
     return apply(player, Change{a.containerId, a.slot, a.stack, b.stack},
                  Change{b.containerId, b.slot, b.stack, a.stack});
 }
@@ -213,11 +255,9 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
     if (a.slot < 0 || b.slot < 0) {
         return false;
     }
-
     if (a.containerId == b.containerId && a.slot == b.slot) {
         return false;
     }
-
     if ((a.containerId == kContainerOffhand && a.slot != kOffhandSlot)
         || (b.containerId == kContainerOffhand && b.slot != kOffhandSlot)) {
         return false;
@@ -225,8 +265,14 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
     if (!available()) {
         if (!m_warnedMissing) {
             m_warnedMissing = true;
-            log().warn(L"LegacyTransaction: the helpers were not found, "
-                       L"the legacy inventory path is skipped");
+            if (m_faulted) {
+                log().warn(L"LegacyTransaction: the legacy inventory path was closed by an "
+                           L"earlier fault, the item will be moved through the request path "
+                           L"instead (the server refuses swords there)");
+            } else {
+                log().warn(L"LegacyTransaction: the helpers were not found, "
+                           L"the legacy inventory path is skipped");
+            }
         }
         return false;
     }
@@ -274,6 +320,8 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
     payload.innerOffset = kInnerTransactionOffset;
     payload.action = action;
 
+    fillEmptyTransaction(payload.empty);
+
     const void* faultPc = nullptr;
     const void* faultAddress = nullptr;
     const bool sent = sendGuarded(payload, &faultPc, &faultAddress);
@@ -281,8 +329,8 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
         log().error(L"LegacyTransaction: faulted at {} while touching {}, "
                     L"the legacy path is disabled",
                     faultPc, faultAddress);
-
         m_makeTransaction = nullptr;
+        m_faulted = true;
         return false;
     }
     return sent;

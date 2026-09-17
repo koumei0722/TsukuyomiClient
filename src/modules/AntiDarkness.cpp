@@ -22,7 +22,6 @@ bool AntiDarkness::available() const
 
 std::byte* AntiDarkness::findReader()
 {
-
     return ItemStackRequest::resolvePacketReader(Target::MobEffectGetId, L"mob-effect reader");
 }
 
@@ -44,7 +43,6 @@ void AntiDarkness::onMobEffectRead(void* packet)
     std::memcpy(&amplifier, bytes + kAmplifierOffset, sizeof(amplifier));
 
     if (m_logged.fetch_add(1, std::memory_order_acq_rel) < 3) {
-
         log().info(L"AntiDarkness: mob-effect packet (effect {}, event {}, "
                    L"duration {}, amplifier {})",
                    effectId, event, duration, amplifier);

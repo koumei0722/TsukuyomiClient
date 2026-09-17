@@ -25,7 +25,6 @@ FastBlockPlacement& FastBlockPlacement::instance()
 
 bool FastBlockPlacement::available() const
 {
-
     const Scanner& scanner = Scanner::instance();
     return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView);
 }
@@ -57,7 +56,6 @@ FastBlockPlacement::BlockPos FastBlockPlacement::shiftByFace(BlockPos pos, unsig
 void FastBlockPlacement::faceCandidates(float stepX, float stepY, float stepZ,
                                         unsigned char (&out)[4]) const
 {
-
     float primary = 0.0f;
     float secondary = 0.0f;
     unsigned char primaryPlus = 0;
@@ -102,7 +100,6 @@ unsigned char FastBlockPlacement::faceForCell(const BlockPos& pos,
                                               const unsigned char (&candidates)[4],
                                               const BlockPos* targets, int count)
 {
-
     for (const unsigned char face : candidates) {
         const BlockPos shifted = shiftByFace(pos, face);
         for (int i = 0; i < count; ++i) {
@@ -155,7 +152,6 @@ MenuItem FastBlockPlacement::buildMenu()
     children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
-
     children.push_back(menu::choice(
         L"Locked axis", {L"X", L"Y", L"Z"}, [this] { return static_cast<int>(m_axis); },
         [this](int at) { m_axis = static_cast<Axis>(std::clamp(at, 0, 2)); }));
@@ -201,25 +197,23 @@ void FastBlockPlacement::onEnabledChanged(bool enabled)
 }
 
 bool FastBlockPlacement::onBuildBlock(void* gameMode, void* blockPos, unsigned char face,
-                                      unsigned char extra)
+                                      unsigned char extra, bool simTick)
 {
-
     if (m_placing) {
-        return hooks::callBuildBlock(gameMode, blockPos, face, extra);
+        return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
 
     m_gameMode = gameMode;
 
     if (!enabled() || !memory::isReadable(blockPos, sizeof(int) * 3)) {
-        return hooks::callBuildBlock(gameMode, blockPos, face, extra);
+        return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
 
     m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
 
     if (m_manualDone) {
-
         BlockPos redirect = m_base;
-        const bool result = hooks::callBuildBlock(gameMode, &redirect, face, extra);
+        const bool result = hooks::callBuildBlock(gameMode, &redirect, face, extra, simTick);
         placeRange();
         return result;
     }
@@ -235,21 +229,19 @@ bool FastBlockPlacement::onBuildBlock(void* gameMode, void* blockPos, unsigned c
     log().info(L"FastBlockPlacement: base ({}, {}, {}) face {}", m_base.x, m_base.y, m_base.z,
                static_cast<int>(face));
 
-    const bool result = hooks::callBuildBlock(gameMode, blockPos, face, extra);
+    const bool result = hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     placeRange();
     return result;
 }
 
 void FastBlockPlacement::onPlayerViewUpdate()
 {
-
     if (!m_hasBase || m_placing) {
         return;
     }
 
     if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) {
         m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
-
         placeRange();
         return;
     }
@@ -263,7 +255,6 @@ void FastBlockPlacement::onPlayerViewUpdate()
 
 void FastBlockPlacement::placeRange()
 {
-
     if (!enabled() || m_placing || m_gameMode == nullptr || !m_hasBase
         || !input::isInGameplay()) {
         return;
@@ -271,6 +262,7 @@ void FastBlockPlacement::placeRange()
 
     const Clock::time_point now = Clock::now();
     const PlayerView view = GameData::instance().playerView();
+    constexpr bool simTick = false;
 
     constexpr float kDegToRad = std::numbers::pi_v<float> / 180.0f;
     const float yawRad = view.yaw * kDegToRad;
@@ -347,7 +339,6 @@ void FastBlockPlacement::placeRange()
 
     m_placing = true;
     for (int i = 0; i < count; ++i) {
-
         BlockPos target = targets[i];
 
         if (alreadyPlaced(target) && !resendDue) {
@@ -358,7 +349,7 @@ void FastBlockPlacement::placeRange()
         lastFace = face;
 
         ++attempted;
-        if (hooks::callBuildBlock(m_gameMode, &target, face, 0)) {
+        if (hooks::callBuildBlock(m_gameMode, &target, face, 0, simTick)) {
             ++placed;
         }
         rememberPlaced(target);
@@ -375,7 +366,6 @@ void FastBlockPlacement::placeRange()
 
     if (now >= m_nextLog) {
         m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-
         log().info(L"FastBlockPlacement: {} yaw {:.1f} pitch {:.1f} face {} (end {}) "
                    L"({}, {}, {}) -> ({}, {}, {}) {}/{} placed",
                    axisName(), view.yaw, view.pitch, static_cast<int>(candidates[0]),

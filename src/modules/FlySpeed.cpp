@@ -34,23 +34,22 @@ FlySpeed& FlySpeed::instance()
 
 bool FlySpeed::available() const
 {
-
     return Scanner::instance().found(Target::AbilitiesAccess);
 }
 
-void FlySpeed::applyOne(std::byte* layered, int index, float wanted)
+bool FlySpeed::applyOne(std::byte* layered, int index, float wanted)
 {
     std::byte* const slot = abilities::slotOf(layered, index);
     if (slot == nullptr) {
-        return;
+        return false;
     }
 
     float value = 0.0f;
     if (!abilities::readFloat(slot + abilities::kValueOffset, value)) {
-        return;
+        return false;
     }
     if (std::fabs(value - wanted) <= kEpsilon) {
-        return;
+        return true;
     }
 
     int type = 0;
@@ -59,13 +58,14 @@ void FlySpeed::applyOne(std::byte* layered, int index, float wanted)
         abilities::writeInt(slot + abilities::kTypeOffset, abilities::kTypeFloat);
     }
     abilities::writeFloat(slot + abilities::kValueOffset, wanted);
+    return false;
 }
 
 void FlySpeed::onAbilitiesAccess(void* context)
 {
-
     const bool active = m_active.load(std::memory_order_relaxed);
-    if (!active && nowMs() >= m_restoreUntilMs.load(std::memory_order_relaxed)) {
+    const bool restoring = m_restorePending.load(std::memory_order_relaxed);
+    if (!active && !restoring) {
         return;
     }
 
@@ -74,19 +74,27 @@ void FlySpeed::onAbilitiesAccess(void* context)
         return;
     }
 
-    const float horizontal =
-        active ? m_horizontal.load(std::memory_order_relaxed) : abilities::kDefaultFlySpeed;
-    const float vertical = active ? m_vertical.load(std::memory_order_relaxed)
-                                  : abilities::kDefaultVerticalFlySpeed;
+    if (active) {
+        m_ledger.note(layered);
+        applyOne(layered, abilities::kFlySpeed, m_horizontal.load(std::memory_order_relaxed));
+        applyOne(layered, abilities::kVerticalFlySpeed,
+                 m_vertical.load(std::memory_order_relaxed));
+        return;
+    }
 
-    applyOne(layered, abilities::kFlySpeed, horizontal);
-    applyOne(layered, abilities::kVerticalFlySpeed, vertical);
-}
+    if (m_ledger.needsRestore(layered)) {
+        const bool okHorizontal =
+            applyOne(layered, abilities::kFlySpeed, abilities::kDefaultFlySpeed);
+        const bool okVertical =
+            applyOne(layered, abilities::kVerticalFlySpeed, abilities::kDefaultVerticalFlySpeed);
+        if (okHorizontal && okVertical) {
+            m_ledger.markClean(layered);
+        }
+    }
 
-void FlySpeed::beginRestoreWindow()
-{
-
-    m_restoreUntilMs.store(nowMs() + kRestoreWindowMs, std::memory_order_relaxed);
+    if (m_ledger.allClean() && m_restorePending.exchange(false, std::memory_order_relaxed)) {
+        log().info(L"FlySpeed: restored the vanilla fly speed");
+    }
 }
 
 void FlySpeed::onEnabledChanged(bool enabled)
@@ -94,7 +102,8 @@ void FlySpeed::onEnabledChanged(bool enabled)
     m_active.store(enabled, std::memory_order_relaxed);
 
     if (enabled) {
-        m_restoreUntilMs.store(0, std::memory_order_relaxed);
+        m_restorePending.store(false, std::memory_order_relaxed);
+        m_ledger.clearDirty();
         if (!m_reported) {
             m_reported = true;
             log().info(L"FlySpeed: horizontal {:g} / vertical {:g}",
@@ -105,20 +114,29 @@ void FlySpeed::onEnabledChanged(bool enabled)
     }
 
     m_reported = false;
-    beginRestoreWindow();
+    m_ledger.markAllDirty();
+    m_restorePending.store(true, std::memory_order_relaxed);
 }
 
 void FlySpeed::shutdown()
 {
-
     if (!m_active.load(std::memory_order_relaxed)
-        && nowMs() >= m_restoreUntilMs.load(std::memory_order_relaxed)) {
+        && !m_restorePending.load(std::memory_order_relaxed)) {
         return;
     }
 
     m_active.store(false, std::memory_order_relaxed);
-    beginRestoreWindow();
-    Sleep(static_cast<DWORD>(kRestoreWindowMs) + 50);
+    m_ledger.markAllDirty();
+    m_restorePending.store(true, std::memory_order_relaxed);
+
+    constexpr int kGiveUpMs = 2000;
+    for (int waited = 0; waited < kGiveUpMs; waited += 10) {
+        if (!m_restorePending.load(std::memory_order_relaxed)) {
+            return;
+        }
+        Sleep(10);
+    }
+    log().warn(L"FlySpeed: gave up waiting for the restore (the game is not ticking)");
 }
 
 MenuItem FlySpeed::buildMenu()

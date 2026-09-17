@@ -133,6 +133,20 @@ MenuItem number(std::wstring title, std::function<float()> get, std::function<vo
     return item;
 }
 
+MenuItem text(std::wstring title, std::function<std::wstring()> get,
+              std::function<void(std::wstring)> set)
+{
+    MenuItem item;
+    item.kind = MenuItemKind::Text;
+    item.label = constant(std::move(title));
+    item.getText = std::move(get);
+    item.setText = std::move(set);
+    item.value = [getter = item.getText]() -> std::wstring {
+        return getter ? getter() : std::wstring{};
+    };
+    return item;
+}
+
 }
 
 }

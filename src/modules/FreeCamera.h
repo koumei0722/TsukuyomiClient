@@ -3,6 +3,8 @@
 #include <Windows.h>
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 #include "memory/Patch.h"
@@ -25,12 +27,27 @@ public:
     void shutdown() override;
 
 protected:
-
     void onUpdate() override;
 
 public:
 
     void onCameraWrite(void* cameraBase);
+
+    void onMoveInput(void* input);
+
+    bool movementSuppressed() const;
+
+    void onMoveIntent(void* out, void* input);
+
+    void onInputGatherBefore(void* out);
+    void noteInputBits(std::uint32_t bits);
+    void onInputGather(void* out, void* src);
+
+    void armPacketTrace(void* address);
+
+    bool intentFresh() const;
+
+    bool borrowForChunkReload();
 
     bool freezeViewVector(float* out);
 
@@ -64,7 +81,6 @@ private:
 
     static constexpr ptrdiff_t kWriteHead = 0x09;
     static constexpr size_t kWriteHeadSize = 5;
-
     static constexpr ptrdiff_t kWriteHeadPair = 0x0E;
     static constexpr size_t kWriteHeadPairSize = 7;
     static constexpr size_t kWriteHeadInputPairSize = 6;
@@ -115,11 +131,75 @@ private:
 
     static FreeCamera* s_hookOwner;
 
+    static constexpr std::uint32_t kRawJumpBit = 1u << 7;
+    static constexpr std::uint32_t kRawSneakBit = 1u << 0;
+    static constexpr std::uint64_t kRawHoldGraceMs = 150;
+
+    static constexpr std::uint32_t kInputJumpHeld = 1u << 26;
+    static constexpr std::uint32_t kInputSneakHeld = 1u << 21;
+
+    void armPosTrace(void* address);
+    void disarmPosTrace();
+    void notePosWrite(unsigned long long rip, unsigned long long rax,
+                      unsigned long long rsi);
+    static long __stdcall posTraceVeh(struct _EXCEPTION_POINTERS* info);
+    bool posTraceWanted() const;
+
+    static FreeCamera* s_posTraceOwner;
+    void* m_posTraceVeh = nullptr;
+    std::atomic<bool> m_posTraceArmed{false};
+    std::atomic<unsigned long long> m_posTraceUntil{0};
+    static constexpr int kPosTraceMax = 32;
+    static constexpr unsigned long long kPosTraceMs = 25000;
+    std::atomic<unsigned long long> m_posTraceRips[kPosTraceMax]{};
+    std::atomic<unsigned long long> m_posTraceRax[kPosTraceMax]{};
+    std::atomic<unsigned long long> m_posTraceRsi[kPosTraceMax]{};
+    std::atomic<int> m_posTraceCount{0};
+
+    std::atomic<unsigned long long> m_diagInputCalls{0};
+    std::atomic<unsigned long long> m_diagCamCalls{0};
+    std::atomic<unsigned long long> m_diagCamMoved{0};
+    static constexpr int kInputBitsSeenMax = 48;
+    std::atomic<std::uint32_t> m_srcSeenBits[kInputBitsSeenMax]{};
+    std::atomic<int> m_srcSeen{0};
+    std::atomic<unsigned long long> m_diagIntentCleared{0};
+    std::atomic<unsigned long long> m_diagCamByIntent{0};
+
+    std::atomic<float> m_intentStrafe{0.0f};
+    std::atomic<float> m_intentForward{0.0f};
+    std::atomic<unsigned long long> m_intentAt{0};
+    static constexpr unsigned long long kIntentFreshMs = 120;
+    static constexpr int kDiagLogLimit = 90;
+
+    std::atomic<int> m_camLogged{0};
+    unsigned long long m_camLoggedAt = 0;
+    static constexpr int kCamLogLimit = 30;
+
+    static constexpr int kUpDownLogLimit = 40;
+
+    std::atomic<unsigned long long> m_inputSeenAt{0};
+
+    static constexpr unsigned long long kInputFreshMs = 500;
+
+    static constexpr int kInputLogLimit = 128;
+
     float m_speed = kDefaultSpeed;
 
     Patch m_patchX;
     Patch m_patchY;
     Patch m_patchZ;
+
+    unsigned long long m_borrowUntil = 0;
+    bool m_borrowSynced = false;
+    float m_borrowX = 0.0f;
+    float m_borrowY = 0.0f;
+    float m_borrowZ = 0.0f;
+
+    static constexpr float kBorrowJump = 4096.0f;
+    static constexpr unsigned long long kBorrowMs = 600;
+
+    bool applyBorrow(std::byte* cameraBase);
+    void endBorrow(std::byte* cameraBase);
 
     Patch m_patchYaw;
     Patch m_patchPitch;
@@ -137,6 +217,7 @@ private:
     HHOOK m_keyHook = nullptr;
 
     std::atomic<bool> m_held[kMoveKeyCount]{};
+    std::atomic<std::uint64_t> m_rawSeenMs[kMoveKeyCount]{};
 
     std::atomic<bool> m_toggleDown{false};
     std::atomic<bool> m_togglePressed{false};

@@ -16,12 +16,11 @@ public:
 
     void saveConfig(nlohmann::json& section) const override;
 
-    int onUseItem(void* gameMode, void* itemStack);
+    int onUseItem(void* gameMode, void* itemStack, int extra);
 
-    int onUseItemTransaction(void* gameMode, void* itemStack);
+    int onUseItemTransaction(void* gameMode, void* itemStack, int extra);
 
 protected:
-
     bool persistEnabled() const override { return false; }
 
 private:

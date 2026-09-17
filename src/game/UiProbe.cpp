@@ -1,8 +1,11 @@
 #include "game/UiProbe.h"
 
 #include "core/Logger.h"
+#include "core/Strings.h"
 #include "game/GameVersion.h"
 #include "game/OreUiPatch.h"
+#include "game/StackCount.h"
+#include "game/UiTree.h"
 #include "hooks/Detours.h"
 #include "hooks/HookManager.h"
 #include "input/Keys.h"
@@ -10,6 +13,7 @@
 #include "memory/Scanner.h"
 #include "modules/Module.h"
 #include "modules/ModuleManager.h"
+#include "modules/Schematica.h"
 
 #include <Windows.h>
 
@@ -20,16 +24,28 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cwchar>
 #include <cwctype>
 #include <format>
 #include <functional>
 #include <mutex>
 #include <set>
+#include <map>
 #include <string>
 #include <vector>
 
 namespace tsukuyomi::uiprobe {
 namespace {
+
+std::atomic<unsigned long long> g_ownNavInvokedAt{0};
+
+std::atomic<bool> g_ownSettingsRoute{false};
+
+std::atomic<unsigned long long> g_ownKeyOpenAt{0};
+
+constexpr char kOwnNavId[] = "json-navigation-level_texture_pack-jsonui";
+
+std::atomic<unsigned long long> g_lookupCount{0};
 
 constexpr std::ptrdiff_t kStringSize = 0x10;
 constexpr std::ptrdiff_t kStringCapacity = 0x18;
@@ -55,13 +71,9 @@ std::atomic<void*> g_optionSelf{nullptr};
 std::atomic<bool> g_optionsCapped{false};
 
 constexpr const wchar_t* kWatched[] = {
-
     L"how_to_play/how_to_play_screen",
-
     L"how_to_play/how_to_play_selector_stack_panel",
-
     L"how_to_play/how_to_play_section_content_panels",
-
     L"how_to_play/moving_around_button",
 
 };
@@ -83,7 +95,6 @@ constexpr unsigned kTagArray = 6;
 constexpr unsigned kTagObject = 7;
 
 constexpr int kMaxNodes = 256;
-
 constexpr size_t kMaxDumpElems = 12;
 constexpr size_t kMaxKeyLength = 96;
 
@@ -117,7 +128,6 @@ std::wstring readString(const void* text)
     out.reserve(length);
     for (size_t i = 0; i < length; ++i) {
         const unsigned char ch = static_cast<unsigned char>(chars[i]);
-
         if (ch < 0x20 || ch > 0x7E) {
             return {};
         }
@@ -167,7 +177,6 @@ bool lookupGuarded(void* self, const void* space, const void* name, void*& out)
 }
 
 #pragma pack(push, 8)
-
 struct TreeNode {
     std::uintptr_t left;
     std::uintptr_t parent;
@@ -181,7 +190,7 @@ struct TreeNode {
     std::uintptr_t seq;
 };
 #pragma pack(pop)
-static_assert(sizeof(TreeNode) == 0x40, "_Tree_node は 0x40 バイト");
+static_assert(sizeof(TreeNode) == 0x40);
 
 constexpr int kMaxOwnKeys = 256;
 
@@ -271,7 +280,6 @@ size_t g_keybindCount[kMaxMenuItems]{};
 constexpr size_t kMaxRowsPerModule = kMaxNumbersPerModule + kMaxKeysPerModule;
 
 constexpr size_t kEditBufBytes = 24;
-
 constexpr int kEditKindKey = 0x10000;
 std::atomic<int> g_editRequest{-1};
 
@@ -363,7 +371,6 @@ void collectNumbers()
 
 bool gameKeyName(int keyCode, std::wstring& out)
 {
-
     thread_local alignas(8) unsigned char slot[0x20]{};
     std::memset(slot, 0, sizeof(slot));
     const std::uintptr_t room = kSsoCapacity;
@@ -372,7 +379,6 @@ bool gameKeyName(int keyCode, std::wstring& out)
     if (!hooks::callKeyDisplayName(slot, keyCode)) {
         return false;
     }
-
     std::uintptr_t after = 0;
     std::memcpy(&after, slot + kStringCapacity, sizeof(after));
     if (after > kSsoCapacity) {
@@ -478,7 +484,7 @@ const char* const kNavItemKeys[kMaxMenuItems] = {
     "tk_nav12", "tk_nav13", "tk_nav14", "tk_nav15", "tk_nav16", "tk_nav17",
     "tk_nav18", "tk_nav19", "tk_nav20", "tk_nav21", "tk_nav22", "tk_nav23",
 };
-static_assert(std::size(kNavItemKeys) == kMaxMenuItems, "鍵の数と上限を合わせること");
+static_assert(std::size(kNavItemKeys) == kMaxMenuItems);
 TreeNode g_navItemHeads[kMaxMenuItems]{};
 TreeNode g_navItemNodes[kMaxMenuItems][1]{};
 std::uintptr_t g_navItemNodePtrs[kMaxMenuItems][4]{};
@@ -511,7 +517,6 @@ std::uintptr_t g_paneItemValues[kMaxMenuItems][4]{};
 
 constexpr size_t kPaneTopicBytes = 16;
 char g_paneTopics[kMaxMenuItems][kPaneTopicBytes]{};
-
 alignas(8) unsigned char g_paneTopicRecs[kMaxMenuItems][16]{};
 TreeNode g_paneOverHeads[kMaxMenuItems]{};
 TreeNode g_paneOverNodes[kMaxMenuItems][3]{};
@@ -536,9 +541,90 @@ std::uintptr_t g_labelTopNode[4]{};
 std::uintptr_t g_labelTopValue[4]{};
 bool g_labelReady = false;
 
-constexpr char kHeaderTitle[] = "Tsukuyomi";
+constexpr char kHeaderTitle[] = "Schematica";
+
+constexpr int kScreenMenu = 0;
+constexpr int kScreenBlueprints = 1;
+constexpr int kScreenBlueprint = 2;
+constexpr int kScreenSettings = 3;
+constexpr int kScreenMaterials = 4;
+constexpr int kScreenVerifier = 5;
+constexpr int kScreenLayers = 6;
+constexpr int kScreenCount = 7;
+std::atomic<int> g_pgScreen{kScreenMenu};
+
+char g_hdrTitleText[96] = "Schematica";
+
+const char* pageHeaderTitle()
+{
+    const auto ascii = [](char* out, size_t cap, const std::wstring& text) {
+        size_t at = 0;
+        for (wchar_t ch : text) {
+            if (at + 1 >= cap) {
+                break;
+            }
+            out[at++] = (ch >= 0x20 && ch <= 0x7E) ? static_cast<char>(ch) : '?';
+        }
+        out[at] = 0;
+    };
+    switch (g_pgScreen.load(std::memory_order_relaxed)) {
+    case kScreenBlueprints:
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Schematic Placements",
+                      kHeaderTitle);
+        break;
+    case kScreenBlueprint: {
+        char name[64]{};
+        Schematica& mod = Schematica::instance();
+        const int at = mod.editingIndex();
+        if (at >= 0) {
+            ascii(name, sizeof(name), mod.blueprintName(static_cast<size_t>(at)));
+        }
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Configure: %s", kHeaderTitle,
+                      (name[0] != 0) ? name : "(none)");
+        break;
+    }
+    case kScreenSettings:
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Configuration menu",
+                      kHeaderTitle);
+        break;
+    case kScreenLayers:
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Render Layers",
+                      kHeaderTitle);
+        break;
+    case kScreenMaterials:
+    case kScreenVerifier: {
+        char name[64]{};
+        Schematica& mod2 = Schematica::instance();
+        const int at2 = mod2.editingIndex();
+        if (at2 >= 0) {
+            ascii(name, sizeof(name), mod2.blueprintName(static_cast<size_t>(at2)));
+        }
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => %s: %s", kHeaderTitle,
+                      (g_pgScreen.load(std::memory_order_relaxed) == kScreenMaterials)
+                          ? "Material List"
+                          : "Schematic Verifier",
+                      (name[0] != 0) ? name : "(none)");
+        break;
+    }
+    default:
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s", kHeaderTitle);
+        break;
+    }
+    return g_hdrTitleText;
+}
 constexpr char kHeaderBindNone[] = "none";
 alignas(8) unsigned char g_hdrTitleRec[16]{};
+constexpr char kHeaderSizeKey[] = "size";
+constexpr char kHeaderWidth[] = "100%";
+constexpr char kHeaderHeight[] = "23px";
+constexpr char kHeaderAnchorFromKey[] = "anchor_from";
+constexpr char kHeaderAnchorToKey[] = "anchor_to";
+constexpr char kHeaderAnchor[] = "top_left";
+alignas(8) unsigned char g_hdrAnchorRecs[2][16]{};
+alignas(8) unsigned char g_hdrSizeRecs[2][16]{};
+std::uintptr_t g_hdrSizeElems[2][4]{};
+std::uintptr_t g_hdrSizeElemPtrs[2]{};
+std::uintptr_t g_hdrSizeVec[4]{};
 alignas(8) unsigned char g_hdrBindRec[16]{};
 constexpr size_t kMaxHdrElems = 16;
 
@@ -573,7 +659,7 @@ constexpr bool kNavPaneOwnItems = true;
 constexpr bool kOwnMenuScreen = false;
 
 constexpr size_t kNavPaneOwnCount = 0;
-static_assert(kNavPaneOwnCount <= kMaxMenuItems, "自前の項目は静的配列に収まること");
+static_assert(kNavPaneOwnCount <= kMaxMenuItems);
 
 constexpr bool kPaneKeepVanilla = false;
 
@@ -623,14 +709,11 @@ constexpr char kSecBindCond[] = "always_when_visible";
 constexpr bool kProbeRealBinding = false;
 constexpr size_t kProbeBindingIndex = 1;
 constexpr char kProbeBindingName[] = "#hide_chat";
-
 constexpr char kSecCtlNameVar[] = "$control_name";
 constexpr char kSecEnabledVar[] = "$enabled";
-
 constexpr char kSecFocusIdVar[] = "$focus_id";
 constexpr char kSecOneLineVar[] = "$one_line_layout";
 constexpr char kSecBindNameVar[] = "$option_binding_name";
-
 constexpr char kSecStateBindVar[] = "$toggle_state_binding_name";
 constexpr char kSecLabelVar[] = "$option_label";
 constexpr char kSecBindCondVar[] = "$toggle_binding_condition";
@@ -640,7 +723,6 @@ constexpr size_t kSecCtlNameBytes = 48;
 char g_secCtlNames[kMaxMenuItems][kSecCtlNameBytes]{};
 alignas(8) unsigned char g_secCtlNameRecs[kMaxMenuItems][16]{};
 alignas(8) unsigned char g_secLabelRecs[kMaxMenuItems][16]{};
-
 char g_secBindNames[kMaxMenuItems][kSecCtlNameBytes]{};
 char g_secToggleNameBufs[kMaxMenuItems][kSecCtlNameBytes]{};
 char g_secFocusIds[kMaxMenuItems][kSecCtlNameBytes]{};
@@ -661,6 +743,23 @@ std::uintptr_t g_secCtlElems[kMaxMenuItems][1 + kMaxRowsPerModule]{};
 std::uintptr_t g_secCtlVec[kMaxMenuItems][4]{};
 
 constexpr char kNumHintVar[] = "$option_place_holder_text";
+
+constexpr char kTgTypeVar[] = "$toggle_binding_type";
+constexpr char kTgTypeNone[] = "none";
+constexpr char kTgTypeGlobal[] = "global";
+constexpr char kTgDefaultVar[] = "$toggle_default_state";
+constexpr char kTgBindVar[] = "$toggle_state_binding_name";
+constexpr char kTgNoBind[] = "#not_data_bound";
+
+constexpr char kTabRef[] = "tk_pt%u@settings_common.section_toggle_base";
+constexpr char kTabRadioVar[] = "$radio_toggle_group";
+constexpr char kTabViewVar[] = "$toggle_view_binding_name";
+constexpr char kTabGlyphVar[] = "$glyph_texture";
+constexpr char kTabGlyphColorVar[] = "$glyph_color_texture";
+constexpr char kTabGlyphSizeVar[] = "$glyph_size";
+
+constexpr char kTgTrueKey[] = "focus_magnet_enabled";
+constexpr char kTgFalseKey[] = "$toggle_default_state|default";
 
 constexpr char kBtnTextVar[] = "$button_text";
 
@@ -685,7 +784,6 @@ alignas(8) unsigned char g_numCtlRecs[kMaxMenuItems][kMaxRowsPerModule][16]{};
 alignas(8) unsigned char g_numBindRecs[kMaxMenuItems][kMaxRowsPerModule][16]{};
 alignas(8) unsigned char g_numLabelRecs[kMaxMenuItems][kMaxRowsPerModule][16]{};
 alignas(8) unsigned char g_numHintRecs[kMaxMenuItems][kMaxRowsPerModule][16]{};
-
 alignas(8) unsigned char g_numTexRecs[kMaxMenuItems][kMaxRowsPerModule][16]{};
 
 alignas(8) unsigned char g_numSizeStrRecs[kMaxMenuItems][kMaxRowsPerModule][kBtnSizeSlots][2][16]{};
@@ -694,7 +792,6 @@ std::uintptr_t g_numSizeElemPtrs[kMaxMenuItems][kMaxRowsPerModule][kBtnSizeSlots
 std::uintptr_t g_numSizeVec[kMaxMenuItems][kMaxRowsPerModule][kBtnSizeSlots][4]{};
 
 TreeNode g_numOverHeads[kMaxMenuItems][kMaxRowsPerModule]{};
-
 TreeNode g_numOverNodes[kMaxMenuItems][kMaxRowsPerModule][9]{};
 std::uintptr_t g_numOverPtrs[kMaxMenuItems][kMaxRowsPerModule][9]{};
 TreeNode g_numHeads[kMaxMenuItems][kMaxRowsPerModule]{};
@@ -732,6 +829,17 @@ void finishMap(TreeNode* head, TreeNode* nodes, int count, std::uintptr_t* node)
 {
     head->isnil = 1;
     head->color = 1;
+    if (count <= 0) {
+        const auto self = reinterpret_cast<std::uintptr_t>(head);
+        head->parent = self;
+        head->left = self;
+        head->right = self;
+        node[0] = self;
+        node[1] = 0;
+        node[2] = 0;
+        node[3] = 0;
+        return;
+    }
     head->parent = linkBalanced(nodes, head, 0, count, reinterpret_cast<std::uintptr_t>(head));
     head->left = reinterpret_cast<std::uintptr_t>(&nodes[0]);
     head->right = reinterpret_cast<std::uintptr_t>(&nodes[count - 1]);
@@ -849,7 +957,6 @@ void dumpVector(const void* at)
         if (!memory::isReadable(reinterpret_cast<const void*>(at), 32)) {
             continue;
         }
-
     }
 }
 
@@ -896,16 +1003,13 @@ void dumpNode(const std::wstring& label, const void* value)
         const std::wstring key = readKey(myval[0]);
         const unsigned tag = static_cast<unsigned>(myval[2] & 0xFF);
         if (tag == kTagString) {
-
             std::uintptr_t inner = 0;
             if (memory::isReadable(reinterpret_cast<const void*>(myval[1]), sizeof(inner))) {
                 std::memcpy(&inner, reinterpret_cast<const void*>(myval[1]), sizeof(inner));
             }
             const std::wstring viaPtr = readKey(inner);
-
         } else {
             if (tag == kTagArray) {
-
                 dumpVector(reinterpret_cast<const void*>(myval[1]));
             }
         }
@@ -915,7 +1019,6 @@ void dumpNode(const std::wstring& label, const void* value)
         }
     }
     if (visited != static_cast<int>(count)) {
-
         log().warn(L"UiProbe: [{}] walked {} nodes (the map holds {})", label, visited, count);
     }
 }
@@ -968,6 +1071,414 @@ bool buildStringPairArray(std::uintptr_t vecSrc, std::uintptr_t elemSrc, std::ui
     return true;
 }
 
+constexpr size_t kArenaNodes = 8192;
+constexpr size_t kArenaWords = 32768;
+constexpr size_t kArenaRecords = 8192;
+constexpr size_t kArenaText = 98304;
+uitree::TreeNode g_arenaNodes[kArenaNodes]{};
+std::uintptr_t g_arenaWords[kArenaWords]{};
+alignas(8) unsigned char g_arenaRecords[kArenaRecords][uitree::kRecordBytes]{};
+char g_arenaText[kArenaText]{};
+uitree::Arena g_pageArena(g_arenaNodes, kArenaNodes, g_arenaWords, kArenaWords,
+                          &g_arenaRecords[0][0], kArenaRecords, g_arenaText, kArenaText);
+
+struct PageDonors {
+    std::uintptr_t arrTag = 0;
+    std::uintptr_t arrSeq = 0;
+    std::uintptr_t strTag = 0;
+    std::uintptr_t strSeq = 0;
+    std::uintptr_t objTag = uitree::kTagObject;
+    std::uintptr_t elemVal[uitree::kValueWords]{};
+    std::uintptr_t vecSrc[uitree::kVectorWords]{};
+    unsigned char strRec[uitree::kRecordBytes]{};
+    std::uintptr_t intTag = 0;
+    std::uintptr_t intSeq = 0;
+    bool ok = false;
+};
+
+bool collectPageDonors(void* self, PageDonors& out)
+{
+    out = PageDonors{};
+    static const std::string kBaseSpace = "settings_common";
+    static const std::string kBaseName = "dialog_content_fullscreen";
+    void* base = nullptr;
+    if (!lookupGuarded(self, &kBaseSpace, &kBaseName, base) || base == nullptr) {
+        log().warn(L"UiProbe: could not resolve the template (dialog_content_fullscreen)");
+        return false;
+    }
+    std::vector<Entry> baseEntries;
+    std::uintptr_t baseCount = 0;
+    if (!collectEntries(base, baseEntries, baseCount) || baseEntries.empty()) {
+        log().warn(L"UiProbe: could not walk the template");
+        return false;
+    }
+    const Entry* controls = nullptr;
+    for (const Entry& one : baseEntries) {
+        if (one.keyText == L"controls") {
+            controls = &one;
+            break;
+        }
+    }
+    if (controls == nullptr
+        || !memory::isReadable(reinterpret_cast<const void*>(controls->value),
+                               sizeof(out.vecSrc))) {
+        log().warn(L"UiProbe: the template has no readable controls");
+        return false;
+    }
+    std::memcpy(out.vecSrc, reinterpret_cast<const void*>(controls->value), sizeof(out.vecSrc));
+    out.arrTag = controls->tag;
+    out.arrSeq = controls->seq;
+    if (out.vecSrc[1] <= out.vecSrc[0]
+        || !memory::isReadable(reinterpret_cast<const void*>(out.vecSrc[0]),
+                               sizeof(std::uintptr_t))) {
+        log().warn(L"UiProbe: the template's controls are empty");
+        return false;
+    }
+    std::uintptr_t firstElem = 0;
+    std::memcpy(&firstElem, reinterpret_cast<const void*>(out.vecSrc[0]), sizeof(firstElem));
+    if (!memory::isReadable(reinterpret_cast<const void*>(firstElem), sizeof(out.elemVal))) {
+        log().warn(L"UiProbe: the template's elements could not be read");
+        return false;
+    }
+    std::memcpy(out.elemVal, reinterpret_cast<const void*>(firstElem), sizeof(out.elemVal));
+    {
+        std::vector<Entry> sample;
+        std::uintptr_t sampleCount = 0;
+        if (collectEntries(reinterpret_cast<const void*>(firstElem), sample, sampleCount)
+            && !sample.empty()) {
+            out.objTag = sample[0].tag;
+        }
+    }
+    static const std::string kBtnSpace = "common_buttons";
+    static const std::string kBtnName = "light_text_button";
+    void* btn = nullptr;
+    if (!lookupGuarded(self, &kBtnSpace, &kBtnName, btn) || btn == nullptr) {
+        log().warn(L"UiProbe: could not resolve the string template (light_text_button)");
+        return false;
+    }
+    std::vector<Entry> btnEntries;
+    std::uintptr_t btnCount = 0;
+    if (!collectEntries(btn, btnEntries, btnCount) || btnEntries.empty()) {
+        log().warn(L"UiProbe: could not walk the string template");
+        return false;
+    }
+    for (const Entry& one : btnEntries) {
+        if ((one.tag & 0xFF) == kTagString
+            && memory::isReadable(reinterpret_cast<const void*>(one.value), sizeof(out.strRec))) {
+            std::memcpy(out.strRec, reinterpret_cast<const void*>(one.value), sizeof(out.strRec));
+            out.strTag = one.tag;
+            out.strSeq = one.seq;
+            break;
+        }
+    }
+    if (out.strTag == 0) {
+        log().warn(L"UiProbe: could not borrow a string value record");
+        return false;
+    }
+    {
+        static const std::string kIntSpace = "common";
+        static const std::string kIntName = "toggle";
+        void* tg = nullptr;
+        std::vector<Entry> tgEntries;
+        std::uintptr_t tgCount = 0;
+        if (lookupGuarded(self, &kIntSpace, &kIntName, tg) && tg != nullptr
+            && collectEntries(tg, tgEntries, tgCount)) {
+            for (const Entry& one : tgEntries) {
+                if (one.keyText == L"layer" && (one.tag & 0xFF) == 1) {
+                    out.intTag = one.tag;
+                    out.intSeq = one.seq;
+                    break;
+                }
+            }
+        }
+        static std::atomic<bool> told{false};
+    }
+    out.ok = true;
+    return true;
+}
+
+PageDonors g_pgDonors;
+
+struct Over {
+    enum class Kind { Text, Pair, Raw, Int, Bag };
+    const char* key = nullptr;
+    Kind kind = Kind::Text;
+    std::string text;
+    std::string second;
+    std::uintptr_t value = 0;
+    std::uintptr_t tag = 0;
+    std::uintptr_t seq = 0;
+    std::int64_t number = 0;
+    std::vector<Over> items;
+};
+
+Over overText(const char* key, std::string text)
+{
+    Over over;
+    over.key = key;
+    over.kind = Over::Kind::Text;
+    over.text = std::move(text);
+    return over;
+}
+
+Over overPair(const char* key, std::string first, std::string second)
+{
+    Over over;
+    over.key = key;
+    over.kind = Over::Kind::Pair;
+    over.text = std::move(first);
+    over.second = std::move(second);
+    return over;
+}
+
+Over overRaw(const char* key, const Entry& donor)
+{
+    Over over;
+    over.key = key;
+    over.kind = Over::Kind::Raw;
+    over.value = donor.value;
+    over.tag = donor.tag;
+    over.seq = donor.seq;
+    return over;
+}
+
+Over overInt(const char* key, std::int64_t number)
+{
+    Over over;
+    over.key = key;
+    over.kind = Over::Kind::Int;
+    over.number = number;
+    return over;
+}
+
+Over overBag(const char* key, std::vector<Over> items)
+{
+    Over over;
+    over.key = key;
+    over.kind = Over::Kind::Bag;
+    over.items = std::move(items);
+    return over;
+}
+
+struct Part {
+    std::string name;
+    std::string def;
+    std::vector<Over> overs;
+    std::vector<Part> kids;
+};
+
+bool fillOverride(uitree::Arena& arena, const PageDonors& donors, const Over& over,
+                  uitree::KeyValue& out)
+{
+    out = uitree::KeyValue{};
+    out.key = over.key;
+    switch (over.kind) {
+    case Over::Kind::Raw:
+        out.value = over.value;
+        out.tag = over.tag;
+        out.seq = over.seq;
+        return true;
+    case Over::Kind::Text: {
+        const char* const body = arena.takeText(over.text.c_str());
+        const unsigned char* const record = arena.makeStringRecord(donors.strRec, body);
+        if (record == nullptr) {
+            return false;
+        }
+        out.value = reinterpret_cast<std::uintptr_t>(record);
+        out.tag = donors.strTag;
+        out.seq = donors.strSeq;
+        return true;
+    }
+    case Over::Kind::Pair: {
+        const unsigned char* const firstRec =
+            arena.makeStringRecord(donors.strRec, arena.takeText(over.text.c_str()));
+        const unsigned char* const secondRec =
+            arena.makeStringRecord(donors.strRec, arena.takeText(over.second.c_str()));
+        if (firstRec == nullptr || secondRec == nullptr) {
+            return false;
+        }
+        const std::uintptr_t* const firstElem =
+            arena.makeStringElement(donors.elemVal, firstRec);
+        const std::uintptr_t* const secondElem =
+            arena.makeStringElement(donors.elemVal, secondRec);
+        if (firstElem == nullptr || secondElem == nullptr) {
+            return false;
+        }
+        const std::uintptr_t* const pair[2] = {firstElem, secondElem};
+        const std::uintptr_t* const vec = arena.makeVector(donors.vecSrc, pair, 2);
+        if (vec == nullptr) {
+            return false;
+        }
+        out.value = reinterpret_cast<std::uintptr_t>(vec);
+        out.tag = donors.arrTag;
+        out.seq = donors.arrSeq;
+        return true;
+    }
+    case Over::Kind::Int: {
+        if (donors.intTag == 0) {
+            return false;
+        }
+        out.value = static_cast<std::uintptr_t>(over.number);
+        out.tag = donors.intTag;
+        out.seq = donors.intSeq;
+        return true;
+    }
+    case Over::Kind::Bag: {
+        std::vector<uitree::KeyValue> inner;
+        inner.reserve(over.items.size());
+        for (const Over& one : over.items) {
+            uitree::KeyValue kv{};
+            if (!fillOverride(arena, donors, one, kv)) {
+                return false;
+            }
+            inner.push_back(kv);
+        }
+        const std::uintptr_t* const node =
+            arena.makeMap(inner.empty() ? nullptr : inner.data(), inner.size());
+        if (node == nullptr) {
+            return false;
+        }
+        out.value = reinterpret_cast<std::uintptr_t>(node);
+        out.tag = donors.objTag;
+        out.seq = 0;
+        return true;
+    }
+    }
+    return false;
+}
+
+bool fillChildren(uitree::Arena& arena, const PageDonors& donors, const std::vector<Part>& kids,
+                  uitree::KeyValue& out);
+
+std::uintptr_t* buildPartElement(uitree::Arena& arena, const PageDonors& donors, const Part& part)
+{
+    if (!donors.ok) {
+        return nullptr;
+    }
+    std::vector<uitree::KeyValue> items;
+    items.reserve(part.overs.size() + 1);
+
+    if (!part.kids.empty()) {
+        uitree::KeyValue kv{};
+        if (!fillChildren(arena, donors, part.kids, kv)) {
+            return nullptr;
+        }
+        items.push_back(kv);
+    }
+    for (const Over& over : part.overs) {
+        uitree::KeyValue kv{};
+        if (!fillOverride(arena, donors, over, kv)) {
+            return nullptr;
+        }
+        items.push_back(kv);
+    }
+
+    const std::uintptr_t* const overNode =
+        arena.makeMap(items.empty() ? nullptr : items.data(), items.size());
+    if (overNode == nullptr) {
+        return nullptr;
+    }
+    std::string keyText = part.name;
+    if (!part.def.empty()) {
+        keyText += '@';
+        keyText += part.def;
+    }
+    const char* const key = arena.takeText(keyText.c_str());
+    if (key == nullptr) {
+        return nullptr;
+    }
+    uitree::KeyValue one{};
+    one.key = key;
+    one.value = reinterpret_cast<std::uintptr_t>(overNode);
+    one.tag = donors.objTag;
+    one.seq = 0;
+    const std::uintptr_t* const elemNode = arena.makeMap(&one, 1);
+    if (elemNode == nullptr) {
+        return nullptr;
+    }
+    return arena.makeValue(donors.elemVal, elemNode);
+}
+
+bool fillChildren(uitree::Arena& arena, const PageDonors& donors, const std::vector<Part>& kids,
+                  uitree::KeyValue& out)
+{
+    std::vector<const std::uintptr_t*> built;
+    built.reserve(kids.size());
+    for (const Part& kid : kids) {
+        const std::uintptr_t* const one = buildPartElement(arena, donors, kid);
+        if (one == nullptr) {
+            return false;
+        }
+        built.push_back(one);
+    }
+    const std::uintptr_t* const vec = arena.makeVector(donors.vecSrc, built.data(), built.size());
+    if (vec == nullptr) {
+        return false;
+    }
+    out = uitree::KeyValue{};
+    out.key = "controls";
+    out.value = reinterpret_cast<std::uintptr_t>(vec);
+    out.tag = donors.arrTag;
+    out.seq = donors.arrSeq;
+    return true;
+}
+
+std::uintptr_t* buildPartDefinition(void* self, uitree::Arena& arena, const PageDonors& donors,
+                                    const char* space, const char* name,
+                                    const std::vector<Over>& overs, const std::vector<Part>& kids)
+{
+    if (!donors.ok) {
+        return nullptr;
+    }
+    const std::string spaceText = space;
+    const std::string nameText = name;
+    void* donor = nullptr;
+    if (!lookupGuarded(self, &spaceText, &nameText, donor) || donor == nullptr) {
+        return nullptr;
+    }
+    std::vector<Entry> entries;
+    std::uintptr_t count = 0;
+    if (!collectEntries(donor, entries, count) || entries.empty()) {
+        return nullptr;
+    }
+    std::uintptr_t donorWords[uitree::kValueWords]{};
+    if (!memory::isReadable(donor, sizeof(donorWords))) {
+        return nullptr;
+    }
+    std::memcpy(donorWords, donor, sizeof(donorWords));
+
+    std::vector<uitree::KeyValue> items;
+    items.reserve(entries.size() + overs.size() + 1);
+    for (const Entry& one : entries) {
+        uitree::KeyValue kv{};
+        kv.key = reinterpret_cast<const char*>(one.key);
+        kv.value = one.value;
+        kv.tag = one.tag;
+        kv.seq = one.seq;
+        items.push_back(kv);
+    }
+    if (!kids.empty()) {
+        uitree::KeyValue kv{};
+        if (!fillChildren(arena, donors, kids, kv)) {
+            return nullptr;
+        }
+        items.push_back(kv);
+    }
+    for (const Over& over : overs) {
+        uitree::KeyValue kv{};
+        if (!fillOverride(arena, donors, over, kv)) {
+            return nullptr;
+        }
+        items.push_back(kv);
+    }
+
+    const std::uintptr_t* const node = arena.makeMap(items.data(), items.size());
+    if (node == nullptr) {
+        return nullptr;
+    }
+    return arena.makeValue(donorWords, node);
+}
+
 void* buildRelabeled(void* self, size_t idx)
 {
     buildMenuTexts();
@@ -1003,7 +1514,6 @@ void* buildRelabeled(void* self, size_t idx)
     if (!retargetString(entries, L"$button_text", g_menuTextBuf[idx], g_ownTextRecs[idx])) {
         return nullptr;
     }
-
     if (!retargetString(entries, L"$pressed_button_name", ownButtonIdText(), g_ownButtonIdRec)) {
         return nullptr;
     }
@@ -1060,7 +1570,6 @@ void* buildSizedKeyButton(void* self)
         log().warn(L"UiProbe: key-button key count out of range ({})", entries.size());
         return nullptr;
     }
-
     std::sort(entries.begin(), entries.end(),
               [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
 
@@ -1100,7 +1609,6 @@ void* buildSizedKeyButton(void* self)
                               g_keyBtnSizeVec)) {
         return nullptr;
     }
-
     sizeEntry->value = reinterpret_cast<std::uintptr_t>(g_keyBtnSizeVec);
 
     for (size_t i = 0; i < entries.size(); ++i) {
@@ -1127,7 +1635,6 @@ constexpr char kKeyPartBtnName[] = "light_text_form_fitting_button";
 
 constexpr char kKeyPanelW[] = "100%";
 constexpr char kKeyPanelH[] = "30px";
-
 constexpr char kKeyPartW[] = "83%";
 constexpr char kKeyPartH[] = "100%";
 constexpr char kResetPartW[] = "17%";
@@ -1146,7 +1653,6 @@ alignas(8) unsigned char g_kpPartSizeRecs[kKeyPanelParts][2][16]{};
 std::uintptr_t g_kpPartSizeElems[kKeyPanelParts][2][4]{};
 std::uintptr_t g_kpPartSizeElemPtrs[kKeyPanelParts][2]{};
 std::uintptr_t g_kpPartSizeVec[kKeyPanelParts][4]{};
-
 TreeNode g_kpPartOverHeads[kKeyPanelParts]{};
 TreeNode g_kpPartOverNodes[kKeyPanelParts][1]{};
 std::uintptr_t g_kpPartOverPtrs[kKeyPanelParts][4]{};
@@ -1204,7 +1710,6 @@ void* buildKeyRowPanel(void* self, size_t item, size_t slot)
     if (g_kpReady[item][slot]) {
         return g_kpValues[item][slot];
     }
-
     g_kpGaveUp = true;
 
     static const std::string kPanelSpace = kKeyPanelSpace;
@@ -1227,7 +1732,6 @@ void* buildKeyRowPanel(void* self, size_t item, size_t slot)
                    entries.size());
         return nullptr;
     }
-
     std::sort(entries.begin(), entries.end(),
               [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
 
@@ -1280,7 +1784,6 @@ void* buildKeyRowPanel(void* self, size_t item, size_t slot)
         log().warn(L"UiProbe: cannot read a keymapping_item controls element");
         return nullptr;
     }
-
     std::vector<Entry> ctlOne;
     std::uintptr_t ctlOneCount = 0;
     if (!collectEntries(reinterpret_cast<const void*>(srcCtlElem), ctlOne, ctlOneCount)
@@ -1352,7 +1855,6 @@ void* buildKeyRowPanel(void* self, size_t item, size_t slot)
 
     g_kpReady[item][slot] = true;
     g_kpGaveUp = false;
-
     static std::atomic<int> said{0};
     if (said.fetch_add(1) < 6) {
         const std::string key = g_kpElemKeys[item][slot][0];
@@ -1368,7 +1870,6 @@ void* buildWrapper(void* self)
 
     static const std::string kPauseSpace = kFromSpace;
     static const std::string kBtn = kFromName;
-
     static const std::string kStackSpace = "settings";
     static const std::string kStackName = "selector_stack_panel";
 
@@ -1480,9 +1981,7 @@ void* buildWrapper(void* self)
     g_wrapValue[0] = reinterpret_cast<std::uintptr_t>(g_wrapNode);
 
     g_wrapReady = true;
-
     armWatchNow();
-
     return g_wrapValue;
 }
 
@@ -1508,7 +2007,6 @@ void* buildNavExtra(void* self)
         log().warn(L"UiProbe: could not look up the left-nav original");
         return nullptr;
     }
-
     static const std::string kToggleSpace = "settings_common";
     static const std::string kToggleName = "option_toggle";
     const std::string* const itemSpace = kNavItemFromToggle ? &kToggleSpace : &kSpace;
@@ -1553,7 +2051,6 @@ void* buildNavExtra(void* self)
         log().warn(L"UiProbe: left-nav key count out of range ({})", entries.size());
         return nullptr;
     }
-
     std::sort(entries.begin(), entries.end(),
               [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
 
@@ -1606,7 +2103,6 @@ void* buildNavExtra(void* self)
             log().warn(L"UiProbe: could not walk the pane node ({} keys)", paneEntries.size());
             return nullptr;
         }
-
         if (paneEntries.size() != 1) {
             log().warn(L"UiProbe: the pane wrapper is not a single-key node ({} keys)",
                        paneEntries.size());
@@ -1646,7 +2142,6 @@ void* buildNavExtra(void* self)
         std::memcpy(srcVec, reinterpret_cast<const void*>(paneControls->value), sizeof(srcVec));
         const size_t srcCount =
             (srcVec[1] > srcVec[0]) ? (srcVec[1] - srcVec[0]) / sizeof(std::uintptr_t) : 0;
-
         const size_t ownCount = (kNavPaneOwnCount != 0) ? kNavPaneOwnCount : g_menuCount;
         if (ownCount == 0 || ownCount > kMaxMenuItems) {
             log().warn(L"UiProbe: the number of items to add is out of range ({})", ownCount);
@@ -1657,7 +2152,6 @@ void* buildNavExtra(void* self)
                        srcCount, ownCount);
             return nullptr;
         }
-
         std::memcpy(&g_paneElems[ownCount], reinterpret_cast<const void*>(srcVec[0]),
                     srcCount * sizeof(std::uintptr_t));
 
@@ -1673,7 +2167,6 @@ void* buildNavExtra(void* self)
                 || one.size() != 1) {
                 continue;
             }
-
             if (dumped < 4 && one[0].keyText.find(L"_button") != std::wstring::npos) {
                 std::uintptr_t overBox[4]{};
                 overBox[0] = one[0].value;
@@ -1746,12 +2239,10 @@ void* buildNavExtra(void* self)
                 log().warn(L"UiProbe: could not build the key for our item {}", i);
                 return nullptr;
             }
-
             if (static_cast<size_t>(at) >= kPaneKeyBytes) {
                 at = static_cast<int>(kPaneKeyBytes) - 1;
             }
             if (atPos != std::wstring::npos) {
-
                 for (size_t k = atPos;
                      k < tplEntry.keyText.size() && static_cast<size_t>(at) + 1 < kPaneKeyBytes;
                      ++k) {
@@ -1759,7 +2250,6 @@ void* buildNavExtra(void* self)
                 }
                 key[at] = '\0';
             }
-
             std::snprintf(g_paneTopics[i], kPaneTopicBytes, "tk%02u", static_cast<unsigned>(i));
             const char* const topic = g_paneTopics[i];
             std::memcpy(g_paneTopicRecs[i], reinterpret_cast<const void*>(topicSrc->value),
@@ -2137,7 +2627,20 @@ void* buildHeader(void* self)
     }
     std::sort(titleEntries.begin(), titleEntries.end(),
               [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
-    if (!retargetString(titleEntries, L"$screen_header_title", kHeaderTitle, g_hdrTitleRec)
+    std::uintptr_t hdrStrDonor = 0;
+    std::uintptr_t hdrStrTag = kTagString;
+    std::uintptr_t hdrStrSeq = 0;
+    for (const Entry& one : titleEntries) {
+        if ((one.tag & 0xFF) == kTagString
+            && memory::isReadable(reinterpret_cast<const void*>(one.value),
+                                  sizeof(g_hdrSizeRecs[0]))) {
+            hdrStrDonor = one.value;
+            hdrStrTag = one.tag;
+            hdrStrSeq = one.seq;
+            break;
+        }
+    }
+    if (!retargetString(titleEntries, L"$screen_header_title", pageHeaderTitle(), g_hdrTitleRec)
         || !retargetString(titleEntries, L"$screen_header_title_binding_type", kHeaderBindNone,
                            g_hdrBindRec)) {
         return nullptr;
@@ -2192,6 +2695,67 @@ void* buildHeader(void* self)
     g_hdrVec[1] = reinterpret_cast<std::uintptr_t>(&g_hdrElems[1]);
     g_hdrVec[2] = reinterpret_cast<std::uintptr_t>(&g_hdrElems[1]);
 
+    if (hdrStrDonor != 0
+        && buildStringPairArray(outer.controls->value, outer.elems[0], hdrStrDonor, kHeaderWidth,
+                                kHeaderHeight, g_hdrSizeRecs, g_hdrSizeElems, g_hdrSizeElemPtrs,
+                                g_hdrSizeVec)) {
+        Entry* found = nullptr;
+        for (Entry& one : outer.entries) {
+            if (one.keyText == L"size") {
+                found = &one;
+                break;
+            }
+        }
+        if (found != nullptr) {
+            found->value = reinterpret_cast<std::uintptr_t>(g_hdrSizeVec);
+            found->tag = outer.controls->tag;
+        } else if (outer.entries.size() + 1 <= static_cast<size_t>(kMaxNavKeys)) {
+            Entry add;
+            add.keyText = L"size";
+            add.key = reinterpret_cast<std::uintptr_t>(kHeaderSizeKey);
+            add.value = reinterpret_cast<std::uintptr_t>(g_hdrSizeVec);
+            add.tag = outer.controls->tag;
+            add.seq = outer.controls->seq;
+            outer.entries.push_back(add);
+        }
+        const struct {
+            const wchar_t* keyText;
+            const char* key;
+            unsigned char* rec;
+        } kAnchors[] = {
+            {L"anchor_from", kHeaderAnchorFromKey, g_hdrAnchorRecs[0]},
+            {L"anchor_to", kHeaderAnchorToKey, g_hdrAnchorRecs[1]},
+        };
+        for (const auto& one : kAnchors) {
+            std::memcpy(one.rec, reinterpret_cast<const void*>(hdrStrDonor), 16);
+            const char* const anchor = kHeaderAnchor;
+            std::memcpy(one.rec, &anchor, sizeof(anchor));
+            Entry* found = nullptr;
+            for (Entry& e : outer.entries) {
+                if (e.keyText == one.keyText) {
+                    found = &e;
+                    break;
+                }
+            }
+            if (found != nullptr) {
+                found->value = reinterpret_cast<std::uintptr_t>(one.rec);
+                found->tag = hdrStrTag;
+                continue;
+            }
+            if (outer.entries.size() + 1 > static_cast<size_t>(kMaxNavKeys)) {
+                continue;
+            }
+            Entry add;
+            add.keyText = one.keyText;
+            add.key = reinterpret_cast<std::uintptr_t>(one.key);
+            add.value = reinterpret_cast<std::uintptr_t>(one.rec);
+            add.tag = hdrStrTag;
+            add.seq = hdrStrSeq;
+            outer.entries.push_back(add);
+        }
+        std::sort(outer.entries.begin(), outer.entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+    }
     for (size_t i = 0; i < outer.entries.size(); ++i) {
         g_hdrNodes[i].key = outer.entries[i].key;
         g_hdrNodes[i].value = (outer.entries[i].keyText == L"controls")
@@ -2567,7 +3131,6 @@ void* buildContentPanel(void* self)
         std::memcpy(g_secLabelRecs[i], &label, sizeof(label));
 
         if (kProbeRealBinding && i == kProbeBindingIndex) {
-
             std::snprintf(g_secBindNames[i], kSecCtlNameBytes, "%s", kProbeBindingName);
         } else {
             std::snprintf(g_secBindNames[i], kSecCtlNameBytes, "#tk_tgl_%02u",
@@ -2580,7 +3143,6 @@ void* buildContentPanel(void* self)
 
         std::snprintf(g_secToggleNameBufs[i], kSecCtlNameBytes, "tk_tgl_%02u",
                       static_cast<unsigned>(i));
-
         const char* const tglName = g_secToggleNameBufs[i];
         std::memcpy(g_secToggleNameRecs[i], reinterpret_cast<const void*>(nameSrc->value),
                     sizeof(g_secToggleNameRecs[i]));
@@ -2605,27 +3167,21 @@ void* buildContentPanel(void* self)
         putKey(kSecCtlNameVar, reinterpret_cast<std::uintptr_t>(g_secCtlNameRecs[i]), nameSrc->tag,
                nameSrc->seq);
         if (owner == nullptr) {
-
             putKey(kSecEnabledVar, kFalseVal, boolTag, trueSrc->seq);
         }
-
         putKey(kSecFocusIdVar, reinterpret_cast<std::uintptr_t>(g_secFocusIdRecs[i]), nameSrc->tag,
                nameSrc->seq);
-
         putKey(kSecOneLineVar, trueVal, boolTag, trueSrc->seq);
         putKey(kSecBindNameVar, reinterpret_cast<std::uintptr_t>(g_secBindNameRecs[i]),
                nameSrc->tag, nameSrc->seq);
         putKey(kSecLabelVar, reinterpret_cast<std::uintptr_t>(g_secLabelRecs[i]), nameSrc->tag,
                nameSrc->seq);
-
         putKey(kSecBindCondVar, reinterpret_cast<std::uintptr_t>(g_secBindCondRec), nameSrc->tag,
                nameSrc->seq);
-
         const bool on = (owner != nullptr && owner->enabled());
         putKey(kSecDefaultVar, on ? trueVal : kFalseVal, boolTag, trueSrc->seq);
         putKey(kSecToggleNameVar, reinterpret_cast<std::uintptr_t>(g_secToggleNameRecs[i]),
                nameSrc->tag, nameSrc->seq);
-
         putKey(kSecStateBindVar, reinterpret_cast<std::uintptr_t>(g_secBindNameRecs[i]),
                nameSrc->tag, nameSrc->seq);
         finishMap(&g_secBtnOverHeads[i], g_secBtnOverNodes[i], keys, g_secBtnOverNodePtrs[i]);
@@ -2828,7 +3384,6 @@ struct OwnRegion {
 };
 
 const OwnRegion kOwnRegions[] = {
-
     {g_wrapValue, sizeof(g_wrapValue), L"wrapValue"},
     {g_wrapNode, sizeof(g_wrapNode), L"wrap"},
     {&g_wrapHead, sizeof(g_wrapHead), L"wrapHead"},
@@ -2843,7 +3398,6 @@ const OwnRegion kOwnRegions[] = {
     {g_childNodeB, sizeof(g_childNodeB), L"childB"},
     {&g_childHeadB, sizeof(g_childHeadB), L"childHeadB"},
     {g_childNodesB, sizeof(g_childNodesB), L"childNodesB"},
-
     {g_ownValues, sizeof(g_ownValues), L"ownValues"},
     {g_ownNodePtrs, sizeof(g_ownNodePtrs), L"ownNodePtrs"},
     {g_ownHeads, sizeof(g_ownHeads), L"ownHeads"},
@@ -2864,6 +3418,8 @@ std::wstring ownName(std::uintptr_t at)
     }
     return {};
 }
+
+std::atomic<int> g_afterInvokeLogs{0};
 
 std::uintptr_t g_exeBase = 0;
 std::uintptr_t g_exeSize = 0;
@@ -2899,6 +3455,24 @@ std::wstring codeName(std::uintptr_t at)
     return L"(not in any module)";
 }
 
+void dumpStackOnce(const wchar_t* why, int skip = 0, int limit = 2)
+{
+    static std::atomic<int> said{0};
+    const int n = said.fetch_add(1);
+    if (n < skip || n >= skip + limit) {
+        return;
+    }
+    if (g_exeSize == 0) {
+        noteModule(GetModuleHandleW(nullptr), g_exeBase, g_exeSize);
+    }
+    void* frames[40]{};
+    const USHORT got = CaptureStackBackTrace(0, 40, frames, nullptr);
+    for (USHORT i = 0; i < got; ++i) {
+        const auto at = reinterpret_cast<std::uintptr_t>(frames[i]);
+        log().info(L"UiProbe: {} stack #{} {}", why, i, codeName(at));
+    }
+}
+
 constexpr int kMaxCrashLogs = 8;
 std::atomic<int> g_crashLogs{0};
 std::atomic<bool> g_inHandler{false};
@@ -2910,7 +3484,6 @@ std::atomic<int> g_hwStage{0};
 std::atomic<int> g_hwHits{0};
 std::atomic<unsigned long long> g_hwArmAt{0};
 DWORD g_hwThreadId = 0;
-
 constexpr int kMaxHwHits = 40;
 
 thread_local void* t_mappingOut = nullptr;
@@ -2920,7 +3493,6 @@ thread_local void* t_varBag = nullptr;
 std::atomic<bool> g_htpStackTaken{false};
 
 constexpr std::uintptr_t kBagResolvedOffset = 0x58;
-
 std::atomic<void*> g_idMappingOut{nullptr};
 std::atomic<bool> g_mappingDumped{false};
 
@@ -3018,14 +3590,12 @@ size_t scanRegion(const char* base, size_t size, const char* needle, size_t need
             if (std::memcmp(base + i, needle, needleLength) != 0) {
                 continue;
             }
-
             if (i == 0) {
                 continue;
             }
             out[found++] = reinterpret_cast<std::uintptr_t>(base + i);
         }
     } __except (accessViolationFilter(GetExceptionCode())) {
-
     }
     return found;
 }
@@ -3080,7 +3650,6 @@ size_t scanRegionForPointers(const std::uintptr_t* base, size_t words,
             }
         }
     } __except (accessViolationFilter(GetExceptionCode())) {
-
     }
     return found;
 }
@@ -3155,7 +3724,6 @@ LONG onHardwareHit(EXCEPTION_POINTERS* info, const EXCEPTION_RECORD& record)
     }
 
     if (hit >= kMaxHwHits) {
-
         clearHardwareWatch(ctx);
         g_hwStage.store(4);
         log().warn(L"UiProbe: hit the watch limit ({}), removing the watch", kMaxHwHits);
@@ -3178,12 +3746,10 @@ LONG CALLBACK crashProbe(EXCEPTION_POINTERS* info)
     if (record.ExceptionCode == static_cast<DWORD>(EXCEPTION_SINGLE_STEP)) {
         return onHardwareHit(info, record);
     }
-
     if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
         && record.ExceptionCode != EXCEPTION_IN_PAGE_ERROR) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-
     if (g_inHandler.exchange(true)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -3196,7 +3762,6 @@ LONG CALLBACK crashProbe(EXCEPTION_POINTERS* info)
             kind = record.ExceptionInformation[0];
             touched = record.ExceptionInformation[1];
         }
-
         const wchar_t* const verb =
             (kind == 1) ? L"write" : (kind == 8) ? L"execute (DEP)" : L"read";
         log().error(L"UiProbe: access violation code={:#x} at {} ({:#x}) / {} address {:#x}{}",
@@ -3314,9 +3879,7 @@ void maybeArmHardwareWatch()
         }
         const bool isString = size == kIdLength;
         if (isString) {
-
         }
-
         if (isString && g_watchSlotCount < kMaxWatchSlots) {
             g_watchSlots[g_watchSlotCount++] = owner;
         }
@@ -3375,7 +3938,6 @@ DWORD WINAPI watchThreadMain(LPVOID)
         maybeArmHardwareWatch();
         maybeSwapToCopyDest();
         if (g_hwStage.load() == 4) {
-
             g_watchSlotCount = kMaxWatchSlots;
             disarmHardwareWatch();
         }
@@ -3392,7 +3954,6 @@ void forgetNumBags();
 
 void installCrashProbe()
 {
-
     if (!kSubstituteEnabled || g_vehHandle != nullptr) {
         return;
     }
@@ -3421,14 +3982,12 @@ void installCrashProbe()
 
 void removeCrashProbe()
 {
-
     if (g_watchThread != nullptr) {
         g_watchStop.store(true);
         WaitForSingleObject(g_watchThread, 3000);
         CloseHandle(g_watchThread);
         g_watchThread = nullptr;
     }
-
     if (g_idPage != nullptr) {
         DWORD previous = 0;
         VirtualProtect(g_idPage, kIdPageSize, PAGE_READWRITE, &previous);
@@ -3438,7 +3997,6 @@ void removeCrashProbe()
     if (g_vehHandle == nullptr) {
         return;
     }
-
     RemoveVectoredExceptionHandler(g_vehHandle);
     g_vehHandle = nullptr;
 
@@ -3457,6 +4015,19 @@ void onLookup(const void* space, const void* name)
     }
     const std::wstring nameText = readString(name);
 
+    if (const unsigned long long at = g_ownNavInvokedAt.load(); at != 0) {
+        if (GetTickCount64() - at > 4000) {
+            g_ownNavInvokedAt.store(0);
+        } else {
+            if (g_afterInvokeLogs.fetch_add(1) < 60) {
+                log().info(L"UiProbe: after invoke -> {}.{}", text, nameText);
+            }
+            if (nameText.rfind(L"screen_", 0) == 0) {
+                dumpStackOnce(L"screen", 0, 2);
+            }
+        }
+    }
+
     if (nameText.empty()) {
         return;
     }
@@ -3467,7 +4038,6 @@ void onLookup(const void* space, const void* name)
     if (g_capped) {
         return;
     }
-
     const auto [inserted, isNew] = g_seen.insert(std::move(text));
     if (!isNew) {
         return;
@@ -3513,17 +4083,2019 @@ void onLookupResult(const void* space, const void* name, void* value)
             return;
         }
     }
-
     dumpNode(text, value);
+}
+
+constexpr size_t kMaxPageRows = 96;
+constexpr size_t kPageKeyBytes = 96;
+constexpr size_t kPageTextBytes = 64;
+
+constexpr size_t kValueWords = 8;
+
+char g_pgKeys[kMaxPageRows][kPageKeyBytes]{};
+char g_pgTexts[kMaxPageRows][kPageTextBytes]{};
+alignas(8) unsigned char g_pgTextRecs[kMaxPageRows][16]{};
+TreeNode g_pgOverHeads[kMaxPageRows]{};
+TreeNode g_pgOverNodes[kMaxPageRows][10]{};
+std::uintptr_t g_pgOverNodePtrs[kMaxPageRows][10]{};
+alignas(8) unsigned char g_pgTgTypeRecs[kMaxPageRows][16]{};
+alignas(8) unsigned char g_pgTgBindRecs[kMaxPageRows][16]{};
+
+char g_pgCtlNames[kMaxPageRows][kPageKeyBytes]{};
+char g_pgBindNames[kMaxPageRows][32]{};
+char g_pgLabels[kMaxPageRows][kPageTextBytes]{};
+char g_pgHints[kMaxPageRows][kPageTextBytes]{};
+alignas(8) unsigned char g_pgCtlRecs[kMaxPageRows][16]{};
+alignas(8) unsigned char g_pgBindRecs[kMaxPageRows][16]{};
+alignas(8) unsigned char g_pgLabelRecs[kMaxPageRows][16]{};
+alignas(8) unsigned char g_pgHintRecs[kMaxPageRows][16]{};
+bool g_pgIsEdit[kMaxPageRows]{};
+constexpr int kRowButton = 0;
+constexpr int kRowEdit = 1;
+constexpr int kRowSlider = 2;
+constexpr int kRowToggle = 3;
+constexpr int kRowLabel = 4;
+constexpr int kRowHeader = 5;
+constexpr int kRowDivider = 6;
+constexpr int kRowColumns = 7;
+
+bool pageRowIsPlain(int kind)
+{
+    return kind == kRowLabel || kind == kRowHeader || kind == kRowDivider
+           || kind == kRowColumns;
+}
+int g_pgRowKind[kMaxPageRows]{};
+std::int32_t g_pgRowIcon[kMaxPageRows]{};
+bool g_pgRowHasIcon[kMaxPageRows]{};
+bool g_pgRowIconCol[kMaxPageRows]{};
+int g_pgRowNameW[kMaxPageRows]{};
+
+constexpr int kActItem = 0;
+constexpr int kActGoto = 1;
+constexpr int kActNone = 2;
+constexpr int kActShow = 3;
+int g_pgRowAct[kMaxPageRows]{};
+int g_pgRowArg[kMaxPageRows]{};
+
+bool g_pgRowChild[kMaxPageRows]{};
+int g_pgRowKids[kMaxPageRows]{};
+char g_pgRowWidth[kMaxPageRows][8]{};
+std::uintptr_t g_pgTopElems[kMaxPageRows]{};
+size_t g_pgTopCount = 0;
+int g_pgRowMenuTab[kMaxPageRows]{};
+int g_pgRowMenuIdx[kMaxPageRows]{};
+int g_pgRowTab[kMaxPageRows]{};
+int g_pgRowBlueprint[kMaxPageRows]{};
+constexpr size_t kMaxTabsForRows = 20;
+size_t g_pgTabStart[kMaxTabsForRows]{};
+size_t g_pgTabRows[kMaxTabsForRows]{};
+
+bool pageRowBorrows(int kind)
+{
+    return kind == kRowEdit || kind == kRowSlider || kind == kRowToggle;
+}
+
+const char* pageRowControlName(int kind)
+{
+    switch (kind) {
+    case kRowSlider: return "option_slider_control";
+    case kRowToggle: return "option_toggle_control";
+    default:         return "option_text_edit_control";
+    }
+}
+std::atomic<std::uintptr_t> g_pgCtl[kMaxPageRows]{};
+char g_pgLastText[kMaxPageRows][kPageTextBytes]{};
+TreeNode g_pgItemHeads[kMaxPageRows]{};
+TreeNode g_pgItemNodes[kMaxPageRows][2]{};
+std::uintptr_t g_pgItemNodePtrs[kMaxPageRows][4]{};
+std::uintptr_t g_pgItemValues[kMaxPageRows][kValueWords]{};
+std::uintptr_t g_pgElems[kMaxPageRows]{};
+std::uintptr_t g_pgVec[4]{};
+alignas(8) unsigned char g_pgSizeRecs[kMaxPageRows][2][16]{};
+std::uintptr_t g_pgSizeElems[kMaxPageRows][2][4]{};
+std::uintptr_t g_pgSizeElemPtrs[kMaxPageRows][2]{};
+std::uintptr_t g_pgSizeVec[kMaxPageRows][4]{};
+constexpr char kPageSizeKey[] = "size";
+constexpr char kPageRowWidth[] = "100% - 4px";
+constexpr char kPageRowHeight[] = "24px";
+constexpr char kPageTabColWidth[] = "30%";
+constexpr char kPageOneColWidth[] = "100% - 4px";
+constexpr char kPageRowColWidth[] = "70% - 16px";
+constexpr char kPageColHeight[] = "100%";
+constexpr char kPageOffsetKey[] = "offset";
+constexpr char kPageInsetX[] = "8px";
+constexpr char kPageInsetY[] = "21px";
+constexpr char kPageBodyWidth[] = "100% - 16px";
+constexpr char kPageBodyHeight[] = "100% - 21px";
+char g_pgBodyW[16] = "58%";
+char g_pgBodyX[16] = "0px";
+constexpr char kBodyWideW[] = "78%";
+constexpr char kBodyNarrowW[] = "58%";
+alignas(8) unsigned char g_pgInsetRecs[2][2][16]{};
+std::uintptr_t g_pgInsetElems[2][2][4]{};
+std::uintptr_t g_pgInsetElemPtrs[2][2]{};
+std::uintptr_t g_pgInsetVec[2][4]{};
+TreeNode g_pgHead{};
+TreeNode g_pgNodes[kMaxOwnKeys]{};
+std::uintptr_t g_pgNode[4]{};
+std::uintptr_t g_pgValue[kValueWords]{};
+bool g_pgReady = false;
+std::atomic<void*> g_pgBag{nullptr};
+
+std::atomic<int> g_pgPressed{-1};
+
+constexpr const char* kPageTabNames[] = {"General", "Blueprint"};
+constexpr size_t kMaxPageTabs = std::size(kPageTabNames);
+constexpr size_t kLeftTabCount = 1;
+constexpr int kEmptyTab = 1;
+
+constexpr size_t kMaxPageFiles = 14;
+constexpr size_t kMaxLeftRows = kMaxPageTabs + kMaxPageFiles;
+constexpr int kLeftTab = 0;
+constexpr int kLeftFile = 1;
+int g_ptKind[kMaxLeftRows]{};
+int g_ptIndex[kMaxLeftRows]{};
+size_t g_ptCount = 0;
+std::atomic<int> g_ptLastPressed{-1};
+
+constexpr char kPtListName[] = "settings_common.tk_ptlist";
+constexpr char kPtListVar[] = "$scrolling_content";
+constexpr char kPtScrollSizeVar[] = "$scroll_size";
+TreeNode g_ptListHead{};
+TreeNode g_ptListNodes[kMaxOwnKeys]{};
+constexpr size_t kListWords = 8;
+std::uintptr_t g_ptListNodePtrs[kListWords]{};
+std::uintptr_t g_ptListValue[kListWords]{};
+bool g_ptListReady = false;
+
+constexpr size_t kViewWords = 8;
+TreeNode g_pgViewHead{};
+TreeNode g_pgViewNodes[8]{};
+std::uintptr_t g_pgViewNodePtrs[kViewWords]{};
+std::uintptr_t g_pgViewValue[kViewWords]{};
+std::uintptr_t g_pgViewElem[2]{};
+std::uintptr_t g_pgViewVec[kViewWords]{};
+char g_pgViewName[48]{};
+alignas(8) unsigned char g_pgViewNameRec[16]{};
+std::uintptr_t g_pgViewKey = 0;
+bool g_pgViewReady = false;
+
+constexpr size_t kBodyCount = kMaxLeftRows;
+char g_pgBodyKeys[kBodyCount][kPageKeyBytes]{};
+std::uintptr_t g_pgBodyRowVec[kBodyCount][kViewWords]{};
+TreeNode g_pgBodyHeads[kBodyCount]{};
+TreeNode g_pgBodyNodes[kBodyCount][kMaxOwnKeys]{};
+std::uintptr_t g_pgBodyNodePtrs[kBodyCount][kViewWords]{};
+std::uintptr_t g_pgBodyValue[kBodyCount][kViewWords]{};
+std::uintptr_t g_pgBodyElems[kBodyCount]{};
+std::uintptr_t g_pgBodyVec[kViewWords]{};
+TreeNode g_pgBodyViewHeads[kBodyCount]{};
+TreeNode g_pgBodyViewNodes[kBodyCount][8]{};
+std::uintptr_t g_pgBodyViewNodePtrs[kBodyCount][kViewWords]{};
+std::uintptr_t g_pgBodyViewValue[kBodyCount][kViewWords]{};
+std::uintptr_t g_pgBodyViewElem[kBodyCount][2]{};
+std::uintptr_t g_pgBodyViewVec[kBodyCount][kViewWords]{};
+char g_pgBodyViewNames[kBodyCount][48]{};
+alignas(8) unsigned char g_pgBodyViewNameRecs[kBodyCount][16]{};
+alignas(8) unsigned char g_pgBodyPropRec[16]{};
+TreeNode g_pgItemHeads2[kBodyCount]{};
+TreeNode g_pgItemNodes2[kBodyCount][1]{};
+std::uintptr_t g_pgItemNodePtrs2[kBodyCount][kViewWords]{};
+std::uintptr_t g_pgItemValues2[kBodyCount][kViewWords]{};
+bool g_pgBodyReady = false;
+
+alignas(8) unsigned char g_ptListSizeRecs[2][16]{};
+std::uintptr_t g_ptListSizeElems[2][4]{};
+std::uintptr_t g_ptListSizeElemPtrs[2]{};
+std::uintptr_t g_ptListSizeVec[4]{};
+alignas(8) unsigned char g_ptListNameRec[16]{};
+
+std::atomic<int> g_pgTab{0};
+std::atomic<int> g_ptPressed{-1};
+
+char g_ptKeys[kMaxLeftRows][kPageKeyBytes]{};
+char g_ptTexts[kMaxLeftRows][kPageTextBytes]{};
+alignas(8) unsigned char g_ptTextRecs[kMaxLeftRows][16]{};
+alignas(8) unsigned char g_ptExitRecs[kMaxLeftRows][16]{};
+TreeNode g_ptOverHeads[kMaxLeftRows]{};
+TreeNode g_ptOverNodes[kMaxLeftRows][12]{};
+std::uintptr_t g_ptOverNodePtrs[kMaxLeftRows][12]{};
+alignas(8) unsigned char g_ptGlyphRecs[kMaxLeftRows][2][16]{};
+alignas(8) unsigned char g_ptRadioRecs[kMaxLeftRows][16]{};
+alignas(8) unsigned char g_ptTypeRecs[kMaxLeftRows][16]{};
+alignas(8) unsigned char g_ptBindRecs2[kMaxLeftRows][16]{};
+alignas(8) unsigned char g_ptViewRecs[kMaxLeftRows][16]{};
+char g_ptBindNames[kMaxLeftRows][32]{};
+char g_ptViewNames[kMaxLeftRows][32]{};
+TreeNode g_ptItemHeads[kMaxLeftRows]{};
+TreeNode g_ptItemNodes[kMaxLeftRows][2]{};
+std::uintptr_t g_ptItemNodePtrs[kMaxLeftRows][4]{};
+std::uintptr_t g_ptItemValues[kMaxLeftRows][kValueWords]{};
+std::uintptr_t g_ptElems[kMaxLeftRows]{};
+std::uintptr_t g_ptVec[4]{};
+alignas(8) unsigned char g_ptSizeRecs[kMaxLeftRows][2][16]{};
+std::uintptr_t g_ptSizeElems[kMaxLeftRows][2][4]{};
+std::uintptr_t g_ptSizeElemPtrs[kMaxLeftRows][2]{};
+std::uintptr_t g_ptSizeVec[kMaxLeftRows][4]{};
+
+char g_pgColKeys[2][kPageKeyBytes]{};
+TreeNode g_pgColOverHeads[2]{};
+TreeNode g_pgColOverNodes[2][4]{};
+std::uintptr_t g_pgColOverNodePtrs[2][4]{};
+TreeNode g_pgColHeads[2]{};
+TreeNode g_pgColNodes[2][2]{};
+std::uintptr_t g_pgColNodePtrs[2][4]{};
+std::uintptr_t g_pgColValues[2][kValueWords]{};
+std::uintptr_t g_pgColElems[2]{};
+std::uintptr_t g_pgColVec[4]{};
+alignas(8) unsigned char g_pgColSizeRecs[2][2][16]{};
+std::uintptr_t g_pgColSizeElems[2][2][4]{};
+std::uintptr_t g_pgColSizeElemPtrs[2][2]{};
+std::uintptr_t g_pgColSizeVec[2][4]{};
+
+constexpr char kPageExitId[] = "button.menu_exit";
+constexpr char kPageExitVar[] = "$pressed_button_name";
+alignas(8) unsigned char g_pgExitRecs[kMaxPageRows][16]{};
+
+std::atomic<bool> g_pgCloseOnPress{false};
+
+std::atomic<unsigned long long> g_pgReopenAt{0};
+
+std::atomic<unsigned long long> g_pgSelfEscUntil{0};
+
+std::atomic<unsigned long long> g_pgCloseDeadline{0};
+constexpr unsigned long long kPageCloseWaitMs = 2000;
+constexpr unsigned long long kPageAfterCloseMs = 80;
+
+void noteScreenClosed()
+{
+    if (g_pgCloseDeadline.exchange(0) == 0) {
+        return;
+    }
+    g_pgReopenAt.store(GetTickCount64() + kPageAfterCloseMs);
+}
+
+bool selfEscapeInFlight()
+{
+    const unsigned long long until = g_pgSelfEscUntil.load(std::memory_order_relaxed);
+    return until != 0 && GetTickCount64() < until;
+}
+
+void sendEscapeToGame()
+{
+    const HWND front = GetForegroundWindow();
+    DWORD pid = 0;
+    if (front != nullptr) {
+        GetWindowThreadProcessId(front, &pid);
+    }
+    if (pid != GetCurrentProcessId()) {
+        static std::atomic<int> saidSkip{0};
+        if (saidSkip.fetch_add(1) < 8) {
+            log().warn(L"UiProbe: the game is not in the foreground, so ESC was not sent (one "
+                       L"screen stays stacked)");
+        }
+        return;
+    }
+    INPUT keys[2]{};
+    keys[0].type = INPUT_KEYBOARD;
+    keys[0].ki.wVk = VK_ESCAPE;
+    keys[1] = keys[0];
+    keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    g_pgSelfEscUntil.store(GetTickCount64() + 500, std::memory_order_relaxed);
+    SendInput(2, keys, sizeof(INPUT));
+}
+
+void cancelPageReopen()
+{
+    g_ptPressed.store(-1);
+    g_pgPressed.store(-1);
+}
+constexpr unsigned long long kPageReopenDelayMs = 120;
+
+bool schematicaRowText(size_t index, char* out, size_t cap);
+
+MenuItem* schematicaRow(size_t index);
+MenuItem* schematicaRowOf(int tab, size_t index);
+bool schematicaRowTextOf(int tab, size_t index, char* out, size_t cap);
+void copyAscii(char* dest, size_t cap, const wchar_t* text);
+
+void forgetPageSliders();
+void forgetToggleState();
+
+size_t buildPageTexts()
+{
+    (void)pageHeaderTitle();
+    forgetPageSliders();
+    forgetToggleState();
+    Schematica& mod = Schematica::instance();
+    size_t rows = 0;
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        g_pgRowIcon[i] = 0;
+        g_pgRowHasIcon[i] = false;
+        g_pgRowIconCol[i] = false;
+        g_pgRowNameW[i] = 0;
+    }
+
+    const auto addItem = [&](int tab, size_t index) -> bool {
+        if (rows >= kMaxPageRows) {
+            return false;
+        }
+        const MenuItem* const row = schematicaRowOf(tab, index);
+        if (row == nullptr) {
+            return false;
+        }
+        if (!schematicaRowTextOf(tab, index, g_pgTexts[rows], kPageTextBytes)) {
+            return false;
+        }
+        copyAscii(g_pgLabels[rows], kPageTextBytes, row->labelText().c_str());
+        copyAscii(g_pgHints[rows], kPageTextBytes, row->valueText().c_str());
+        g_pgRowAct[rows] = kActItem;
+        g_pgRowArg[rows] = 0;
+        g_pgRowMenuTab[rows] = tab;
+        g_pgRowMenuIdx[rows] = static_cast<int>(index);
+        g_pgRowTab[rows] = 0;
+        g_pgRowBlueprint[rows] = (tab == 1) ? mod.editingIndex() : -1;
+        if (row->kind == MenuItemKind::Text && row->getText && row->setText) {
+            g_pgRowKind[rows] = kRowEdit;
+        } else if (row->kind == MenuItemKind::Number && row->getNumber && row->setNumber) {
+            g_pgRowKind[rows] = kRowSlider;
+        } else if (row->kind == MenuItemKind::Toggle) {
+            g_pgRowKind[rows] = kRowToggle;
+        } else {
+            g_pgRowKind[rows] = kRowButton;
+        }
+        g_pgIsEdit[rows] = (g_pgRowKind[rows] == kRowEdit);
+        g_pgRowChild[rows] = false;
+        g_pgRowKids[rows] = 0;
+        g_pgRowWidth[rows][0] = 0;
+        ++rows;
+        return true;
+    };
+
+    const auto addPlain = [&](int kind, const char* text) {
+        if (rows >= kMaxPageRows) {
+            return;
+        }
+        std::snprintf(g_pgTexts[rows], kPageTextBytes, "%s", (text != nullptr) ? text : "");
+        g_pgLabels[rows][0] = 0;
+        g_pgHints[rows][0] = 0;
+        g_pgRowAct[rows] = kActNone;
+        g_pgRowArg[rows] = 0;
+        g_pgRowMenuTab[rows] = -1;
+        g_pgRowMenuIdx[rows] = -1;
+        g_pgRowTab[rows] = 0;
+        g_pgRowBlueprint[rows] = -1;
+        g_pgRowKind[rows] = kind;
+        g_pgIsEdit[rows] = false;
+        g_pgRowChild[rows] = false;
+        g_pgRowKids[rows] = 0;
+        g_pgRowWidth[rows][0] = 0;
+        ++rows;
+    };
+
+    const auto addGoto = [&](const char* text, int screen, int blueprint) {
+        if (rows >= kMaxPageRows) {
+            return;
+        }
+        std::snprintf(g_pgTexts[rows], kPageTextBytes, "%s", text);
+        g_pgLabels[rows][0] = '\0';
+        g_pgHints[rows][0] = '\0';
+        g_pgRowAct[rows] = kActGoto;
+        g_pgRowArg[rows] = screen;
+        g_pgRowMenuTab[rows] = -1;
+        g_pgRowMenuIdx[rows] = -1;
+        g_pgRowTab[rows] = 0;
+        g_pgRowBlueprint[rows] = blueprint;
+        g_pgRowKind[rows] = kRowButton;
+        g_pgIsEdit[rows] = false;
+        g_pgRowChild[rows] = false;
+        g_pgRowKids[rows] = 0;
+        g_pgRowWidth[rows][0] = 0;
+        ++rows;
+    };
+
+    const auto addColumns = [&](const char* name, const char* count, bool header, bool iconCol,
+                                bool hasIcon, std::int32_t icon, int nameW,
+                                const char* stacks = nullptr) {
+        if (rows >= kMaxPageRows) {
+            return;
+        }
+        const auto putText = [](char* dest, const char* src) {
+            std::snprintf(dest, kPageTextBytes, "%s", (src != nullptr) ? src : "");
+            if (dest[0] == '(') {
+                dest[0] = '[';
+            }
+        };
+        putText(g_pgTexts[rows], name);
+        putText(g_pgHints[rows], count);
+        if (stacks != nullptr && stacks[0] != 0) {
+            putText(g_pgLabels[rows], stacks);
+        } else {
+            g_pgLabels[rows][0] = 0;
+        }
+        g_pgRowAct[rows] = kActNone;
+        g_pgRowArg[rows] = header ? 1 : 0;
+        g_pgRowMenuTab[rows] = -1;
+        g_pgRowMenuIdx[rows] = -1;
+        g_pgRowTab[rows] = 0;
+        g_pgRowBlueprint[rows] = -1;
+        g_pgRowKind[rows] = kRowColumns;
+        g_pgIsEdit[rows] = false;
+        g_pgRowChild[rows] = false;
+        g_pgRowKids[rows] = 0;
+        g_pgRowWidth[rows][0] = 0;
+        g_pgRowIconCol[rows] = iconCol;
+        g_pgRowHasIcon[rows] = iconCol && hasIcon && !header;
+        g_pgRowIcon[rows] = icon;
+        g_pgRowNameW[rows] = nameW;
+        ++rows;
+    };
+    const auto nameWidthFor = [](size_t longest) {
+        const int want = static_cast<int>(longest) * 6 + 24;
+        return std::clamp(want, 96, 420);
+    };
+
+    const auto addListRow = [&](size_t which) {
+        if (rows + 4 > kMaxPageRows) {
+            return;
+        }
+        char name[kPageTextBytes]{};
+        copyAscii(name, sizeof(name), mod.blueprintName(which).c_str());
+        const bool shown = mod.blueprintVisible(which);
+
+        const size_t parent = rows;
+        g_pgTexts[parent][0] = 0;
+        g_pgLabels[parent][0] = 0;
+        g_pgHints[parent][0] = 0;
+        g_pgRowAct[parent] = kActNone;
+        g_pgRowArg[parent] = 0;
+        g_pgRowMenuTab[parent] = -1;
+        g_pgRowMenuIdx[parent] = -1;
+        g_pgRowTab[parent] = 0;
+        g_pgRowBlueprint[parent] = static_cast<int>(which);
+        g_pgRowKind[parent] = kRowButton;
+        g_pgIsEdit[parent] = false;
+        g_pgRowChild[parent] = false;
+        g_pgRowKids[parent] = 3;
+        g_pgRowWidth[parent][0] = 0;
+        ++rows;
+
+        const auto kid = [&](const char* text, int act, int arg, const char* width) {
+            std::snprintf(g_pgTexts[rows], kPageTextBytes, "%s", text);
+            g_pgLabels[rows][0] = 0;
+            g_pgHints[rows][0] = 0;
+            g_pgRowAct[rows] = act;
+            g_pgRowArg[rows] = arg;
+            g_pgRowMenuTab[rows] = -1;
+            g_pgRowMenuIdx[rows] = -1;
+            g_pgRowTab[rows] = 0;
+            g_pgRowBlueprint[rows] = static_cast<int>(which);
+            g_pgRowKind[rows] = kRowButton;
+            g_pgIsEdit[rows] = false;
+            g_pgRowChild[rows] = true;
+            g_pgRowKids[rows] = 0;
+            std::snprintf(g_pgRowWidth[rows], sizeof(g_pgRowWidth[rows]), "%s", width);
+            ++rows;
+        };
+        char label[kPageTextBytes]{};
+        std::snprintf(label, sizeof(label), "%s %s", shown ? "*" : " ", name);
+        kid(label, kActGoto, kScreenBlueprint, "52%");
+        kid(shown ? "Placement: ON" : "Placement: OFF", kActShow, 0, "26%");
+        {
+            const MenuItem* const del = schematicaRowOf(1, 4);
+            std::wstring armed = (del != nullptr) ? del->valueText() : std::wstring{};
+            char armedText[kPageTextBytes]{};
+            copyAscii(armedText, sizeof(armedText), armed.c_str());
+            const bool armedHere =
+                (armed.rfind(L"press again: ", 0) == 0)
+                && (std::strstr(armedText, name) != nullptr) && (name[0] != 0);
+            std::snprintf(g_pgTexts[rows], kPageTextBytes, "%s",
+                          armedHere ? "Remove: sure?" : "Remove");
+            g_pgLabels[rows][0] = 0;
+            g_pgHints[rows][0] = 0;
+            g_pgRowAct[rows] = kActItem;
+            g_pgRowArg[rows] = 0;
+            g_pgRowMenuTab[rows] = 1;
+            g_pgRowMenuIdx[rows] = 4;
+            g_pgRowTab[rows] = 0;
+            g_pgRowBlueprint[rows] = static_cast<int>(which);
+            g_pgRowKind[rows] = kRowButton;
+            g_pgIsEdit[rows] = false;
+            g_pgRowChild[rows] = true;
+            g_pgRowKids[rows] = 0;
+            std::snprintf(g_pgRowWidth[rows], sizeof(g_pgRowWidth[rows]), "%s", "20%");
+            ++rows;
+        }
+    };
+
+    switch (g_pgScreen.load(std::memory_order_relaxed)) {
+    case kScreenBlueprints: {
+        const size_t count = mod.blueprintCount();
+        for (size_t i = 0; i < count && rows + 5 < kMaxPageRows; ++i) {
+            addListRow(i);
+        }
+        if (count == 0) {
+            addPlain(kRowLabel, "No blueprints: use Import .mcstructure");
+        }
+        addGoto("< Schematica menu", kScreenMenu, -1);
+        break;
+    }
+    case kScreenBlueprint: {
+        {
+            char name[kPageTextBytes]{};
+            const int at = mod.editingIndex();
+            if (at >= 0) {
+                copyAscii(name, sizeof(name), mod.blueprintName(static_cast<size_t>(at)).c_str());
+            }
+            char text[kPageTextBytes]{};
+            std::snprintf(text, sizeof(text), "Schematic: %s", (name[0] != 0) ? name : "(none)");
+            addPlain(kRowLabel, text);
+        }
+        {
+            const int at = mod.editingIndex();
+            int sx = 0;
+            int sy = 0;
+            int sz = 0;
+            std::size_t solid = 0;
+            char text[kPageTextBytes]{};
+            if (at >= 0 && mod.blueprintInfo(static_cast<size_t>(at), sx, sy, sz, solid)) {
+                std::snprintf(text, sizeof(text), "Enclosing size: %d x %d x %d  (%u blocks)",
+                              sx, sy, sz, static_cast<unsigned>(solid));
+            } else {
+                std::snprintf(text, sizeof(text), "Enclosing size: not loaded yet");
+            }
+            addPlain(kRowLabel, text);
+        }
+        addItem(1, 0);
+        addPlain(kRowHeader, "Placement origin");
+        addItem(1, 1);
+        addItem(1, 2);
+        addItem(1, 3);
+        addItem(1, 6);
+        addItem(1, 5);
+        addPlain(kRowDivider, nullptr);
+        addGoto("Material List", kScreenMaterials, -1);
+        addGoto("Schematic Verifier", kScreenVerifier, -1);
+        addPlain(kRowDivider, nullptr);
+        addItem(1, 4);
+        addGoto("< Blueprints", kScreenBlueprints, -1);
+        break;
+    }
+    case kScreenMaterials: {
+        const int at = mod.editingIndex();
+        std::size_t kinds = 0;
+        const size_t room = (kMaxPageRows > rows + 5) ? (kMaxPageRows - rows - 5) : 0;
+        const auto list = (at >= 0)
+                              ? mod.blueprintMaterials(static_cast<size_t>(at), room, &kinds)
+                              : std::vector<Schematica::MaterialRow>{};
+        std::vector<std::string> names;
+        names.reserve(list.size());
+        size_t longest = std::strlen("Item");
+        for (const auto& one : list) {
+            char name[kPageTextBytes]{};
+            copyAscii(name, sizeof(name), one.name.c_str());
+            const char* body = name;
+            if (const char* colon = std::strchr(name, ':'); colon != nullptr) {
+                body = colon + 1;
+            }
+            std::string shown(body);
+            if (shown.size() > 40) {
+                shown = shown.substr(0, 37) + "...";
+            }
+            longest = std::max(longest, shown.size());
+            names.push_back(std::move(shown));
+        }
+        const int nameW = nameWidthFor(longest);
+        addColumns("Item", "Total", true, true, false, 0, nameW, "SB+stacks");
+        if (at < 0 || list.empty()) {
+            addPlain(kRowLabel, "- nothing loaded yet: turn Show on once");
+        }
+        for (size_t i = 0; i < list.size(); ++i) {
+            char count[24]{};
+            std::snprintf(count, sizeof(count), "%u", static_cast<unsigned>(list[i].count));
+            char rawName[kPageTextBytes]{};
+            copyAscii(rawName, sizeof(rawName), list[i].name.c_str());
+            const int stackSize = (list[i].stackSize > 0)
+                                      ? list[i].stackSize
+                                      : stackcount::maxStackSize(rawName);
+            const std::string stacks = stackcount::formatStacks(list[i].count, stackSize);
+            addColumns(names[i].c_str(), count, false, true, list[i].hasIcon, list[i].iconIdAux,
+                       nameW, stacks.c_str());
+        }
+        if (kinds > list.size()) {
+            char more[kPageTextBytes]{};
+            std::snprintf(more, sizeof(more), "... and %u more (not shown)",
+                          static_cast<unsigned>(kinds - list.size()));
+            addPlain(kRowLabel, more);
+        }
+        addPlain(kRowDivider, nullptr);
+        addGoto("< Configure", kScreenBlueprint, -1);
+        break;
+    }
+    case kScreenVerifier: {
+        std::size_t tally[6]{};
+        mod.diffTally(tally);
+        const std::size_t seen = tally[0] + tally[1] + tally[2] + tally[3] + tally[4] + tally[5];
+        const struct {
+            const char* label;
+            std::size_t at;
+        } kRowsOf[] = {
+            {"Correct", 0}, {"Missing", 1},        {"Wrong block", 2},
+            {"Wrong state", 3}, {"World not read", 4}, {"State unresolved", 5},
+        };
+        size_t longest = std::strlen("Status");
+        for (const auto& one : kRowsOf) {
+            longest = std::max(longest, std::strlen(one.label));
+        }
+        const int nameW = nameWidthFor(longest);
+        addColumns("Status", "Count", true, false, false, 0, nameW);
+        if (seen == 0) {
+            addPlain(kRowLabel, "- no result yet: turn Show on and wait");
+        }
+        for (const auto& one : kRowsOf) {
+            char count[24]{};
+            std::snprintf(count, sizeof(count), "%u", static_cast<unsigned>(tally[one.at]));
+            addColumns(one.label, count, false, false, false, 0, nameW);
+        }
+        addPlain(kRowDivider, nullptr);
+        addGoto("< Configure", kScreenBlueprint, -1);
+        break;
+    }
+    case kScreenSettings: {
+        addPlain(kRowHeader, "Visuals");
+        for (size_t i = 1; i < kMaxPageRows; ++i) {
+            if (!addItem(0, i)) {
+                break;
+            }
+        }
+        addGoto("< Schematica menu", kScreenMenu, -1);
+        break;
+    }
+    case kScreenLayers: {
+        const int layerMode = mod.layerMode();
+        addItem(2, 0);
+        addItem(2, 1);
+        if (layerMode == Schematica::kLayerSingle || layerMode == Schematica::kLayerBelow
+            || layerMode == Schematica::kLayerAbove) {
+            addItem(2, 2);
+        } else if (layerMode == Schematica::kLayerRange) {
+            addItem(2, 3);
+            addItem(2, 4);
+        }
+        {
+            bool on = false;
+            int axis = 1;
+            int lo = 0;
+            int hi = 0;
+            mod.layerRangeOffsets(on, axis, lo, hi);
+            const char axisName = (axis == 0) ? 'x' : ((axis == 2) ? 'z' : 'y');
+            {
+                int ox = 0;
+                int oy = 0;
+                int oz = 0;
+                std::wstring who;
+                char name[kPageTextBytes]{};
+                char text[kPageTextBytes]{};
+                if (mod.layerOrigin(ox, oy, oz, &who)) {
+                    copyAscii(name, sizeof(name), who.c_str());
+                    std::snprintf(text, sizeof(text), "Offset from: %s  [%d, %d, %d]", name,
+                                  ox, oy, oz);
+                } else {
+                    std::snprintf(text, sizeof(text),
+                                  "Offset from: no schematic - using world coordinates");
+                }
+                addPlain(kRowLabel, text);
+            }
+            char text[kPageTextBytes]{};
+            constexpr int kFarShown = 1 << 20;
+            const auto edge = [](char* into, size_t room, int value) {
+                if (value <= -kFarShown) {
+                    std::snprintf(into, room, "...");
+                } else if (value >= kFarShown) {
+                    std::snprintf(into, room, "...");
+                } else {
+                    std::snprintf(into, room, "%d", value);
+                }
+            };
+            char lowText[16]{};
+            char highText[16]{};
+            edge(lowText, sizeof(lowText), lo);
+            edge(highText, sizeof(highText), hi);
+            if (!on) {
+                std::snprintf(text, sizeof(text), "Showing: all layers");
+            } else {
+                bool worldOn = false;
+                int worldAxis = 1;
+                int worldLo = 0;
+                int worldHi = 0;
+                mod.layerRange(worldOn, worldAxis, worldLo, worldHi);
+                if (lo == hi) {
+                    std::snprintf(text, sizeof(text), "Showing: %c offset %s  [world %c = %d]",
+                                  axisName, lowText, axisName, worldLo);
+                } else {
+                    std::snprintf(text, sizeof(text),
+                                  "Showing: %s <= %c offset <= %s  [world %d..%d]", lowText,
+                                  axisName, highText, worldLo, worldHi);
+                }
+            }
+            addPlain(kRowLabel, text);
+        }
+        if (layerMode != Schematica::kLayerAll) {
+            addItem(2, 5);
+            addItem(2, 6);
+            addItem(2, 7);
+        }
+        addPlain(kRowDivider, nullptr);
+        addGoto("< Schematica menu", kScreenMenu, -1);
+        break;
+    }
+    default: {
+        char text[kPageTextBytes]{};
+        std::snprintf(text, sizeof(text), "Schematic Placements (%u)",
+                      static_cast<unsigned>(mod.blueprintCount()));
+        addGoto(text, kScreenBlueprints, -1);
+        addItem(0, 0);
+        addPlain(kRowDivider, nullptr);
+        addGoto("Configuration menu", kScreenSettings, -1);
+        {
+            static constexpr const char* kModeNames[Schematica::kLayerModeCount] = {
+                "All", "Single layer", "All below", "All above", "Layer range"};
+            char layers[kPageTextBytes]{};
+            std::snprintf(layers, sizeof(layers), "Render Layers: %s",
+                          kModeNames[std::clamp(mod.layerMode(), 0,
+                                                Schematica::kLayerModeCount - 1)]);
+            addGoto(layers, kScreenLayers, -1);
+        }
+        break;
+    }
+    }
+
+    {
+        const int screen = g_pgScreen.load(std::memory_order_relaxed);
+        const bool wide = (screen == kScreenMaterials) || (screen == kScreenVerifier)
+                          || (screen == kScreenBlueprints);
+        std::snprintf(g_pgBodyW, sizeof(g_pgBodyW), "%s", wide ? kBodyWideW : kBodyNarrowW);
+        std::snprintf(g_pgBodyX, sizeof(g_pgBodyX), "%s", "0px");
+    }
+
+    g_pgTabStart[0] = 0;
+    g_pgTabRows[0] = rows;
+    return rows;
+}
+int pageSelectedLeftRow();
+
+bool pageLeftRowSelected(size_t row)
+{
+    if (row >= g_ptCount) {
+        return false;
+    }
+    if (g_ptKind[row] == kLeftTab) {
+        return g_ptIndex[row] == g_pgTab.load(std::memory_order_relaxed);
+    }
+    return g_ptIndex[row] == Schematica::instance().editingIndex();
+}
+
+constexpr size_t kMaxTabKeys = 32;
+constexpr char kTabTopicVar[] = "$section_topic";
+constexpr char kTabIndexVar[] = "$default_selector_toggle_index";
+constexpr char kTabForcedVar[] = "$toggle_group_forced_index";
+char g_ptTopics[kMaxLeftRows][16]{};
+alignas(8) unsigned char g_ptTopicRecs[kMaxLeftRows][16]{};
+TreeNode g_ptOwnHeads[kMaxLeftRows]{};
+TreeNode g_ptOwnNodes[kMaxLeftRows][kMaxTabKeys]{};
+std::uintptr_t g_ptOwnNodePtrs[kMaxLeftRows][4]{};
+std::uintptr_t g_ptOwnValues[kMaxLeftRows][kValueWords]{};
+
+const char* pageLeftLabel(size_t row)
+{
+    return (row < kMaxLeftRows) ? g_ptTexts[row] : "";
+}
+
+int pageLeftRowFromKey(const char* key)
+{
+    constexpr char kPrefix[] = "howtoplay.tk_pt";
+    constexpr size_t kLen = sizeof(kPrefix) - 1;
+    if (key == nullptr || std::strncmp(key, kPrefix, kLen) != 0) {
+        return -1;
+    }
+    int row = -1;
+    for (size_t d = kLen; key[d] >= '0' && key[d] <= '9'; ++d) {
+        row = (row < 0 ? 0 : row) * 10 + (key[d] - '0');
+    }
+    return (row >= 0 && static_cast<size_t>(row) < kMaxLeftRows) ? row : -1;
+}
+
+void* buildLeftTab(void* self, size_t row, const void* strSrc)
+{
+    static const std::string kSpace = "how_to_play_common";
+    static const std::string kName = "section_toggle_button";
+    void* donor = nullptr;
+    if (!lookupGuarded(self, &kSpace, &kName, donor) || donor == nullptr) {
+        log().warn(L"UiProbe: could not resolve the How to Play row definition");
+        return nullptr;
+    }
+    std::vector<Entry> entries;
+    std::uintptr_t count = 0;
+    if (!collectEntries(donor, entries, count) || entries.empty()
+        || entries.size() + 6 > kMaxTabKeys) {
+        log().warn(L"UiProbe: could not walk the How to Play row ({} keys)", entries.size());
+        return nullptr;
+    }
+
+    static Entry tgTrueRec{};
+    static Entry tgFalseRec{};
+    static Entry tgIntRec{};
+    static bool tgReady = false;
+    if (!tgReady) {
+        static const std::string kTgSpace3 = "common";
+        static const std::string kTgName3 = "toggle";
+        void* tg = nullptr;
+        std::vector<Entry> tgAll;
+        std::uintptr_t tgCount = 0;
+        if (lookupGuarded(self, &kTgSpace3, &kTgName3, tg) && tg != nullptr
+            && collectEntries(tg, tgAll, tgCount)) {
+            for (const Entry& one : tgAll) {
+                if (one.keyText == L"focus_magnet_enabled") {
+                    tgTrueRec = one;
+                } else if (one.keyText == L"$toggle_default_state|default") {
+                    tgFalseRec = one;
+                } else if (one.keyText == L"layer") {
+                    tgIntRec = one;
+                }
+            }
+            tgReady = (tgIntRec.tag != 0);
+        }
+    }
+
+    const auto addStr = [&](const char* var, unsigned char (&rec)[16], const char* text) {
+        std::memcpy(rec, strSrc, sizeof(rec));
+        std::memcpy(rec, &text, sizeof(text));
+        Entry one{};
+        one.keyText = toUtf16(var);
+        one.key = reinterpret_cast<std::uintptr_t>(var);
+        one.value = reinterpret_cast<std::uintptr_t>(rec);
+        one.tag = entries[0].tag;
+        one.seq = entries[0].seq;
+        entries.push_back(one);
+    };
+    const auto addBorrowed = [&](const char* var, const Entry& src) {
+        Entry one{};
+        one.keyText = toUtf16(var);
+        one.key = reinterpret_cast<std::uintptr_t>(var);
+        one.value = src.value;
+        one.tag = src.tag;
+        one.seq = src.seq;
+        entries.push_back(one);
+    };
+
+    if (tgReady) {
+        Entry pick{};
+        pick.keyText = toUtf16(kTabIndexVar);
+        pick.key = reinterpret_cast<std::uintptr_t>(kTabIndexVar);
+        pick.value = static_cast<std::uintptr_t>(pageSelectedLeftRow());
+        pick.tag = tgIntRec.tag;
+        pick.seq = tgIntRec.seq;
+        entries.push_back(pick);
+    }
+
+    std::snprintf(g_ptTopics[row], sizeof(g_ptTopics[row]), "tk_pt%u",
+                  static_cast<unsigned>(row));
+    const char* const topic = g_ptTopics[row];
+    std::memcpy(g_ptTopicRecs[row], strSrc, sizeof(g_ptTopicRecs[row]));
+    std::memcpy(g_ptTopicRecs[row], &topic, sizeof(topic));
+    Entry topicEntry{};
+    topicEntry.keyText = toUtf16(kTabTopicVar);
+    topicEntry.key = reinterpret_cast<std::uintptr_t>(kTabTopicVar);
+    topicEntry.value = reinterpret_cast<std::uintptr_t>(g_ptTopicRecs[row]);
+    topicEntry.tag = entries[0].tag;
+    topicEntry.seq = entries[0].seq;
+    entries.push_back(topicEntry);
+
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+    for (size_t i = 0; i < entries.size(); ++i) {
+        g_ptOwnNodes[row][i].key = entries[i].key;
+        g_ptOwnNodes[row][i].value = entries[i].value;
+        g_ptOwnNodes[row][i].tag = entries[i].tag;
+        g_ptOwnNodes[row][i].seq = entries[i].seq;
+    }
+    finishMap(&g_ptOwnHeads[row], g_ptOwnNodes[row], static_cast<int>(entries.size()),
+              g_ptOwnNodePtrs[row]);
+    std::memcpy(g_ptOwnValues[row], donor, sizeof(g_ptOwnValues[row]));
+    g_ptOwnValues[row][0] = reinterpret_cast<std::uintptr_t>(g_ptOwnNodePtrs[row]);
+    return g_ptOwnValues[row];
+}
+
+int pageSelectedLeftRow()
+{
+    const int last = g_ptLastPressed.load(std::memory_order_relaxed);
+    if (last >= 0 && static_cast<size_t>(last) < g_ptCount) {
+        return last;
+    }
+    for (size_t t = 0; t < g_ptCount; ++t) {
+        if (g_ptKind[t] == kLeftTab
+            && g_ptIndex[t] == g_pgTab.load(std::memory_order_relaxed)) {
+            return static_cast<int>(t);
+        }
+    }
+    return 0;
+}
+
+void buildPageTabTexts()
+{
+    {
+        static unsigned long long lastScanAt = 0;
+        const unsigned long long now = GetTickCount64();
+        if (now - lastScanAt > 400) {
+            lastScanAt = now;
+            Schematica::instance().refreshFiles();
+        }
+    }
+    const int now = g_pgTab.load(std::memory_order_relaxed);
+    size_t rows = 0;
+    for (size_t i = 0; i < kLeftTabCount && rows < kMaxLeftRows; ++i) {
+        std::snprintf(g_ptTexts[rows], kPageTextBytes, "%s", kPageTabNames[i]);
+        g_ptKind[rows] = kLeftTab;
+        g_ptIndex[rows] = static_cast<int>(i);
+        ++rows;
+    }
+
+    Schematica& mod = Schematica::instance();
+    const size_t count = mod.blueprintCount();
+    const int editing = mod.editingIndex();
+    for (size_t i = 0; i < count && rows < kMaxLeftRows; ++i) {
+        const bool shown = mod.blueprintVisible(i);
+        const bool picked = (static_cast<int>(i) == editing);
+        char name[kPageTextBytes]{};
+        copyAscii(name, sizeof(name), mod.blueprintName(i).c_str());
+        (void)picked;
+        std::snprintf(g_ptTexts[rows], kPageTextBytes, "%c %s", shown ? '*' : ' ', name);
+        g_ptKind[rows] = kLeftFile;
+        g_ptIndex[rows] = static_cast<int>(i);
+        ++rows;
+    }
+    if (count > kMaxPageFiles) {
+        log().warn(L"UiProbe: {} schematics found - only {} of them can be listed on the left",
+                   count,
+                   kMaxPageFiles);
+    }
+    g_ptCount = rows;
+}
+
+constexpr bool kPageReuseProbe = false;
+
+constexpr char kCountColW[] = "72px";
+constexpr char kStackColW[] = "108px";
+constexpr char kRowLineTexture[] = "textures/ui/list_item_divider_line_light";
+constexpr std::int64_t kIconLayer = 5;
+
+Part buildColumnsRow(size_t i, bool iconsUsable)
+{
+    const bool header = (g_pgRowArg[i] == 1);
+    const bool iconCol = g_pgRowIconCol[i];
+    const char* const rowH = header ? "16px" : (iconCol ? "18px" : "14px");
+    const char* const outerH = header ? "17px" : (iconCol ? "19px" : "15px");
+    const char* const textY = header ? "3px" : (iconCol ? "4px" : "2px");
+
+    Part row;
+    row.name = "r";
+    row.def = "common.horizontal_stack_panel";
+    row.overs.push_back(overPair("size", "100%", rowH));
+
+    int nameW = (g_pgRowNameW[i] > 0) ? g_pgRowNameW[i] : 160;
+    if (iconCol) {
+        if (header) {
+            nameW += 20;
+        } else {
+            Part ico;
+            ico.name = "ico";
+            if (g_pgRowHasIcon[i] && iconsUsable) {
+                ico.def = "beacon.item_renderer";
+                ico.overs.push_back(
+                    overBag("property_bag", {overInt("#item_id_aux", g_pgRowIcon[i])}));
+                ico.overs.push_back(overInt("layer", kIconLayer));
+            } else {
+                ico.def = "common.empty_panel";
+            }
+            ico.overs.push_back(overPair("size", "16px", "16px"));
+            row.kids.push_back(std::move(ico));
+
+            Part gap;
+            gap.name = "gap";
+            gap.def = "common.empty_panel";
+            gap.overs.push_back(overPair("size", "4px", rowH));
+            row.kids.push_back(std::move(gap));
+        }
+    }
+    const auto cell = [&](const char* cellName, const char* text, const std::string& width,
+                          bool right) {
+        Part box;
+        box.name = cellName;
+        box.def = "common.empty_panel";
+        box.overs.push_back(overPair("size", width, rowH));
+        Part label;
+        label.name = "t";
+        label.def = "common.single_line_label";
+        label.overs.push_back(overText("$single_line_label_text", text));
+        label.overs.push_back(overPair("$single_line_label_offset", "2px", textY));
+        if (right) {
+            label.overs.push_back(overText("anchor_from", "top_right"));
+            label.overs.push_back(overText("anchor_to", "top_right"));
+        } else {
+            label.overs.push_back(overPair("$size", "100%", "100%"));
+            label.overs.push_back(overText("anchor_from", "top_left"));
+            label.overs.push_back(overText("anchor_to", "top_left"));
+        }
+        box.kids.push_back(std::move(label));
+        return box;
+    };
+    row.kids.push_back(cell("nm", g_pgTexts[i], std::to_string(nameW) + "px", false));
+    row.kids.push_back(cell("ct", g_pgHints[i], kCountColW, true));
+    if (g_pgLabels[i][0] != 0) {
+        row.kids.push_back(cell("sk", g_pgLabels[i], kStackColW, true));
+    }
+
+    Part line;
+    line.name = "ln";
+    line.def = "common.dialog_divider";
+    line.overs.push_back(overPair("size", "100%", "1px"));
+    line.overs.push_back(overText("texture", kRowLineTexture));
+    line.overs.push_back(overInt("layer", kIconLayer));
+
+    Part outer;
+    outer.name = g_pgKeys[i];
+    outer.def = "common.vertical_stack_panel";
+    outer.overs.push_back(overPair("size", kPageRowWidth, outerH));
+    outer.kids.push_back(std::move(row));
+    outer.kids.push_back(std::move(line));
+    return outer;
+}
+
+void* buildSchematicaPage(void* self)
+{
+    if (kPageReuseProbe && g_pgReady && g_pgValue[0] != 0) {
+        static std::atomic<int> said{0};
+        return g_pgValue;
+    }
+    g_pgBag.store(nullptr);
+    g_pgReady = false;
+    g_pageArena.reset();
+    if (!collectPageDonors(self, g_pgDonors)) {
+        log().warn(L"UiProbe: the templates could not be collected (clickable rows cannot be "
+                   L"built)");
+    }
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        g_pgCtl[i].store(0);
+        g_pgLastText[i][0] = '\0';
+        g_pgIsEdit[i] = false;
+        g_pgRowKind[i] = kRowButton;
+    }
+    static const std::string kBaseSpace = "settings_common";
+    static const std::string kBaseName = "dialog_content_fullscreen";
+    void* base = nullptr;
+    if (!lookupGuarded(self, &kBaseSpace, &kBaseName, base) || base == nullptr
+        || !memory::isReadable(base, sizeof(g_pgValue))) {
+        log().warn(L"UiProbe: could not look up the page base");
+        return nullptr;
+    }
+    std::vector<Entry> baseEntries;
+    std::uintptr_t baseCount = 0;
+    if (!collectEntries(base, baseEntries, baseCount) || baseEntries.empty()
+        || baseEntries.size() > static_cast<size_t>(kMaxOwnKeys)) {
+        log().warn(L"UiProbe: could not walk the page base ({} keys)", baseEntries.size());
+        return nullptr;
+    }
+    std::sort(baseEntries.begin(), baseEntries.end(),
+              [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+
+    const Entry* controls = nullptr;
+    for (const Entry& one : baseEntries) {
+        if (one.keyText == L"controls") {
+            controls = &one;
+            break;
+        }
+    }
+    if (controls == nullptr
+        || !memory::isReadable(reinterpret_cast<const void*>(controls->value), sizeof(g_pgVec))) {
+        log().warn(L"UiProbe: the page base has no readable controls");
+        return nullptr;
+    }
+    std::uintptr_t srcVec[4]{};
+    std::memcpy(srcVec, reinterpret_cast<const void*>(controls->value), sizeof(srcVec));
+    if (srcVec[1] <= srcVec[0]
+        || !memory::isReadable(reinterpret_cast<const void*>(srcVec[0]), sizeof(std::uintptr_t))) {
+        log().warn(L"UiProbe: the page base controls are empty");
+        return nullptr;
+    }
+    std::uintptr_t firstElem = 0;
+    std::memcpy(&firstElem, reinterpret_cast<const void*>(srcVec[0]), sizeof(firstElem));
+    if (!memory::isReadable(reinterpret_cast<const void*>(firstElem), sizeof(g_pgItemValues[0]))) {
+        log().warn(L"UiProbe: the first element of the page base is unreadable");
+        return nullptr;
+    }
+    std::uintptr_t objectTag = kTagObject;
+    {
+        std::vector<Entry> sample;
+        std::uintptr_t sampleCount = 0;
+        if (collectEntries(reinterpret_cast<const void*>(firstElem), sample, sampleCount)
+            && !sample.empty()) {
+            objectTag = sample[0].tag;
+        }
+    }
+
+    static const std::string kBtnSpace = "common_buttons";
+    static const std::string kBtnName = "light_text_button";
+    void* btn = nullptr;
+    if (!lookupGuarded(self, &kBtnSpace, &kBtnName, btn) || btn == nullptr) {
+        log().warn(L"UiProbe: could not look up the row button");
+        return nullptr;
+    }
+    const Entry* tgTrue = nullptr;
+    const Entry* tgFalse = nullptr;
+    static std::vector<Entry> tgEntries;
+    const Entry* tabGlyphSize = nullptr;
+    static std::vector<Entry> navEntries;
+    {
+        static const std::string kTgSpace = "common";
+        static const std::string kTgName = "toggle";
+        void* tg = nullptr;
+        std::uintptr_t tgCount = 0;
+        tgEntries.clear();
+        if (lookupGuarded(self, &kTgSpace, &kTgName, tg) && tg != nullptr
+            && collectEntries(tg, tgEntries, tgCount)) {
+            for (const Entry& one : tgEntries) {
+                if (one.keyText == toUtf16(kTgTrueKey)) {
+                    tgTrue = &one;
+                } else if (one.keyText == toUtf16(kTgFalseKey)) {
+                    tgFalse = &one;
+                }
+            }
+        }
+    }
+
+    {
+        static const std::string kNavSpace = "general_section";
+        static const std::string kNavName = "how_to_play_button";
+        void* nav = nullptr;
+        std::uintptr_t navCount = 0;
+        navEntries.clear();
+        if (lookupGuarded(self, &kNavSpace, &kNavName, nav) && nav != nullptr
+            && collectEntries(nav, navEntries, navCount)) {
+            for (const Entry& one : navEntries) {
+                if (one.keyText == L"$glyph_size") {
+                    tabGlyphSize = &one;
+                }
+            }
+        }
+    }
+
+    std::vector<Entry> btnEntries;
+    std::uintptr_t btnCount = 0;
+    if (!collectEntries(btn, btnEntries, btnCount) || btnEntries.empty()) {
+        log().warn(L"UiProbe: could not walk the row button ({} keys)", btnEntries.size());
+        return nullptr;
+    }
+    {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            std::wstring all;
+            for (const Entry& one : btnEntries) {
+                if (one.keyText.find(L"binding") == std::wstring::npos
+                    && one.keyText.find(L"text") == std::wstring::npos) {
+                    continue;
+                }
+                if (!all.empty()) {
+                    all += L" ";
+                }
+                all += one.keyText;
+            }
+            log().info(L"UiProbe: light_text_button keys with text/binding: {}", all);
+        }
+    }
+    const Entry* textSrc = nullptr;
+    for (const Entry& one : btnEntries) {
+        if ((one.tag & 0xFF) == kTagString
+            && memory::isReadable(reinterpret_cast<const void*>(one.value),
+                                  sizeof(g_pgTextRecs[0]))) {
+            textSrc = &one;
+            break;
+        }
+    }
+    if (textSrc == nullptr) {
+        log().warn(L"UiProbe: the row button has no string value to copy ({} keys)",
+                   btnEntries.size());
+        return nullptr;
+    }
+
+    buildPageTabTexts();
+    const size_t rows = buildPageTexts();
+    {
+        static std::atomic<int> said{0};
+    }
+    if (rows == 0) {
+        log().warn(L"UiProbe: the page has no rows (left {})", g_ptCount);
+        return nullptr;
+    }
+    bool iconsUsable = false;
+    {
+        static const std::string kIconSpace = "beacon";
+        static const std::string kIconName = "item_renderer";
+        void* iconDef = nullptr;
+        iconsUsable = g_pgDonors.ok && g_pgDonors.intTag != 0
+                      && lookupGuarded(self, &kIconSpace, &kIconName, iconDef)
+                      && iconDef != nullptr;
+        static std::atomic<bool> told{false};
+    }
+    size_t iconRows = 0;
+    g_pgTopCount = 0;
+    for (size_t i = 0; i < rows; ++i) {
+        if (g_pgRowChild[i]) {
+            continue;
+        }
+        if (g_pgRowKids[i] > 0) {
+            std::snprintf(g_pgKeys[i], kPageKeyBytes, "tk_pg%u", static_cast<unsigned>(i));
+            Part row;
+            row.name = g_pgKeys[i];
+            row.def = "common.horizontal_stack_panel";
+            row.overs.push_back(overPair("size", kPageRowWidth, kPageRowHeight));
+            for (int k = 1; k <= g_pgRowKids[i]; ++k) {
+                const size_t at = i + static_cast<size_t>(k);
+                if (at >= rows) {
+                    break;
+                }
+                std::snprintf(g_pgKeys[at], kPageKeyBytes, "tk_pg%u",
+                              static_cast<unsigned>(at));
+                Part kid;
+                kid.name = g_pgKeys[at];
+                kid.def = "common_buttons.light_text_button";
+                kid.overs.push_back(overText(kOwnTextVar, g_pgTexts[at]));
+                if (g_pgCloseOnPress.load()) {
+                    kid.overs.push_back(overText(kPageExitVar, kPageExitId));
+                }
+                kid.overs.push_back(overPair("size",
+                                             (g_pgRowWidth[at][0] != 0) ? g_pgRowWidth[at] : "33%",
+                                             "100%"));
+                row.kids.push_back(std::move(kid));
+            }
+            std::uintptr_t* const elem = buildPartElement(g_pageArena, g_pgDonors, row);
+            if (elem == nullptr) {
+                log().warn(L"UiProbe: could not build the side-by-side row {} (arena overflow "
+                           L"= {})",
+                           i,
+                           g_pageArena.overflowed() ? 1 : 0);
+                return nullptr;
+            }
+            g_pgElems[i] = reinterpret_cast<std::uintptr_t>(elem);
+            g_pgTopElems[g_pgTopCount++] = g_pgElems[i];
+            continue;
+        }
+        if (pageRowIsPlain(g_pgRowKind[i])) {
+            std::snprintf(g_pgKeys[i], kPageKeyBytes, "tk_pg%u", static_cast<unsigned>(i));
+            Part part;
+            part.name = g_pgKeys[i];
+            switch (g_pgRowKind[i]) {
+            case kRowHeader:
+                part.def = "common.single_line_label";
+                part.overs.push_back(overText("$single_line_label_text", g_pgTexts[i]));
+                part.overs.push_back(overPair("$size", kPageRowWidth, "16px"));
+                break;
+            case kRowDivider:
+                part.def = "common.empty_panel";
+                part.overs.push_back(overPair("size", kPageRowWidth, "8px"));
+                break;
+            case kRowColumns:
+                part = buildColumnsRow(i, iconsUsable);
+                if (g_pgRowHasIcon[i] && iconsUsable) {
+                    ++iconRows;
+                }
+                break;
+            default:
+                part.def = "common.single_line_label";
+                part.overs.push_back(overText("$single_line_label_text", g_pgTexts[i]));
+                part.overs.push_back(overPair("$size", kPageRowWidth, "14px"));
+                break;
+            }
+            std::uintptr_t* const elem = buildPartElement(g_pageArena, g_pgDonors, part);
+            if (elem == nullptr) {
+                log().warn(L"UiProbe: could not build row {} ({}) (arena overflow = {})",
+                           i,
+                           toUtf16(g_pgTexts[i]),
+                           g_pageArena.overflowed() ? 1 : 0);
+                return nullptr;
+            }
+            g_pgElems[i] = reinterpret_cast<std::uintptr_t>(elem);
+            g_pgTopElems[g_pgTopCount++] = g_pgElems[i];
+            continue;
+        }
+        if (pageRowBorrows(g_pgRowKind[i])) {
+            std::snprintf(g_pgCtlNames[i], kPageKeyBytes, "settings_common.tk_pg%u",
+                          static_cast<unsigned>(i));
+            std::snprintf(g_pgBindNames[i], sizeof(g_pgBindNames[i]), "#tk_pg_%u",
+                          static_cast<unsigned>(i));
+            const struct {
+                const char* var;
+                unsigned char* rec;
+                const char* text;
+            } kParts[] = {
+                {kSecCtlNameVar, g_pgCtlRecs[i], g_pgCtlNames[i]},
+                {kSecBindNameVar, g_pgBindRecs[i], g_pgBindNames[i]},
+                {kSecLabelVar, g_pgLabelRecs[i], g_pgLabels[i]},
+                {kNumHintVar, g_pgHintRecs[i], g_pgHints[i]},
+            };
+            int over = 0;
+            for (const auto& part : kParts) {
+                std::memcpy(part.rec, reinterpret_cast<const void*>(textSrc->value), 16);
+                std::memcpy(part.rec, &part.text, sizeof(part.text));
+                g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(part.var);
+                g_pgOverNodes[i][over].value = reinterpret_cast<std::uintptr_t>(part.rec);
+                g_pgOverNodes[i][over].tag = textSrc->tag;
+                g_pgOverNodes[i][over].seq = textSrc->seq;
+                ++over;
+            }
+            if (g_pgRowKind[i] == kRowToggle) {
+                const MenuItem* const tgItem = schematicaRow(i);
+                const bool tgOn = (tgItem != nullptr) && tgItem->toggleState();
+                {
+                    const char* const type = tgOn ? kTgTypeNone : kTgTypeGlobal;
+                    std::memcpy(g_pgTgTypeRecs[i], reinterpret_cast<const void*>(textSrc->value),
+                                sizeof(g_pgTgTypeRecs[i]));
+                    std::memcpy(g_pgTgTypeRecs[i], &type, sizeof(type));
+                    g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(kTgTypeVar);
+                    g_pgOverNodes[i][over].value =
+                        reinterpret_cast<std::uintptr_t>(g_pgTgTypeRecs[i]);
+                    g_pgOverNodes[i][over].tag = textSrc->tag;
+                    g_pgOverNodes[i][over].seq = textSrc->seq;
+                    ++over;
+                }
+                if (const Entry* const src = tgOn ? tgTrue : tgFalse; src != nullptr) {
+                    g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(kTgDefaultVar);
+                    g_pgOverNodes[i][over].value = src->value;
+                    g_pgOverNodes[i][over].tag = src->tag;
+                    g_pgOverNodes[i][over].seq = src->seq;
+                    ++over;
+                }
+                {
+                    static const char* const noBind = kTgNoBind;
+                    std::memcpy(g_pgTgBindRecs[i], reinterpret_cast<const void*>(textSrc->value),
+                                sizeof(g_pgTgBindRecs[i]));
+                    std::memcpy(g_pgTgBindRecs[i], &noBind, sizeof(noBind));
+                    g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(kTgBindVar);
+                    g_pgOverNodes[i][over].value =
+                        reinterpret_cast<std::uintptr_t>(g_pgTgBindRecs[i]);
+                    g_pgOverNodes[i][over].tag = textSrc->tag;
+                    g_pgOverNodes[i][over].seq = textSrc->seq;
+                    ++over;
+                }
+            }
+            finishMap(&g_pgOverHeads[i], g_pgOverNodes[i], over, g_pgOverNodePtrs[i]);
+            const char* const borrowed =
+                (g_pgRowKind[i] == kRowSlider)   ? "option_slider"
+                : (g_pgRowKind[i] == kRowToggle) ? "option_toggle"
+                                                 : "option_text_edit";
+            std::snprintf(g_pgKeys[i], kPageKeyBytes, "tk_pg%u@settings_common.%s",
+                          static_cast<unsigned>(i), borrowed);
+            g_pgItemNodes[i][0].key = reinterpret_cast<std::uintptr_t>(g_pgKeys[i]);
+            g_pgItemNodes[i][0].value = reinterpret_cast<std::uintptr_t>(g_pgOverNodePtrs[i]);
+            g_pgItemNodes[i][0].tag = objectTag;
+            g_pgItemNodes[i][0].seq = 0;
+            finishMap(&g_pgItemHeads[i], g_pgItemNodes[i], 1, g_pgItemNodePtrs[i]);
+            std::memcpy(g_pgItemValues[i], reinterpret_cast<const void*>(firstElem),
+                        sizeof(g_pgItemValues[i]));
+            g_pgItemValues[i][0] = reinterpret_cast<std::uintptr_t>(g_pgItemNodePtrs[i]);
+            g_pgElems[i] = reinterpret_cast<std::uintptr_t>(g_pgItemValues[i]);
+            g_pgTopElems[g_pgTopCount++] = g_pgElems[i];
+            continue;
+        }
+        std::snprintf(g_pgKeys[i], kPageKeyBytes, "tk_pg%u@common_buttons.light_text_button",
+                      static_cast<unsigned>(i));
+        std::memcpy(g_pgTextRecs[i], reinterpret_cast<const void*>(textSrc->value),
+                    sizeof(g_pgTextRecs[i]));
+        const char* const label = g_pgTexts[i];
+        std::memcpy(g_pgTextRecs[i], &label, sizeof(label));
+
+        g_pgOverNodes[i][0].key = reinterpret_cast<std::uintptr_t>(kOwnTextVar);
+        g_pgOverNodes[i][0].value = reinterpret_cast<std::uintptr_t>(g_pgTextRecs[i]);
+        g_pgOverNodes[i][0].tag = textSrc->tag;
+        g_pgOverNodes[i][0].seq = textSrc->seq;
+        int over = 1;
+        if (g_pgCloseOnPress.load()) {
+            std::memcpy(g_pgExitRecs[i], reinterpret_cast<const void*>(textSrc->value),
+                        sizeof(g_pgExitRecs[i]));
+            const char* const exitId = kPageExitId;
+            std::memcpy(g_pgExitRecs[i], &exitId, sizeof(exitId));
+            g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(kPageExitVar);
+            g_pgOverNodes[i][over].value = reinterpret_cast<std::uintptr_t>(g_pgExitRecs[i]);
+            g_pgOverNodes[i][over].tag = textSrc->tag;
+            g_pgOverNodes[i][over].seq = textSrc->seq;
+            ++over;
+        }
+        if (!buildStringPairArray(controls->value, firstElem, textSrc->value, kPageRowWidth,
+                                  kPageRowHeight, g_pgSizeRecs[i], g_pgSizeElems[i],
+                                  g_pgSizeElemPtrs[i], g_pgSizeVec[i])) {
+            return nullptr;
+        }
+        g_pgOverNodes[i][over].key = reinterpret_cast<std::uintptr_t>(kPageSizeKey);
+        g_pgOverNodes[i][over].value = reinterpret_cast<std::uintptr_t>(g_pgSizeVec[i]);
+        g_pgOverNodes[i][over].tag = controls->tag;
+        g_pgOverNodes[i][over].seq = controls->seq;
+        ++over;
+        finishMap(&g_pgOverHeads[i], g_pgOverNodes[i], over, g_pgOverNodePtrs[i]);
+
+        g_pgItemNodes[i][0].key = reinterpret_cast<std::uintptr_t>(g_pgKeys[i]);
+        g_pgItemNodes[i][0].value = reinterpret_cast<std::uintptr_t>(g_pgOverNodePtrs[i]);
+        g_pgItemNodes[i][0].tag = objectTag;
+        g_pgItemNodes[i][0].seq = 0;
+        finishMap(&g_pgItemHeads[i], g_pgItemNodes[i], 1, g_pgItemNodePtrs[i]);
+
+        std::memcpy(g_pgItemValues[i], reinterpret_cast<const void*>(firstElem),
+                    sizeof(g_pgItemValues[i]));
+        g_pgItemValues[i][0] = reinterpret_cast<std::uintptr_t>(g_pgItemNodePtrs[i]);
+        g_pgElems[i] = reinterpret_cast<std::uintptr_t>(g_pgItemValues[i]);
+        g_pgTopElems[g_pgTopCount++] = g_pgElems[i];
+    }
+    {
+        size_t columnRows = 0;
+        int nameW = 0;
+        for (size_t i = 0; i < rows; ++i) {
+            if (g_pgRowKind[i] == kRowColumns) {
+                ++columnRows;
+                nameW = (nameW == 0) ? g_pgRowNameW[i] : nameW;
+            }
+        }
+        static std::atomic<int> said{0};
+    }
+    std::memcpy(g_pgVec, srcVec, sizeof(g_pgVec));
+    g_pgVec[0] = reinterpret_cast<std::uintptr_t>(&g_pgTopElems[0]);
+    g_pgVec[1] = reinterpret_cast<std::uintptr_t>(&g_pgTopElems[g_pgTopCount]);
+    g_pgVec[2] = reinterpret_cast<std::uintptr_t>(&g_pgTopElems[g_pgTopCount]);
+
+    static Entry tgIntRec{};
+    if (tgIntRec.tag == 0) {
+        static const std::string kTgSpace = "common";
+        static const std::string kTgName = "toggle";
+        void* tg = nullptr;
+        std::vector<Entry> tgAll;
+        std::uintptr_t tgN = 0;
+        if (lookupGuarded(self, &kTgSpace, &kTgName, tg) && tg != nullptr
+            && collectEntries(tg, tgAll, tgN)) {
+            for (const Entry& one : tgAll) {
+                if (one.keyText == L"layer") {
+                    tgIntRec = one;
+                }
+            }
+        }
+    }
+
+    for (size_t t = 0; t < g_ptCount; ++t) {
+        std::snprintf(g_ptKeys[t], kPageKeyBytes,
+                      "tk_pt%u@how_to_play_common.section_toggle_button",
+                      static_cast<unsigned>(t));
+        int tabOver = 0;
+        std::snprintf(g_ptTopics[t], sizeof(g_ptTopics[t]), "tk_pt%u",
+                      static_cast<unsigned>(t));
+        const char* const topic = g_ptTopics[t];
+        std::memcpy(g_ptTopicRecs[t], reinterpret_cast<const void*>(textSrc->value),
+                    sizeof(g_ptTopicRecs[t]));
+        std::memcpy(g_ptTopicRecs[t], &topic, sizeof(topic));
+        g_ptOverNodes[t][tabOver].key = reinterpret_cast<std::uintptr_t>(kTabTopicVar);
+        g_ptOverNodes[t][tabOver].value = reinterpret_cast<std::uintptr_t>(g_ptTopicRecs[t]);
+        g_ptOverNodes[t][tabOver].tag = textSrc->tag;
+        g_ptOverNodes[t][tabOver].seq = textSrc->seq;
+        ++tabOver;
+        if (tgIntRec.tag != 0) {
+            const size_t picked = static_cast<size_t>(pageSelectedLeftRow());
+            const size_t forced = (t == picked) ? 0 : (t < picked ? t + 1 : t);
+            g_ptOverNodes[t][tabOver].key = reinterpret_cast<std::uintptr_t>(kTabForcedVar);
+            g_ptOverNodes[t][tabOver].value = static_cast<std::uintptr_t>(forced);
+            g_ptOverNodes[t][tabOver].tag = tgIntRec.tag;
+            g_ptOverNodes[t][tabOver].seq = tgIntRec.seq;
+            ++tabOver;
+        }
+        finishMap(&g_ptOverHeads[t], g_ptOverNodes[t], tabOver, g_ptOverNodePtrs[t]);
+
+        g_ptItemNodes[t][0].key = reinterpret_cast<std::uintptr_t>(g_ptKeys[t]);
+        g_ptItemNodes[t][0].value = reinterpret_cast<std::uintptr_t>(g_ptOverNodePtrs[t]);
+        g_ptItemNodes[t][0].tag = objectTag;
+        g_ptItemNodes[t][0].seq = 0;
+        finishMap(&g_ptItemHeads[t], g_ptItemNodes[t], 1, g_ptItemNodePtrs[t]);
+        std::memcpy(g_ptItemValues[t], reinterpret_cast<const void*>(firstElem),
+                    sizeof(g_ptItemValues[t]));
+        g_ptItemValues[t][0] = reinterpret_cast<std::uintptr_t>(g_ptItemNodePtrs[t]);
+        g_ptElems[t] = reinterpret_cast<std::uintptr_t>(g_ptItemValues[t]);
+    }
+    std::memcpy(g_ptVec, srcVec, sizeof(g_ptVec));
+    g_ptVec[0] = reinterpret_cast<std::uintptr_t>(&g_ptElems[0]);
+    g_ptVec[1] = reinterpret_cast<std::uintptr_t>(&g_ptElems[g_ptCount]);
+    g_ptVec[2] = g_ptVec[1];
+
+    g_pgViewReady = false;
+    {
+        static const std::string kSecSpace = "how_to_play";
+        static const std::string kSecName = "moving_around_section";
+        void* sec = nullptr;
+        std::vector<Entry> secEntries;
+        std::uintptr_t secCount = 0;
+        if (lookupGuarded(self, &kSecSpace, &kSecName, sec) && sec != nullptr
+            && collectEntries(sec, secEntries, secCount)) {
+            const Entry* bindSrc = nullptr;
+            for (const Entry& one : secEntries) {
+                if (one.keyText == L"bindings") {
+                    bindSrc = &one;
+                    break;
+                }
+            }
+            std::uintptr_t srcVec2[4]{};
+            std::uintptr_t srcElem = 0;
+            std::vector<Entry> bindEntries;
+            std::uintptr_t bindCount = 0;
+            if (bindSrc != nullptr
+                && memory::isReadable(reinterpret_cast<const void*>(bindSrc->value),
+                                      sizeof(srcVec2))) {
+                std::memcpy(srcVec2, reinterpret_cast<const void*>(bindSrc->value),
+                            sizeof(srcVec2));
+                if (srcVec2[1] > srcVec2[0]
+                    && memory::isReadable(reinterpret_cast<const void*>(srcVec2[0]),
+                                          sizeof(srcElem))) {
+                    std::memcpy(&srcElem, reinterpret_cast<const void*>(srcVec2[0]),
+                                sizeof(srcElem));
+                    collectEntries(reinterpret_cast<const void*>(srcElem), bindEntries,
+                                   bindCount);
+                }
+            }
+            if (!bindEntries.empty() && bindEntries.size() <= std::size(g_pgViewNodes)) {
+                std::sort(bindEntries.begin(), bindEntries.end(),
+                          [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+                std::snprintf(g_pgViewName, sizeof(g_pgViewName), "tk_pt0_button_toggle");
+                const char* const viewName = g_pgViewName;
+                std::memcpy(g_pgViewNameRec, reinterpret_cast<const void*>(textSrc->value),
+                            sizeof(g_pgViewNameRec));
+                std::memcpy(g_pgViewNameRec, &viewName, sizeof(viewName));
+                for (size_t i = 0; i < bindEntries.size(); ++i) {
+                    g_pgViewNodes[i].key = bindEntries[i].key;
+                    g_pgViewNodes[i].value =
+                        (bindEntries[i].keyText == L"source_control_name")
+                            ? reinterpret_cast<std::uintptr_t>(g_pgViewNameRec)
+                            : bindEntries[i].value;
+                    g_pgViewNodes[i].tag = bindEntries[i].tag;
+                    g_pgViewNodes[i].seq = bindEntries[i].seq;
+                }
+                finishMap(&g_pgViewHead, g_pgViewNodes, static_cast<int>(bindEntries.size()),
+                          g_pgViewNodePtrs);
+                std::memcpy(g_pgViewValue, reinterpret_cast<const void*>(srcElem),
+                            sizeof(g_pgViewValue));
+                g_pgViewValue[0] = reinterpret_cast<std::uintptr_t>(g_pgViewNodePtrs);
+                g_pgViewElem[0] = reinterpret_cast<std::uintptr_t>(g_pgViewValue);
+                std::memcpy(g_pgViewVec, reinterpret_cast<const void*>(bindSrc->value),
+                            sizeof(g_pgViewVec));
+                g_pgViewVec[0] = reinterpret_cast<std::uintptr_t>(&g_pgViewElem[0]);
+                g_pgViewVec[1] = reinterpret_cast<std::uintptr_t>(&g_pgViewElem[1]);
+                g_pgViewVec[2] = g_pgViewVec[1];
+                g_pgViewKey = bindSrc->key;
+                g_pgViewReady = true;
+                for (size_t b = 0; b < kBodyCount; ++b) {
+                    std::snprintf(g_pgBodyViewNames[b], sizeof(g_pgBodyViewNames[b]),
+                                  "tk_pt%u_button_toggle", static_cast<unsigned>(b));
+                    const char* const bodyName = g_pgBodyViewNames[b];
+                    std::memcpy(g_pgBodyViewNameRecs[b],
+                                reinterpret_cast<const void*>(textSrc->value),
+                                sizeof(g_pgBodyViewNameRecs[b]));
+                    std::memcpy(g_pgBodyViewNameRecs[b], &bodyName, sizeof(bodyName));
+                    for (size_t i = 0; i < bindEntries.size(); ++i) {
+                        g_pgBodyViewNodes[b][i].key = bindEntries[i].key;
+                        std::uintptr_t use = bindEntries[i].value;
+                        if (bindEntries[i].keyText == L"source_control_name") {
+                            use = reinterpret_cast<std::uintptr_t>(g_pgBodyViewNameRecs[b]);
+                        }
+                        g_pgBodyViewNodes[b][i].value = use;
+                        g_pgBodyViewNodes[b][i].tag = bindEntries[i].tag;
+                        g_pgBodyViewNodes[b][i].seq = bindEntries[i].seq;
+                    }
+                    finishMap(&g_pgBodyViewHeads[b], g_pgBodyViewNodes[b],
+                              static_cast<int>(bindEntries.size()), g_pgBodyViewNodePtrs[b]);
+                    std::memcpy(g_pgBodyViewValue[b], reinterpret_cast<const void*>(srcElem),
+                                sizeof(g_pgBodyViewValue[b]));
+                    g_pgBodyViewValue[b][0] =
+                        reinterpret_cast<std::uintptr_t>(g_pgBodyViewNodePtrs[b]);
+                    g_pgBodyViewElem[b][0] =
+                        reinterpret_cast<std::uintptr_t>(g_pgBodyViewValue[b]);
+                    std::memcpy(g_pgBodyViewVec[b], reinterpret_cast<const void*>(bindSrc->value),
+                                sizeof(g_pgBodyViewVec[b]));
+                    g_pgBodyViewVec[b][0] =
+                        reinterpret_cast<std::uintptr_t>(&g_pgBodyViewElem[b][0]);
+                    g_pgBodyViewVec[b][1] =
+                        reinterpret_cast<std::uintptr_t>(&g_pgBodyViewElem[b][1]);
+                    g_pgBodyViewVec[b][2] = g_pgBodyViewVec[b][1];
+                }
+            }
+        }
+    }
+
+    g_pgBodyReady = false;
+    if (g_pgViewReady) {
+        static const std::string kVSpace2 = "common";
+        static const std::string kVName2 = "vertical_stack_panel";
+        void* vstack2 = nullptr;
+        std::vector<Entry> vEnt;
+        std::uintptr_t vN = 0;
+        if (lookupGuarded(self, &kVSpace2, &kVName2, vstack2) && vstack2 != nullptr
+            && collectEntries(vstack2, vEnt, vN) && !vEnt.empty()
+            && vEnt.size() + 2 <= static_cast<size_t>(kMaxOwnKeys)
+            && memory::isReadable(vstack2, sizeof(g_pgBodyValue[0]))) {
+            bool ok = true;
+            for (size_t b = 0; b < g_ptCount && b < kBodyCount && ok; ++b) {
+                const size_t start = g_pgTabStart[b];
+                const size_t count = g_pgTabRows[b];
+                std::memcpy(g_pgBodyRowVec[b], srcVec, sizeof(g_pgBodyRowVec[b]));
+                g_pgBodyRowVec[b][0] = reinterpret_cast<std::uintptr_t>(&g_pgElems[start]);
+                g_pgBodyRowVec[b][1] =
+                    reinterpret_cast<std::uintptr_t>(&g_pgElems[start + count]);
+                g_pgBodyRowVec[b][2] = g_pgBodyRowVec[b][1];
+
+                std::vector<Entry> mine = vEnt;
+                bool hasControls = false;
+                for (Entry& one : mine) {
+                    if (one.keyText == L"controls") {
+                        one.value = reinterpret_cast<std::uintptr_t>(g_pgBodyRowVec[b]);
+                        hasControls = true;
+                    }
+                }
+                if (!hasControls) {
+                    Entry one{};
+                    one.keyText = L"controls";
+                    one.key = controls->key;
+                    one.value = reinterpret_cast<std::uintptr_t>(g_pgBodyRowVec[b]);
+                    one.tag = controls->tag;
+                    one.seq = controls->seq;
+                    mine.push_back(one);
+                }
+                {
+                    Entry one{};
+                    one.keyText = L"bindings";
+                    one.key = g_pgViewKey;
+                    one.value = reinterpret_cast<std::uintptr_t>(g_pgBodyViewVec[b]);
+                    one.tag = controls->tag;
+                    one.seq = controls->seq;
+                    mine.push_back(one);
+                }
+                std::sort(mine.begin(), mine.end(),
+                          [](const Entry& a, const Entry& c) { return a.keyText < c.keyText; });
+                if (mine.size() > static_cast<size_t>(kMaxOwnKeys)) {
+                    ok = false;
+                    break;
+                }
+                for (size_t i = 0; i < mine.size(); ++i) {
+                    g_pgBodyNodes[b][i].key = mine[i].key;
+                    g_pgBodyNodes[b][i].value = mine[i].value;
+                    g_pgBodyNodes[b][i].tag = mine[i].tag;
+                    g_pgBodyNodes[b][i].seq = mine[i].seq;
+                }
+                finishMap(&g_pgBodyHeads[b], g_pgBodyNodes[b], static_cast<int>(mine.size()),
+                          g_pgBodyNodePtrs[b]);
+                std::memcpy(g_pgBodyValue[b], vstack2, sizeof(g_pgBodyValue[b]));
+                g_pgBodyValue[b][0] = reinterpret_cast<std::uintptr_t>(g_pgBodyNodePtrs[b]);
+
+                std::snprintf(g_pgBodyKeys[b], kPageKeyBytes, "tk_body%u",
+                              static_cast<unsigned>(b));
+                g_pgItemNodes2[b][0].key = reinterpret_cast<std::uintptr_t>(g_pgBodyKeys[b]);
+                g_pgItemNodes2[b][0].value =
+                    reinterpret_cast<std::uintptr_t>(g_pgBodyNodePtrs[b]);
+                g_pgItemNodes2[b][0].tag = objectTag;
+                g_pgItemNodes2[b][0].seq = 0;
+                finishMap(&g_pgItemHeads2[b], g_pgItemNodes2[b], 1, g_pgItemNodePtrs2[b]);
+                std::memcpy(g_pgItemValues2[b], reinterpret_cast<const void*>(firstElem),
+                            sizeof(g_pgItemValues2[b]));
+                g_pgItemValues2[b][0] = reinterpret_cast<std::uintptr_t>(g_pgItemNodePtrs2[b]);
+                g_pgBodyElems[b] = reinterpret_cast<std::uintptr_t>(g_pgItemValues2[b]);
+            }
+            if (ok) {
+                std::memcpy(g_pgBodyVec, srcVec, sizeof(g_pgBodyVec));
+                g_pgBodyVec[0] = reinterpret_cast<std::uintptr_t>(&g_pgBodyElems[0]);
+                g_pgBodyVec[1] = reinterpret_cast<std::uintptr_t>(&g_pgBodyElems[g_ptCount]);
+                g_pgBodyVec[2] = g_pgBodyVec[1];
+                g_pgBodyReady = true;
+            }
+        }
+    }
+
+    {
+        static const std::string kVSpace = "common";
+        static const std::string kVName = "vertical_stack_panel";
+        void* vstack = nullptr;
+        std::vector<Entry> vEntries;
+        std::uintptr_t vCount = 0;
+        g_ptListReady = false;
+        if (lookupGuarded(self, &kVSpace, &kVName, vstack) && vstack != nullptr
+            && collectEntries(vstack, vEntries, vCount) && !vEntries.empty()
+            && vEntries.size() + 2 <= static_cast<size_t>(kMaxOwnKeys)) {
+            std::uintptr_t* const listRows = g_pgVec;
+            bool hasControls = false;
+            bool hasSize = false;
+            for (Entry& one : vEntries) {
+                if (one.keyText == L"controls") {
+                    one.value = reinterpret_cast<std::uintptr_t>(listRows);
+                    hasControls = true;
+                } else if (one.keyText == L"size") {
+                    hasSize = true;
+                }
+            }
+            if (!hasControls) {
+                Entry one{};
+                one.keyText = L"controls";
+                one.key = controls->key;
+                one.value = reinterpret_cast<std::uintptr_t>(listRows);
+                one.tag = controls->tag;
+                one.seq = controls->seq;
+                vEntries.push_back(one);
+            }
+            if (!hasSize
+                && buildStringPairArray(controls->value, firstElem, textSrc->value, "100%",
+                                        "100%c", g_ptSizeRecs[0], g_ptSizeElems[0],
+                                        g_ptSizeElemPtrs[0], g_ptSizeVec[0])) {
+                Entry one{};
+                one.keyText = L"size";
+                one.key = reinterpret_cast<std::uintptr_t>(kPageSizeKey);
+                one.value = reinterpret_cast<std::uintptr_t>(g_ptSizeVec[0]);
+                one.tag = controls->tag;
+                one.seq = controls->seq;
+                vEntries.push_back(one);
+            }
+            std::sort(vEntries.begin(), vEntries.end(),
+                      [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+            for (size_t i = 0; i < vEntries.size(); ++i) {
+                g_ptListNodes[i].key = vEntries[i].key;
+                g_ptListNodes[i].value = vEntries[i].value;
+                g_ptListNodes[i].tag = vEntries[i].tag;
+                g_ptListNodes[i].seq = vEntries[i].seq;
+            }
+            finishMap(&g_ptListHead, g_ptListNodes, static_cast<int>(vEntries.size()),
+                      g_ptListNodePtrs);
+            if (memory::isReadable(vstack, sizeof(g_ptListValue))) {
+                std::memcpy(g_ptListValue, vstack, sizeof(g_ptListValue));
+                g_ptListValue[0] = reinterpret_cast<std::uintptr_t>(g_ptListNodePtrs);
+                g_ptListReady = true;
+            }
+        }
+    }
+
+    for (size_t c = 0; c < 1; ++c) {
+        std::snprintf(g_pgColKeys[c], kPageKeyBytes,
+                      (c == 0 && g_ptListReady) ? "tk_col%u@common.scrolling_panel"
+                                                : "tk_col%u@common.vertical_stack_panel",
+                      static_cast<unsigned>(c));
+        int colOver = 0;
+        if (c == 0 && g_ptListReady) {
+            const char* const listName = kPtListName;
+            std::memcpy(g_ptListNameRec, reinterpret_cast<const void*>(textSrc->value),
+                        sizeof(g_ptListNameRec));
+            std::memcpy(g_ptListNameRec, &listName, sizeof(listName));
+        }
+        (void)tgIntRec;
+        if (c == 0 && g_ptListReady) {
+            if (!buildStringPairArray(controls->value, firstElem, textSrc->value, "5px",
+                                      "100% - 4px", g_ptListSizeRecs, g_ptListSizeElems,
+                                      g_ptListSizeElemPtrs, g_ptListSizeVec)) {
+                return nullptr;
+            }
+            g_pgColOverNodes[c][colOver].key = reinterpret_cast<std::uintptr_t>(kPtScrollSizeVar);
+            g_pgColOverNodes[c][colOver].value =
+                reinterpret_cast<std::uintptr_t>(g_ptListSizeVec);
+            g_pgColOverNodes[c][colOver].tag = controls->tag;
+            g_pgColOverNodes[c][colOver].seq = controls->seq;
+            ++colOver;
+            g_pgColOverNodes[c][colOver].key = reinterpret_cast<std::uintptr_t>(kPtListVar);
+            g_pgColOverNodes[c][colOver].value =
+                reinterpret_cast<std::uintptr_t>(g_ptListNameRec);
+            g_pgColOverNodes[c][colOver].tag = textSrc->tag;
+            g_pgColOverNodes[c][colOver].seq = textSrc->seq;
+            ++colOver;
+        } else {
+            g_pgColOverNodes[c][colOver].key = controls->key;
+            g_pgColOverNodes[c][colOver].value = reinterpret_cast<std::uintptr_t>(g_pgVec);
+            g_pgColOverNodes[c][colOver].tag = controls->tag;
+            g_pgColOverNodes[c][colOver].seq = controls->seq;
+            ++colOver;
+        }
+        if (!buildStringPairArray(controls->value, firstElem, textSrc->value,
+                                  kPageOneColWidth, kPageColHeight,
+                                  g_pgColSizeRecs[c], g_pgColSizeElems[c],
+                                  g_pgColSizeElemPtrs[c], g_pgColSizeVec[c])) {
+            return nullptr;
+        }
+        g_pgColOverNodes[c][colOver].key = reinterpret_cast<std::uintptr_t>(kPageSizeKey);
+        g_pgColOverNodes[c][colOver].value = reinterpret_cast<std::uintptr_t>(g_pgColSizeVec[c]);
+        g_pgColOverNodes[c][colOver].tag = controls->tag;
+        g_pgColOverNodes[c][colOver].seq = controls->seq;
+        ++colOver;
+        finishMap(&g_pgColOverHeads[c], g_pgColOverNodes[c], colOver, g_pgColOverNodePtrs[c]);
+
+        g_pgColNodes[c][0].key = reinterpret_cast<std::uintptr_t>(g_pgColKeys[c]);
+        g_pgColNodes[c][0].value = reinterpret_cast<std::uintptr_t>(g_pgColOverNodePtrs[c]);
+        g_pgColNodes[c][0].tag = objectTag;
+        g_pgColNodes[c][0].seq = 0;
+        finishMap(&g_pgColHeads[c], g_pgColNodes[c], 1, g_pgColNodePtrs[c]);
+        std::memcpy(g_pgColValues[c], reinterpret_cast<const void*>(firstElem),
+                    sizeof(g_pgColValues[c]));
+        g_pgColValues[c][0] = reinterpret_cast<std::uintptr_t>(g_pgColNodePtrs[c]);
+        g_pgColElems[c] = reinterpret_cast<std::uintptr_t>(g_pgColValues[c]);
+    }
+    std::memcpy(g_pgColVec, srcVec, sizeof(g_pgColVec));
+    g_pgColVec[0] = reinterpret_cast<std::uintptr_t>(&g_pgColElems[0]);
+    g_pgColVec[1] = reinterpret_cast<std::uintptr_t>(&g_pgColElems[1]);
+    g_pgColVec[2] = g_pgColVec[1];
+
+    static const std::string kStackSpace = "common";
+    static const std::string kStackName = "horizontal_stack_panel";
+    void* stack = nullptr;
+    if (!lookupGuarded(self, &kStackSpace, &kStackName, stack) || stack == nullptr
+        || !memory::isReadable(stack, sizeof(g_pgValue))) {
+        log().warn(L"UiProbe: could not look up the horizontal stack panel");
+        return nullptr;
+    }
+    std::vector<Entry> stackEntries;
+    std::uintptr_t stackCount = 0;
+    if (!collectEntries(stack, stackEntries, stackCount) || stackEntries.empty()
+        || stackEntries.size() + 2 > static_cast<size_t>(kMaxOwnKeys)) {
+        log().warn(L"UiProbe: could not walk the horizontal stack panel ({} keys)",
+                   stackEntries.size());
+        return nullptr;
+    }
+    Entry ours;
+    ours.keyText = L"controls";
+    ours.key = controls->key;
+    ours.value = reinterpret_cast<std::uintptr_t>(g_pgColVec);
+    ours.tag = controls->tag;
+    ours.seq = controls->seq;
+    stackEntries.push_back(ours);
+
+    {
+        const struct {
+            const wchar_t* keyText;
+            const char* key;
+            const char* first;
+            const char* second;
+            size_t slot;
+        } kInsets[] = {
+            {L"offset", kPageOffsetKey, g_pgBodyX, kPageInsetY, 0},
+            {L"size", kPageSizeKey, g_pgBodyW, kPageBodyHeight, 1},
+        };
+        for (const auto& one : kInsets) {
+            if (!buildStringPairArray(controls->value, firstElem, textSrc->value, one.first,
+                                      one.second, g_pgInsetRecs[one.slot],
+                                      g_pgInsetElems[one.slot], g_pgInsetElemPtrs[one.slot],
+                                      g_pgInsetVec[one.slot])) {
+                continue;
+            }
+            Entry* found = nullptr;
+            for (Entry& e : stackEntries) {
+                if (e.keyText == one.keyText) {
+                    found = &e;
+                    break;
+                }
+            }
+            if (found != nullptr) {
+                found->value = reinterpret_cast<std::uintptr_t>(g_pgInsetVec[one.slot]);
+                found->tag = controls->tag;
+                continue;
+            }
+            Entry add;
+            add.keyText = one.keyText;
+            add.key = reinterpret_cast<std::uintptr_t>(one.key);
+            add.value = reinterpret_cast<std::uintptr_t>(g_pgInsetVec[one.slot]);
+            add.tag = controls->tag;
+            add.seq = controls->seq;
+            stackEntries.push_back(add);
+        }
+    }
+    if (stackEntries.size() > static_cast<size_t>(kMaxOwnKeys)) {
+        log().warn(L"UiProbe: too many keys for the page body ({})", stackEntries.size());
+        return nullptr;
+    }
+    std::sort(stackEntries.begin(), stackEntries.end(),
+              [](const Entry& a, const Entry& b) { return a.keyText < b.keyText; });
+    for (size_t i = 0; i < stackEntries.size(); ++i) {
+        g_pgNodes[i].key = stackEntries[i].key;
+        g_pgNodes[i].value = stackEntries[i].value;
+        g_pgNodes[i].tag = stackEntries[i].tag;
+        g_pgNodes[i].seq = stackEntries[i].seq;
+    }
+    finishMap(&g_pgHead, g_pgNodes, static_cast<int>(stackEntries.size()), g_pgNode);
+    std::memcpy(g_pgValue, stack, sizeof(g_pgValue));
+    g_pgValue[0] = reinterpret_cast<std::uintptr_t>(g_pgNode);
+    g_pgReady = true;
+    log().info(L"UiProbe: built the Schematica page (tab {}, {} row(s), base had {} keys)",
+               g_pgTab.load(), rows, baseEntries.size());
+    return g_pgValue;
+}
+
+void* substituteOwnPage(void* self, const void* space, const void* name)
+{
+    if (self == nullptr) {
+        return nullptr;
+    }
+
+    if (const unsigned long long keyAt = g_ownKeyOpenAt.load(); keyAt != 0) {
+        if (GetTickCount64() - keyAt > 6000) {
+            g_ownKeyOpenAt.store(0);
+        } else {
+            const std::wstring keySpace = readString(space);
+            const std::wstring keyName = readString(name);
+            if (g_afterInvokeLogs.fetch_add(1) < 80) {
+                log().info(L"UiProbe: borrowed screen -> {}.{}", keySpace, keyName);
+            }
+            if (keySpace == L"how_to_play_common" && keyName == L"dialog_content") {
+                g_pgCloseOnPress.store(true);
+                if (void* const page = buildSchematicaPage(self)) {
+                    log().info(L"UiProbe: served our page inside How to Play");
+                    return page;
+                }
+            }
+            if (keySpace == L"how_to_play_common" && keyName == L"how_to_play_header") {
+                std::lock_guard<std::mutex> guard(g_mutex);
+                if (void* const header = buildHeader(self)) {
+                    return header;
+                }
+            }
+        }
+    }
+
+    const unsigned long long at = g_ownNavInvokedAt.load();
+    if (at == 0 || GetTickCount64() - at > 4000) {
+        return nullptr;
+    }
+    g_lookupCount.fetch_add(1, std::memory_order_relaxed);
+    const std::wstring spaceText = readString(space);
+
+    if (spaceText == L"common" && readString(name) == L"fullscreen_header"
+        && g_ownSettingsRoute.load()) {
+        static std::atomic<unsigned long long> servedFor{0};
+        if (servedFor.exchange(at) != at) {
+            std::lock_guard<std::mutex> guard(g_mutex);
+            if (void* const header = buildHeader(self)) {
+                log().info(L"UiProbe: served our header (fullscreen_header)");
+                return header;
+            }
+        }
+        return nullptr;
+    }
+
+    if (spaceText != L"settings_common") {
+        return nullptr;
+    }
+    {
+        const std::wstring editName = readString(name);
+        if (editName == L"tk_ptlist" && g_ptListReady) {
+            return g_ptListValue;
+        }
+        if (editName.rfind(L"tk_pg", 0) == 0) {
+            int which = 0;
+            for (size_t d = 5; d < editName.size()
+                               && editName[d] >= L'0' && editName[d] <= L'9'; ++d) {
+                which = which * 10 + (editName[d] - L'0');
+            }
+            const int kind = (static_cast<size_t>(which) < kMaxPageRows)
+                                 ? g_pgRowKind[which] : kRowEdit;
+            static const std::string kEditSpace = "settings_common";
+            const std::string kEditName = pageRowControlName(kind);
+            void* ctl = nullptr;
+            if (lookupGuarded(self, &kEditSpace, &kEditName, ctl) && ctl != nullptr) {
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1) < 3) {
+                    log().info(L"UiProbe: served the page edit box ({})", editName);
+                }
+                return ctl;
+            }
+            log().warn(L"UiProbe: could not look up option_text_edit_control");
+            return nullptr;
+        }
+    }
+    const std::wstring nameText = readString(name);
+    if (nameText != L"dialog_content_fullscreen") {
+        return nullptr;
+    }
+    if (!g_ownSettingsRoute.load()) {
+        static std::atomic<int> said{0};
+        return nullptr;
+    }
+    g_pgCloseOnPress.store(false);
+    void* const page = buildSchematicaPage(self);
+    if (page == nullptr) {
+        return nullptr;
+    }
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 3) {
+        log().info(L"UiProbe: served our page body (dialog_content_fullscreen)");
+    }
+    return page;
 }
 
 void* substitute(void* self, const void* space, const void* name)
 {
-
+    if (void* const own = substituteOwnPage(self, space, name)) {
+        return own;
+    }
     if (!kSubstituteEnabled || self == nullptr) {
         return nullptr;
     }
-
     static const std::string kSpace = kFromSpace;
     static const std::string kFrom = kFromName;
 
@@ -3541,7 +6113,6 @@ void* substitute(void* self, const void* space, const void* name)
         std::lock_guard<std::mutex> guard(g_mutex);
         g_selectedMenu.store(0);
         g_contentReady = false;
-
         forgetNumBags();
     }
 
@@ -3569,7 +6140,6 @@ void* substitute(void* self, const void* space, const void* name)
     }
 
     if (kOwnMenuScreen && kNavPaneOwnItems && spaceText == L"settings_common") {
-
         const wchar_t tail2 = (nameText.size() > 2) ? nameText[nameText.size() - 2] : L'\0';
         const wchar_t tail1 = (nameText.size() > 2) ? nameText[nameText.size() - 1] : L'\0';
         const bool isToggle = (menuIndexFromName(nameText, L"_tgl") >= 0);
@@ -3577,7 +6147,6 @@ void* substitute(void* self, const void* space, const void* name)
                              && menuIndexFromName(nameText.substr(0, nameText.size() - 2), L"_")
                                     >= 0);
         if (isToggle || isEdit) {
-
             const bool isKeybind = isEdit && (tail2 == L'k');
 
             if (isKeybind) {
@@ -3598,14 +6167,12 @@ void* substitute(void* self, const void* space, const void* name)
             static const std::string kBtnSpaceStr = "common_buttons";
             static const std::string kToggleStr = "option_toggle_control";
             static const std::string kEditStr = "option_text_edit_control";
-
             static const std::string kKeyBtnStr = "light_text_form_fitting_button";
             void* ctl = nullptr;
             const std::string* const want =
                 isToggle ? &kToggleStr : (isKeybind ? &kKeyBtnStr : &kEditStr);
             const std::string* const space = isKeybind ? &kBtnSpaceStr : &kSpaceStr;
             if (lookupGuarded(self, space, want, ctl) && ctl != nullptr) {
-
                 constexpr bool kDumpButtonNode = false;
                 if (kDumpButtonNode && isKeybind) {
                     static std::atomic<bool> dumped{false};
@@ -3619,7 +6186,6 @@ void* substitute(void* self, const void* space, const void* name)
                     if (sized != nullptr) {
                         return sized;
                     }
-
                     log().warn(L"UiProbe: could not build the sized copy; using the vanilla one");
                 }
 
@@ -3711,7 +6277,6 @@ void addEditCandidate(std::uintptr_t control)
 void addNumBag(void* bag, const char* via, std::ptrdiff_t off)
 {
     const size_t n = g_numBagCount.load();
-
     if (n >= kMaxNumBags) {
         return;
     }
@@ -3786,7 +6351,6 @@ bool controlHitBy(std::uintptr_t control, float x, float y, float* out)
     float rect[4]{};
     std::memcpy(pos, posAt, sizeof(pos));
     std::memcpy(rect, rectAt, sizeof(rect));
-
     const float x0 = pos[0];
     const float y0 = pos[1];
     if (out != nullptr) {
@@ -3794,11 +6358,9 @@ bool controlHitBy(std::uintptr_t control, float x, float y, float* out)
         out[1] = y0;
         out[2] = rect[2];
         out[3] = rect[3];
-
         out[4] = rect[0];
         out[5] = rect[1];
     }
-
     if (!(rect[2] > 0.0f) || !(rect[3] > 0.0f)) {
         return false;
     }
@@ -3914,7 +6476,6 @@ bool readEditBoxText(std::uintptr_t box, std::string& out)
             if (elem == 0 || !memory::isReadable(reinterpret_cast<const void*>(elem), 0x40)) {
                 continue;
             }
-
             std::ptrdiff_t nameAt = -1;
             for (std::ptrdiff_t s = 0; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
                 std::string name;
@@ -3927,7 +6488,6 @@ bool readEditBoxText(std::uintptr_t box, std::string& out)
             if (nameAt < 0) {
                 continue;
             }
-
             for (std::ptrdiff_t s = nameAt + 0x20; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
                 std::string text;
                 if (!readStdString(reinterpret_cast<const char*>(elem + s), text)) {
@@ -3936,7 +6496,6 @@ bool readEditBoxText(std::uintptr_t box, std::string& out)
                 if (text.empty() || text.size() > 32) {
                     continue;
                 }
-
                 bool numeric = true;
                 for (const char c : text) {
                     if ((c < '0' || c > '9') && c != '.' && c != '-' && c != '+') {
@@ -4018,7 +6577,6 @@ void dumpVectorsIn(std::uintptr_t obj)
             if (elem == 0 || !memory::isReadable(reinterpret_cast<const void*>(elem), 0x40)) {
                 continue;
             }
-
             dumpStringsIn(elem, 0x400);
         }
     }
@@ -4276,7 +6834,6 @@ void onControlsBindingName(void* self, void* arg3)
     if (base == 0 || idx < 0) {
         return;
     }
-
     const std::uintptr_t elem = base + static_cast<std::uintptr_t>(idx) * 0x60;
     if (!memory::isReadable(reinterpret_cast<const void*>(elem), 0x60)) {
         return;
@@ -4285,7 +6842,6 @@ void onControlsBindingName(void* self, void* arg3)
 
 void onControlsRowBindings(void* rcx, void* rdx, void* ctx)
 {
-
     constexpr int kMaxLogs = 8;
     static std::atomic<int> seen{0};
     const int n = seen.fetch_add(1) + 1;
@@ -4320,7 +6876,6 @@ void onOreFacetBind(void* out, void* rdx, void* name, unsigned flag)
 {
     std::string text;
     if (!readFacetName(name, text)) {
-
         static std::atomic<bool> said{false};
         return;
     }
@@ -4364,7 +6919,6 @@ void onOreKeyboardInputGroup(void* self, void* out)
 
 std::uintptr_t g_oreKeyRowsWrapAddr = 0;
 std::atomic<int> g_rowNameCalls{0};
-std::atomic<bool> g_rowBuilding{false};
 
 int bumpKeyRowLimit(void* container, int delta)
 {
@@ -4378,7 +6932,6 @@ int bumpKeyRowLimit(void* container, int delta)
     if (begin == 0 || end <= begin || (end - begin) % 0x40 != 0) {
         return 0;
     }
-
     const std::uintptr_t at = end - 0x40 + 0x38;
     if (!memory::isWritable(reinterpret_cast<void*>(at), 1)) {
         return 0;
@@ -4396,7 +6949,6 @@ int bumpKeyRowLimit(void* container, int delta)
 
 void dumpKeyRowContainer(void* container, void* arg3)
 {
-
     constexpr int kMaxCalls = 6;
     constexpr size_t kMaxElements = 64;
     static std::atomic<int> seen{0};
@@ -4445,7 +6997,6 @@ void dumpKeyRowContainer(void* container, void* arg3)
         std::memcpy(&len, elem + 0x10, sizeof(len));
         std::memcpy(&room, elem + 0x18, sizeof(room));
         std::string id;
-
         std::wstring keys;
         std::uintptr_t keysBegin = 0;
         std::uintptr_t keysEnd = 0;
@@ -4469,21 +7020,174 @@ void dumpKeyRowContainer(void* container, void* arg3)
 }
 
 constexpr size_t kRowEntrySize = 0x40;
-constexpr size_t kMaxRowEntries = 96;
+constexpr size_t kMaxRowEntries = 128;
 
-constexpr char kExtraRowId[] = "key.tk.freecam";
-static_assert(sizeof(kExtraRowId) - 1 <= kSsoCapacity, "id は SSO に収めること");
+constexpr size_t kMaxOwnKeyRows = 40;
+
+struct OwnKeyRow {
+    char id[16]{};
+    char label[64]{};
+    int keyCode = 0;
+    int lastSeen = 0;
+    int defaultKey = 0;
+    int module = -1;
+    int child = -1;
+};
+
+OwnKeyRow g_ownKeyRows[kMaxOwnKeyRows];
+size_t g_ownKeyRowCount = 0;
+
+std::atomic<int> g_keyRowFilterModule{-1};
+
+std::vector<MenuItem> sortedMenuItems()
+{
+    std::vector<MenuItem> tree = ModuleManager::instance().buildMenuItems();
+    std::sort(tree.begin(), tree.end(), [](const MenuItem& a, const MenuItem& b) {
+        const std::wstring left = a.labelText();
+        const std::wstring right = b.labelText();
+        return std::lexicographical_compare(
+            left.begin(), left.end(), right.begin(), right.end(),
+            [](wchar_t x, wchar_t y) { return towlower(x) < towlower(y); });
+    });
+    return tree;
+}
+
+size_t ensureOwnKeyRows()
+{
+    if (g_ownKeyRowCount != 0) {
+        return g_ownKeyRowCount;
+    }
+    const std::vector<MenuItem> tree = sortedMenuItems();
+    for (size_t i = 0; i < tree.size() && g_ownKeyRowCount < kMaxOwnKeyRows; ++i) {
+        const MenuItem& tab = tree[i];
+        for (size_t c = 0; c < tab.children.size() && g_ownKeyRowCount < kMaxOwnKeyRows; ++c) {
+            const MenuItem& one = tab.children[c];
+            if (one.kind != MenuItemKind::Keybind || !one.setKeys || !one.getKeys) {
+                continue;
+            }
+            OwnKeyRow& row = g_ownKeyRows[g_ownKeyRowCount];
+            std::snprintf(row.id, sizeof(row.id), "key.tk.%02zu", g_ownKeyRowCount);
+            copyAscii(row.label, sizeof(row.label),
+                      (tab.labelText() + L" " + one.labelText()).c_str());
+            row.module = static_cast<int>(i);
+            row.child = static_cast<int>(c);
+            const std::vector<int> keys = one.getKeys();
+            row.keyCode = keys.empty() ? 0 : keys.front();
+            row.lastSeen = row.keyCode;
+            row.defaultKey = one.defaultKeys.empty() ? 0 : one.defaultKeys.front();
+            ++g_ownKeyRowCount;
+        }
+    }
+    return g_ownKeyRowCount;
+}
+
+int ownKeyRowIndexFromBindingIndex(const void* self, std::uintptr_t index) noexcept
+{
+    if (self == nullptr || !memory::isReadable(self, 16)) {
+        return -1;
+    }
+    std::uintptr_t holder = 0;
+    std::memcpy(&holder, static_cast<const char*>(self) + 8, sizeof(holder));
+    if (holder == 0 || !memory::isReadable(reinterpret_cast<const void*>(holder), 16)) {
+        return -1;
+    }
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::memcpy(&begin, reinterpret_cast<const void*>(holder), sizeof(begin));
+    std::memcpy(&end, reinterpret_cast<const char*>(holder) + 8, sizeof(end));
+    if (begin == 0 || end <= begin) {
+        return -1;
+    }
+    const size_t count = static_cast<size_t>(end - begin) / 0x40;
+    if (index >= count) {
+        return -1;
+    }
+    const auto* const elem = reinterpret_cast<const char*>(begin + index * 0x40);
+    if (!memory::isReadable(elem, 0x20)) {
+        return -1;
+    }
+    std::string id;
+    if (!readStdString(elem, id)) {
+        return -1;
+    }
+    if (id.rfind("key.tk.", 0) != 0) {
+        return -1;
+    }
+    size_t at = 7;
+    size_t number = 0;
+    if (at >= id.size() || id[at] < '0' || id[at] > '9') {
+        return -1;
+    }
+    while (at < id.size() && id[at] >= '0' && id[at] <= '9') {
+        number = number * 10 + static_cast<size_t>(id[at] - '0');
+        ++at;
+    }
+    if (at != id.size() || number >= g_ownKeyRowCount) {
+        return -1;
+    }
+    return static_cast<int>(number);
+}
+
+int ownKeyRowIndexFromCompId(const char* id) noexcept
+{
+    if (id == nullptr) {
+        return -1;
+    }
+    const char* const at = std::strstr(id, "key.tk.");
+    if (at == nullptr) {
+        return -1;
+    }
+    const char* p = at + 7;
+    if (*p < '0' || *p > '9') {
+        return -1;
+    }
+    size_t index = 0;
+    while (*p >= '0' && *p <= '9') {
+        index = index * 10 + static_cast<size_t>(*p - '0');
+        ++p;
+    }
+    if (*p != 0) {
+        return -1;
+    }
+    return (index < g_ownKeyRowCount) ? static_cast<int>(index) : -1;
+}
+
+const char* ownKeyRowLabel(const char* key) noexcept
+{
+    constexpr size_t kPrefix = 7;
+    if (key == nullptr || std::strncmp(key, "key.tk.", kPrefix) != 0) {
+        return nullptr;
+    }
+    const char* p = key + kPrefix;
+    if (*p < '0' || *p > '9') {
+        return nullptr;
+    }
+    size_t index = 0;
+    while (*p >= '0' && *p <= '9') {
+        index = index * 10 + static_cast<size_t>(*p - '0');
+        ++p;
+    }
+    if (index >= g_ownKeyRowCount) {
+        return nullptr;
+    }
+    if (*p != 0 && std::strcmp(p, ".name") != 0 && std::strcmp(p, ".description") != 0) {
+        return nullptr;
+    }
+    return g_ownKeyRows[index].label;
+}
 
 constexpr size_t kMaxRowSpans = 8;
 
 alignas(16) unsigned char g_rowEntryBuffer[kMaxRowSpans][kMaxRowEntries * kRowEntrySize];
 
-alignas(4) int g_extraKeyCodes[1] = {0};
+alignas(16) unsigned char g_rowDefaultBuffer[kMaxRowSpans][kMaxRowEntries * kRowEntrySize];
 
 struct SavedRowSpan {
     void* container = nullptr;
     std::uintptr_t begin = 0;
     std::uintptr_t end = 0;
+    std::uintptr_t defBegin = 0;
+    std::uintptr_t defEnd = 0;
 };
 
 SavedRowSpan g_savedRowSpans[kMaxRowSpans];
@@ -4541,7 +7245,6 @@ bool purgeOwnKeyRows(void* container)
     const std::uintptr_t newEnd = newBegin + kept * kRowEntrySize;
     std::memcpy(base + 0x08, &newBegin, sizeof(newBegin));
     std::memcpy(base + 0x10, &newEnd, sizeof(newEnd));
-
     constexpr bool kPurgeIsPermanent = true;
     g_savedRowSpans[g_savedRowSpanCount] =
         kPurgeIsPermanent ? SavedRowSpan{} : SavedRowSpan{container, begin, end};
@@ -4559,7 +7262,6 @@ bool substituteKeyRows(void* container, bool refresh)
     if (container == nullptr || !memory::isReadable(container, 0x50)) {
         return false;
     }
-
     for (size_t i = 0; i < g_savedRowSpanCount; ++i) {
         if (g_savedRowSpans[i].container == container) {
             if (!refresh) {
@@ -4591,69 +7293,147 @@ bool substituteKeyRows(void* container, bool refresh)
         || !memory::isWritable(base + 0x08, 0x10)) {
         return false;
     }
-
     std::string first;
     if (!readStdString(reinterpret_cast<const char*>(begin), first)
         || first.rfind("key.", 0) != 0) {
         return false;
     }
 
+    const size_t extras = ensureOwnKeyRows();
+    size_t picked[kMaxOwnKeyRows]{};
+    size_t pickCount = 0;
+    for (size_t r = 0; r < extras && pickCount < kMaxOwnKeyRows; ++r) {
+        picked[pickCount++] = r;
+    }
+    const size_t keep = count;
+    if (pickCount == 0 || keep + pickCount > kMaxRowEntries) {
+        return false;
+    }
     unsigned char* const buffer = g_rowEntryBuffer[g_savedRowSpanCount];
-    std::memcpy(buffer, reinterpret_cast<const void*>(begin), count * kRowEntrySize);
-    unsigned char* const extra = buffer + count * kRowEntrySize;
-    std::memset(extra, 0, kRowEntrySize);
-
-    constexpr size_t kIdLength = sizeof(kExtraRowId) - 1;
-    std::memcpy(extra, kExtraRowId, kIdLength);
-    std::uintptr_t value = kIdLength;
-    std::memcpy(extra + kStringSize, &value, sizeof(value));
-    value = kSsoCapacity;
-    std::memcpy(extra + kStringCapacity, &value, sizeof(value));
-
-    const auto keysBegin = reinterpret_cast<std::uintptr_t>(&g_extraKeyCodes[0]);
-    const std::uintptr_t keysEnd = keysBegin + sizeof(g_extraKeyCodes);
-    std::memcpy(extra + 0x20, &keysBegin, sizeof(keysBegin));
-    std::memcpy(extra + 0x28, &keysEnd, sizeof(keysEnd));
-    std::memcpy(extra + 0x30, &keysEnd, sizeof(keysEnd));
-    value = 1;
-    std::memcpy(extra + 0x38, &value, sizeof(value));
+    std::memcpy(buffer, reinterpret_cast<const void*>(begin), keep * kRowEntrySize);
+    for (size_t k = 0; k < pickCount; ++k) {
+        const size_t r = picked[k];
+        unsigned char* const extra = buffer + (keep + k) * kRowEntrySize;
+        std::memset(extra, 0, kRowEntrySize);
+        const size_t idLength = std::strlen(g_ownKeyRows[r].id);
+        std::memcpy(extra, g_ownKeyRows[r].id, idLength);
+        std::uintptr_t value = idLength;
+        std::memcpy(extra + kStringSize, &value, sizeof(value));
+        value = kSsoCapacity;
+        std::memcpy(extra + kStringCapacity, &value, sizeof(value));
+        const auto keysBegin = reinterpret_cast<std::uintptr_t>(&g_ownKeyRows[r].keyCode);
+        const std::uintptr_t keysEnd = keysBegin + sizeof(int);
+        std::memcpy(extra + 0x20, &keysBegin, sizeof(keysBegin));
+        std::memcpy(extra + 0x28, &keysEnd, sizeof(keysEnd));
+        std::memcpy(extra + 0x30, &keysEnd, sizeof(keysEnd));
+        value = 1;
+        std::memcpy(extra + 0x38, &value, sizeof(value));
+    }
 
     const auto newBegin = reinterpret_cast<std::uintptr_t>(buffer);
-    const std::uintptr_t newEnd = newBegin + (count + 1) * kRowEntrySize;
+    const std::uintptr_t newEnd = newBegin + (keep + pickCount) * kRowEntrySize;
+
+    std::uintptr_t defBegin = 0;
+    std::uintptr_t defEnd = 0;
+    bool defDone = false;
+    if (memory::isReadable(base + 0x20, 0x10) && memory::isWritable(base + 0x20, 0x10)) {
+        std::memcpy(&defBegin, base + 0x20, sizeof(defBegin));
+        std::memcpy(&defEnd, base + 0x28, sizeof(defEnd));
+        const size_t defCount =
+            (defEnd > defBegin) ? static_cast<size_t>(defEnd - defBegin) / kRowEntrySize : 0;
+        if (defCount > 0 && defCount + pickCount <= kMaxRowEntries
+            && memory::isReadable(reinterpret_cast<const void*>(defBegin),
+                                  defCount * kRowEntrySize)) {
+            unsigned char* const defBuf = g_rowDefaultBuffer[g_savedRowSpanCount];
+            std::memcpy(defBuf, reinterpret_cast<const void*>(defBegin),
+                        defCount * kRowEntrySize);
+            for (size_t k = 0; k < pickCount; ++k) {
+                const size_t r = picked[k];
+                unsigned char* const extra = defBuf + (defCount + k) * kRowEntrySize;
+                std::memset(extra, 0, kRowEntrySize);
+                const size_t idLength = std::strlen(g_ownKeyRows[r].id);
+                std::memcpy(extra, g_ownKeyRows[r].id, idLength);
+                std::uintptr_t value = idLength;
+                std::memcpy(extra + kStringSize, &value, sizeof(value));
+                value = kSsoCapacity;
+                std::memcpy(extra + kStringCapacity, &value, sizeof(value));
+                const auto keysBegin =
+                    reinterpret_cast<std::uintptr_t>(&g_ownKeyRows[r].defaultKey);
+                const std::uintptr_t keysEnd = keysBegin + sizeof(int);
+                std::memcpy(extra + 0x20, &keysBegin, sizeof(keysBegin));
+                std::memcpy(extra + 0x28, &keysEnd, sizeof(keysEnd));
+                std::memcpy(extra + 0x30, &keysEnd, sizeof(keysEnd));
+                value = 1;
+                std::memcpy(extra + 0x38, &value, sizeof(value));
+            }
+            const auto newDefBegin = reinterpret_cast<std::uintptr_t>(defBuf);
+            const std::uintptr_t newDefEnd =
+                newDefBegin + (defCount + pickCount) * kRowEntrySize;
+            std::memcpy(base + 0x20, &newDefBegin, sizeof(newDefBegin));
+            std::memcpy(base + 0x28, &newDefEnd, sizeof(newDefEnd));
+            defDone = true;
+        }
+    }
+
     std::memcpy(base + 0x08, &newBegin, sizeof(newBegin));
     std::memcpy(base + 0x10, &newEnd, sizeof(newEnd));
-    g_savedRowSpans[g_savedRowSpanCount] = SavedRowSpan{container, begin, end};
+    g_savedRowSpans[g_savedRowSpanCount] =
+        SavedRowSpan{container, begin, end, defDone ? defBegin : 0, defDone ? defEnd : 0};
     ++g_savedRowSpanCount;
 
     static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 3) {
+        std::uintptr_t defBegin = 0;
+        std::uintptr_t defEnd = 0;
+        if (memory::isReadable(base + 0x20, 0x10)) {
+            std::memcpy(&defBegin, base + 0x20, sizeof(defBegin));
+            std::memcpy(&defEnd, base + 0x28, sizeof(defEnd));
+        }
+        const size_t defCount =
+            (defEnd > defBegin) ? static_cast<size_t>(defEnd - defBegin) / kRowEntrySize : 0;
+        std::string defLast;
+        if (defCount > 0
+            && memory::isReadable(reinterpret_cast<const void*>(defBegin),
+                                  defCount * kRowEntrySize)) {
+            readStdString(reinterpret_cast<const char*>(defBegin + (defCount - 1) * kRowEntrySize),
+                          defLast);
+        }
+    }
     return true;
 }
 
 void pumpControlsKeybind()
 {
-    static int lastSeen = 0;
-    const int current = g_extraKeyCodes[0];
-    if (current == lastSeen) {
+    if (g_ownKeyRowCount == 0) {
         return;
     }
-    lastSeen = current;
-    if (current <= 0) {
-        return;
-    }
-
-    for (Module* const one : ModuleManager::instance().modules()) {
-        if (one == nullptr || std::wcscmp(one->name(), L"FreeCamera") != 0) {
+    std::vector<MenuItem> tree;
+    for (size_t r = 0; r < g_ownKeyRowCount; ++r) {
+        OwnKeyRow& row = g_ownKeyRows[r];
+        const int current = row.keyCode;
+        if (current == row.lastSeen) {
             continue;
         }
-        const MenuItem menu = one->buildMenu();
-        for (const MenuItem& child : menu.children) {
-            if (child.kind != MenuItemKind::Keybind || !child.setKeys) {
-                continue;
-            }
-            child.setKeys({current});
-            return;
+        row.lastSeen = current;
+        if (tree.empty()) {
+            tree = sortedMenuItems();
         }
-        break;
+        if (row.module < 0 || static_cast<size_t>(row.module) >= tree.size()) {
+            continue;
+        }
+        const MenuItem& tab = tree[static_cast<size_t>(row.module)];
+        if (row.child < 0 || static_cast<size_t>(row.child) >= tab.children.size()) {
+            continue;
+        }
+        const MenuItem& child = tab.children[static_cast<size_t>(row.child)];
+        if (child.kind != MenuItemKind::Keybind || !child.setKeys) {
+            continue;
+        }
+        if (current > 0) {
+            child.setKeys({current});
+        } else {
+            child.setKeys({});
+        }
     }
 }
 
@@ -4669,7 +7449,10 @@ void restoreKeyRowsFor(void* container)
             std::memcpy(base + 0x08, &span.begin, sizeof(span.begin));
             std::memcpy(base + 0x10, &span.end, sizeof(span.end));
         }
-
+        if (span.defBegin != 0 && memory::isWritable(base + 0x20, 0x10)) {
+            std::memcpy(base + 0x20, &span.defBegin, sizeof(span.defBegin));
+            std::memcpy(base + 0x28, &span.defEnd, sizeof(span.defEnd));
+        }
         for (size_t k = i + 1; k < g_savedRowSpanCount; ++k) {
             g_savedRowSpans[k - 1] = g_savedRowSpans[k];
         }
@@ -4692,13 +7475,16 @@ void popKeyRowSubstitution()
             std::memcpy(base + 0x08, &span.begin, sizeof(span.begin));
             std::memcpy(base + 0x10, &span.end, sizeof(span.end));
         }
+        if (span.defBegin != 0 && memory::isWritable(base + 0x20, 0x10)) {
+            std::memcpy(base + 0x20, &span.defBegin, sizeof(span.defBegin));
+            std::memcpy(base + 0x28, &span.defEnd, sizeof(span.defEnd));
+        }
     }
     span = SavedRowSpan{};
 }
 
 void restoreKeyRows()
 {
-
     while (g_savedRowSpanCount > 0) {
         popKeyRowSubstitution();
     }
@@ -4706,7 +7492,6 @@ void restoreKeyRows()
 
 void onOreKeyRowData(void* container, std::uintptr_t index, bool substituted)
 {
-
     constexpr int kMaxHeadLogs = 3;
     constexpr int kMaxTailLogs = 10;
     constexpr std::uintptr_t kTailFrom = 40;
@@ -4771,19 +7556,20 @@ bool overrideTranslation(const void* key, void* out) noexcept
     if (!copyStdStringFast(key, buf, sizeof(buf))) {
         return false;
     }
-
     flushOwnPublishes();
+    pumpControlsKeybind();
     const char* text = nullptr;
-    if (std::strcmp(buf, kOwnSettingsNameKey) == 0) {
-
+    if (const int leftRow = pageLeftRowFromKey(buf); leftRow >= 0) {
+        text = pageLeftLabel(static_cast<size_t>(leftRow));
+    } else if (std::strcmp(buf, kOwnSettingsNameKey) == 0) {
         text = kOwnSettingsNameText;
     } else if (const char* const own = ownSettingsText(buf); own != nullptr) {
-
         text = own;
+    } else if (const char* const rowLabel = ownKeyRowLabel(buf); rowLabel != nullptr) {
+        text = rowLabel;
     } else {
-        constexpr size_t kIdLength = sizeof(kExtraRowId) - 1;
-        if (std::strncmp(buf, kExtraRowId, kIdLength) != 0) {
-
+        constexpr size_t kIdLength = 7;
+        if (std::strncmp(buf, "key.tk.", kIdLength) != 0) {
             if (buf[0] == 't' && buf[1] == 'k' && buf[2] == '.') {
                 static std::atomic<int> missed{0};
                 if (missed.fetch_add(1) < 30) {
@@ -4793,9 +7579,7 @@ bool overrideTranslation(const void* key, void* out) noexcept
             }
             return false;
         }
-
-        text = (std::strcmp(buf + kIdLength, ".description") == 0) ? "Tsukuyomi FreeCamera"
-                                                                  : "FreeCamera";
+        return false;
     }
     const size_t len = std::strlen(text);
 
@@ -4810,7 +7594,6 @@ bool overrideTranslation(const void* key, void* out) noexcept
     }
     char* dest = head;
     if (room < len) {
-
         void* const buf = hooks::callGameAllocate(len + 1);
         if (buf == nullptr) {
             return false;
@@ -4837,19 +7620,16 @@ bool overrideTranslation(const void* key, void* out) noexcept
 void onOreKeyRowsBegin()
 {
     g_rowNameCalls.store(0);
-    g_rowBuilding.store(true);
 }
 
 constexpr bool kAddTestRow = false;
 
 constexpr bool kOverwriteOnly = true;
-
 constexpr std::uintptr_t kTestRowIndex = 50;
 constexpr std::uintptr_t kMinRowsToTouch = 20;
 
 void onOreKeyRowsEnd(void* out)
 {
-    g_rowBuilding.store(false);
 
     constexpr int kMaxLogs = 4;
     static std::atomic<int> seen{0};
@@ -4869,7 +7649,6 @@ void onOreKeyRowsEnd(void* out)
         && memory::isWritable(reinterpret_cast<void*>(vec[1]), sizeof(std::uintptr_t))
         && memory::isWritable(out, sizeof(vec))) {
         if (kOverwriteOnly) {
-
             std::memcpy(reinterpret_cast<void*>(vec[0]), &kTestRowIndex, sizeof(kTestRowIndex));
             return;
         }
@@ -4925,7 +7704,6 @@ void onOreKeyRowsConsume(void* rcx, void* rdx, bool after)
     }
 
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-
     const auto inModule = [base](std::uintptr_t p) {
         return base != 0 && p > base && p < base + 0x13000000;
     };
@@ -4989,7 +7767,6 @@ void onTranslate(const void* key)
     if (key == nullptr) {
         return;
     }
-
     char buf[256]{};
     if (!copyStdStringFast(key, buf, sizeof(buf))) {
         return;
@@ -4998,7 +7775,6 @@ void onTranslate(const void* key)
         return;
     }
     std::string text(buf);
-
     if (text.rfind("key.tk", 0) == 0) {
         static std::atomic<int> ownSeen{0};
         return;
@@ -5023,7 +7799,6 @@ void onTranslate(const void* key)
 void onOreKeyNameToIndex(void* arg1)
 {
     std::string text;
-
     if (!readFacetName(arg1, text) && !readStdString(reinterpret_cast<const char*>(arg1), text)) {
         static std::atomic<bool> said{false};
         return;
@@ -5052,7 +7827,6 @@ void onRowDataCandidate(int which, void* arg4)
 {
     static std::atomic<int> counts[2]{};
     const int n = counts[which & 1].fetch_add(1) + 1;
-
     if (n > 3 && n != 48 && n != 50 && n != 96 && n != 100) {
         return;
     }
@@ -5075,13 +7849,10 @@ void onOreKeyRowsWrap(void* out, void* container)
     if (n > kMaxLogs) {
         return;
     }
-
     if (n == 1) {
-
         const std::uintptr_t want = g_oreKeyRowsWrapAddr;
         std::uintptr_t probe = reinterpret_cast<std::uintptr_t>(&want);
         bool found = false;
-
         for (std::ptrdiff_t off = 0; off < 0x4000 && !found; off += 8) {
             const auto slot = reinterpret_cast<const void*>(probe + off);
             if (!memory::isReadable(slot, 8)) {
@@ -5092,7 +7863,6 @@ void onOreKeyRowsWrap(void* out, void* container)
             if (obj == 0 || !memory::isReadable(reinterpret_cast<const void*>(obj), 0x80)) {
                 continue;
             }
-
             std::uintptr_t inner38 = 0;
             std::memcpy(&inner38, reinterpret_cast<const char*>(obj) + 0x38, sizeof(inner38));
             if (inner38 == 0 || !memory::isReadable(reinterpret_cast<const void*>(inner38), 8)) {
@@ -5103,7 +7873,6 @@ void onOreKeyRowsWrap(void* out, void* container)
             if (vft38 == 0 || !memory::isReadable(reinterpret_cast<const void*>(vft38), 0x20)) {
                 continue;
             }
-
             std::ptrdiff_t hitSlot = -1;
             for (std::ptrdiff_t slot = 0; slot < 0x40; slot += 8) {
                 std::uintptr_t fn38 = 0;
@@ -5117,7 +7886,6 @@ void onOreKeyRowsWrap(void* out, void* container)
                 continue;
             }
             found = true;
-
             std::uintptr_t inner78 = 0;
             std::memcpy(&inner78, reinterpret_cast<const char*>(obj) + 0x78, sizeof(inner78));
             if (inner78 == 0 || !memory::isReadable(reinterpret_cast<const void*>(inner78), 8)) {
@@ -5154,44 +7922,6 @@ void onKeyBindingLookup(const void* name)
             return;
         }
     }
-}
-
-void onKeyActionName(void* out, int index)
-{
-    if (g_rowBuilding.load()) {
-        g_rowNameCalls.fetch_add(1);
-    }
-
-    constexpr int kMaxLogs = 100;
-    static std::atomic<int> seen{0};
-    const int n = seen.fetch_add(1) + 1;
-    if (n > kMaxLogs) {
-        return;
-    }
-
-    std::string name;
-    readStdString(reinterpret_cast<const char*>(out), name);
-
-}
-
-void onKeyRowListBuild(void* array, void* rdx, bool after)
-{
-    constexpr int kMaxLogs = 6;
-    static std::atomic<int> seen{0};
-    const int n = seen.fetch_add(1) + 1;
-    if (n > kMaxLogs) {
-        return;
-    }
-
-    if (array != nullptr) {
-        for (int i = 0; i < 4; ++i) {
-            const auto* at = reinterpret_cast<const char*>(array) + i * 0x90;
-            if (!memory::isReadable(at, 0x20)) {
-                break;
-            }
-        }
-    }
-
 }
 
 void onControlsSectionSetup(void* self, void* arg2)
@@ -5255,7 +7985,6 @@ void onKeybindListBuilt(void* self)
     }
 
     {
-
         for (const std::ptrdiff_t base : {0x18, 0x58, 0x98, 0xd8, 0x118}) {
             std::uintptr_t h = 0;
             std::uintptr_t c = 0;
@@ -5286,14 +8015,12 @@ void onKeybindListBuilt(void* self)
         if (head == 0 || !memory::isReadable(reinterpret_cast<const void*>(head), 0x18)) {
             return;
         }
-
         std::uintptr_t node = 0;
         std::memcpy(&node, reinterpret_cast<const void*>(head), sizeof(node));
         for (int n = 0; n < 6 && node != 0 && node != head; ++n) {
             if (!memory::isReadable(reinterpret_cast<const void*>(node), 0x50)) {
                 break;
             }
-
             std::memcpy(&node, reinterpret_cast<const void*>(node), sizeof(node));
         }
     }
@@ -5309,6 +8036,7 @@ constexpr float kMenuPitchY = 28.0f;
 constexpr float kMenuMaxX = 190.0f;
 
 constexpr unsigned kMouseEventType = 0xb447f8e7u;
+constexpr unsigned kKeyEventType = 0xf9fbc001u;
 
 int menuIndexFromName(const std::wstring& name, const wchar_t* suffix)
 {
@@ -5325,7 +8053,6 @@ int menuIndexFromName(const std::wstring& name, const wchar_t* suffix)
     if (hi < L'0' || hi > L'9' || lo < L'0' || lo > L'9') {
         return -1;
     }
-
     if (at != 0 && name[at - 1] != L'.') {
         return -1;
     }
@@ -5496,7 +8223,6 @@ int menuIndexFromPoint(float x, float y)
     if (idx < 0 || idx >= static_cast<int>(g_menuCount)) {
         return -1;
     }
-
     const float gap = rel - static_cast<float>(idx);
     if (gap > 0.5f || gap < -0.5f) {
         return -1;
@@ -5520,13 +8246,11 @@ void onUiEvent(void* self, const void* event)
     int seen = 0;
     bool verbose = true;
     if (kind == 1) {
-
         unsigned char act = 0;
         std::memcpy(&act, reinterpret_cast<const char*>(event) + 0x10, sizeof(act));
         if (act != 2) {
             return;
         }
-
         constexpr int kMaxInputLogs = 40;
         static std::atomic<int> g_inputSeen{0};
         const int n = g_inputSeen.fetch_add(1);
@@ -5548,6 +8272,9 @@ void onUiEvent(void* self, const void* event)
         unsigned evType = 0;
         std::memcpy(&evType, reinterpret_cast<const char*>(event) + 0x0C, sizeof(evType));
         if (evType != kMouseEventType) {
+            if (evType == kKeyEventType) {
+                noteScreenClosed();
+            }
             return;
         }
 
@@ -5560,11 +8287,9 @@ void onUiEvent(void* self, const void* event)
             (now - g_lastPressAt.load() < kSameClickMs) && (g_lastPressKey.load() == posKey);
         g_lastPressAt.store(now);
         g_lastPressKey.store(posKey);
-
         const std::wstring anyName =
             (p38 != 0) ? readString(reinterpret_cast<const char*>(p38) + kControlName)
                        : std::wstring();
-
         const wchar_t anyKind = (anyName.size() >= 2) ? anyName[anyName.size() - 2] : L'\0';
         const bool isEditRow =
             (anyKind == L'n' || anyKind == L'k') && anyName[anyName.size() - 1] >= L'0'
@@ -5573,8 +8298,9 @@ void onUiEvent(void* self, const void* event)
         if (isEditRow && anyKind == L'n') {
             addEditCandidate(p38);
         }
-
-        if (duplicate && !isEditRow) {
+        const bool isPageRow = (anyName.find(L"tk_pg") != std::wstring::npos)
+                               || (anyName.find(L"tk_pt") != std::wstring::npos);
+        if (duplicate && !isEditRow && !isPageRow) {
             return;
         }
 
@@ -5592,6 +8318,74 @@ void onUiEvent(void* self, const void* event)
             const std::wstring hitName18 =
                 (p18 != 0) ? readString(reinterpret_cast<const char*>(p18) + kControlName)
                            : std::wstring();
+        }
+
+        {
+            {
+                const size_t tabAt = hitName.rfind(L"tk_pt");
+                if (tabAt != std::wstring::npos && tabAt + 5 < hitName.size()
+                    && hitName[tabAt + 5] >= L'0' && hitName[tabAt + 5] <= L'9') {
+                    int tab = 0;
+                    for (size_t d = tabAt + 5;
+                         d < hitName.size() && hitName[d] >= L'0' && hitName[d] <= L'9'; ++d) {
+                        tab = tab * 10 + (hitName[d] - L'0');
+                    }
+                    if (static_cast<size_t>(tab) < kMaxLeftRows) {
+                        float box[6]{};
+                        const bool inside = controlHitBy(p38, x, y, box);
+                        static unsigned long long lastTabAt[kMaxLeftRows]{};
+                        const unsigned long long now = GetTickCount64();
+                        if (now - lastTabAt[tab] < 300) {
+                            return;
+                        }
+                        lastTabAt[tab] = now;
+                        if (inside) {
+                            g_ptPressed.store(tab);
+                        } else {
+                            int none = -1;
+                            g_ptPressed.compare_exchange_strong(none, tab);
+                        }
+                    }
+                    return;
+                }
+            }
+            const size_t at = hitName.rfind(L"tk_pg");
+            if (at != std::wstring::npos && at + 5 < hitName.size() && hitName[at + 5] >= L'0'
+                && hitName[at + 5] <= L'9') {
+                int row = 0;
+                for (size_t d = at + 5;
+                     d < hitName.size() && hitName[d] >= L'0' && hitName[d] <= L'9'; ++d) {
+                    row = row * 10 + (hitName[d] - L'0');
+                }
+                float box[6]{};
+                const bool inside = controlHitBy(p38, x, y, box);
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1) < 12) {
+                    log().info(
+                        L"UiProbe: page hit {} (row {}, inside={}, at {},{}, box {},{} {}x{})",
+                        hitName, row, inside ? 1 : 0, x, y, box[0], box[1], box[2], box[3]);
+                }
+                if (static_cast<size_t>(row) < kMaxPageRows) {
+                    g_pgCtl[row].store(p38);
+                }
+                const bool isEditRow =
+                    (static_cast<size_t>(row) < kMaxPageRows) && g_pgIsEdit[row];
+                if (!isEditRow) {
+                    static unsigned long long lastAt[kMaxPageRows]{};
+                    const unsigned long long now = GetTickCount64();
+                    if (now - lastAt[row] < 300) {
+                        return;
+                    }
+                    lastAt[row] = now;
+                    if (inside) {
+                        g_pgPressed.store(row);
+                    } else {
+                        int none = -1;
+                        g_pgPressed.compare_exchange_strong(none, row);
+                    }
+                }
+                return;
+            }
         }
 
         if (kProbeControlNames && hitName.find(L"_n") != std::wstring::npos) {
@@ -5621,11 +8415,9 @@ void onUiEvent(void* self, const void* event)
                 const size_t slotMax =
                     (rowKind == L'k') ? kMaxKeysPerModule : kMaxNumbersPerModule;
                 if (owner >= 0 && slot >= 0 && static_cast<size_t>(slot) < slotMax) {
-
                     float box[6]{};
                     const bool inside = controlHitBy(p38, x, y, box);
                     {
-
                         static std::atomic<int> hitLogs{0};
                     }
                     if (!inside) {
@@ -5655,11 +8447,9 @@ void onUiEvent(void* self, const void* event)
                 const std::string text = g_menuTextBuf[btnIdx];
 
                 g_pendingMenu.store(btnIdx);
-
                 g_toggleCtl.store(p38);
             }
         } else {
-
             const int menuIdx = menuIndexFromPoint(x, y);
             if (menuIdx >= 0) {
                 const std::string text = g_menuTextBuf[menuIdx];
@@ -5717,7 +8507,6 @@ void onUiEvent(void* self, const void* event)
 
 void pumpNumberEntry()
 {
-
     static bool down[256]{};
     const auto pressedOnce = [](int vk) {
         const SHORT state = GetAsyncKeyState(vk);
@@ -5738,7 +8527,6 @@ void pumpNumberEntry()
             }
             g_keybinds[i][k].set(g_keybinds[i][k].defaults);
             const std::wstring shown = gameComboName(g_keybinds[i][k].defaults);
-
             size_t s = 0;
             for (; s < shown.size() && s + 1 < kNumTextBytes; ++s) {
                 g_keybinds[i][k].shown[s] = (shown[s] < 0x80) ? static_cast<char>(shown[s]) : '?';
@@ -5770,7 +8558,6 @@ void pumpNumberEntry()
                 down[vk] = isDown;
                 if (isDown) {
                     ++held;
-
                     if (held <= 6) {
                         if (!heldNames.empty()) {
                             heldNames += L" ";
@@ -5785,7 +8572,6 @@ void pumpNumberEntry()
         g_editStartCaptured = false;
     }
     if (g_editTarget < 0) {
-
         pressedOnce(VK_RETURN);
         pressedOnce(VK_ESCAPE);
         return;
@@ -5803,26 +8589,21 @@ void pumpNumberEntry()
         bool hasReal = false;
         int stillHeld = 0;
         for (int vk = 0x08; vk <= 0xFE; ++vk) {
-
             if (vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_MBUTTON) {
                 continue;
             }
-
             const SHORT state = GetAsyncKeyState(vk);
             const bool nowDown = (state & 0x8000) != 0;
             const bool sincePrev = (state & 0x0001) != 0;
             if (!nowDown && !sincePrev) {
-
                 g_keyWaitHeld[vk] = false;
                 continue;
             }
-
             if (g_keyWaitHeld[vk] && !sincePrev) {
                 ++stillHeld;
                 continue;
             }
             g_keyWaitHeld[vk] = false;
-
             const int norm = keys::normalize(vk);
             if (std::find(combo.begin(), combo.end(), norm) == combo.end()) {
                 combo.push_back(norm);
@@ -5855,7 +8636,6 @@ void pumpNumberEntry()
 
         const std::string label = g_keybinds[i][k].label;
         const std::string owner = g_menuTextBuf[i];
-
         const std::wstring shown = gameComboName(combo);
         return;
     }
@@ -5873,7 +8653,6 @@ void pumpNumberEntry()
         g_editTarget = -1;
         return;
     }
-
     if (!pressedOnce(VK_RETURN)) {
         return;
     }
@@ -5910,7 +8689,6 @@ void pumpNumberEntry()
         || ctlName[ctlName.size() - 1] < L'0' || ctlName[ctlName.size() - 1] > L'9') {
         return;
     }
-
     const int ownerIdx = menuIndexFromName(ctlName.substr(0, ctlName.size() - 2), L"_");
     const int slot = ctlName[ctlName.size() - 1] - L'0';
     if (ownerIdx < 0 || slot < 0 || static_cast<size_t>(slot) >= kMaxNumbersPerModule) {
@@ -5980,7 +8758,6 @@ void dumpBindingNames(std::uintptr_t obj, const wchar_t* label, int n)
 
 void dumpToggleControlPeriodically()
 {
-
     constexpr bool kDumpToggleControl = false;
     if (!kDumpToggleControl) {
         return;
@@ -5993,7 +8770,6 @@ void dumpToggleControlPeriodically()
     constexpr int kMaxDumps = 4;
     static std::atomic<unsigned long long> lastAt{0};
     static std::atomic<int> dumps{0};
-
     static std::atomic<std::uintptr_t> lastCtl{0};
     if (lastCtl.exchange(ctl) != ctl) {
         dumps.store(0);
@@ -6036,7 +8812,6 @@ void dumpToggleControlPeriodically()
         return;
     }
     const std::uintptr_t bcount = (bvec[1] - bvec[0]) / sizeof(void*);
-
     int found = 0;
     for (std::uintptr_t i = 0; i < bcount && i < 16; ++i) {
         std::uintptr_t elem = 0;
@@ -6054,7 +8829,6 @@ void dumpToggleControlPeriodically()
                 continue;
             }
             ++found;
-
             for (int c = -2; c < 4; ++c) {
                 const std::ptrdiff_t at = s + c * 0x20;
                 if (at < 0) {
@@ -6064,7 +8838,6 @@ void dumpToggleControlPeriodically()
             break;
         }
     }
-
 }
 
 std::atomic<void*> g_settingsRegistry{nullptr};
@@ -6123,40 +8896,15 @@ const char* findGroupIdByCapture(std::uintptr_t cap0, std::uintptr_t cap1)
     return nullptr;
 }
 
-void reportRegistryVtableOnce(void* registry)
-{
-    static std::atomic<bool> said{false};
-    if (registry == nullptr || said.exchange(true)) {
-        return;
-    }
-    std::uintptr_t vtable = 0;
-    if (!memory::isReadable(registry, sizeof(vtable))) {
-        return;
-    }
-    std::memcpy(&vtable, registry, sizeof(vtable));
-    if (vtable == 0 || !memory::isReadable(reinterpret_cast<const void*>(vtable), 8 * 10)) {
-        return;
-    }
-    for (int i = 0; i < 10; ++i) {
-        std::uintptr_t slot = 0;
-        std::memcpy(&slot, reinterpret_cast<const void*>(vtable + i * 8), sizeof(slot));
-    }
-}
-
-constexpr size_t kMaxOwnItems = 160;
+constexpr size_t kMaxOwnItems = 256;
 constexpr size_t kOwnItemIdMax = 48;
-
 constexpr size_t kOwnItemTextMax = 48;
 constexpr char kKeyValueSuffix = 'v';
-
 constexpr bool kVanillaKeyRows = true;
-
 constexpr char kBorrowedKeyGroupId[] = "keyboardAndMouse.inputGroup.full.chord";
 
 bool useOwnKeyGroups();
-
 int ownKeyGroupIndex(const char* id);
-
 constexpr char kKeyRowIdFormat[] = "tk.g%d";
 constexpr char kChoiceSuffix = 'o';
 extern void* g_ownActionVtable[6];
@@ -6180,18 +8928,19 @@ constexpr std::ptrdiff_t kCompPubPending = 0x1B0;
 constexpr std::ptrdiff_t kCompPublisher = 0x1B8;
 constexpr std::ptrdiff_t kCompNameMode = 0x1D9;
 constexpr std::ptrdiff_t kCompBoolProvider = 0x1E0;
-
 constexpr std::ptrdiff_t kCompActionLabel = 0x1E0;
 constexpr std::ptrdiff_t kCompActionConfirm = 0x288;
 constexpr std::ptrdiff_t kCompActionEnabledFn = 0x348;
-
 constexpr std::ptrdiff_t kCompVisibleFn = 0x0F8;
 constexpr std::ptrdiff_t kCompVisibleFnPtr = 0x130;
 constexpr std::ptrdiff_t kCompActionEnabledFnPtr = 0x380;
 constexpr std::ptrdiff_t kCompActionFn = 0x388;
 constexpr std::ptrdiff_t kCompActionFnPtr = 0x3C0;
+constexpr std::ptrdiff_t kTextProviderNotify = 0x40;
+constexpr std::ptrdiff_t kTextProviderSource = 0x58;
+constexpr std::ptrdiff_t kTextProviderDraft = 0x78;
+constexpr std::ptrdiff_t kTextProviderHasDraft = 0x98;
 constexpr std::ptrdiff_t kCompType = 0x3C8;
-
 constexpr size_t kCompSize = 0x3E0;
 constexpr unsigned char kCompTypeGroupInfo = 7;
 
@@ -6312,7 +9061,6 @@ void requestOwnPublishWithTab(int index)
     requestOwnPublish(index);
     requestOwnPublish(ownTabOf(index));
     requestOwnPublishSiblings(index);
-
     if (ownItemIsKeyRow(index)) {
         requestOwnPublish(ownHolderIndex());
         requestOwnPublish(ownKeysTabIndex());
@@ -6332,7 +9080,6 @@ void flushOwnPublishes()
     if (!anyPublishPending()) {
         return;
     }
-
     bool expected = false;
     if (!g_publishing.compare_exchange_strong(expected, true)) {
         return;
@@ -6364,7 +9111,6 @@ BOOL WINAPI detourPeekMessageW(LPMSG msg, HWND hwnd, UINT filterMin, UINT filter
         flushOwnPublishes();
         return result;
     }
-
     static std::atomic<int> said{0};
     return result;
 }
@@ -6439,6 +9185,41 @@ void writeSsoString(void* slot, const char* text, size_t length)
     std::memcpy(p + kStringCapacity, &room, sizeof(room));
 }
 
+size_t neutralizeHeapStrings(unsigned char* dest, std::ptrdiff_t from, std::ptrdiff_t to,
+                             std::ptrdiff_t skip)
+{
+    size_t hit = 0;
+    for (std::ptrdiff_t off = from; off + 0x20 <= to; off += 8) {
+        if (off == skip) {
+            continue;
+        }
+        std::uintptr_t ptr = 0;
+        std::uintptr_t size = 0;
+        std::uintptr_t room = 0;
+        std::memcpy(&ptr, dest + off, sizeof(ptr));
+        std::memcpy(&size, dest + off + kStringSize, sizeof(size));
+        std::memcpy(&room, dest + off + kStringCapacity, sizeof(room));
+        if (room <= kSsoCapacity || room > 0x4000 || size > room || size == 0) {
+            continue;
+        }
+        if (ptr == 0 || !memory::isReadable(reinterpret_cast<const void*>(ptr), size + 1)) {
+            continue;
+        }
+        const auto* const text = reinterpret_cast<const char*>(ptr);
+        bool printable = true;
+        for (size_t i = 0; i < size && printable; ++i) {
+            const auto ch = static_cast<unsigned char>(text[i]);
+            printable = (ch >= 0x20 && ch <= 0x7E);
+        }
+        if (!printable) {
+            continue;
+        }
+        writeSsoString(dest + off, "", 0);
+        ++hit;
+    }
+    return hit;
+}
+
 bool buildOwnComponent(unsigned char* dest, const void* donor, const char* id, size_t idLength,
                        const char* nameKey, size_t nameKeyLength,
                        unsigned char type = kCompTypeGroupInfo, void* boolProvider = nullptr,
@@ -6464,10 +9245,27 @@ bool buildOwnComponent(unsigned char* dest, const void* donor, const char* id, s
     if (type == 5) {
         std::memset(dest + 0x1D0, 0, 0x388 - 0x1D0);
     } else if (type == 2) {
-
         std::memset(dest + 0x1D0, 0, kCompType - 0x1D0);
         const float scale = 1.0f;
         std::memcpy(dest + 0x1E8, &scale, sizeof(scale));
+    } else if (type == 4) {
+        const size_t dropped =
+            neutralizeHeapStrings(dest, 0x1D0, kCompType, kCompBoolProvider);
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            log().info(L"UiProbe: text component - emptied {} heap string(s) in the copy",
+                       dropped);
+        }
+        {
+            const auto* const donorVisible = static_cast<const char*>(donor) + kCompVisibleFn;
+            if (prepareOwnVisibleVtable(donorVisible)) {
+                std::memset(dest + kCompVisibleFn, 0, 0x40);
+                const auto vtable = reinterpret_cast<std::uintptr_t>(&g_ownVisibleVtable[0]);
+                std::memcpy(dest + kCompVisibleFn, &vtable, sizeof(vtable));
+                const auto self = reinterpret_cast<std::uintptr_t>(dest) + kCompVisibleFn;
+                std::memcpy(dest + kCompVisibleFnPtr, &self, sizeof(self));
+            }
+        }
     }
 
     const std::uintptr_t head = ownBase + kCompPubList;
@@ -6498,14 +9296,12 @@ bool buildOwnComponent(unsigned char* dest, const void* donor, const char* id, s
         std::memcpy(dest + kCompActionFn, &vtable, sizeof(vtable));
         const auto self = reinterpret_cast<std::uintptr_t>(dest) + kCompActionFn;
         std::memcpy(dest + kCompActionFnPtr, &self, sizeof(self));
-
         char valueKey[kOwnItemIdMax]{};
-        const size_t n = (std::min)(idLength, sizeof(valueKey) - 2);
-        std::memcpy(valueKey, id, n);
+        const size_t n = (std::min)(nameKeyLength, sizeof(valueKey) - 2);
+        std::memcpy(valueKey, nameKey, n);
         valueKey[n] = kKeyValueSuffix;
         valueKey[n + 1] = '\0';
         writeSsoString(dest + kCompActionLabel, valueKey, n + 1);
-
         {
             const auto* const donorEnabled = static_cast<const char*>(donor) + kCompActionEnabledFn;
             std::uintptr_t donorPtr = 0;
@@ -6523,7 +9319,6 @@ bool buildOwnComponent(unsigned char* dest, const void* donor, const char* id, s
         }
 
         {
-
             const auto* const donorVisible = static_cast<const char*>(donor) + kCompVisibleFn;
             const bool ready = prepareOwnVisibleVtable(donorVisible);
             if (ready) {
@@ -6538,7 +9333,6 @@ bool buildOwnComponent(unsigned char* dest, const void* donor, const char* id, s
                 const std::string_view text(id, idLength);
             }
         }
-
         dest[kCompActionConfirm] = 0;
         static std::atomic<int> said{0};
     }
@@ -6646,7 +9440,6 @@ void requestOwnPublish(int index);
 
 bool ownItemValue(int index);
 void ownItemRequestToggle(int index);
-
 void buildOwnItems();
 
 unsigned char __fastcall ownBoolGet(void* self)
@@ -6665,11 +9458,9 @@ void __fastcall ownBoolSet(void* self, unsigned value)
     if (index < 0) {
         return;
     }
-
     const bool want = (value & 1u) != 0;
     static std::atomic<int> said{0};
     if (want != ownItemValue(index)) {
-
         setOwnPending(index, want ? 1.0f : 0.0f);
         ownItemRequestToggle(index);
         publishOwnComponent(ownItemComponent(index));
@@ -6689,7 +9480,6 @@ unsigned char __fastcall ownProviderAvailable(void* self)
     markGameThread();
     flushOwnPublishes();
     const int index = indexOfProvider(self);
-
     static std::atomic<int> said{0};
     if (said.fetch_add(1) < 3) {
         if (const unsigned char* const comp = ownItemComponent(index); comp != nullptr) {
@@ -6736,13 +9526,11 @@ void __fastcall ownNumberSet(void* self, float value)
         return;
     }
     static std::atomic<int> said{0};
-
     setOwnPending(index, value);
     ownItemSetNumber(index, value);
 }
 
 constexpr std::ptrdiff_t kOptionProviderList = 0xD8;
-
 constexpr bool kProbeOptionLabels = false;
 
 constexpr size_t kOptionStride = 0xA8;
@@ -6763,7 +9551,6 @@ OptionDonorTemplate g_optionDonor{};
 struct OwnOptionSet {
     alignas(16) unsigned char elements[kMaxChoices][kOptionStride];
     alignas(16) unsigned char labels[kMaxChoices][kOptionLabelCopy];
-
     std::uintptr_t labelObject[kMaxChoices];
     size_t count;
     int item;
@@ -6948,6 +9735,165 @@ bool prepareOwnNumberVtable(const void* donorProvider)
     return true;
 }
 
+constexpr size_t kOwnTextMax = 64;
+
+struct OwnPendingText {
+    bool has = false;
+    char text[kOwnTextMax]{};
+};
+OwnPendingText g_ownPendingText[kMaxOwnItems]{};
+std::mutex g_ownPendingTextMutex;
+
+void setOwnPendingText(int index, const char* text, size_t length)
+{
+    if (index < 0 || index >= static_cast<int>(kMaxOwnItems)) {
+        return;
+    }
+    if (length > kOwnTextMax - 1) {
+        length = kOwnTextMax - 1;
+    }
+    const std::lock_guard<std::mutex> lock(g_ownPendingTextMutex);
+    OwnPendingText& slot = g_ownPendingText[index];
+    std::memcpy(slot.text, text, length);
+    slot.text[length] = '\0';
+    slot.has = true;
+}
+
+void clearOwnPendingText(int index)
+{
+    if (index < 0 || index >= static_cast<int>(kMaxOwnItems)) {
+        return;
+    }
+    const std::lock_guard<std::mutex> lock(g_ownPendingTextMutex);
+    g_ownPendingText[index].has = false;
+}
+
+bool ownPendingText(int index, char* out, size_t cap)
+{
+    if (index < 0 || index >= static_cast<int>(kMaxOwnItems) || out == nullptr || cap == 0) {
+        return false;
+    }
+    const std::lock_guard<std::mutex> lock(g_ownPendingTextMutex);
+    const OwnPendingText& slot = g_ownPendingText[index];
+    if (!slot.has) {
+        return false;
+    }
+    std::snprintf(out, cap, "%s", slot.text);
+    return true;
+}
+
+bool ownItemText(int index, char* out, size_t cap);
+void ownItemSetText(int index, const char* text, size_t length);
+void noteTextSlot(int slot);
+
+void* __fastcall ownTextGet(void* self, void* out)
+{
+    flushOwnPublishes();
+    if (out == nullptr) {
+        return out;
+    }
+    const int index = indexOfProvider(self);
+    char text[kOwnTextMax]{};
+    if (!ownPendingText(index, text, sizeof(text))) {
+        ownItemText(index, text, sizeof(text));
+    }
+    {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 2) {
+            log().info(L"UiProbe: text get for item {} -> [{}]", index, toUtf16(text));
+        }
+    }
+    writeOwnString(out, text, std::strlen(text));
+    return out;
+}
+
+void __fastcall ownTextSet(void* self, const std::uintptr_t* view)
+{
+    const int index = indexOfProvider(self);
+    if (index < 0 || view == nullptr
+        || !memory::isReadable(view, sizeof(std::uintptr_t) * 2)) {
+        return;
+    }
+    const auto* const chars = reinterpret_cast<const char*>(view[0]);
+    size_t length = view[1];
+    if (length > kOwnTextMax - 1) {
+        length = kOwnTextMax - 1;
+    }
+    char text[kOwnTextMax]{};
+    if (length > 0) {
+        if (chars == nullptr || !memory::isReadable(chars, length)) {
+            return;
+        }
+        std::memcpy(text, chars, length);
+    }
+    text[length] = '\0';
+    {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 2) {
+            log().info(L"UiProbe: text set for item {} -> [{}]", index, toUtf16(text));
+        }
+    }
+    setOwnPendingText(index, text, length);
+    ownItemSetText(index, text, length);
+}
+
+void __fastcall ownTextCommit(void* self)
+{
+    (void)self;
+    noteTextSlot(5);
+    flushOwnPublishes();
+}
+
+void noteTextSlot(int slot)
+{
+    static std::atomic<unsigned> seen{0};
+    const unsigned bit = 1u << slot;
+    if ((seen.fetch_or(bit) & bit) == 0) {
+        log().info(L"UiProbe: text provider slot [{}] was called", slot);
+    }
+}
+
+unsigned int __fastcall ownTextZero(void*)
+{
+    noteTextSlot(6);
+    return 0u;
+}
+
+unsigned int __fastcall ownTextAvailable(void* self)
+{
+    noteTextSlot(2);
+    markGameThread();
+    flushOwnPublishes();
+    return ownItemAvailable(indexOfProvider(self)) ? 1u : 0u;
+}
+
+void* __fastcall ownTextSpare7(void*, void*, void*, void*) { noteTextSlot(7); return nullptr; }
+void* __fastcall ownTextSpare8(void*, void*, void*, void*) { noteTextSlot(8); return nullptr; }
+void* __fastcall ownTextSpare9(void*, void*, void*, void*) { noteTextSlot(9); return nullptr; }
+
+void* g_ownTextVtable[kBoolVtableSlots]{};
+std::atomic<bool> g_ownTextVtableReady{false};
+
+bool prepareOwnTextVtable()
+{
+    if (g_ownTextVtableReady.load()) {
+        return true;
+    }
+    std::memset(g_ownTextVtable, 0, sizeof(g_ownTextVtable));
+    g_ownTextVtable[0] = reinterpret_cast<void*>(&ownProviderNoop);
+    g_ownTextVtable[1] = reinterpret_cast<void*>(&ownProviderNoop);
+    g_ownTextVtable[2] = reinterpret_cast<void*>(&ownTextAvailable);
+    g_ownTextVtable[3] = reinterpret_cast<void*>(&ownTextGet);
+    g_ownTextVtable[4] = reinterpret_cast<void*>(&ownTextSet);
+    g_ownTextVtable[5] = reinterpret_cast<void*>(&ownTextCommit);
+    g_ownTextVtable[6] = reinterpret_cast<void*>(&ownTextZero);
+    g_ownTextVtable[7] = reinterpret_cast<void*>(&ownTextSpare7);
+    g_ownTextVtable[8] = reinterpret_cast<void*>(&ownTextSpare8);
+    g_ownTextVtable[9] = reinterpret_cast<void*>(&ownTextSpare9);
+    g_ownTextVtableReady.store(true);
+    return true;
+}
+
 std::atomic<int> g_ownCaptureRequest{-1};
 
 void ownItemActivated(const void* callable);
@@ -6967,7 +9913,6 @@ void rememberActionCopy(const void* callable, int index)
     if (callable == nullptr || index < 0) {
         return;
     }
-
     for (auto& one : g_actionCopies) {
         if (one.callable == callable) {
             one.index = index;
@@ -6987,7 +9932,6 @@ void* __fastcall ownActionCopy(void* self, void* where)
     std::memcpy(where, self, 0x40);
     const auto ptr = reinterpret_cast<std::uintptr_t>(where);
     std::memcpy(static_cast<char*>(where) + 0x38, &ptr, sizeof(ptr));
-
     rememberActionCopy(where, indexOfActionCallable(self));
     return where;
 }
@@ -7066,7 +10010,6 @@ bool prepareOwnVisibleVtable(const void* donorCallable, bool force)
         return true;
     }
     std::uintptr_t donorVtable = 0;
-
     if (std::byte* const ref = Scanner::instance().address(Target::KeyResetVisibleVtableRef);
         ref != nullptr) {
         const auto candidate = reinterpret_cast<std::uintptr_t>(
@@ -7153,13 +10096,13 @@ bool prepareOwnBoolVtable(const void* donorProvider)
 
 struct OwnItem {
     char id[kOwnItemIdMax];
-
     char nameKey[kOwnItemIdMax];
     char text[kOwnItemTextMax];
     unsigned char type;
     int module;
     int child;
     void* comp;
+    bool weakBody;
 };
 
 std::vector<MenuItem> g_ownMenuTree;
@@ -7220,7 +10163,6 @@ int ownCaptureStateOf(int index)
 
 bool ownItemValue(int index)
 {
-
     if (index >= 0 && static_cast<size_t>(index) < kMaxOwnItems) {
         const char* const id = g_ownItems[index].id;
         const size_t len = std::strlen(id);
@@ -7332,6 +10274,491 @@ bool ownKeyRowIsDefault(int index)
     return now == want;
 }
 
+void* findRegistryComponent(const char* id);
+
+bool refreshOwnPage();
+
+MenuItem* schematicaRowOf(int want, size_t index)
+{
+    buildOwnItems();
+    MenuItem* tab = nullptr;
+    for (MenuItem& one : g_ownMenuTree) {
+        if (one.labelText() == L"Schematica") {
+            tab = &one;
+            break;
+        }
+    }
+    if (tab == nullptr) {
+        return nullptr;
+    }
+    size_t seen = 0;
+    for (MenuItem& child : tab->children) {
+        if (!child.onPage) {
+            continue;
+        }
+        if (child.pageTab != want) {
+            continue;
+        }
+        if (seen++ == index) {
+            return &child;
+        }
+    }
+    return nullptr;
+}
+
+MenuItem* schematicaRow(size_t index)
+{
+    if (index >= kMaxPageRows) {
+        return nullptr;
+    }
+    const int tab = g_pgRowMenuTab[index];
+    const int at = g_pgRowMenuIdx[index];
+    if (tab < 0 || at < 0) {
+        return nullptr;
+    }
+    return schematicaRowOf(tab, static_cast<size_t>(at));
+}
+
+bool schematicaRowTextOf(int tab, size_t index, char* out, size_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return false;
+    }
+    out[0] = 0;
+    const MenuItem* const child = schematicaRowOf(tab, index);
+    if (child == nullptr) {
+        return false;
+    }
+    std::wstring text = child->labelText();
+    const std::wstring value = child->valueText();
+    if (!value.empty()) {
+        text += L": ";
+        text += value;
+    } else if (child->kind == MenuItemKind::Toggle) {
+        text += child->toggleState() ? L": ON" : L": OFF";
+    }
+    copyAscii(out, cap, text.c_str());
+    return true;
+}
+
+bool schematicaRowText(size_t index, char* out, size_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const MenuItem* const child = schematicaRow(index);
+    if (child == nullptr) {
+        return false;
+    }
+    std::wstring text = child->labelText();
+    const std::wstring value = child->valueText();
+    if (!value.empty()) {
+        text += L": ";
+        text += value;
+    } else if (child->kind == MenuItemKind::Toggle) {
+        text += child->toggleState() ? L": ON" : L": OFF";
+    }
+    copyAscii(out, cap, text.c_str());
+    return true;
+}
+
+void requestPageRebuild(bool closeItOurselves)
+{
+    if (g_pgCloseOnPress.load()) {
+        const unsigned long long want = GetTickCount64() + kPageReopenDelayMs;
+        unsigned long long have = g_pgReopenAt.load();
+        bool alreadyBooked = false;
+        while (true) {
+            if (have != 0 && have <= want) {
+                alreadyBooked = true;
+                break;
+            }
+            if (g_pgReopenAt.compare_exchange_weak(have, want)) {
+                break;
+            }
+        }
+        if (closeItOurselves && !alreadyBooked) {
+            g_pgReopenAt.store(0);
+            g_pgCloseDeadline.store(GetTickCount64() + kPageCloseWaitMs);
+            sendEscapeToGame();
+        }
+        return;
+    }
+    openOwnPage(true);
+}
+
+void pumpPagePress()
+{
+    if (const int row = g_ptPressed.exchange(-1); row >= 0) {
+        if (static_cast<size_t>(row) < g_ptCount) {
+            const int wasLast = g_ptLastPressed.exchange(row);
+            bool changed = (wasLast != row);
+            if (g_ptKind[row] == kLeftTab) {
+                const int tab = g_ptIndex[row];
+                const int before = g_pgTab.exchange(tab);
+                changed = changed || (before != tab);
+                if (before != tab) {
+                    log().info(L"UiProbe: page tab {} -> {} ({})", before, tab,
+                               toUtf16(kPageTabNames[tab]));
+                }
+            } else {
+                Schematica& mod = Schematica::instance();
+                const int beforeAt = mod.editingIndex();
+                mod.selectBlueprint(static_cast<size_t>(g_ptIndex[row]));
+                changed = changed || (beforeAt != mod.editingIndex());
+                if (g_pgTab.load() == kEmptyTab) {
+                    g_pgTab.store(1);
+                    changed = true;
+                }
+                if (beforeAt != mod.editingIndex()) {
+                    log().info(L"UiProbe: selected blueprint {}",
+                               mod.blueprintName(static_cast<size_t>(g_ptIndex[row])));
+                }
+            }
+            (void)changed;
+        }
+        return;
+    }
+
+    const int idx = g_pgPressed.exchange(-1);
+    if (idx < 0 || static_cast<size_t>(idx) >= kMaxPageRows) {
+        return;
+    }
+    if (g_pgRowAct[idx] == kActGoto) {
+        const int want = g_pgRowArg[idx];
+        if (want < 0 || want >= kScreenCount) {
+            return;
+        }
+        bool changed = false;
+        if (g_pgRowBlueprint[idx] >= 0
+            && Schematica::instance().editingIndex() != g_pgRowBlueprint[idx]) {
+            Schematica::instance().selectBlueprint(static_cast<size_t>(g_pgRowBlueprint[idx]));
+            changed = true;
+        }
+        const int before = g_pgScreen.exchange(want);
+        changed = changed || (before != want);
+        if (!changed) {
+            return;
+        }
+        (void)pageHeaderTitle();
+        requestPageRebuild(false);
+        return;
+    }
+    if (g_pgRowAct[idx] == kActNone) {
+        return;
+    }
+    if (g_pgRowAct[idx] == kActShow) {
+        const int which = g_pgRowBlueprint[idx];
+        if (which < 0 || static_cast<size_t>(which) >= Schematica::instance().blueprintCount()) {
+            return;
+        }
+        const bool was = Schematica::instance().blueprintVisible(static_cast<size_t>(which));
+        Schematica::instance().setBlueprintVisible(static_cast<size_t>(which), !was);
+        log().info(L"UiProbe: {} display set to {}",
+                   Schematica::instance().blueprintName(static_cast<size_t>(which)),
+                   was ? L"OFF" : L"ON");
+        requestPageRebuild(false);
+        return;
+    }
+    MenuItem* const row = schematicaRow(static_cast<size_t>(idx));
+    if (row == nullptr) {
+        log().warn(L"UiProbe: page row {} has no item", idx);
+        return;
+    }
+    if (g_pgIsEdit[idx]) {
+        return;
+    }
+    if (g_pgRowKind[idx] == kRowSlider) {
+        return;
+    }
+    if (g_pgRowBlueprint[idx] >= 0
+        && Schematica::instance().editingIndex() != g_pgRowBlueprint[idx]) {
+        Schematica::instance().selectBlueprint(static_cast<size_t>(g_pgRowBlueprint[idx]));
+    }
+    const std::wstring before = row->labelText() + L" = " + row->valueText();
+    const size_t countBefore = Schematica::instance().blueprintCount();
+    if (row->activate) {
+        row->activate();
+    }
+    if (Schematica::instance().blueprintCount() < countBefore) {
+        g_pgTab.store(kEmptyTab);
+        g_ptLastPressed.store(-1);
+        g_pgScreen.store(kScreenBlueprints);
+    }
+    schematicaRowText(static_cast<size_t>(idx), g_pgTexts[idx], kPageTextBytes);
+    log().info(L"UiProbe: page row {} pressed ({} -> {})", idx, before,
+               toUtf16(g_pgTexts[idx]));
+
+    const std::wstring after = row->labelText() + L" = " + row->valueText();
+    const bool layerRow = (g_pgRowMenuTab[idx] == 2);
+    if (after == before && g_pgRowKind[idx] != kRowToggle && !layerRow) {
+        return;
+    }
+    const bool needsSelfClose = (g_pgRowKind[idx] != kRowButton);
+    requestPageRebuild(needsSelfClose);
+}
+
+void pumpPageReopen()
+{
+    if (const unsigned long long limit = g_pgCloseDeadline.load(); limit != 0) {
+        if (GetTickCount64() < limit) {
+            return;
+        }
+        g_pgCloseDeadline.store(0);
+        log().warn(L"UiProbe: no close signal after {} ms, reopening the page",
+                   kPageCloseWaitMs);
+        openOwnPage(true);
+        g_pgReopenAt.store(0);
+        return;
+    }
+    const unsigned long long at = g_pgReopenAt.load();
+    if (at == 0 || GetTickCount64() < at) {
+        return;
+    }
+    g_pgReopenAt.store(0);
+    openOwnPage(true);
+}
+
+void pumpPageEntry()
+{
+    Schematica& mod = Schematica::instance();
+    const int keepEditing = mod.editingIndex();
+    int nowEditing = keepEditing;
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        if (!g_pgIsEdit[i]) {
+            continue;
+        }
+        const std::uintptr_t box = g_pgCtl[i].load();
+        if (box == 0) {
+            continue;
+        }
+        wchar_t want[24]{};
+        std::swprintf(want, 24, L"tk_pg%u", static_cast<unsigned>(i));
+        const size_t wantLen = std::wcslen(want);
+        const std::wstring name = readString(reinterpret_cast<const char*>(box) + kControlName);
+        if (name.size() < wantLen || name.compare(name.size() - wantLen, wantLen, want) != 0) {
+            g_pgCtl[i].store(0);
+            continue;
+        }
+        std::string text;
+        if (!readEditBoxText(box, text) || text.empty()) {
+            continue;
+        }
+        if (std::strncmp(text.c_str(), g_pgLastText[i], kPageTextBytes) == 0) {
+            continue;
+        }
+        std::snprintf(g_pgLastText[i], kPageTextBytes, "%s", text.c_str());
+        MenuItem* const row = schematicaRow(i);
+        if (row == nullptr || !row->setText) {
+            continue;
+        }
+        if (g_pgRowBlueprint[i] >= 0 && nowEditing != g_pgRowBlueprint[i]) {
+            mod.selectBlueprintQuiet(static_cast<size_t>(g_pgRowBlueprint[i]));
+            nowEditing = g_pgRowBlueprint[i];
+        }
+        row->setText(toUtf16(text));
+        log().info(L"UiProbe: page row {} typed [{}] -> {}", i, toUtf16(text), row->valueText());
+    }
+    if (nowEditing != keepEditing && keepEditing >= 0) {
+        mod.selectBlueprintQuiet(static_cast<size_t>(keepEditing));
+    }
+}
+
+constexpr std::uintptr_t kSliderRaw = 0x38;
+constexpr std::uintptr_t kSliderStep = 0x3C;
+constexpr std::uintptr_t kSliderSteps = 0x40;
+constexpr std::uintptr_t kSliderFlags = 0x58;
+float g_pgLastSlider[kMaxPageRows]{};
+
+constexpr std::ptrdiff_t kSliderOwner = 0x88;
+
+int pageSliderRowOf(void* self)
+{
+    if (self == nullptr || !memory::isReadable(reinterpret_cast<const char*>(self) + 8, 8)) {
+        return -1;
+    }
+    const void* const ctl =
+        *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(self) + 8);
+    if (ctl == nullptr || !memory::isReadable(reinterpret_cast<const char*>(ctl) + kSliderOwner, 8)) {
+        return -1;
+    }
+    const void* const owner =
+        *reinterpret_cast<void* const*>(reinterpret_cast<const char*>(ctl) + kSliderOwner);
+    if (owner == nullptr
+        || !memory::isReadable(reinterpret_cast<const char*>(owner) + kControlName, 0x20)) {
+        return -1;
+    }
+    const std::wstring name = readString(reinterpret_cast<const char*>(owner) + kControlName);
+    const size_t at = name.rfind(L"tk_pg");
+    if (at == std::wstring::npos) {
+        return -1;
+    }
+    int row = -1;
+    for (size_t d = at + 5; d < name.size() && name[d] >= L'0' && name[d] <= L'9'; ++d) {
+        row = (row < 0 ? 0 : row) * 10 + (name[d] - L'0');
+    }
+    return (row >= 0 && static_cast<size_t>(row) < kMaxPageRows) ? row : -1;
+}
+
+void writeSliderRatio(void* self, float ratio)
+{
+    if (!memory::isReadable(reinterpret_cast<const char*>(self) + kSliderFlags, 8)) {
+        return;
+    }
+    unsigned char flags = 0;
+    std::memcpy(&flags, reinterpret_cast<const char*>(self) + kSliderFlags, sizeof(flags));
+    std::memcpy(reinterpret_cast<char*>(self) + kSliderRaw, &ratio, sizeof(ratio));
+    if ((flags & 1u) != 0) {
+        std::int32_t steps = 0;
+        std::memcpy(&steps, reinterpret_cast<const char*>(self) + kSliderSteps, sizeof(steps));
+        if (steps > 1) {
+            const std::int32_t step = static_cast<std::int32_t>(
+                std::lround(static_cast<double>(ratio) * (steps - 1)));
+            const std::int32_t clamped = std::clamp(step, 0, steps - 1);
+            std::memcpy(reinterpret_cast<char*>(self) + kSliderStep, &clamped, sizeof(clamped));
+        }
+    }
+}
+
+bool g_pgSliderSeeded[kMaxPageRows]{};
+
+void forgetPageSliders()
+{
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        g_pgSliderSeeded[i] = false;
+        g_pgLastSlider[i] = -1.0F;
+    }
+}
+
+bool onSliderPublishImpl(void* self, float value, float& reseed)
+{
+    const int row = pageSliderRowOf(self);
+    if (row < 0 || g_pgRowKind[row] != kRowSlider) {
+        return false;
+    }
+    MenuItem* const item = schematicaRow(static_cast<size_t>(row));
+    if (item == nullptr || !item->setNumber || !item->getNumber) {
+        return false;
+    }
+    const float low = item->numberMin;
+    const float high = item->numberMax;
+    if (!(high > low)) {
+        return false;
+    }
+
+    const float want = std::clamp((item->getNumber() - low) / (high - low), 0.0F, 1.0F);
+    if (!g_pgSliderSeeded[row]) {
+        g_pgSliderSeeded[row] = true;
+        g_pgLastSlider[row] = want;
+        if (std::fabs(value - want) < 0.0005F) {
+            return false;
+        }
+        writeSliderRatio(self, want);
+        reseed = want;
+        return true;
+    }
+
+    if (!(value >= 0.0F) || value > 1.0F) {
+        return false;
+    }
+    if (std::fabs(value - g_pgLastSlider[row]) < 0.0005F) {
+        return false;
+    }
+    g_pgLastSlider[row] = value;
+    const float made = low + value * (high - low);
+    item->setNumber(made);
+    log().info(L"UiProbe: {} set to {}", item->labelText(), made);
+    return false;
+}
+
+void onPageBag(void* bag)
+{
+    g_pgBag.store(bag);
+}
+
+float g_pgToldToggle[kMaxPageRows]{};
+bool g_pgToldOnce[kMaxPageRows]{};
+float g_ptTold[kMaxLeftRows]{};
+bool g_ptToldOnce[kMaxLeftRows]{};
+
+void pumpToggleState()
+{
+    void* const holder = g_pgBag.load();
+    if (holder == nullptr || !memory::isReadable(holder, 32)) {
+        return;
+    }
+    Schematica& mod = Schematica::instance();
+    const int keepEditing = mod.editingIndex();
+    int nowEditing = keepEditing;
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        if (g_pgRowKind[i] != kRowToggle) {
+            continue;
+        }
+        const MenuItem* const item = schematicaRow(i);
+        if (item == nullptr) {
+            continue;
+        }
+        if (g_pgRowBlueprint[i] >= 0 && nowEditing != g_pgRowBlueprint[i]) {
+            mod.selectBlueprintQuiet(static_cast<size_t>(g_pgRowBlueprint[i]));
+            nowEditing = g_pgRowBlueprint[i];
+        }
+        const float want = item->toggleState() ? 1.0F : 0.0F;
+        if (g_pgToldOnce[i] && g_pgToldToggle[i] == want) {
+            continue;
+        }
+        char name[24]{};
+        const int len = std::snprintf(name, sizeof(name), "#tk_pg_%u",
+                                      static_cast<unsigned>(i));
+        if (len <= 0) {
+            continue;
+        }
+        if (!hooks::setUiBagNumber(holder, name, static_cast<size_t>(len), want)) {
+            break;
+        }
+        g_pgToldToggle[i] = want;
+        g_pgToldOnce[i] = true;
+    }
+    if (nowEditing != keepEditing && keepEditing >= 0) {
+        mod.selectBlueprintQuiet(static_cast<size_t>(keepEditing));
+    }
+
+    for (size_t t = 0; t < g_ptCount; ++t) {
+        const float want = pageLeftRowSelected(t) ? 1.0F : 0.0F;
+        if (g_ptToldOnce[t] && g_ptTold[t] == want) {
+            continue;
+        }
+        const int len = std::snprintf(g_ptBindNames[t], sizeof(g_ptBindNames[t]), "#tk_pt_%u",
+                                      static_cast<unsigned>(t));
+        if (len <= 0) {
+            continue;
+        }
+        if (!hooks::setUiBagNumber(holder, g_ptBindNames[t], static_cast<size_t>(len), want)) {
+            return;
+        }
+        g_ptTold[t] = want;
+        g_ptToldOnce[t] = true;
+    }
+}
+
+void forgetToggleState()
+{
+    for (size_t i = 0; i < kMaxPageRows; ++i) {
+        g_pgToldOnce[i] = false;
+    }
+    for (size_t t = 0; t < kMaxLeftRows; ++t) {
+        g_ptToldOnce[t] = false;
+    }
+}
+
+bool onSliderPublish(void* self, float value, float& reseed)
+{
+    if (self == nullptr) {
+        return false;
+    }
+    return onSliderPublishImpl(self, value, reseed);
+}
+
 bool ownItemAvailable(int index)
 {
     const MenuItem* const item = ownMenuItem(index);
@@ -7394,6 +10821,37 @@ void ownItemSetNumber(int index, float value)
 
 void ownItemRequestToggle(int index) { g_ownToggleRequest.store(index); }
 
+bool ownItemText(int index, char* out, size_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const MenuItem* const item = ownMenuItem(index);
+    if (item == nullptr || !item->getText) {
+        return false;
+    }
+    copyAscii(out, cap, item->getText().c_str());
+    return true;
+}
+
+std::atomic<int> g_ownTextRequest{-1};
+char g_ownTextValue[kOwnTextMax]{};
+std::mutex g_ownTextValueMutex;
+
+void ownItemSetText(int index, const char* text, size_t length)
+{
+    if (length > kOwnTextMax - 1) {
+        length = kOwnTextMax - 1;
+    }
+    {
+        const std::lock_guard<std::mutex> lock(g_ownTextValueMutex);
+        std::memcpy(g_ownTextValue, text, length);
+        g_ownTextValue[length] = '\0';
+    }
+    g_ownTextRequest.store(index);
+}
+
 int ownItemChoice(int index)
 {
     const MenuItem* const item = ownMenuItem(index);
@@ -7439,7 +10897,6 @@ void writeArgString(unsigned char* dest, const char* text)
 
 bool buildOwnOptionSetByGame(OwnOptionSet& set, const MenuItem& item)
 {
-
     const auto make = Scanner::instance().addressAs<MakeOptionElementFn>(
         Target::MakeOptionElement);
     if (make == nullptr) {
@@ -7521,9 +10978,7 @@ bool buildOwnOptionSet(int index, const MenuItem& item, const char* id)
 
     for (size_t n = 0; n < set.count; ++n) {
         std::memcpy(set.elements[n], g_optionDonor.element, kOptionStride);
-
         dropForeignPointers(set.elements[n], kOptionStride, nullptr);
-
         const std::uintptr_t value = n;
         std::memcpy(set.elements[n] + kOptionValue, &value, sizeof(value));
 
@@ -7562,13 +11017,11 @@ bool buildOwnOptionSet(int index, const MenuItem& item, const char* id)
                 continue;
             }
             writeSsoString(set.labels[n] + off, key, keyLength);
-
             for (std::ptrdiff_t at = off; at < off + 0x10; at += 8) {
                 isText[at / 8] = true;
             }
             ++rewritten;
         }
-
         dropForeignPointers(set.labels[n], kOptionLabelCopy, isText);
 
         if (prepareOwnOptionLabelVtable(set.labels[n])) {
@@ -7628,7 +11081,6 @@ int indexOfActionCallable(const void* callable)
 
 void ownItemActivated(const void* callable)
 {
-
     if (g_inPublish.load()) {
         static std::atomic<int> said{0};
         return;
@@ -7648,7 +11100,6 @@ void ownItemActivated(const void* callable)
                             != callable);
     (void)since;
     (void)isCopy;
-
     g_maybePressedAt.store(GetTickCount64());
     g_maybePressed.store(index);
 }
@@ -7662,7 +11113,6 @@ void formatOwnValueText(char* dest, size_t cap, int index)
         copyAscii(dest, cap, L"-");
         return;
     }
-
     if (index >= 0 && static_cast<size_t>(index) < kMaxOwnItems) {
         const char* const id = g_ownItems[static_cast<size_t>(index)].id;
         const size_t length = std::strlen(id);
@@ -7690,9 +11140,14 @@ const char* ownSettingsText(const char* key)
         if (std::strcmp(g_ownItems[i].nameKey, key) != 0) {
             continue;
         }
-
         g_nameResolvedAt[i] = GetTickCount64();
         markItemResolved(static_cast<int>(i));
+        if (g_ownItems[i].type == 4) {
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1) < 2) {
+                log().info(L"UiProbe: the name of the text row {} was asked for", toUtf16(key));
+            }
+        }
         return g_ownItems[i].text;
     }
     const size_t length = std::strlen(key);
@@ -7701,7 +11156,6 @@ const char* ownSettingsText(const char* key)
         if (key[at - 1] != kChoiceSuffix) {
             continue;
         }
-
         bool digits = (at < length);
         for (size_t d = at; d < length && digits; ++d) {
             digits = (key[d] >= '0' && key[d] <= '9');
@@ -7771,7 +11225,7 @@ const char* ownSettingsText(const char* key)
     std::memcpy(base, key, length - 1);
     base[length - 1] = '\0';
     for (size_t i = 0; i < count && i < kMaxOwnItems; ++i) {
-        if (g_ownItems[i].type == 5 && std::strcmp(g_ownItems[i].id, base) == 0) {
+        if (g_ownItems[i].type == 5 && std::strcmp(g_ownItems[i].nameKey, base) == 0) {
             static char text[kOwnItemTextMax]{};
             formatOwnValueText(text, sizeof(text), static_cast<int>(i));
             return text;
@@ -7781,13 +11235,11 @@ const char* ownSettingsText(const char* key)
 }
 
 constexpr size_t kMaxOwnProviders = kMaxOwnItems + 1;
-
 std::atomic<bool> g_ownItemsIncomplete{false};
 
 std::atomic<bool> g_resetUsedFallback{false};
 
 alignas(16) unsigned char g_ownProviderPool[kMaxOwnProviders][0x40]{};
-
 alignas(16) unsigned char g_swapProviderPool[0x40]{};
 std::atomic<bool> g_swapProviderReady{false};
 std::atomic<size_t> g_ownProviderCount{0};
@@ -7873,7 +11325,6 @@ void swapBorrowedGroupProvider(void* registry)
     if (done.load() == slot) {
         return;
     }
-
     if (!g_vanillaBorrowedReady.load()) {
         g_vanillaBorrowedReady.store(copyStdFunction(slot, g_vanillaBorrowedProvider));
     }
@@ -7885,15 +11336,47 @@ void swapBorrowedGroupProvider(void* registry)
     done.store(slot);
 }
 
+bool captureKeyGroupProvider(void* registry)
+{
+    if (g_vanillaBorrowedReady.load()) {
+        return true;
+    }
+    constexpr char kSourceId[] = "keyboardAndMouse.inputGroup.standard";
+    const std::wstring want(kSourceId, kSourceId + sizeof(kSourceId) - 1);
+    void* const node = findRegistryNode(registry, want);
+    if (node == nullptr) {
+        return false;
+    }
+    const bool ok = copyStdFunction(static_cast<char*>(node) + 0x30, g_vanillaBorrowedProvider);
+    g_vanillaBorrowedReady.store(ok);
+    static std::atomic<bool> told{false};
+    return ok;
+}
+
 void onSettingsGroupRegister(void* registry, const void* idView, void* provider)
 {
     const std::string id = readStringView(idView);
     g_settingsGroupCount.fetch_add(1);
     if (registry != nullptr) {
         g_settingsRegistry.store(registry);
-        reportRegistryVtableOnce(registry);
     }
-
+    {
+        static std::atomic<int> said{0};
+        const bool interesting = (id.rfind("json-navigation-", 0) == 0)
+                                 || (id.size() > 7 && id.compare(id.size() - 7, 7, "-jsonui") == 0);
+        const int at = said.fetch_add(1);
+        if (interesting || at < 3) {
+            std::uintptr_t vtable = 0;
+            if (provider != nullptr && memory::isReadable(provider, sizeof(vtable))) {
+                std::memcpy(&vtable, provider, sizeof(vtable));
+            }
+            const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+            log().info(L"UiProbe: settings group [{}] \"{}\" provider {} (vtable RVA {:#x}){}",
+                       at, toUtf16(id), provider,
+                       (vtable > base) ? (vtable - base) : vtable,
+                       interesting ? L"  <<< json navigation" : L"");
+        }
+    }
     std::uintptr_t words[3]{};
     const bool readable = (provider != nullptr && memory::isReadable(provider, sizeof(words)));
     if (readable) {
@@ -7903,7 +11386,6 @@ void onSettingsGroupRegister(void* registry, const void* idView, void* provider)
         g_tabsGroupProvider.store(provider);
         g_tabsCapture0.store(words[1]);
         g_tabsCapture1.store(words[2]);
-
         if (kAddOwnSettingsTab) {
             buildOwnItems();
             size_t need = kVanillaKeyRows ? 2 : 1;
@@ -7922,13 +11404,14 @@ void onSettingsGroupRegister(void* registry, const void* idView, void* provider)
                     break;
                 }
             }
-
             if (kVanillaKeyRows && !g_swapProviderReady.load()) {
                 g_swapProviderReady.store(copyStdFunction(provider, g_swapProviderPool));
             }
-
             if (kVanillaKeyRows && !useOwnKeyGroups() && g_swapProviderReady.load()) {
                 swapBorrowedGroupProvider(registry);
+            }
+            if (kVanillaKeyRows && useOwnKeyGroups()) {
+                captureKeyGroupProvider(registry);
             }
             g_ownProviderCount.store(made);
             g_ownProvidersReady.store(made == need && made > 0);
@@ -7954,6 +11437,13 @@ bool g_keyRowMade = false;
 int g_keyRowCount = 0;
 
 constexpr int kKeysModule = -2;
+
+constexpr int kJsonTabModule = -3;
+constexpr char kOwnTabId[] = "tkschem-jsonui";
+constexpr char kOwnTabNameKey[] = "tk.schematica";
+constexpr bool kOpenPageFromKey = false;
+
+constexpr bool kOwnJsonTabEntry = false;
 
 bool useOwnKeyGroups()
 {
@@ -8033,7 +11523,6 @@ void buildOwnItems()
         return;
     }
     g_ownMenuTree = ModuleManager::instance().buildMenuItems();
-
     std::sort(g_ownMenuTree.begin(), g_ownMenuTree.end(),
               [](const MenuItem& a, const MenuItem& b) {
                   const std::wstring left = a.labelText();
@@ -8045,7 +11534,6 @@ void buildOwnItems()
     size_t count = 0;
     for (size_t i = 0; i < g_ownMenuTree.size() && count < kMaxOwnItems; ++i) {
         MenuItem& tabSource = g_ownMenuTree[i];
-
         OwnItem& tab = g_ownItems[count];
         std::snprintf(tab.id, sizeof(tab.id), "tk.m%zu", i);
         std::snprintf(tab.nameKey, sizeof(tab.nameKey), "%s", tab.id);
@@ -8055,29 +11543,47 @@ void buildOwnItems()
         tab.child = -1;
         tab.comp = nullptr;
         ++count;
-
         for (size_t c = 0; c < tabSource.children.size() && count < kMaxOwnItems; ++c) {
             const MenuItem& child = tabSource.children[c];
+            if (child.onPage) {
+                continue;
+            }
             unsigned char type = 0xFF;
             switch (child.kind) {
             case MenuItemKind::Toggle:
                 type = 0;
                 break;
             case MenuItemKind::Keybind:
-
                 type = 5;
                 break;
             case MenuItemKind::Cycle:
-
-                type = (!child.choices.empty() && child.getChoice && child.setChoice) ? 3 : 5;
+                type = (child.choices.size() >= 2 && child.getChoice && child.setChoice) ? 3 : 5;
+                if (child.choices.size() == 1) {
+                    static std::atomic<bool> told{false};
+                    if (!told.exchange(true)) {
+                        log().warn(L"UiProbe: a choice has only one option - showing it as a "
+                                   L"button instead");
+                    }
+                }
                 break;
             case MenuItemKind::Number:
                 type = 2;
                 break;
+            case MenuItemKind::Text:
+                if (!child.getText || !child.setText) {
+                    continue;
+                }
+                type = 4;
+                break;
+            case MenuItemKind::Action:
+                if (!child.opensPage) {
+                    continue;
+                }
+                type = 5;
+                break;
             default:
                 continue;
             }
-
             if (kVanillaKeyRows && child.kind == MenuItemKind::Keybind
                 && count + 6 <= kMaxOwnItems) {
                 const int rowNo = g_keyRowCount++;
@@ -8091,6 +11597,16 @@ void buildOwnItems()
                                    && g_ownItems[k].module == static_cast<int>(i));
                     }
                     const char* const groupId = oreui::ownGroupId(static_cast<int>(i));
+                    if (groupId == nullptr) {
+                        static std::atomic<bool> told{false};
+                        if (!told.exchange(true)) {
+                            log().warn(L"UiProbe: not enough keys for the key-row container "
+                                       L"({} available, {} modules). Raise kOwnIds in "
+                                       L"OreUiPatch.cpp",
+                                       oreui::ownGroupIdCount(),
+                                       g_ownMenuTree.size());
+                        }
+                    }
                     if (!already && groupId != nullptr) {
                         OwnItem& holder = g_ownItems[count++];
                         std::snprintf(holder.id, sizeof(holder.id), "%s", groupId);
@@ -8140,7 +11656,7 @@ void buildOwnItems()
             }
             OwnItem& row = g_ownItems[count];
             std::snprintf(row.id, sizeof(row.id), "tk.m%zu.%zu", i, c);
-            std::snprintf(row.nameKey, sizeof(row.nameKey), "%s", row.id);
+            std::snprintf(row.nameKey, sizeof(row.nameKey), "tk.m%zu.%zu", i, c);
             copyAscii(row.text, sizeof(row.text), child.labelText().c_str());
             row.type = type;
             row.module = static_cast<int>(i);
@@ -8149,7 +11665,6 @@ void buildOwnItems()
             ++count;
         }
     }
-
     if (kVanillaKeyRows && !useOwnKeyGroups() && g_keyRowCount > 0
         && count + 2 <= kMaxOwnItems) {
         g_keyRowMade = true;
@@ -8171,7 +11686,38 @@ void buildOwnItems()
         holder.child = 9999;
         holder.comp = nullptr;
     }
+    if (kOwnJsonTabEntry && count + 2 <= kMaxOwnItems) {
+        OwnItem& tab = g_ownItems[count++];
+        std::snprintf(tab.id, sizeof(tab.id), "%s", kOwnTabId);
+        std::snprintf(tab.nameKey, sizeof(tab.nameKey), "%s", kOwnTabNameKey);
+        copyAscii(tab.text, sizeof(tab.text), L"Schematica");
+        tab.type = kCompTypeGroupInfo;
+        tab.module = kJsonTabModule;
+        tab.child = -1;
+        tab.comp = nullptr;
+
+        OwnItem& nav = g_ownItems[count++];
+        std::snprintf(nav.id, sizeof(nav.id), "%s", kOwnNavId);
+        std::snprintf(nav.nameKey, sizeof(nav.nameKey), "%s", kOwnTabNameKey);
+        copyAscii(nav.text, sizeof(nav.text), L"Schematica");
+        nav.type = 5;
+        nav.module = kJsonTabModule;
+        nav.child = 0;
+        nav.comp = nullptr;
+    }
     g_ownItemCount.store(count);
+
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true)) {
+        log().info(L"UiProbe: built {} own item(s) (limit {})", count, kMaxOwnItems);
+    }
+    if (count >= kMaxOwnItems) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            log().warn(L"UiProbe: own items hit the limit ({}) - the tree is cut short",
+                       kMaxOwnItems);
+        }
+    }
 }
 
 std::uintptr_t g_ownViewPool[kMaxOwnProviders][2]{};
@@ -8237,7 +11783,6 @@ void dumpComponentStrings(const unsigned char* comp, int kind)
         if (size == 0) {
             continue;
         }
-
         bool printable = true;
         for (size_t i = 0; i < size; ++i) {
             const auto ch = static_cast<unsigned char>(text[i]);
@@ -8251,6 +11796,173 @@ void dumpComponentStrings(const unsigned char* comp, int kind)
         }
         const std::string body(text, size);
     }
+}
+
+void dumpTextDonor(const unsigned char* comp)
+{
+    if (comp == nullptr || !memory::isReadable(comp, kCompSize)) {
+        return;
+    }
+    log().info(L"UiProbe: --- text (kind 4) donor at {} ---", static_cast<const void*>(comp));
+    for (std::ptrdiff_t off = 0x1D0; off + 8 <= kCompType; off += 8) {
+        std::uintptr_t word = 0;
+        std::memcpy(&word, comp + off, sizeof(word));
+        if (word == 0) {
+            continue;
+        }
+        std::wstring note;
+        if (off + 0x20 <= kCompType) {
+            std::uintptr_t size = 0;
+            std::uintptr_t room = 0;
+            std::memcpy(&size, comp + off + kStringSize, sizeof(size));
+            std::memcpy(&room, comp + off + kStringCapacity, sizeof(room));
+            if (room >= kSsoCapacity && room <= 0x4000 && size <= room && size > 0) {
+                const char* text = (room == kSsoCapacity)
+                                       ? reinterpret_cast<const char*>(comp + off)
+                                       : reinterpret_cast<const char*>(word);
+                if (text != nullptr && memory::isReadable(text, size + 1)) {
+                    bool printable = true;
+                    for (size_t i = 0; i < size && printable; ++i) {
+                        const auto ch = static_cast<unsigned char>(text[i]);
+                        printable = (ch >= 0x20 && ch <= 0x7E);
+                    }
+                    if (printable) {
+                        const std::string body(text, size);
+                        note = std::format(L" string({}) \"{}\"",
+                                           (room == kSsoCapacity) ? L"sso" : L"heap",
+                                           std::wstring(body.begin(), body.end()));
+                    }
+                }
+            }
+        }
+        float asFloat = 0.0f;
+        std::memcpy(&asFloat, comp + off, sizeof(asFloat));
+        log().info(L"UiProbe:   +{:#05x} = {:#x} (float {}){}", static_cast<size_t>(off), word,
+                   asFloat, note);
+    }
+    std::uintptr_t provider = 0;
+    std::memcpy(&provider, comp + kCompBoolProvider, sizeof(provider));
+    if (provider == 0 || !memory::isReadable(reinterpret_cast<const void*>(provider), 0xA0)) {
+        log().warn(L"UiProbe:   the provider at +0x1E0 is not readable ({:#x})", provider);
+        return;
+    }
+    const auto* const p = reinterpret_cast<const unsigned char*>(provider);
+    std::uintptr_t notify = 0;
+    std::uintptr_t source = 0;
+    std::uintptr_t length = 0;
+    std::uintptr_t room = 0;
+    std::memcpy(&notify, p + kTextProviderNotify, sizeof(notify));
+    std::memcpy(&source, p + kTextProviderSource, sizeof(source));
+    std::memcpy(&length, p + kTextProviderDraft + kStringSize, sizeof(length));
+    std::memcpy(&room, p + kTextProviderDraft + kStringCapacity, sizeof(room));
+    log().info(L"UiProbe:   provider {:#x} notify={:#x} source={:#x} draft(len {} cap {}) has={}",
+               provider, notify, source, length, room,
+               static_cast<int>(p[kTextProviderHasDraft]));
+    std::uintptr_t vtable = 0;
+    std::memcpy(&vtable, p, sizeof(vtable));
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    if (vtable != 0 && memory::isReadable(reinterpret_cast<const void*>(vtable), 8 * 10)) {
+        for (int i = 0; i < 10; ++i) {
+            std::uintptr_t slot = 0;
+            std::memcpy(&slot, reinterpret_cast<const char*>(vtable) + i * 8, sizeof(slot));
+            log().info(L"UiProbe:   vtable[{}] = RVA {:#x}", i,
+                       (slot > base) ? (slot - base) : slot);
+        }
+    }
+}
+
+void dumpNavComponent(const unsigned char* comp, const std::string& id)
+{
+    if (comp == nullptr || !memory::isReadable(comp, kCompSize)) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    log().info(L"UiProbe: === json-navigation component \"{}\" at {} (kind {}) ===",
+               toUtf16(id), static_cast<const void*>(comp), comp[kCompType]);
+    for (std::ptrdiff_t off = 0; off + 0x20 <= kCompSize; off += 8) {
+        std::uintptr_t size = 0;
+        std::uintptr_t room = 0;
+        std::memcpy(&size, comp + off + kStringSize, sizeof(size));
+        std::memcpy(&room, comp + off + kStringCapacity, sizeof(room));
+        if (room < kSsoCapacity || room > 0x400 || size == 0 || size > room) {
+            continue;
+        }
+        const char* text = reinterpret_cast<const char*>(comp + off);
+        if (room > kSsoCapacity) {
+            std::uintptr_t ptr = 0;
+            std::memcpy(&ptr, comp + off, sizeof(ptr));
+            if (ptr == 0 || !memory::isReadable(reinterpret_cast<const void*>(ptr), size + 1)) {
+                continue;
+            }
+            text = reinterpret_cast<const char*>(ptr);
+        }
+        bool printable = true;
+        for (size_t i = 0; i < size && printable; ++i) {
+            const auto ch = static_cast<unsigned char>(text[i]);
+            printable = (ch >= 0x20 && ch <= 0x7E);
+        }
+        if (!printable) {
+            continue;
+        }
+        const std::string body(text, size);
+        log().info(L"UiProbe:   +{:#05x} string \"{}\"", static_cast<size_t>(off),
+                   toUtf16(body));
+    }
+    const auto self = reinterpret_cast<std::uintptr_t>(comp);
+    for (std::ptrdiff_t off = 0; off + 0x40 <= static_cast<std::ptrdiff_t>(kCompSize); off += 8) {
+        std::uintptr_t ptr = 0;
+        std::memcpy(&ptr, comp + off + 0x38, sizeof(ptr));
+        if (ptr == 0 || ptr != self + static_cast<std::uintptr_t>(off)) {
+            continue;
+        }
+        std::uintptr_t vtable = 0;
+        std::memcpy(&vtable, comp + off, sizeof(vtable));
+        std::uintptr_t doCall = 0;
+        if (vtable != 0 && memory::isReadable(reinterpret_cast<const void*>(vtable), 8 * 5)) {
+            std::memcpy(&doCall, reinterpret_cast<const char*>(vtable) + 0x10, sizeof(doCall));
+        }
+        std::uintptr_t cap0 = 0;
+        std::uintptr_t cap1 = 0;
+        std::uintptr_t cap2 = 0;
+        std::memcpy(&cap0, comp + off + 0x08, sizeof(cap0));
+        std::memcpy(&cap1, comp + off + 0x10, sizeof(cap1));
+        std::memcpy(&cap2, comp + off + 0x18, sizeof(cap2));
+        log().info(L"UiProbe:   +{:#05x} function _Do_call RVA {:#x} caps {:#x} {:#x} {:#x}",
+                   static_cast<size_t>(off), (doCall > base) ? (doCall - base) : doCall, cap0,
+                   cap1, cap2);
+    }
+    for (std::ptrdiff_t off = 0x1D0; off + 8 <= kCompSize; off += 8) {
+        std::uintptr_t word = 0;
+        std::memcpy(&word, comp + off, sizeof(word));
+        if (word == 0) {
+            continue;
+        }
+        log().info(L"UiProbe:   +{:#05x} = {:#x}{}", static_cast<size_t>(off), word,
+                   (word > base && word < base + 0x13000000)
+                       ? std::format(L" (module RVA {:#x})", word - base)
+                       : std::wstring{});
+    }
+}
+
+void dumpComponentVtable(const void* comp, int kind)
+{
+    if (comp == nullptr || !memory::isReadable(comp, 8)) {
+        return;
+    }
+    std::uintptr_t vtable = 0;
+    std::memcpy(&vtable, comp, sizeof(vtable));
+    if (vtable == 0 || !memory::isReadable(reinterpret_cast<const void*>(vtable), 8 * 32)) {
+        return;
+    }
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    std::wstring line;
+    for (int i = 0; i < 32; ++i) {
+        std::uintptr_t slot = 0;
+        std::memcpy(&slot, reinterpret_cast<const char*>(vtable) + i * 8, sizeof(slot));
+        line += std::format(L"{:#x} ", (slot > base) ? (slot - base) : slot);
+    }
+    log().info(L"UiProbe: component vtable for kind {} ({:#x}): {}", kind,
+               (vtable > base) ? (vtable - base) : vtable, line);
 }
 
 void dumpOptionList(const unsigned char* comp)
@@ -8340,7 +12052,6 @@ void dumpComponentPointers(const unsigned char* comp, std::uintptr_t base, int k
         if (moduleBase == 0 || vtable <= moduleBase || vtable >= moduleBase + 0x13000000) {
             continue;
         }
-
         std::uintptr_t slot[6]{};
         if (memory::isReadable(reinterpret_cast<const void*>(vtable), sizeof(slot))) {
             std::memcpy(slot, reinterpret_cast<const void*>(vtable), sizeof(slot));
@@ -8358,14 +12069,21 @@ void* findDonorByType(unsigned char type, const char* const* candidates, size_t 
         std::uintptr_t view[2] = {reinterpret_cast<std::uintptr_t>(candidates[i]),
                                   std::strlen(candidates[i])};
         void* const found = hooks::callSettingsFindComponent(registry, view);
-
         if (found != nullptr && memory::isReadable(found, kCompType + 1)
             && static_cast<const unsigned char*>(found)[kCompType] == type) {
             return found;
         }
     }
-
-    return (type < 16) ? g_donorByType[type].load() : nullptr;
+    void* const warm = (type < 16) ? g_donorByType[type].load() : nullptr;
+    if (warm == nullptr) {
+        return nullptr;
+    }
+    if (!memory::isReadable(warm, kCompType + 1)
+        || static_cast<const unsigned char*>(warm)[kCompType] != type) {
+        g_donorByType[type].store(nullptr);
+        return nullptr;
+    }
+    return warm;
 }
 
 void* findBooleanDonor()
@@ -8400,9 +12118,155 @@ void* findNumberDonor()
     return findDonorByType(2, kCandidates, std::size(kCandidates));
 }
 
+std::string readCompId(const void* comp)
+{
+    if (comp == nullptr || !memory::isReadable(comp, kCompId + 0x20)) {
+        return {};
+    }
+    const auto* const slot = static_cast<const char*>(comp) + kCompId;
+    std::uintptr_t size = 0;
+    std::uintptr_t room = 0;
+    std::memcpy(&size, slot + kStringSize, sizeof(size));
+    std::memcpy(&room, slot + kStringCapacity, sizeof(room));
+    if (size == 0 || size > 200 || room < size) {
+        return {};
+    }
+    const char* text = slot;
+    if (room > kSsoCapacity) {
+        std::uintptr_t ptr = 0;
+        std::memcpy(&ptr, slot, sizeof(ptr));
+        if (ptr == 0 || !memory::isReadable(reinterpret_cast<const void*>(ptr), size)) {
+            return {};
+        }
+        text = reinterpret_cast<const char*>(ptr);
+    }
+    std::string out(text, size);
+    for (const char ch : out) {
+        if (static_cast<unsigned char>(ch) < 0x20 || static_cast<unsigned char>(ch) > 0x7E) {
+            return {};
+        }
+    }
+    return out;
+}
+
+void dumpNavComponent(const unsigned char* comp, const std::string& id);
+
+void dumpSettingsRegistry(const wchar_t* why)
+{
+    void* const registry = g_settingsRegistry.load();
+    if (registry == nullptr || !memory::isReadable(registry, 0x58)) {
+        log().warn(L"UiProbe: registry census ({}) - no registry", why);
+        return;
+    }
+    std::uintptr_t head = 0;
+    std::memcpy(&head, static_cast<const char*>(registry) + 0x50, sizeof(head));
+    if (head == 0 || !memory::isReadable(reinterpret_cast<const void*>(head), 0x40)) {
+        log().warn(L"UiProbe: registry census ({}) - the list head is not readable", why);
+        return;
+    }
+    size_t counts[16]{};
+    size_t nodes = 0;
+    size_t comps = 0;
+    std::string textIds;
+    std::string navIds;
+    std::uintptr_t node = 0;
+    std::memcpy(&node, reinterpret_cast<const void*>(head), sizeof(node));
+    while (node != 0 && node != head && nodes < 4096
+           && memory::isReadable(reinterpret_cast<const void*>(node), 0x40)) {
+        ++nodes;
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        std::memcpy(&begin, reinterpret_cast<const char*>(node) + 0x30, sizeof(begin));
+        std::memcpy(&end, reinterpret_cast<const char*>(node) + 0x38, sizeof(end));
+        for (std::uintptr_t at = begin; at + 8 <= end && at - begin < 0x8000; at += 8) {
+            if (!memory::isReadable(reinterpret_cast<const void*>(at), 8)) {
+                break;
+            }
+            std::uintptr_t comp = 0;
+            std::memcpy(&comp, reinterpret_cast<const void*>(at), sizeof(comp));
+            if (comp == 0 || !memory::isReadable(reinterpret_cast<const void*>(comp), kCompSize)) {
+                continue;
+            }
+            ++comps;
+            const auto kind = reinterpret_cast<const unsigned char*>(comp)[kCompType];
+            if (kind < 16) {
+                ++counts[kind];
+            }
+            if (kind == 4 && textIds.size() < 600) {
+                textIds += readCompId(reinterpret_cast<const void*>(comp));
+                textIds += ' ';
+            }
+            {
+                const std::string one = readCompId(reinterpret_cast<const void*>(comp));
+                if (one.rfind("json-navigation-", 0) == 0) {
+                    if (navIds.size() < 600) {
+                        navIds += one;
+                        navIds += ' ';
+                    }
+                    static std::atomic<int> shown{0};
+                    if (shown.fetch_add(1) < 2) {
+                        dumpNavComponent(reinterpret_cast<const unsigned char*>(comp), one);
+                    }
+                }
+            }
+        }
+        std::memcpy(&node, reinterpret_cast<const void*>(node), sizeof(node));
+    }
+    std::wstring tally;
+    for (size_t k = 0; k < 16; ++k) {
+        if (counts[k] != 0) {
+            tally += std::format(L"{}:{} ", k, counts[k]);
+        }
+    }
+    log().info(L"UiProbe: registry census ({}) - {} node(s), {} component(s), {}", why, nodes,
+               comps, tally);
+    if (!navIds.empty()) {
+        log().info(L"UiProbe:   json-navigation ids: {}", toUtf16(navIds));
+    }
+    if (!textIds.empty()) {
+        log().info(L"UiProbe:   kind 4 ids: {}", toUtf16(textIds));
+    }
+}
+
+void* findTextDonorPreferred()
+{
+    static const char* const kCandidates[] = {
+        "game.general.worldName",
+        "game.worldPreferences.worldSeed.string",
+        "game.cheats.randomTickSpeed.string",
+        "game.worldOptions.respawnRadius",
+    };
+    void* const registry = g_settingsRegistry.load();
+    if (registry == nullptr) {
+        return nullptr;
+    }
+    for (const char* const candidate : kCandidates) {
+        std::uintptr_t view[2] = {reinterpret_cast<std::uintptr_t>(candidate),
+                                  std::strlen(candidate)};
+        void* const found = hooks::callSettingsFindComponent(registry, view);
+        if (found != nullptr && memory::isReadable(found, kCompType + 1)
+            && static_cast<const unsigned char*>(found)[kCompType] == 4) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
+void* findTextDonor()
+{
+    if (void* const good = findTextDonorPreferred(); good != nullptr) {
+        return good;
+    }
+    static const char* const kCandidates[] = {
+        "account.change_name",
+    };
+    return findDonorByType(4, kCandidates, std::size(kCandidates));
+}
+
 std::atomic<void*> g_ownGroupDonor{nullptr};
 
 void* findActionDonor();
+void* findTextDonorPreferred();
 void* findKeyResetDonor();
 void* findRegistryNode(void* registry, const std::wstring& id);
 bool callStdFunctionInto(void* fn, void* out);
@@ -8414,11 +12278,17 @@ bool ensureOwnItem(size_t index)
     }
     OwnItem& item = g_ownItems[index];
     if (item.comp != nullptr) {
-        return true;
+        if (item.type == 4 && item.weakBody && findTextDonorPreferred() != nullptr) {
+            item.comp = nullptr;
+            item.weakBody = false;
+            log().info(L"UiProbe: rebuilding the text row {} with a better body",
+                       toUtf16(item.id));
+        } else {
+            return true;
+        }
     }
     const bool isGroup = (item.type == kCompTypeGroupInfo);
     void* donor = nullptr;
-
     void* providerDonor = nullptr;
     std::uintptr_t donorBase = 0;
     if (isGroup) {
@@ -8427,25 +12297,40 @@ bool ensureOwnItem(size_t index)
         donor = findNumberDonor();
         providerDonor = donor;
     } else if (item.type == 5) {
-
         donor = findActionDonor();
         providerDonor = donor;
+    } else if (item.type == 4) {
+        donor = findTextDonorPreferred();
+        item.weakBody = (donor == nullptr);
+        if (donor == nullptr) {
+            donor = findTextDonor();
+        }
+        providerDonor = nullptr;
+        if (donor == nullptr) {
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true)) {
+                log().warn(L"UiProbe: no text donor for {} - the row will not appear",
+                           toUtf16(item.id));
+                dumpSettingsRegistry(L"no text donor");
+            }
+        }
     } else if (item.type == 3) {
-
         donor = findOptionDonor();
         providerDonor = donor;
     } else {
         donor = findBooleanDonor();
         providerDonor = donor;
     }
-
     if (donor == nullptr && item.type == 5 && g_donorTemplate[5].ready) {
         donor = g_donorTemplate[5].bytes;
         providerDonor = donor;
         donorBase = g_donorTemplate[5].base;
     }
+    if (donor == nullptr && item.type == 4 && g_donorTemplate[4].ready) {
+        donor = g_donorTemplate[4].bytes;
+        donorBase = g_donorTemplate[4].base;
+    }
     if (donor == nullptr) {
-
         g_ownItemsIncomplete.store(true);
         return false;
     }
@@ -8454,14 +12339,31 @@ bool ensureOwnItem(size_t index)
         return false;
     }
     void* provider = nullptr;
-    if (item.type == 0 || item.type == 2 || item.type == 3) {
-
+    if (item.type == 4) {
+        if (!prepareOwnTextVtable()) {
+            return false;
+        }
+        void* const own = hooks::callGameAllocate(kBoolProviderSize);
+        if (own == nullptr) {
+            return false;
+        }
+        std::memset(own, 0, kBoolProviderSize);
+        const auto vtable = reinterpret_cast<std::uintptr_t>(&g_ownTextVtable[0]);
+        std::memcpy(own, &vtable, sizeof(vtable));
+        const size_t slot = g_providerLinkCount.load();
+        if (slot >= kMaxOwnItems) {
+            return false;
+        }
+        g_providerLinks[slot].provider = own;
+        g_providerLinks[slot].index = static_cast<int>(index);
+        g_providerLinkCount.store(slot + 1);
+        provider = own;
+    } else if (item.type == 0 || item.type == 2 || item.type == 3) {
         std::uintptr_t donorProvider = 0;
         std::memcpy(&donorProvider, static_cast<const char*>(providerDonor) + kCompBoolProvider,
                     sizeof(donorProvider));
         const bool isNumber = (item.type == 2);
         const bool isOption = (item.type == 3);
-
         const size_t providerSize = kBoolProviderSize;
         if (donorProvider == 0
             || !memory::isReadable(reinterpret_cast<const void*>(donorProvider), providerSize)) {
@@ -8488,7 +12390,6 @@ bool ensureOwnItem(size_t index)
                      : (isNumber ? &g_ownNumberVtable[0] : &g_ownBoolVtable[0]));
         std::memcpy(own, &vtable, sizeof(vtable));
         if (isOption) {
-
             std::memset(static_cast<char*>(own) + kOptionProviderList, 0,
                         sizeof(std::uintptr_t) * 3);
         }
@@ -8506,14 +12407,11 @@ bool ensureOwnItem(size_t index)
                            std::strlen(item.nameKey), item.type, provider, donorBase)) {
         return false;
     }
-
     if (item.type == 2) {
         const float scale = ownItemNumberScale(static_cast<int>(index));
         std::memcpy(comp + 0x1E8, &scale, sizeof(scale));
     }
-
     if (item.type == 3) {
-
         if (!g_optionDonor.ready) {
             dumpOptionList(static_cast<const unsigned char*>(donor));
         }
@@ -8525,7 +12423,6 @@ bool ensureOwnItem(size_t index)
         }
     }
     item.comp = comp;
-
     {
         static std::atomic<int> said{0};
     }
@@ -8543,7 +12440,6 @@ void* findKeyResetDonor()
         "keyboardAndMouse.inputGroup.full.key.attack.reset",
         "keyboardAndMouse.inputGroup.standard.key.jump.reset",
     };
-
     if (void* const warm = g_keyResetDonor.load();
         warm != nullptr && memory::isReadable(warm, kCompSize)
         && static_cast<const unsigned char*>(warm)[kCompType] == 5) {
@@ -8569,19 +12465,16 @@ void* findKeyResetDonor()
         if (pass != 0) {
             break;
         }
-
         static const wchar_t* const kGroups[] = {
             L"keyboardAndMouse.inputGroup.standard.key.attack",
             L"keyboardAndMouse.inputGroup.full.key.attack",
             L"keyboardAndMouse.inputGroup.standard.key.jump",
         };
-
         break;
     }
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true)) {
         log().warn(L"UiProbe: could not capture the reset donor for key rows");
-
         if (void* const head = findRegistryNode(registry, L"settings-tabs-groups");
             head != nullptr) {
             void* node = head;
@@ -8649,6 +12542,12 @@ void rebuildOwnComponents(void* groupDonor)
     for (auto& one : g_ownPending) {
         one.has.store(false);
     }
+    {
+        const std::lock_guard<std::mutex> lock(g_ownPendingTextMutex);
+        for (auto& one : g_ownPendingText) {
+            one.has = false;
+        }
+    }
     for (auto& slot : g_donorByType) {
         slot.store(nullptr);
     }
@@ -8664,6 +12563,7 @@ void rebuildOwnComponents(void* groupDonor)
     int madeTabs = 0;
     for (size_t i = 0; i < items; ++i) {
         g_ownItems[i].comp = nullptr;
+        g_ownItems[i].weakBody = false;
     }
     for (size_t i = 0; i < items; ++i) {
         if (g_ownItems[i].type == kCompTypeGroupInfo && ensureOwnItem(i)) {
@@ -8689,7 +12589,6 @@ void fillOwnItemsByPrefix(void* out, const std::uintptr_t (&vec)[3], size_t coun
         if (!exact && std::strchr(id + want.size(), '.') != nullptr) {
             continue;
         }
-
         if (onlyModule >= 0 && g_ownItems[i].module != onlyModule) {
             continue;
         }
@@ -8728,8 +12627,10 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], size_t count, int o
     size_t picks = 0;
     const size_t items = g_ownItemCount.load();
     if (owner < 0) {
-
         for (size_t i = 0; i < items && picks < kMaxOwnItems; ++i) {
+            if (g_ownItems[i].module == kJsonTabModule) {
+                continue;
+            }
             if (g_ownItems[i].type == kCompTypeGroupInfo && g_ownItems[i].child < 0
                 && g_ownItems[i].comp != nullptr) {
                 picked[picks++] = g_ownItems[i].comp;
@@ -8738,19 +12639,18 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], size_t count, int o
     } else {
         const int module = g_ownItems[static_cast<size_t>(owner)].module;
         for (size_t i = 0; i < items && picks < kMaxOwnItems; ++i) {
-
             const bool isTabItself = (g_ownItems[i].child < 0);
-            const bool isOwnRow = (module == kKeysModule)
-                                      ? (g_ownItems[i].child == 9999)
-                                      : (std::strncmp(g_ownItems[i].id, "tk.m", 4) == 0);
+            const bool isOwnRow =
+                (module == kKeysModule)
+                    ? (g_ownItems[i].child == 9999)
+                    : (std::strncmp(g_ownItems[i].id, "tk.m", 4) == 0
+                       || std::strcmp(g_ownItems[i].id, kOwnNavId) == 0);
             if (g_ownItems[i].module == module && !isTabItself && isOwnRow) {
-
                 if (ensureOwnItem(i) && g_ownItems[i].comp != nullptr) {
                     picked[picks++] = g_ownItems[i].comp;
                 }
             }
         }
-
         if (useOwnKeyGroups()) {
             for (size_t i = 0; i < items && picks < kMaxOwnItems; ++i) {
                 if (g_ownItems[i].child == 9999 && g_ownItems[i].module == module
@@ -8762,7 +12662,6 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], size_t count, int o
         }
     }
     if (picks == 0) {
-
         std::memcpy(static_cast<char*>(out) + 0x08, &vec[0], sizeof(vec[0]));
         return;
     }
@@ -8795,6 +12694,108 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], size_t count, int o
                 }
             }
         }
+    }
+}
+
+constexpr unsigned kOwnTabEnum = 0x27;
+
+constexpr char kOwnScreenName[] = "tsukuyomi.schematica";
+constexpr char kOwnTabDescKey[] = "tk.schematica.tab";
+
+constexpr bool kAddOwnJsonTab = kOwnJsonTabEntry;
+
+void afterSettingsTabList(void* out)
+{
+    if (!kAddOwnSettingsTab || out == nullptr || !memory::isWritable(out, 0x18)) {
+        return;
+    }
+    std::uintptr_t vec[3]{};
+    std::memcpy(vec, out, sizeof(vec));
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true)) {
+        const size_t count = (vec[1] > vec[0]) ? (vec[1] - vec[0]) / 8 : 0;
+        log().info(L"UiProbe: settings tab list has {} entr(ies)", count);
+        for (size_t i = 0; i < count && i < 64; ++i) {
+            std::uintptr_t entry = 0;
+            std::memcpy(&entry, reinterpret_cast<const void*>(vec[0] + i * 8), sizeof(entry));
+            if (entry == 0 || !memory::isReadable(reinterpret_cast<const void*>(entry), 0x60)) {
+                log().info(L"UiProbe:   tab[{}] = {:#x}", i, entry);
+                continue;
+            }
+            std::wstring texts;
+            for (std::ptrdiff_t off = 0; off + 0x20 <= 0x60; off += 8) {
+                const auto* const slot = reinterpret_cast<const char*>(entry) + off;
+                std::uintptr_t size = 0;
+                std::uintptr_t room = 0;
+                std::memcpy(&size, slot + kStringSize, sizeof(size));
+                std::memcpy(&room, slot + kStringCapacity, sizeof(room));
+                if (size == 0 || size > 200 || room < size || room > 0x400) {
+                    continue;
+                }
+                const char* text = slot;
+                if (room > kSsoCapacity) {
+                    std::uintptr_t ptr = 0;
+                    std::memcpy(&ptr, slot, sizeof(ptr));
+                    if (ptr == 0
+                        || !memory::isReadable(reinterpret_cast<const void*>(ptr), size + 1)) {
+                        continue;
+                    }
+                    text = reinterpret_cast<const char*>(ptr);
+                }
+                bool printable = true;
+                for (size_t k = 0; k < size && printable; ++k) {
+                    const auto ch = static_cast<unsigned char>(text[k]);
+                    printable = (ch >= 0x20 && ch <= 0x7E);
+                }
+                if (!printable) {
+                    continue;
+                }
+                texts += std::format(L" +{:#x} [{}]", static_cast<size_t>(off),
+                                     toUtf16(std::string(text, size)));
+            }
+            unsigned tag = 0;
+            std::memcpy(&tag, reinterpret_cast<const void*>(entry), sizeof(tag));
+            log().info(L"UiProbe:   tab[{}] {:#x} first-dword {:#x}{}", i, entry, tag, texts);
+        }
+    }
+    if (!kAddOwnJsonTab) {
+        return;
+    }
+    static std::uintptr_t screenView[2] = {
+        reinterpret_cast<std::uintptr_t>(kOwnScreenName), sizeof(kOwnScreenName) - 1};
+    static std::uintptr_t descView[2] = {reinterpret_cast<std::uintptr_t>(kOwnTabDescKey),
+                                         sizeof(kOwnTabDescKey) - 1};
+    const bool ok = hooks::callSettingsAddTab(out, kOwnTabEnum, screenView, descView);
+    std::uintptr_t now[3]{};
+    std::memcpy(now, out, sizeof(now));
+    std::wstring was;
+    if (ok && now[1] > now[0]) {
+        std::uintptr_t entry = 0;
+        std::memcpy(&entry, reinterpret_cast<const void*>(now[1] - 8), sizeof(entry));
+        if (entry != 0 && memory::isWritable(reinterpret_cast<void*>(entry), 0x50)) {
+            auto* const p = reinterpret_cast<char*>(entry);
+            std::uintptr_t size = 0;
+            std::uintptr_t room = 0;
+            std::memcpy(&size, p + 0x08 + kStringSize, sizeof(size));
+            std::memcpy(&room, p + 0x08 + kStringCapacity, sizeof(room));
+            const char* text = p + 0x08;
+            if (room > kSsoCapacity) {
+                std::uintptr_t ptr = 0;
+                std::memcpy(&ptr, p + 0x08, sizeof(ptr));
+                text = reinterpret_cast<const char*>(ptr);
+            }
+            if (text != nullptr && size > 0 && size < 100
+                && memory::isReadable(text, size + 1)) {
+                was = toUtf16(std::string(text, size));
+            }
+            writeSsoString(p + 0x08, kOwnTabId, sizeof(kOwnTabId) - 1);
+            writeSsoString(p + 0x28, kOwnTabNameKey, sizeof(kOwnTabNameKey) - 1);
+        }
+    }
+    static std::atomic<int> said{0};
+    if (said.fetch_add(1) < 3) {
+        log().info(L"UiProbe: added our settings tab ({}); id [{}] -> [{}]",
+                   ok ? L"ok" : L"failed", was, toUtf16(kOwnTabId));
     }
 }
 
@@ -8831,9 +12832,7 @@ void afterSettingsGroupRegister(void* registry, const void* idView, void* provid
 
     const size_t items = g_ownItemCount.load();
     registerOne(kOwnGroupIdBytes, sizeof(kOwnGroupIdBytes) - 1);
-
     if (kVanillaKeyRows) {
-
         const bool registerHolders = useOwnKeyGroups();
         for (size_t i = 0; i < items; ++i) {
             if (g_ownItems[i].type != kCompTypeGroupInfo || g_ownItems[i].child < 0) {
@@ -8851,7 +12850,6 @@ void afterSettingsGroupRegister(void* registry, const void* idView, void* provid
         }
     }
     g_ownProvidersReady.store(false);
-
     g_keyResetDonor.store(nullptr);
 }
 
@@ -8883,7 +12881,6 @@ void onSettingsProviderCall(void* self, void* out)
         tell = told.insert(group).second;
     }
     if (tell) {
-
         const size_t count = static_cast<size_t>(bytes / 8);
         for (size_t i = 0; i < count && i < 12; ++i) {
             std::uintptr_t item = 0;
@@ -8906,13 +12903,11 @@ void onSettingsProviderCall(void* self, void* out)
     const size_t count = static_cast<size_t>(bytes / 8);
 
     if (group == L"settings-tabs-groups") {
-
         if (count >= 1) {
             std::uintptr_t donor = 0;
             std::memcpy(&donor, reinterpret_cast<const void*>(vec[0]), sizeof(donor));
             rebuildOwnComponents(reinterpret_cast<void*>(donor));
         }
-
         if (g_ownCompsReady.load()) {
             void* const buf = hooks::callGameAllocate((count + 1) * 8);
             if (buf == nullptr) {
@@ -8941,10 +12936,44 @@ void onSettingsProviderCall(void* self, void* out)
         return;
     }
 
+    if (group == std::wstring(kOwnTabId, kOwnTabId + sizeof(kOwnTabId) - 1)) {
+        const int index = findOwnItem(kOwnNavId);
+        if (index >= 0 && ensureOwnItem(static_cast<size_t>(index))
+            && g_ownItems[static_cast<size_t>(index)].comp != nullptr) {
+            void* const one[1] = {g_ownItems[static_cast<size_t>(index)].comp};
+            const size_t room = static_cast<size_t>((vec[2] - vec[0]) / 8);
+            std::uintptr_t begin = vec[0];
+            if (room < 1) {
+                void* const buf = hooks::callGameAllocate(8);
+                if (buf == nullptr) {
+                    return;
+                }
+                begin = reinterpret_cast<std::uintptr_t>(buf);
+                const std::uintptr_t cap = begin + 8;
+                std::memcpy(static_cast<char*>(out) + 0x00, &begin, sizeof(begin));
+                std::memcpy(static_cast<char*>(out) + 0x10, &cap, sizeof(cap));
+            }
+            const auto value = reinterpret_cast<std::uintptr_t>(one[0]);
+            std::memcpy(reinterpret_cast<void*>(begin), &value, sizeof(value));
+            const std::uintptr_t end = begin + 8;
+            std::memcpy(static_cast<char*>(out) + 0x08, &end, sizeof(end));
+            static std::atomic<int> said{0};
+            if (said.fetch_add(1) < 2) {
+                log().info(L"UiProbe: served the json tab with 1 action ({})",
+                           toUtf16(kOwnNavId));
+            }
+        } else {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true)) {
+                log().warn(L"UiProbe: could not build the json navigation action");
+            }
+        }
+        return;
+    }
+
     if (group == std::wstring(kBorrowedKeyGroupId, kBorrowedKeyGroupId
                                                       + sizeof(kBorrowedKeyGroupId) - 1)) {
         if (!ownTabIsRendering()) {
-
             if (!callStdFunctionInto(g_vanillaBorrowedProvider, out)) {
                 std::memcpy(static_cast<char*>(out) + 0x08, &vec[0], sizeof(vec[0]));
             }
@@ -8953,12 +12982,10 @@ void onSettingsProviderCall(void* self, void* out)
         fillOwnItemsByPrefix(out, vec, count, L"tk.g", false);
         return;
     }
-
     if (group.size() > 4 && group.compare(0, 4, L"tk.g") == 0) {
         fillOwnItemsByPrefix(out, vec, count, group + L".", true);
         return;
     }
-
     if (useOwnKeyGroups() && group.size() > 4 && group.compare(0, 4, L"tk.k") == 0) {
         char idBytes[kOwnItemIdMax]{};
         size_t n = 0;
@@ -8968,11 +12995,56 @@ void onSettingsProviderCall(void* self, void* out)
         idBytes[n] = '\0';
         const int which = ownKeyGroupIndex(idBytes);
         if (which >= 0) {
+            if (g_vanillaBorrowedReady.load()) {
+                const bool ok = callStdFunctionInto(g_vanillaBorrowedProvider, out);
+                if (ok) {
+                    std::uintptr_t made[3]{};
+                    std::memcpy(made, out, sizeof(made));
+                    const size_t n = (made[1] >= made[0]) ? (made[1] - made[0]) / 8 : 0;
+                    size_t kept = 0;
+                    for (size_t i = 0; i < n; ++i) {
+                        std::uintptr_t comp = 0;
+                        std::memcpy(&comp, reinterpret_cast<const void*>(made[0] + i * 8),
+                                    sizeof(comp));
+                        if (comp == 0
+                            || !memory::isReadable(reinterpret_cast<const void*>(comp), 0x30)) {
+                            continue;
+                        }
+                        std::string cid;
+                        if (!readStdString(reinterpret_cast<const char*>(comp) + 0x08, cid)) {
+                            continue;
+                        }
+                        const int row = ownKeyRowIndexFromCompId(cid.c_str());
+                        if (row < 0 || g_ownKeyRows[row].module != which) {
+                            continue;
+                        }
+                        std::memcpy(reinterpret_cast<void*>(made[0] + kept * 8), &comp,
+                                    sizeof(comp));
+                        ++kept;
+                    }
+                    const std::uintptr_t end = made[0] + kept * 8;
+                    std::memcpy(static_cast<char*>(out) + 0x08, &end, sizeof(end));
+                }
+                static std::atomic<int> said{0};
+                if (said.fetch_add(1) < 6) {
+                    std::uintptr_t made[3]{};
+                    std::memcpy(made, out, sizeof(made));
+                    const size_t n = (made[1] >= made[0]) ? (made[1] - made[0]) / 8 : 0;
+                    for (size_t i = 0; i < n && i < 4; ++i) {
+                        std::uintptr_t comp = 0;
+                        std::memcpy(&comp, reinterpret_cast<const void*>(made[0] + i * 8),
+                                    sizeof(comp));
+                        std::string id;
+                    }
+                }
+                if (ok) {
+                    return;
+                }
+            }
             fillOwnItemsByPrefix(out, vec, count, L"tk.g", false, which);
             return;
         }
     }
-
     if (group == L"tk.k") {
         const int keys = ownKeysTabIndex();
         if (keys >= 0) {
@@ -9007,7 +13079,13 @@ bool beforeSettingsGroupInfoUpdate(void* self)
         return false;
     }
     const std::wstring id = readString(static_cast<const char*>(self) + kGroupInfoFacetId);
-
+    {
+        static std::mutex mutex;
+        static std::set<std::wstring> seen;
+        if (id.find(L"key.tk.") != std::wstring::npos) {
+            std::lock_guard<std::mutex> guard(mutex);
+        }
+    }
     static std::atomic<int> said{0};
     if (!kAddOwnSettingsTab) {
         return false;
@@ -9022,10 +13100,294 @@ void afterSettingsGroupInfoUpdate(void* self, bool swapped)
     (void)swapped;
 }
 
-void onSettingsFindComponent(void* registry, void* out, const void* idView)
-{
-    (void)registry;
+std::atomic<std::uintptr_t> g_navComp{0};
 
+void* __fastcall pgDoneCopy(void* self, void* dest)
+{
+    if (self != nullptr && dest != nullptr) {
+        std::memcpy(dest, self, 0x38);
+    }
+    return dest;
+}
+void* __fastcall pgDoneCall(void*, void*, void*, void*) { return nullptr; }
+void* __fastcall pgDoneType(void*) { return nullptr; }
+void __fastcall pgDoneDelete(void*, unsigned) {}
+
+void* g_pgDoneVtable[8]{};
+alignas(16) unsigned char g_pgDone[0x40]{};
+
+alignas(16) unsigned char g_pgAction[0x40]{};
+std::atomic<std::uintptr_t> g_pgActionImpl{0};
+
+bool copyNavAction(std::uintptr_t comp)
+{
+    if (g_pgActionImpl.load() != 0) {
+        return true;
+    }
+    if (comp == 0 || !memory::isReadable(reinterpret_cast<const void*>(comp), kCompSize)) {
+        return false;
+    }
+    std::uintptr_t impl = 0;
+    std::memcpy(&impl, reinterpret_cast<const char*>(comp) + kCompActionEnabledFnPtr,
+                sizeof(impl));
+    if (impl == 0 || !memory::isReadable(reinterpret_cast<const void*>(impl), 8)) {
+        return false;
+    }
+    std::uintptr_t vtable = 0;
+    std::memcpy(&vtable, reinterpret_cast<const void*>(impl), sizeof(vtable));
+    if (vtable == 0 || !memory::isReadable(reinterpret_cast<const void*>(vtable), 0x28)) {
+        return false;
+    }
+    std::uintptr_t copyFn = 0;
+    std::memcpy(&copyFn, reinterpret_cast<const char*>(vtable), sizeof(copyFn));
+    if (copyFn == 0) {
+        return false;
+    }
+    std::memset(g_pgAction, 0, sizeof(g_pgAction));
+    using CopyFn = void*(__fastcall*)(void*, void*);
+    void* fresh = nullptr;
+    __try {
+        fresh = reinterpret_cast<CopyFn>(copyFn)(reinterpret_cast<void*>(impl), &g_pgAction[0]);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log().warn(L"UiProbe: could not copy the navigation action");
+        return false;
+    }
+    if (fresh == nullptr) {
+        return false;
+    }
+    const auto value = reinterpret_cast<std::uintptr_t>(fresh);
+    std::memcpy(g_pgAction + 0x38, &value, sizeof(value));
+    g_pgActionImpl.store(value);
+    log().info(L"UiProbe: copied the navigation action ({:#x} -> {:#x})", impl, value);
+    return true;
+}
+
+bool callCopiedNavAction()
+{
+    const std::uintptr_t impl = g_pgActionImpl.load();
+    if (impl == 0 || !memory::isReadable(reinterpret_cast<const void*>(impl), 8)) {
+        return false;
+    }
+    std::uintptr_t vtable = 0;
+    std::memcpy(&vtable, reinterpret_cast<const void*>(impl), sizeof(vtable));
+    if (vtable == 0 || !memory::isReadable(reinterpret_cast<const void*>(vtable), 0x28)) {
+        return false;
+    }
+    std::uintptr_t doCall = 0;
+    std::memcpy(&doCall, reinterpret_cast<const char*>(vtable) + 0x10, sizeof(doCall));
+    if (doCall == 0) {
+        return false;
+    }
+    using DoCall = void*(__fastcall*)(void*, void*);
+    __try {
+        reinterpret_cast<DoCall>(doCall)(reinterpret_cast<void*>(impl), &g_pgDone[0]);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        log().warn(L"UiProbe: the copied navigation action threw");
+        return false;
+    }
+}
+
+void* findRegistryComponent(const char* id)
+{
+    void* const registry = g_settingsRegistry.load();
+    if (id == nullptr || registry == nullptr || !memory::isReadable(registry, 0x58)) {
+        return nullptr;
+    }
+    std::uintptr_t head = 0;
+    std::memcpy(&head, static_cast<const char*>(registry) + 0x50, sizeof(head));
+    if (head == 0 || !memory::isReadable(reinterpret_cast<const void*>(head), 0x40)) {
+        return nullptr;
+    }
+    std::uintptr_t node = 0;
+    std::memcpy(&node, reinterpret_cast<const void*>(head), sizeof(node));
+    size_t nodes = 0;
+    while (node != 0 && node != head && nodes < 4096
+           && memory::isReadable(reinterpret_cast<const void*>(node), 0x40)) {
+        ++nodes;
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        std::memcpy(&begin, reinterpret_cast<const char*>(node) + 0x30, sizeof(begin));
+        std::memcpy(&end, reinterpret_cast<const char*>(node) + 0x38, sizeof(end));
+        for (std::uintptr_t at = begin; at + 8 <= end && at - begin < 0x8000; at += 8) {
+            if (!memory::isReadable(reinterpret_cast<const void*>(at), 8)) {
+                break;
+            }
+            std::uintptr_t comp = 0;
+            std::memcpy(&comp, reinterpret_cast<const void*>(at), sizeof(comp));
+            if (comp == 0 || !memory::isReadable(reinterpret_cast<const void*>(comp), kCompSize)) {
+                continue;
+            }
+            if (readCompId(reinterpret_cast<const void*>(comp)) == id) {
+                return reinterpret_cast<void*>(comp);
+            }
+        }
+        std::memcpy(&node, reinterpret_cast<const void*>(node), sizeof(node));
+    }
+    return nullptr;
+}
+
+void renameNavComponent(const std::string& id, void* out)
+{
+    if (id != kOwnNavId) {
+        return;
+    }
+    if (out == nullptr || !memory::isReadable(out, 16)) {
+        return;
+    }
+    std::uintptr_t comp = 0;
+    std::memcpy(&comp, out, sizeof(comp));
+    if (comp == 0 || !memory::isWritable(reinterpret_cast<void*>(comp), kCompSize)) {
+        return;
+    }
+    const int index = findOwnItem(kOwnNavId);
+    if (index < 0) {
+        return;
+    }
+    const OwnItem& item = g_ownItems[static_cast<size_t>(index)];
+    const size_t keyLength = std::strlen(item.nameKey);
+    if (keyLength == 0 || keyLength + 2 > kOwnItemIdMax) {
+        return;
+    }
+    char valueKey[kOwnItemIdMax]{};
+    std::memcpy(valueKey, item.nameKey, keyLength);
+    valueKey[keyLength] = kKeyValueSuffix;
+    auto* const at = reinterpret_cast<unsigned char*>(comp);
+    if (readString(at + kCompNameKey) == toUtf16(item.nameKey)) {
+        g_navComp.store(comp);
+        copyNavAction(comp);
+        return;
+    }
+    writeSsoString(at + kCompNameKey, item.nameKey, keyLength);
+    writeSsoString(at + kCompActionLabel, valueKey, keyLength + 1);
+    g_navComp.store(comp);
+    copyNavAction(comp);
+    log().info(L"UiProbe: renamed the borrowed navigation component at {:#x} to {}", comp,
+               toUtf16(item.nameKey));
+}
+
+bool openOwnPage(bool force)
+{
+    static std::atomic<unsigned long long> lastAt{0};
+    const unsigned long long now = GetTickCount64();
+    if (!force && now - lastAt.load() < 500) {
+        return false;
+    }
+    lastAt.store(now);
+    if (!force) {
+        Schematica& mod = Schematica::instance();
+        const int beforeAt = mod.editingIndex();
+        const std::wstring beforeName =
+            (beforeAt >= 0) ? mod.blueprintName(static_cast<size_t>(beforeAt)) : std::wstring{};
+        mod.refreshFiles();
+        const int afterAt = mod.editingIndex();
+        const std::wstring afterName =
+            (afterAt >= 0) ? mod.blueprintName(static_cast<size_t>(afterAt)) : std::wstring{};
+        int screen = g_pgScreen.load();
+        const int was = screen;
+        const bool perBlueprint = screen == kScreenBlueprint || screen == kScreenMaterials
+                                  || screen == kScreenVerifier;
+        if (screen < 0 || screen >= kScreenCount) {
+            screen = kScreenMenu;
+        } else if (perBlueprint && (afterName.empty() || afterName != beforeName)) {
+            screen = kScreenBlueprints;
+        }
+        if (screen != was) {
+            g_pgScreen.store(screen);
+        }
+        (void)pageHeaderTitle();
+    }
+    g_ownNavInvokedAt.store(now);
+
+    g_afterInvokeLogs.store(0);
+
+    g_pgDoneVtable[0] = reinterpret_cast<void*>(&pgDoneCopy);
+    g_pgDoneVtable[1] = reinterpret_cast<void*>(&pgDoneCopy);
+    g_pgDoneVtable[2] = reinterpret_cast<void*>(&pgDoneCall);
+    g_pgDoneVtable[3] = reinterpret_cast<void*>(&pgDoneType);
+    g_pgDoneVtable[4] = reinterpret_cast<void*>(&pgDoneDelete);
+    std::memset(g_pgDone, 0, sizeof(g_pgDone));
+    {
+        const auto vtable = reinterpret_cast<std::uintptr_t>(&g_pgDoneVtable[0]);
+        std::memcpy(g_pgDone, &vtable, sizeof(vtable));
+        const auto self = reinterpret_cast<std::uintptr_t>(&g_pgDone[0]);
+        std::memcpy(g_pgDone + 0x38, &self, sizeof(self));
+    }
+
+    constexpr bool kAlwaysBorrowScreen = true;
+    const auto comp = kAlwaysBorrowScreen
+                          ? 0
+                          : reinterpret_cast<std::uintptr_t>(findRegistryComponent(kOwnNavId));
+    if (comp == 0) {
+        g_ownKeyOpenAt.store(GetTickCount64());
+        g_ownSettingsRoute.store(false);
+        g_afterInvokeLogs.store(0);
+        log().info(L"UiProbe: opening a screen from the key (lookups so far: {})",
+                   g_lookupCount.load());
+        if (hooks::callOpenHowToPlayScreen()) {
+            log().info(L"UiProbe: opened the borrowed How to Play screen for the page");
+            return true;
+        }
+        g_ownKeyOpenAt.store(0);
+        log().warn(L"UiProbe: could not open a screen (no client instance yet?)");
+        return false;
+    }
+    g_navComp.store(comp);
+
+    if (!memory::isReadable(reinterpret_cast<const void*>(comp), kCompSize)) {
+        log().warn(L"UiProbe: the navigation component is not readable ({:#x})", comp);
+        return false;
+    }
+    const auto kind = reinterpret_cast<const unsigned char*>(comp)[kCompType];
+    if (kind != 5) {
+        log().warn(L"UiProbe: the navigation component is kind {} (expected 5)", kind);
+        return false;
+    }
+    std::uintptr_t action = 0;
+    std::memcpy(&action, reinterpret_cast<const char*>(comp) + kCompActionEnabledFnPtr,
+                sizeof(action));
+    if (action == 0 || !memory::isReadable(reinterpret_cast<const void*>(action), 8)) {
+        log().warn(L"UiProbe: the navigation component has no action at +0x380");
+        return false;
+    }
+    {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            if (g_exeSize == 0) {
+                noteModule(GetModuleHandleW(nullptr), g_exeBase, g_exeSize);
+            }
+            std::uintptr_t vtable = 0;
+            std::memcpy(&vtable, reinterpret_cast<const void*>(action), sizeof(vtable));
+            std::wstring slots;
+            if (vtable != 0 && memory::isReadable(reinterpret_cast<const void*>(vtable), 0x28)) {
+                for (int i = 0; i < 5; ++i) {
+                    std::uintptr_t fn = 0;
+                    std::memcpy(&fn, reinterpret_cast<const char*>(vtable) + i * 8, sizeof(fn));
+                    slots += std::format(L"[{}] {} ", i, codeName(fn));
+                }
+            }
+            log().info(L"UiProbe: navigation action {:#x} vtable {:#x} {}", action, vtable,
+                       slots);
+        }
+    }
+    g_ownSettingsRoute.store(true);
+    const bool ok =
+        hooks::callSettingsInvokeAction(reinterpret_cast<void*>(comp), &g_pgDone[0]);
+    log().info(L"UiProbe: asked the game to open the Schematica page ({})",
+               ok ? L"ok" : L"the game said no");
+    return ok;
+}
+
+bool refreshOwnPage()
+{
+    if (findRegistryComponent(kOwnNavId) == nullptr) {
+        return false;
+    }
+    return openOwnPage();
+}
+
+void onSettingsFindComponent(void* , void* out, const void* idView)
+{
     if (kAddOwnSettingsTab && g_ownCompsReady.load() && out != nullptr
         && memory::isWritable(out, 16)) {
         const std::string want = readStringView(idView);
@@ -9033,21 +13395,43 @@ void onSettingsFindComponent(void* registry, void* out, const void* idView)
         if (want == kOwnGroupIdBytes) {
             own = g_ownSectionComp.load();
         } else if (kVanillaKeyRows && want == kBorrowedKeyGroupId) {
-
             g_ownRowTouchedAt.store(GetTickCount64());
-
             const int index = findOwnItem(want.c_str());
             if (index >= 0 && ensureOwnItem(static_cast<size_t>(index))) {
                 own = g_ownItems[static_cast<size_t>(index)].comp;
             }
         } else if (useOwnKeyGroups() && ownKeyGroupIndex(want.c_str()) >= 0) {
-
             const int index = findOwnItem(want.c_str());
             if (index >= 0 && ensureOwnItem(static_cast<size_t>(index))) {
                 own = g_ownItems[static_cast<size_t>(index)].comp;
             }
+        } else if (want.rfind("json-navigation-", 0) == 0) {
+            renameNavComponent(want, out);
         } else if (want.size() > 3 && want.compare(0, 3, "tk.") == 0) {
             const int index = findOwnItem(want.c_str());
+            {
+                static std::mutex mutex;
+                static std::set<std::string> seen;
+                static bool capped = false;
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!capped && seen.insert(want).second) {
+                    if (seen.size() > 64) {
+                        capped = true;
+                        log().info(L"UiProbe: stopped listing rows at 64");
+                    } else {
+                        const int type = index >= 0
+                                             ? g_ownItems[static_cast<size_t>(index)].type
+                                             : -1;
+                        log().info(L"UiProbe: row {} (type {})", toUtf16(want), type);
+                    }
+                }
+            }
+            {
+                static std::atomic<bool> told{false};
+                if (!told.exchange(true)) {
+                    dumpSettingsRegistry(L"looking for json-navigation");
+                }
+            }
             if (index >= 0 && ensureOwnItem(static_cast<size_t>(index))) {
                 own = g_ownItems[static_cast<size_t>(index)].comp;
 
@@ -9057,7 +13441,6 @@ void onSettingsFindComponent(void* registry, void* out, const void* idView)
             const auto value = reinterpret_cast<std::uintptr_t>(own);
             std::memcpy(out, &value, sizeof(value));
             *(static_cast<unsigned char*>(out) + 8) = 1;
-
             static std::atomic<int> said{0};
             return;
         }
@@ -9071,23 +13454,36 @@ void onSettingsFindComponent(void* registry, void* out, const void* idView)
             const auto kind = reinterpret_cast<const unsigned char*>(comp)[kCompType];
             if (kind < 16) {
                 g_donorByType[kind].store(reinterpret_cast<void*>(comp));
-
                 if (!g_donorTemplate[kind].ready
                     && memory::isReadable(reinterpret_cast<const void*>(comp), kCompSize)) {
                     std::memcpy(g_donorTemplate[kind].bytes, reinterpret_cast<const void*>(comp),
                                 kCompSize);
                     g_donorTemplate[kind].base = comp;
                     g_donorTemplate[kind].ready = true;
-
-                    if (g_ownItemsIncomplete.exchange(false)) {
-                        requestOwnPublishAllTabs();
+                    if (kind == 4) {
+                        dumpTextDonor(reinterpret_cast<const unsigned char*>(comp));
                     }
-
+                    if (kind == 0 || kind == 4) {
+                        dumpComponentVtable(reinterpret_cast<const void*>(comp),
+                                            static_cast<int>(kind));
+                    }
                     if (kind == 3 || kind == 5) {
                         dumpComponentStrings(g_donorTemplate[kind].bytes, static_cast<int>(kind));
                         dumpComponentCallables(g_donorTemplate[kind].bytes, comp,
                                                static_cast<int>(kind));
                     }
+                }
+                if (kind == 5) {
+                    const std::string seen = readStringView(idView);
+                    if (seen.rfind("json-navigation-", 0) == 0) {
+                        static std::atomic<int> said{0};
+                        if (said.fetch_add(1) < 2) {
+                            dumpNavComponent(reinterpret_cast<const unsigned char*>(comp), seen);
+                        }
+                    }
+                }
+                if (g_ownItemsIncomplete.exchange(false)) {
+                    requestOwnPublishAllTabs();
                 }
             }
         }
@@ -9101,7 +13497,6 @@ void onSettingsFindComponent(void* registry, void* out, const void* idView)
     if (id.empty()) {
         return;
     }
-
     static std::set<std::string> told;
     static std::mutex toldMutex;
     {
@@ -9185,7 +13580,6 @@ void pumpSettingsKeybind()
     const int requested = g_ownCaptureRequest.exchange(-1);
     if (requested >= 0) {
         MenuItem* const source = ownMenuItem(requested);
-
         const char* const pressedId =
             (requested >= 0 && static_cast<size_t>(requested) < kMaxOwnItems)
                 ? g_ownItems[static_cast<size_t>(requested)].id
@@ -9197,8 +13591,9 @@ void pumpSettingsKeybind()
             source->setKeys(source->defaultKeys);
             g_settingsDirty.store(true);
             requestOwnPublishWithTab(requested);
+        } else if (source != nullptr && source->opensPage) {
+            openOwnPage(true);
         } else if (source != nullptr && source->kind == MenuItemKind::Cycle) {
-
             if (source->activate) {
                 source->activate();
             }
@@ -9212,7 +13607,6 @@ void pumpSettingsKeybind()
     if (capturing < 0) {
         return;
     }
-
     std::vector<int> pressed;
     for (int vk = 0x08; vk <= 0xDF; ++vk) {
         if (vk >= 0x15 && vk <= 0x1A) {
@@ -9242,7 +13636,6 @@ void pumpSettingsKeybind()
         g_captureItem.store(-1);
         return;
     }
-
     const bool onlyModifiers =
         std::all_of(pressed.begin(), pressed.end(), [](int vk) { return keys::isModifier(vk); });
     if (onlyModifiers) {
@@ -9254,14 +13647,12 @@ void pumpSettingsKeybind()
     capturing = -1;
     g_captureItem.store(-1);
     requestOwnPublish(ownCaptureStateOf(target));
-
     MenuItem* const source = ownMenuItem(target);
     if (source == nullptr || !source->setKeys) {
         return;
     }
     source->setKeys(pressed);
     g_settingsDirty.store(true);
-
     requestOwnPublishWithTab(target);
 }
 
@@ -9278,7 +13669,6 @@ void pumpSettingsNumber()
     const float value = g_ownNumberValue.load();
     source->setNumber(value);
     g_settingsDirty.store(true);
-
     clearOwnPending(index);
     requestOwnPublishWithTab(index);
     static std::atomic<int> said{0};
@@ -9304,21 +13694,57 @@ void pumpSettingsChoice()
     requestOwnPublishWithTab(index);
 }
 
+void pumpSettingsText()
+{
+    const int index = g_ownTextRequest.exchange(-1);
+    if (index < 0) {
+        return;
+    }
+    MenuItem* const source = ownMenuItem(index);
+    if (source == nullptr || !source->setText) {
+        return;
+    }
+    char text[kOwnTextMax]{};
+    {
+        const std::lock_guard<std::mutex> lock(g_ownTextValueMutex);
+        std::snprintf(text, sizeof(text), "%s", g_ownTextValue);
+    }
+    source->setText(toUtf16(text));
+    g_settingsDirty.store(true);
+}
+
 LONG CALLBACK crashWatch(EXCEPTION_POINTERS* info)
 {
     if (info == nullptr || info->ExceptionRecord == nullptr) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     const DWORD code = info->ExceptionRecord->ExceptionCode;
-
     if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION
         && code != EXCEPTION_STACK_OVERFLOW && code != EXCEPTION_INT_DIVIDE_BY_ZERO
         && code != 0xC0000374 ) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    static std::atomic<int> said{0};
-    if (said.fetch_add(1) < 4) {
-        const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    constexpr std::size_t kCrashSeenMax = 32;
+    static std::atomic<std::uintptr_t> crashSeen[kCrashSeenMax] = {};
+    static std::atomic<std::size_t> crashSeenCount{0};
+    bool fresh = false;
+    {
+        const std::size_t used =
+            std::min(crashSeenCount.load(std::memory_order_acquire), kCrashSeenMax);
+        std::size_t i = 0;
+        for (; i < used; ++i) {
+            if (crashSeen[i].load(std::memory_order_relaxed) == at) {
+                break;
+            }
+        }
+        if (i == used && used < kCrashSeenMax) {
+            crashSeen[used].store(at, std::memory_order_relaxed);
+            crashSeenCount.store(used + 1, std::memory_order_release);
+            fresh = true;
+        }
+    }
+    if (fresh) {
         const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
@@ -9326,13 +13752,82 @@ LONG CALLBACK crashWatch(EXCEPTION_POINTERS* info)
                            reinterpret_cast<LPCWSTR>(&crashWatch), &self);
         const auto mine = reinterpret_cast<std::uintptr_t>(self);
         const bool inSelf = (mine != 0 && at >= mine && at < mine + 0x800000);
-        log().warn(L"UiProbe: crashed. exception {:#x} at {:#x} ({} RVA {:#x})", code, at,
-                   inSelf ? L"Tsukuyomi.dll" : L"Minecraft.Windows.exe",
-                   inSelf ? (at - mine) : (at > exe ? at - exe : 0));
+        HMODULE owner = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(at), &owner);
+        wchar_t ownerName[MAX_PATH] = L"";
+        if (owner != nullptr) {
+            GetModuleFileNameW(owner, ownerName, MAX_PATH);
+        }
+        const wchar_t* const slash = std::wcsrchr(ownerName, 0x5C );
+        const wchar_t* const leaf = slash != nullptr ? slash + 1 : ownerName;
+        if (owner != nullptr) {
+            log().warn(L"UiProbe: crashed. exception {:#x} at {:#x} ({} + {:#x}) thread {}",
+                       code, at, leaf, at - reinterpret_cast<std::uintptr_t>(owner),
+                       GetCurrentThreadId());
+        } else {
+            MEMORY_BASIC_INFORMATION mbi = {};
+            const SIZE_T got = VirtualQuery(reinterpret_cast<LPCVOID>(at), &mbi, sizeof(mbi));
+            log().warn(L"UiProbe: crashed. exception {:#x} at {:#x} (outside the module, base "
+                       L"{:#x} state {:#x} protect {:#x} type {:#x}) thread {}",
+                       code,
+                       at,
+                       got != 0 ? reinterpret_cast<std::uintptr_t>(mbi.AllocationBase) : 0,
+                       got != 0 ? mbi.State : 0,
+                       got != 0 ? mbi.Protect : 0,
+                       got != 0 ? mbi.Type : 0,
+                       GetCurrentThreadId());
+        }
+        log().warn(L"UiProbe: exe {:#x} / self {:#x} ({})",
+                   exe,
+                   mine,
+                   inSelf ? L"inside us" : L"outside us");
         if (info->ExceptionRecord->NumberParameters >= 2) {
-            log().warn(L"UiProbe:   touched address {:#x} ({})",
+            log().warn(L"UiProbe:   touched address {:#x}{} ({})",
                        info->ExceptionRecord->ExceptionInformation[1],
+                       ownName(info->ExceptionRecord->ExceptionInformation[1]),
                        info->ExceptionRecord->ExceptionInformation[0] == 0 ? L"read" : L"write");
+        }
+        if (g_exeSize == 0) {
+            noteModule(GetModuleHandleW(nullptr), g_exeBase, g_exeSize);
+        }
+        if (g_selfSize == 0 && self != nullptr) {
+            noteModule(self, g_selfBase, g_selfSize);
+        }
+        void* frames[24]{};
+        const USHORT got = CaptureStackBackTrace(0, 24, frames, nullptr);
+        std::wstring chain;
+        for (USHORT i = 0; i < got && i < 14; ++i) {
+            chain += std::format(L"[{}] {} ", i,
+                                 codeName(reinterpret_cast<std::uintptr_t>(frames[i])));
+        }
+        log().warn(L"UiProbe: call chain {}", chain);
+        if (const CONTEXT* const ctx = info->ContextRecord;
+            ctx != nullptr && memory::isReadable(ctx, sizeof(CONTEXT))) {
+            log().warn(L"UiProbe:   rax={:#x}{} rcx={:#x}{} rdx={:#x}{} r8={:#x}{} r9={:#x}{}",
+                       ctx->Rax, ownName(ctx->Rax), ctx->Rcx, ownName(ctx->Rcx), ctx->Rdx,
+                       ownName(ctx->Rdx), ctx->R8, ownName(ctx->R8), ctx->R9,
+                       ownName(ctx->R9));
+            constexpr std::size_t kProbeSlots = 192;
+            const auto* const sp = reinterpret_cast<const std::uintptr_t*>(ctx->Rsp);
+            if (memory::isReadable(sp, kProbeSlots * sizeof(std::uintptr_t))) {
+                std::wstring raw;
+                int found = 0;
+                for (std::size_t i = 0; i < kProbeSlots && found < 12; ++i) {
+                    const std::uintptr_t value = sp[i];
+                    const bool mine = (g_selfSize != 0 && value >= g_selfBase
+                                       && value < g_selfBase + g_selfSize);
+                    const bool game = (g_exeSize != 0 && value >= g_exeBase
+                                       && value < g_exeBase + g_exeSize);
+                    if (mine || game) {
+                        raw += std::format(L"(+{:#x}) {} ", i * sizeof(std::uintptr_t),
+                                           codeName(value));
+                        ++found;
+                    }
+                }
+                log().warn(L"UiProbe: raw stack {}", raw);
+            }
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -9369,7 +13864,7 @@ void pumpSettingsToggle()
     pumpSettingsKeybind();
     pumpSettingsNumber();
     pumpSettingsChoice();
-
+    pumpSettingsText();
     const int index = g_ownToggleRequest.exchange(-1);
     if (index < 0) {
         return;
@@ -9380,7 +13875,6 @@ void pumpSettingsToggle()
     }
     switch (source->kind) {
     case MenuItemKind::Keybind:
-
         g_ownCaptureRequest.store(index);
         return;
     case MenuItemKind::Cycle:
@@ -9402,9 +13896,24 @@ void pumpSettingsToggle()
 
 void pumpMenuSelection()
 {
+    {
+        static bool escDown = false;
+        const bool now = (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+        if (now && !escDown) {
+            if (!selfEscapeInFlight()) {
+                cancelPageReopen();
+            }
+            g_pgBag.store(nullptr);
+        }
+        escDown = now;
+    }
     if (kNavPaneOwnItems) {
         pumpNumberEntry();
     }
+    pumpPagePress();
+    pumpToggleState();
+    pumpPageReopen();
+    pumpPageEntry();
     dumpToggleControlPeriodically();
     reportSettingsGroups();
 
@@ -9443,7 +13952,6 @@ void onOptionRegister(void* self, int id, const void* name)
 
     void* known = g_optionSelf.load();
     if (known != self) {
-
         if (!g_optionSelf.compare_exchange_strong(known, self) && known != self) {
             log().warn(L"UiProbe: option registry self changed to {} at #{}",
                        static_cast<const void*>(self), index);
@@ -9459,7 +13967,6 @@ void onOptionRegister(void* self, int id, const void* name)
 
     const std::wstring text = readString(name);
     if (text.empty()) {
-
         return;
     }
 }

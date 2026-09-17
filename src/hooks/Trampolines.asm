@@ -27,6 +27,7 @@ tsukuyomiCameraTrampolineEntry proc
 
     sub rsp, 20h
     mov rcx, rdi
+    mov rdx, rbx
     call tsukuyomiCameraHook
     add rsp, 20h
 
@@ -77,7 +78,6 @@ tsukuyomiPlayerViewTrampolineEntry proc
     movdqu [rsp + 50h], xmm5
 
     sub rsp, 20h
-
     call tsukuyomiPlayerViewHook
     add rsp, 20h
 

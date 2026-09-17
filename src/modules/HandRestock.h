@@ -190,6 +190,13 @@ private:
     bool m_clientSideKnown = false;
     bool m_loggedClientSide = false;
 
+    mutable void* m_checkedHolder = nullptr;
+    mutable void* m_checkedContainer = nullptr;
+    mutable std::byte* m_checkedSlots = nullptr;
+
+    mutable void* m_localPlayerVtable = nullptr;
+    mutable bool m_localPlayerVtableTried = false;
+
     void watch(Spot spot, const Inventory& inventory, const SlotView& view);
 
     void servePending(Spot spot);

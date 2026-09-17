@@ -123,14 +123,12 @@ OffhandSwap& OffhandSwap::instance()
 
 bool OffhandSwap::available() const
 {
-
     return Scanner::instance().found(Target::SetSelectedSlot)
            && ItemStackRequest::instance().available();
 }
 
 void OffhandSwap::onScansReady()
 {
-
     ItemStackRequest::instance().onScansReady();
 
     ItemStackOps::instance().onScansReady();
@@ -141,28 +139,23 @@ void OffhandSwap::onScansReady()
 
 void OffhandSwap::onSetSelectedSlot(void* holder)
 {
-
     if (holder == nullptr) {
         return;
     }
 
     void* const previous = m_holder.exchange(holder, std::memory_order_acq_rel);
     if (previous != holder) {
-
         m_holderAlt.store(previous, std::memory_order_release);
     }
 }
 
 void OffhandSwap::onUpdate()
 {
-
     const bool wants = m_swapKey.triggered();
-
     if (!enabled() || !input::isInGameplay()) {
         return;
     }
     if (wants) {
-
         m_requestedAtMs.store(GetTickCount64(), std::memory_order_relaxed);
         m_requestedSlot.store(slotUnderCursor(), std::memory_order_release);
     }
@@ -170,7 +163,6 @@ void OffhandSwap::onUpdate()
 
 int OffhandSwap::slotUnderCursor()
 {
-
     if (!instance().screenSwapEnabled()) {
         return kHeldSlot;
     }
@@ -181,14 +173,12 @@ int OffhandSwap::slotUnderCursor()
     case InventoryScreen::Area::Inventory:
         return hovered.containerSlot;
     default:
-
         return kHeldSlot;
     }
 }
 
 bool OffhandSwap::onInventoryHotbarKey(const void* controller, int hotbarIndex)
 {
-
     if (!m_screenSwap || !enabled() || hotbarIndex < 0 || hotbarIndex >= kHotbarSlots) {
         return false;
     }
@@ -204,10 +194,8 @@ bool OffhandSwap::onInventoryHotbarKey(const void* controller, int hotbarIndex)
 
 void OffhandSwap::onPlayerViewUpdate()
 {
-
     if (!enabled()) {
         if (m_pending.active) {
-
             ItemStackOps::instance().discard();
         }
         m_pending = Pending{};
@@ -229,7 +217,6 @@ void OffhandSwap::onPlayerViewUpdate()
         if (GetTickCount64() < m_requestedAtMs.load(std::memory_order_relaxed) + kQueueWaitMs) {
             return;
         }
-
         m_requestedSlot.store(kNoRequest, std::memory_order_release);
         log().warn(L"OffhandSwap: dropped a swap, the previous one is still waiting for the "
                    L"server");
@@ -239,7 +226,6 @@ void OffhandSwap::onPlayerViewUpdate()
     int expected = slot;
     if (!m_requestedSlot.compare_exchange_strong(expected, kNoRequest, std::memory_order_acq_rel,
                                                  std::memory_order_acquire)) {
-
         return;
     }
     apply(slot);
@@ -253,7 +239,6 @@ void OffhandSwap::servePending()
 
     int result = 0;
     if (!ItemStackRequest::instance().takeResponse(m_pending.requestId, result)) {
-
         if (GetTickCount64() >= m_pending.giveUpAtMs) {
             log().warn(L"OffhandSwap: the server did not answer request {}, "
                        L"the hotbar and the server may disagree",
@@ -265,7 +250,6 @@ void OffhandSwap::servePending()
     }
 
     if (result == ItemStackRequest::kResultSuccess) {
-
         ItemStackOps::instance().discard();
         m_pending = Pending{};
         return;
@@ -287,7 +271,6 @@ void OffhandSwap::servePending()
 
 void OffhandSwap::onInventoryContent(const void* payload)
 {
-
     if (payload == nullptr || !memory::isReadable(payload, kPacketMinSize)) {
         return;
     }
@@ -296,7 +279,6 @@ void OffhandSwap::onInventoryContent(const void* payload)
     const int containerId =
         static_cast<int>(*reinterpret_cast<const std::int8_t*>(base + kPacketContainerIdOffset));
     if (containerId != kOffhandContainerId) {
-
         return;
     }
 
@@ -315,7 +297,6 @@ void OffhandSwap::onInventoryContent(const void* payload)
     std::memcpy(&item, entry + kEntryItemOffset, sizeof(item));
     std::memcpy(&netId, entry + kEntryNetIdOffset, sizeof(netId));
     if (item == nullptr || netId <= 0) {
-
         log().info(L"OffhandSwap: the server sent an empty offhand");
         return;
     }
@@ -339,15 +320,12 @@ void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
     StackView handView;
     if (readStack(hand, handView) && handView.item != nullptr) {
         m_netIdFix.hand = hand;
-
         if (slot == hands.selected && hands.offhand != nullptr) {
             m_netIdFix.mainhand = hands.offhand + (kMainhandOffset - kOffhandOffset);
         }
     }
     m_netIdFix.slot = slot;
-
     m_netIdFix.offhand = hands.offhand;
-
     m_netIdFix.serial = m_offhandSerial.load(std::memory_order_acquire);
     m_netIdFix.giveUpAtMs = GetTickCount64() + kNetIdWaitMs;
     m_netIdFix.active = true;
@@ -369,11 +347,8 @@ void OffhandSwap::serveNetIdFix()
     }
 
     if (m_offhandSerial.load(std::memory_order_acquire) == m_netIdFix.serial) {
-
         if (GetTickCount64() >= m_netIdFix.giveUpAtMs) {
-
             if (m_netIdFix.hand == nullptr) {
-
                 log().warn(L"OffhandSwap: the server did not send the offhand back after "
                            L"slot {} was moved into it, the next swap may be refused",
                            m_netIdFix.slot);
@@ -411,7 +386,6 @@ void OffhandSwap::serveNetIdFix()
     }
 
     if (serverMovedNetIds) {
-
         log().info(L"OffhandSwap: the server moved the net ids too, slot {} is already right",
                    m_netIdFix.slot);
         m_netIdFix = NetIdFix{};
@@ -426,10 +400,8 @@ void OffhandSwap::serveNetIdFix()
 
     std::int32_t wanted = 0;
     if (serverHeldNetIds) {
-
         wanted = m_netIdFix.offhandValue;
     } else {
-
         wanted = offhandNetId - 1;
         if (wanted <= handView.netValue) {
             log().warn(L"OffhandSwap: the offhand came back with net id {} but slot {} holds {} "
@@ -482,7 +454,6 @@ bool OffhandSwap::looksLikeInventory(std::byte* slots) const
     if (!readPointerGuarded(slots, first)) {
         return false;
     }
-
     if (!mainModule().contains(first)) {
         return false;
     }
@@ -578,7 +549,6 @@ int OffhandSwap::swapWithOffhand(const Hands* hands, int count, int slot)
 
 bool OffhandSwap::apply(int slot)
 {
-
     if (slot != kHeldSlot && (slot < 0 || slot >= kSlotCount)) {
         return false;
     }
@@ -592,7 +562,6 @@ bool OffhandSwap::apply(int slot)
         if (!resolve(holder, resolved)) {
             continue;
         }
-
         bool duplicate = false;
         for (int i = 0; i < count; ++i) {
             duplicate = duplicate || hands[i].container == resolved.container;
@@ -605,7 +574,6 @@ bool OffhandSwap::apply(int slot)
     }
 
     if (count == 0) {
-
         log().info(L"OffhandSwap: could not reach the hands for slot {} "
                    L"(holders {:#x} / {:#x})",
                    slot, reinterpret_cast<std::uintptr_t>(holders[0]),
@@ -625,7 +593,6 @@ bool OffhandSwap::apply(int slot)
     const bool serverAuthoritative = count <= 1;
 
     if (serverAuthoritative) {
-
         const int firstSlot = targetSlot(hands[0], slot);
         std::byte* const firstStack = hands[0].slots + kSlotStride * firstSlot;
 
@@ -649,7 +616,6 @@ bool OffhandSwap::apply(int slot)
         if (!useRequestPath && LegacyTransaction::instance().swap(
                 hands[0].player, LegacyTransaction::inventorySlot(firstSlot, firstStack),
                 LegacyTransaction::offhand(hands[0].offhand))) {
-
             const int applied = swapWithOffhand(hands, count, slot);
             if (applied == 0) {
                 log().warn(L"OffhandSwap: the server was told to swap but the client side "
@@ -669,9 +635,7 @@ bool OffhandSwap::apply(int slot)
             ItemStackRequest::inventorySlot(hands[0].slots, firstSlot);
         const ItemStackRequest::SlotRef offhand =
             ItemStackRequest::offhandSlot(hands[0].offhand);
-
         if (!ItemStackRequest::instance().requestSwap(hand, offhand)) {
-
             log().warn(L"OffhandSwap: the swap request for slot {} could not be sent "
                        L"(server thinks the screen is {})",
                        firstSlot,
@@ -695,7 +659,6 @@ bool OffhandSwap::apply(int slot)
         m_pending.giveUpAtMs = GetTickCount64() + kResponseWaitMs;
 
         if (applied == 0) {
-
             log().warn(L"OffhandSwap: the request went out but the client side could not be "
                        L"updated, your hotbar may look stale until you use the item");
             return false;

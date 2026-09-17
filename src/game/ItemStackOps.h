@@ -43,7 +43,6 @@ private:
     using CopyCtorFn = void(__fastcall*)(void* dst, const void* src);
     using AssignFn = void(__fastcall*)(void* dst, const void* src);
     using DtorFn = void(__fastcall*)(void* self);
-
     using NetIdAssignFn = void(__fastcall*)(std::int64_t tagPlusOne, void** dstField,
                                             const void* srcField);
 

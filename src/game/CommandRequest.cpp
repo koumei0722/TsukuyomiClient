@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "core/Logger.h"
+#include "game/BlockWrite.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -60,7 +61,6 @@ void collectRegionGuarded(const std::byte* vtable, std::byte* base, const std::b
             ++count;
         }
     } __except (accessViolationFilter(GetExceptionCode())) {
-
     }
 }
 
@@ -164,13 +164,12 @@ bool CommandRequest::available() const
 
 void CommandRequest::onEntityContext(void* entityContext)
 {
-
     if (entityContext == nullptr) {
         return;
     }
     auto* const player = static_cast<std::byte*>(entityContext) - kEntityContextOffset;
     if (!hasVtable(player, Target::PlayerVtableRef, kPlayerVtableDisp)) {
-
+        GameData::instance().setPlayerAlt(player);
         if (!m_warnedBadPlayer.exchange(true, std::memory_order_acq_rel)) {
             void* head = nullptr;
             readPointerGuarded(player, head);
@@ -184,11 +183,11 @@ void CommandRequest::onEntityContext(void* entityContext)
     GameData::instance().setPlayer(player);
 
     if (m_player.exchange(player, std::memory_order_acq_rel) != player) {
-
         m_sender.store(nullptr, std::memory_order_release);
         m_warnedNoPlayer.store(false, std::memory_order_release);
         m_nextSenderWarnMs.store(0, std::memory_order_release);
         m_nextPlayerWarnMs.store(0, std::memory_order_release);
+        blockwrite::noteWorldChanged();
         log().info(L"CommandRequest: player found at {:#x}",
                    reinterpret_cast<std::uintptr_t>(player));
     }
@@ -211,7 +210,6 @@ int CommandRequest::scoreSender(const std::byte* candidate)
             return -1;
         }
         const auto value = reinterpret_cast<std::uintptr_t>(fields[i]);
-
         if (value == 0 || value >= kUserAddressLimit || (value & 0x7) != 0
             || module.contains(fields[i])) {
             return -1;
@@ -261,7 +259,6 @@ void* CommandRequest::findSender(int& survivors)
                                 || region.Protect == PAGE_WRITECOPY)
                             && (region.Protect & PAGE_GUARD) == 0;
         if (usable) {
-
             auto* const end = base + (size & ~static_cast<std::size_t>(7));
             collectRegionGuarded(vtable, base, end, raw, kMaxSenderCandidates, rawCount);
         }
@@ -284,7 +281,6 @@ void* CommandRequest::findSender(int& survivors)
     }
 
     if (survivors > 1) {
-
         log().warn(L"CommandRequest: {} command sender candidates passed the check, "
                    L"using the most likely one (score {})",
                    survivors, bestScore);
@@ -296,7 +292,6 @@ void* CommandRequest::sender()
 {
     void* cached = m_sender.load(std::memory_order_acquire);
     if (cached != nullptr) {
-
         if (hasVtable(cached, Target::SenderVtableRef, kSenderVtableDisp)) {
             return cached;
         }
@@ -306,7 +301,6 @@ void* CommandRequest::sender()
     int survivors = 0;
     void* const found = findSender(survivors);
     if (found == nullptr) {
-
         const unsigned long long now = GetTickCount64();
         if (now >= m_nextSenderWarnMs.load(std::memory_order_acquire)) {
             m_nextSenderWarnMs.store(now + kWarnIntervalMs, std::memory_order_release);
@@ -330,13 +324,10 @@ const void* CommandRequest::makeOrigin()
         return nullptr;
     }
     void* const player = m_player.load(std::memory_order_acquire);
-
     if (player == nullptr
         || !hasVtable(player, Target::PlayerVtableRef, kPlayerVtableDisp)) {
         m_player.store(nullptr, std::memory_order_release);
-
         m_warnedNoPlayer.store(false, std::memory_order_release);
-
         const unsigned long long now = GetTickCount64();
         if (player != nullptr && now >= m_nextPlayerWarnMs.load(std::memory_order_acquire)) {
             m_nextPlayerWarnMs.store(now + kWarnIntervalMs, std::memory_order_release);
@@ -365,7 +356,6 @@ const void* CommandRequest::makeOrigin()
         if (m_origin[kOriginSize + i] == kOriginGuardByte) {
             continue;
         }
-
         m_originBroken.store(true, std::memory_order_release);
         log().error(L"CommandRequest: the command origin constructor wrote past {} bytes, "
                     L"the signature is pointing at the wrong function",
@@ -380,7 +370,6 @@ const void* CommandRequest::makeOrigin()
         return nullptr;
     }
     if (!m_loggedOrigin.exchange(true, std::memory_order_acq_rel)) {
-
         log().info(L"CommandRequest: command origin built (vtable rva {:#x})",
                    mainModule().rvaOf(head));
     }
@@ -399,7 +388,6 @@ bool CommandRequest::run(const char* command)
 
     if (m_player.load(std::memory_order_acquire) == nullptr) {
         if (!m_warnedNoPlayer.exchange(true, std::memory_order_acq_rel)) {
-
             log().warn(L"CommandRequest: waiting for the player, re-enter the world");
         }
         return false;
@@ -419,7 +407,6 @@ bool CommandRequest::run(const char* command)
     args.origin = origin;
     args.version = kCommandVersion;
     args.text.length = length;
-
     if (length <= 15) {
         std::memcpy(args.text.data.inline_, command, length);
         args.text.data.inline_[length] = '\0';
@@ -434,7 +421,6 @@ bool CommandRequest::run(const char* command)
     std::int32_t out = 0;
     const void* faultPc = nullptr;
     const void* faultAddress = nullptr;
-
     if (!callGuarded(&faultPc, &faultAddress, m_send, target, &out,
                      static_cast<const Args*>(&args), 0)) {
         const ModuleRange& module = mainModule();

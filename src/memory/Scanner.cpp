@@ -87,7 +87,6 @@ size_t Scanner::scanAll()
             log().warn(L"{} not found - {} is unavailable", info.name, info.purpose);
             break;
         default:
-
             log().warn(L"{} matched more than once - ignoring to avoid a false positive", info.name);
             break;
         }

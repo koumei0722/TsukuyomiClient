@@ -31,7 +31,7 @@ private:
         std::uint64_t length = 0;
         std::uint64_t capacity = 15;
     };
-    static_assert(sizeof(StdString) == 0x20, "std::string のレイアウトが実測と合っていません");
+    static_assert(sizeof(StdString) == 0x20);
 
     struct Args {
         StdString text;
@@ -39,7 +39,7 @@ private:
         std::int32_t version = 0;
         std::int32_t pad = 0;
     };
-    static_assert(sizeof(Args) == 0x30, "コマンド引数のレイアウトが実測と合っていません");
+    static_assert(sizeof(Args) == 0x30);
 
     static constexpr std::int32_t kCommandVersion = 50;
 
@@ -56,7 +56,6 @@ private:
 
     using SendCommandFn = void(__fastcall*)(void* sender, std::int32_t* out, const Args* command,
                                             std::int32_t flags);
-
     using MakeCommandOriginFn = void*(__fastcall*)(void* out, void* player);
 
     void* findSender(int& survivors);
@@ -80,11 +79,9 @@ private:
 
     std::atomic<bool> m_warnedNoPlayer{false};
     std::atomic<bool> m_warnedBadPlayer{false};
-
     std::atomic<unsigned long long> m_nextSenderWarnMs{0};
     std::atomic<unsigned long long> m_nextPlayerWarnMs{0};
     std::atomic<bool> m_loggedOrigin{false};
-
     std::atomic<bool> m_originBroken{false};
 };
 

@@ -18,23 +18,22 @@ long long nowMs()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-void setBoolAbility(std::byte* layered, int index, int wanted)
+bool setBoolAbility(std::byte* layered, int index, int wanted)
 {
     std::byte* const slot = abilities::slotOf(layered, index);
     if (slot == nullptr) {
-        return;
+        return false;
     }
 
     int value = 0;
     if (!abilities::readInt(slot + abilities::kValueOffset, value)) {
-        return;
+        return false;
     }
     if (value == wanted) {
-        return;
+        return true;
     }
 
     if (wanted != 0) {
-
         int type = 0;
         if (abilities::readInt(slot + abilities::kTypeOffset, type)
             && type != abilities::kTypeBool) {
@@ -42,6 +41,7 @@ void setBoolAbility(std::byte* layered, int index, int wanted)
         }
     }
     abilities::writeInt(slot + abilities::kValueOffset, wanted);
+    return false;
 }
 
 }
@@ -54,13 +54,11 @@ CreativeNoClip& CreativeNoClip::instance()
 
 bool CreativeNoClip::available() const
 {
-
     return Scanner::instance().found(Target::AbilitiesAccess);
 }
 
 bool CreativeNoClip::mayFly(std::byte* layered)
 {
-
     std::byte* const slot = abilities::slotOf(layered, abilities::kMayFly);
     if (slot == nullptr) {
         return false;
@@ -74,9 +72,9 @@ bool CreativeNoClip::mayFly(std::byte* layered)
 
 void CreativeNoClip::onAbilitiesAccess(void* context)
 {
-
     const bool active = m_active.load(std::memory_order_relaxed);
-    if (!active && nowMs() >= m_restoreUntilMs.load(std::memory_order_relaxed)) {
+    const bool restoring = m_restorePending.load(std::memory_order_relaxed);
+    if (!active && !restoring) {
         return;
     }
 
@@ -91,15 +89,22 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
         setBoolAbility(layered, abilities::kFlying, 1);
     }
 
-    const bool noClipReady =
-        allowed && nowMs() >= m_noClipFromMs.load(std::memory_order_relaxed);
-    setBoolAbility(layered, abilities::kNoClip, noClipReady ? 1 : 0);
-}
+    if (active) {
+        m_ledger.note(layered);
+        const bool noClipReady =
+            allowed && nowMs() >= m_noClipFromMs.load(std::memory_order_relaxed);
+        setBoolAbility(layered, abilities::kNoClip, noClipReady ? 1 : 0);
+        return;
+    }
 
-void CreativeNoClip::beginRestoreWindow()
-{
+    if (m_ledger.needsRestore(layered)
+        && setBoolAbility(layered, abilities::kNoClip, 0)) {
+        m_ledger.markClean(layered);
+    }
 
-    m_restoreUntilMs.store(nowMs() + kRestoreWindowMs, std::memory_order_relaxed);
+    if (m_ledger.allClean() && m_restorePending.exchange(false, std::memory_order_relaxed)) {
+        log().info(L"CreativeNoClip: restored (no-clip is off again)");
+    }
 }
 
 void CreativeNoClip::onEnabledChanged(bool enabled)
@@ -107,7 +112,8 @@ void CreativeNoClip::onEnabledChanged(bool enabled)
     m_active.store(enabled, std::memory_order_relaxed);
 
     if (enabled) {
-        m_restoreUntilMs.store(0, std::memory_order_relaxed);
+        m_restorePending.store(false, std::memory_order_relaxed);
+        m_ledger.clearDirty();
 
         m_noClipFromMs.store(nowMs() + kFlyingLeadMs, std::memory_order_relaxed);
         if (!m_reported) {
@@ -118,20 +124,29 @@ void CreativeNoClip::onEnabledChanged(bool enabled)
     }
 
     m_reported = false;
-    beginRestoreWindow();
+    m_ledger.markAllDirty();
+    m_restorePending.store(true, std::memory_order_relaxed);
 }
 
 void CreativeNoClip::shutdown()
 {
-
     if (!m_active.load(std::memory_order_relaxed)
-        && nowMs() >= m_restoreUntilMs.load(std::memory_order_relaxed)) {
+        && !m_restorePending.load(std::memory_order_relaxed)) {
         return;
     }
 
     m_active.store(false, std::memory_order_relaxed);
-    beginRestoreWindow();
-    Sleep(static_cast<DWORD>(kRestoreWindowMs) + 50);
+    m_ledger.markAllDirty();
+    m_restorePending.store(true, std::memory_order_relaxed);
+
+    constexpr int kGiveUpMs = 2000;
+    for (int waited = 0; waited < kGiveUpMs; waited += 10) {
+        if (!m_restorePending.load(std::memory_order_relaxed)) {
+            return;
+        }
+        Sleep(10);
+    }
+    log().warn(L"CreativeNoClip: gave up waiting for the restore (the game is not ticking)");
 }
 
 }

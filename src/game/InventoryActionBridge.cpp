@@ -161,7 +161,6 @@ bool InventoryActionBridge::readRequest(void* const* clientHolder, std::int32_t&
     if (clientHolder == nullptr || !memory::isReadable(clientHolder, sizeof(void*))) {
         return false;
     }
-
     const auto* const client = static_cast<const std::byte*>(*clientHolder);
     if (client == nullptr || !memory::isReadable(client + kPendingOffset, sizeof(void*))) {
         return false;
@@ -179,7 +178,6 @@ bool InventoryActionBridge::readRequest(void* const* clientHolder, std::int32_t&
     std::uintptr_t end = 0;
     std::memcpy(&begin, request + kRequestActionsBeginOffset, sizeof(begin));
     std::memcpy(&end, request + kRequestActionsEndOffset, sizeof(end));
-
     index = end >= begin ? (end - begin) / sizeof(void*) : 0;
     return true;
 }
@@ -243,7 +241,6 @@ std::byte* InventoryActionBridge::findCollection(const void* items, const char* 
     if (items == nullptr) {
         return nullptr;
     }
-
     const int firstByte = static_cast<int>(reinterpret_cast<std::uintptr_t>(items) & 0xFFu);
 
     MEMORY_BASIC_INFORMATION info{};
@@ -255,14 +252,12 @@ std::byte* InventoryActionBridge::findCollection(const void* items, const char* 
         if (size == 0) {
             break;
         }
-
         const DWORD kind = info.Protect & 0xFF;
         const bool usable = info.State == MEM_COMMIT
                             && (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0
                             && (kind == PAGE_READWRITE || kind == PAGE_WRITECOPY
                                 || kind == PAGE_EXECUTE_READWRITE);
         if (usable) {
-
             std::byte* p = base;
             std::byte* const regionEnd = base + size;
             while (static_cast<std::size_t>(regionEnd - p) >= sizeof(void*)) {
@@ -275,7 +270,6 @@ std::byte* InventoryActionBridge::findCollection(const void* items, const char* 
                 auto* const site = static_cast<std::byte*>(hit);
                 if ((reinterpret_cast<std::uintptr_t>(site) % sizeof(void*)) == 0
                     && *reinterpret_cast<void* const*>(site) == items) {
-
                     std::byte* const candidate = site - kCollectionItemsOffset;
                     if (candidate >= base
                         && memory::isReadable(candidate, kCollectionItemsOffset + sizeof(void*))
@@ -308,7 +302,6 @@ std::byte* InventoryActionBridge::findSlots(void* container, int count, const st
         }
         auto* const head = static_cast<std::byte*>(begin);
         auto* const tail = static_cast<std::byte*>(end);
-
         if (head == exclude || tail - head != static_cast<std::ptrdiff_t>(kStackSize) * count) {
             continue;
         }
@@ -322,7 +315,6 @@ std::byte* InventoryActionBridge::findSlots(void* container, int count, const st
 
 bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
 {
-
     const InventoryScreen& screen = InventoryScreen::instance();
     if (screen.ownScreenOpen()) {
         return false;
@@ -353,7 +345,7 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
 
     static constexpr char kContainerName[] = "container_items";
     static constexpr std::size_t kNameLength = sizeof(kContainerName) - 1;
-    static_assert(kNameLength <= kShortStringCapacity, "名前が短い文字列の枠に収まらない");
+    static_assert(kNameLength <= kShortStringCapacity);
 
     alignas(void*) std::byte query[kQuerySize]{};
     std::memcpy(query, kContainerName, kNameLength);
@@ -575,7 +567,6 @@ bool InventoryActionBridge::translate(const Places& places, const OpenContainer&
     case kContainerWholeInventory:
     case kContainerHotbar:
     case kContainerInventory: {
-
         const int index = static_cast<int>(view.slot);
         if (index < 0 || index >= kSlotCount) {
             return false;
@@ -588,7 +579,6 @@ bool InventoryActionBridge::translate(const Places& places, const OpenContainer&
         return true;
     }
     case kContainerCursor:
-
         if (view.slot != 0) {
             return false;
         }
@@ -599,7 +589,6 @@ bool InventoryActionBridge::translate(const Places& places, const OpenContainer&
         out.notifyContainer = nullptr;
         return true;
     case kContainerOpened: {
-
         const int index = static_cast<int>(view.slot);
         if (open.container == nullptr || open.slots == nullptr || openId < 0 || openId > 0xFF
             || index < 0 || index >= open.count) {
@@ -613,7 +602,6 @@ bool InventoryActionBridge::translate(const Places& places, const OpenContainer&
         return true;
     }
     default:
-
         return false;
     }
 }
@@ -691,18 +679,15 @@ std::byte* InventoryActionBridge::findEmptyStack(const Places& places, const std
 
 bool InventoryActionBridge::shouldBlockPacket(void* packet)
 {
-
     if (!bridgeActive()) {
         return false;
     }
     if (packet == nullptr || m_blockLeft.load(std::memory_order_acquire) <= 0) {
         return false;
     }
-
     const unsigned long long until = m_blockUntilMs.load(std::memory_order_acquire);
     if (GetTickCount64() > until) {
         const int left = m_blockLeft.exchange(0, std::memory_order_acq_rel);
-
         log().info(L"InventoryActionBridge: {} request packets never went out, "
                    L"letting the next ones through",
                    left);
@@ -776,7 +761,6 @@ InventoryActionBridge::Plan InventoryActionBridge::choosePlan(const Places& plac
                                                              std::uint8_t amount, const Spot& a,
                                                              const Spot& b, std::byte*& empty)
 {
-
     if (kind == kKindSwap) {
         return Plan::Swap;
     }
@@ -787,7 +771,6 @@ InventoryActionBridge::Plan InventoryActionBridge::choosePlan(const Places& plac
     }
 
     if (isEmptyStack(b.stack)) {
-
         return amount == have ? Plan::Swap : Plan::Split;
     }
 
@@ -798,7 +781,6 @@ InventoryActionBridge::Plan InventoryActionBridge::choosePlan(const Places& plac
         return Plan::None;
     }
     if (amount == have) {
-
         empty = findEmptyStack(places, a.stack, b.stack);
         if (empty == nullptr) {
             return Plan::None;
@@ -809,7 +791,6 @@ InventoryActionBridge::Plan InventoryActionBridge::choosePlan(const Places& plac
 
 void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* const* action)
 {
-
     if (!bridgeActive()) {
         return;
     }
@@ -825,7 +806,6 @@ void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* 
     if (action == nullptr || !memory::isReadable(action, sizeof(void*))) {
         return;
     }
-
     const auto* const object = static_cast<const std::byte*>(*action);
     if (object == nullptr || !memory::isReadable(object, kActionHeadSize)) {
         return;
@@ -857,10 +837,8 @@ void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* 
         if (!bridgeActive()) {
             skipped = L"offhand features are off";
         } else if (!ownScreen && !haveOpen) {
-
             skipped = L"another screen is open and its container could not be reached";
         } else if (m_queued >= kQueueSize) {
-
             skipped = L"too many moves in one frame";
             if (!m_warnedBusy.exchange(true, std::memory_order_acq_rel)) {
                 log().warn(L"InventoryActionBridge: more than {} moves landed in one frame, "
@@ -881,13 +859,11 @@ void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* 
                 }
             } else if (!translate(places, open, openId, src, a)
                        || !translate(places, open, openId, dst, b)) {
-
                 skipped = L"this move touches something we do not handle";
             } else if (a.stack == b.stack) {
                 skipped = L"both sides point at the same stack";
             } else if (plan = choosePlan(places, kind, amount, a, b, empty);
                        plan == Plan::None) {
-
                 skipped = L"this move cannot be expressed on the legacy path";
             } else if (queueMove(places, plan, amount, a, b, empty)) {
                 replaced = true;
@@ -908,7 +884,6 @@ void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* 
                                            : std::wstring(L"request ? #?");
 
     if (name == nullptr) {
-
         log().info(L"InventoryActionBridge: {} kind {} (layout not confirmed, left to the game)",
                    where, kind);
         return;
@@ -959,7 +934,6 @@ bool InventoryActionBridge::applyPlan(Plan plan, std::uint8_t amount, const Spot
         return ops.swap(src, dst);
 
     case Plan::Split:
-
         if (amount >= have) {
             return false;
         }
@@ -976,7 +950,6 @@ bool InventoryActionBridge::applyPlan(Plan plan, std::uint8_t amount, const Spot
         if (amount < have) {
             return ops.setCount(src, static_cast<std::uint8_t>(have - amount));
         }
-
         return empty != nullptr && ops.assignFrom(src, empty);
     }
 
@@ -1011,7 +984,6 @@ bool InventoryActionBridge::queueMove(const Places& places, Plan plan, std::uint
     }
 
     if (!ops.cloneTo(entry.afterA, a.stack) || !ops.cloneTo(entry.afterB, b.stack)) {
-
         log().error(L"InventoryActionBridge: could not keep the result of a move, "
                     L"the server will not hear about it");
         ops.destroyClone(entry.beforeA);
@@ -1040,7 +1012,6 @@ bool InventoryActionBridge::queueMove(const Places& places, Plan plan, std::uint
 
 void InventoryActionBridge::onContainerOpen(void* packet)
 {
-
     if (!bridgeActive()) {
         return;
     }
@@ -1066,7 +1037,6 @@ void InventoryActionBridge::onContainerOpen(void* packet)
 
 void InventoryActionBridge::onFrame()
 {
-
     if (!bridgeActive()) {
         return;
     }

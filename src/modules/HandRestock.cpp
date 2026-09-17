@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include "core/Logger.h"
+#include "core/Perf.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
 #include "memory/Memory.h"
@@ -130,7 +131,6 @@ HandRestock& HandRestock::instance()
 
 bool HandRestock::available() const
 {
-
     return ItemStackRequest::instance().available();
 }
 
@@ -159,7 +159,6 @@ void HandRestock::saveConfig(nlohmann::json& section) const
 
 void HandRestock::onEnabledChanged(bool )
 {
-
     for (int spot = 0; spot < kSpotCount; ++spot) {
         m_last[spot] = HandState{};
         m_pending[spot] = Pending{};
@@ -168,23 +167,19 @@ void HandRestock::onEnabledChanged(bool )
 
 void HandRestock::onSetSelectedSlot(void* holder)
 {
-
     if (holder == nullptr) {
         return;
     }
 
     void* const previous = m_holder.exchange(holder, std::memory_order_acq_rel);
     if (previous != holder) {
-
         m_holderAlt.store(previous, std::memory_order_release);
     }
 }
 
 void HandRestock::onPlayerViewUpdate()
 {
-
     if (!enabled()) {
-
         clearOutstanding();
         for (int spot = 0; spot < kSpotCount; ++spot) {
             m_last[spot] = HandState{};
@@ -193,6 +188,8 @@ void HandRestock::onPlayerViewUpdate()
         return;
     }
 
+    const perf::Scope guard{perf::Slot::HandRestock};
+
     serveOutstanding();
 
     servePending(kSpotHand);
@@ -200,14 +197,17 @@ void HandRestock::onPlayerViewUpdate()
 
     Inventory inventory;
     if (!resolveClient(inventory)) {
-
         for (int spot = 0; spot < kSpotCount; ++spot) {
             m_last[spot] = HandState{};
         }
         return;
     }
 
-    const bool clientSide = isClientSidePlayer(inventory.playerRaw);
+    bool clientSide = false;
+    {
+        const perf::Scope guard2{perf::Slot::HrClientSide};
+        clientSide = isClientSidePlayer(inventory.playerRaw);
+    }
     if (!m_loggedClientSide || clientSide != m_clientSideKnown) {
         m_loggedClientSide = true;
         m_clientSideKnown = clientSide;
@@ -233,7 +233,6 @@ void HandRestock::onPlayerViewUpdate()
 
 void HandRestock::noteDeliberateMove()
 {
-
     const Clock::time_point until = Clock::now() + std::chrono::milliseconds(kIgnoreMoveMs);
     for (int spot = 0; spot < kSpotCount; ++spot) {
         m_ignoreUntil[spot] = until;
@@ -244,6 +243,8 @@ void HandRestock::noteDeliberateMove()
 
 void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& view)
 {
+    const perf::Scope guard{perf::Slot::HrWatch};
+
     const int slot = (spot == kSpotHand) ? inventory.hand : -1;
 
     const int total = (view.item != nullptr && view.count > 0)
@@ -260,7 +261,6 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
     const bool sameSpot = previous.container == inventory.container && previous.slot == slot;
     const bool ranOut = sameSpot && wentEmpty;
     if (!ranOut) {
-
         if (wentEmpty) {
             log().info(L"HandRestock: the {} went empty but the holder moved "
                        L"(container {:#x} -> {:#x}, slot {} -> {}), not counting it as used up",
@@ -289,7 +289,6 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
 
 void HandRestock::dropPending(Spot spot, const wchar_t* why)
 {
-
     log().info(L"HandRestock: gave up refilling the {} ({})",
                (spot == kSpotHand) ? L"hand" : L"offhand", why);
     m_pending[spot] = Pending{};
@@ -319,7 +318,6 @@ void HandRestock::servePending(Spot spot)
 
     Inventory inventory;
     if (!resolveClient(inventory)) {
-
         return;
     }
 
@@ -328,11 +326,9 @@ void HandRestock::servePending(Spot spot)
         return;
     }
     if (spot == kSpotOffhand && inventory.offhand == nullptr) {
-
         return;
     }
     if (!emptyEverywhere(spot, pending.destSlot)) {
-
         dropPending(spot, L"the slot is not empty in every reachable container");
         return;
     }
@@ -354,7 +350,6 @@ void HandRestock::servePending(Spot spot)
     const int keepSlot = (spot == kSpotHand) ? pending.destSlot : inventory.hand;
     const int source = findSource(inventory, wanted, keepSlot);
     if (source < 0) {
-
         dropPending(spot, L"there is no matching stack left to refill from");
         return;
     }
@@ -364,7 +359,6 @@ void HandRestock::servePending(Spot spot)
 
     const int applied = applyRefill(spot, pending.destSlot, source);
     if (applied == 0) {
-
         m_nextRefillAt[spot] = now + std::chrono::milliseconds(kRetryMs);
         return;
     }
@@ -409,7 +403,6 @@ bool HandRestock::emptyEverywhere(Spot spot, int destSlot) const
                 return false;
             }
         } else {
-
             if (inventory.offhand == nullptr) {
                 continue;
             }
@@ -430,6 +423,8 @@ int HandRestock::countItem(const Inventory& inventory, void* item, std::uint16_t
     if (item == nullptr) {
         return 0;
     }
+
+    const perf::Scope guard{perf::Slot::HrCount};
 
     int total = 0;
     for (int slot = 0; slot < kSlotCount; ++slot) {
@@ -524,7 +519,6 @@ bool HandRestock::looksLikeInventory(std::byte* slots) const
     if (!readPointerGuarded(slots, first)) {
         return false;
     }
-
     if (!mainModule().contains(first)) {
         return false;
     }
@@ -590,8 +584,15 @@ bool HandRestock::resolve(void* holder, Inventory& out) const
     }
 
     auto* const array = static_cast<std::byte*>(slots);
-    if (!looksLikeInventory(array)) {
-        return false;
+
+    if (holder != m_checkedHolder || container != m_checkedContainer
+        || array != m_checkedSlots) {
+        if (!looksLikeInventory(array)) {
+            return false;
+        }
+        m_checkedHolder = holder;
+        m_checkedContainer = container;
+        m_checkedSlots = array;
     }
 
     out = Inventory{};
@@ -637,15 +638,23 @@ bool HandRestock::isClientSidePlayer(void* player) const
     if (!readPointerGuarded(player, vtable) || vtable == nullptr) {
         return false;
     }
-    std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
-    if (ref == nullptr) {
+    if (!m_localPlayerVtableTried) {
+        m_localPlayerVtableTried = true;
+        if (std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
+            ref != nullptr) {
+            m_localPlayerVtable = memory::ripTarget(ref, kLocalPlayerVtableDisp);
+        }
+    }
+    if (m_localPlayerVtable == nullptr) {
         return false;
     }
-    return vtable == memory::ripTarget(ref, kLocalPlayerVtableDisp);
+    return vtable == m_localPlayerVtable;
 }
 
 bool HandRestock::resolveClient(Inventory& out) const
 {
+    const perf::Scope guard{perf::Slot::HrResolve};
+
     void* const holders[2] = {m_holder.load(std::memory_order_acquire),
                               m_holderAlt.load(std::memory_order_acquire)};
 
@@ -677,9 +686,7 @@ bool HandRestock::resolveClient(Inventory& out) const
 bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destSlot,
                                 int sourceSlot)
 {
-
     if (spot == kSpotOffhand) {
-
         if (inventory.offhand == nullptr) {
             return false;
         }
@@ -687,7 +694,6 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
                                            inventory.offhand)) {
             return false;
         }
-
         notifyRefilled(inventory.container, -1, sourceSlot);
         return true;
     }
@@ -700,7 +706,6 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
     const void* faultAddress = nullptr;
     if (callSwapGuarded(reinterpret_cast<SwapSlotsRaw>(m_swapSlots), inventory.container, destSlot,
                         sourceSlot, &faultPc, &faultAddress)) {
-
         notifyRefilled(inventory.container, destSlot, sourceSlot);
         return true;
     }
@@ -721,7 +726,6 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
 
 bool HandRestock::outstandingStillValid() const
 {
-
     void* const holders[2] = {m_holder.load(std::memory_order_acquire),
                               m_holderAlt.load(std::memory_order_acquire)};
     for (void* const holder : holders) {
@@ -744,7 +748,6 @@ bool HandRestock::rollbackOutstanding()
     }
 
     if (m_outstanding.spot == kSpotHand) {
-
         if (m_swapSlots == nullptr) {
             return false;
         }
@@ -755,7 +758,6 @@ bool HandRestock::rollbackOutstanding()
                              &faultAddress)) {
             return false;
         }
-
         notifyRefilled(m_outstanding.container, m_outstanding.destSlot, m_outstanding.sourceSlot);
         return true;
     }
@@ -786,7 +788,6 @@ void HandRestock::notifyRefilled(void* container, int destSlot, int sourceSlot)
 void HandRestock::clearOutstanding()
 {
     if (m_outstanding.hasBefore) {
-
         ItemStackOps::instance().destroyClone(m_before);
     }
     m_outstanding = Outstanding{};
@@ -802,7 +803,6 @@ void HandRestock::serveOutstanding()
 
     int result = 0;
     if (!ItemStackRequest::instance().takeResponse(m_outstanding.requestId, result)) {
-
         if (Clock::now() >= m_outstanding.giveUpAt) {
             log().warn(L"HandRestock: the server did not answer refill request {}, "
                        L"the {} and the server may disagree",
@@ -843,7 +843,6 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
         return 0;
     }
     if (spot == kSpotOffhand && inventory.offhand == nullptr) {
-
         return 0;
     }
 
@@ -857,7 +856,6 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
             : ItemStackRequest::instance().requestMove(inventory.slots, sourceSlot, destSlot);
 
     if (!sent) {
-
         if (!m_warnedNoRequest) {
             m_warnedNoRequest = true;
             log().warn(L"HandRestock: could not send the refill request for the {} "
@@ -884,7 +882,6 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
                        L"could not be updated, it may look stale until you use the item",
                        (spot == kSpotHand) ? L"hand" : L"offhand");
         }
-
         return 1;
     }
     m_warnedNoPredict = false;

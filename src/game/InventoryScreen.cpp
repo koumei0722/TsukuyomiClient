@@ -58,7 +58,6 @@ bool InventoryScreen::readString(const void* text, char* out, std::size_t outSiz
 
     const std::byte* chars = base;
     if (capacity > kShortStringCapacity) {
-
         const void* pointer = nullptr;
         std::memcpy(&pointer, base, sizeof(pointer));
         if (!memory::isReadable(pointer, length)) {
@@ -154,7 +153,6 @@ bool InventoryScreen::ownScreenOpen() const
 
 const void* InventoryScreen::controller() const
 {
-
     if (!screenLooksOpen()) {
         return nullptr;
     }

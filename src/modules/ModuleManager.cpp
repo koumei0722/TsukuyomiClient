@@ -57,7 +57,6 @@ void ModuleManager::update()
 
 void ModuleManager::shutdown()
 {
-
     for (auto it = m_modules.rbegin(); it != m_modules.rend(); ++it) {
         (*it)->shutdown();
     }

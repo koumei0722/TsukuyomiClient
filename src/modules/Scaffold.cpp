@@ -22,7 +22,6 @@ Scaffold& Scaffold::instance()
 
 bool Scaffold::available() const
 {
-
     const Scanner& scanner = Scanner::instance();
     return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView);
 }
@@ -124,7 +123,6 @@ bool Scaffold::resolveY(float footY, int& outY) const
 
     case Height::Follow:
     default:
-
         outY = static_cast<int>(std::floor(footY)) - 1;
         return true;
     }
@@ -132,7 +130,6 @@ bool Scaffold::resolveY(float footY, int& outY) const
 
 int Scaffold::buildTargets(const BlockPos& center, BlockPos (&targets)[kMaxTargets]) const
 {
-
     int count = 0;
     targets[count++] = center;
 
@@ -158,7 +155,6 @@ int Scaffold::buildTargets(const BlockPos& center, BlockPos (&targets)[kMaxTarge
 
 unsigned char Scaffold::faceTowardCenter(const BlockPos& pos, const BlockPos& center)
 {
-
     if (pos.x > center.x) { return 4; }
     if (pos.x < center.x) { return 5; }
     if (pos.z > center.z) { return 2; }
@@ -173,7 +169,6 @@ void Scaffold::placeAll()
 
     void* const gameMode = data.gameMode();
     if (gameMode == nullptr) {
-
         if (!m_warnedNoGameMode) {
             m_warnedNoGameMode = true;
             log().warn(L"Scaffold: place one block by hand first (game mode not captured yet)");
@@ -186,7 +181,6 @@ void Scaffold::placeAll()
     }
 
     const PlayerView view = data.playerView();
-
     float footX = view.x;
     float footY = view.y - GameData::kEyeHeight;
     float footZ = view.z;
@@ -222,11 +216,12 @@ void Scaffold::placeAll()
     const int count = buildTargets(center, targets);
 
     int placed = 0;
+    constexpr bool simTick = false;
     m_placing = true;
     for (int i = 0; i < count; ++i) {
-
         BlockPos target = targets[i];
-        if (hooks::callBuildBlock(gameMode, &target, faceTowardCenter(target, center), 0)) {
+        if (hooks::callBuildBlock(gameMode, &target, faceTowardCenter(target, center), 0,
+                                  simTick)) {
             ++placed;
         }
     }
@@ -245,7 +240,6 @@ void Scaffold::placeAll()
 
 void Scaffold::onPlayerViewUpdate()
 {
-
     if (!enabled() || m_placing) {
         return;
     }
@@ -263,7 +257,6 @@ MenuItem Scaffold::buildMenu()
     children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
-
     children.push_back(menu::choice(
         L"Pattern", {L"Cross (5)", L"Square 3x3", L"Square 5x5", L"Square 7x7"},
         [this] { return static_cast<int>(m_pattern); },
@@ -272,7 +265,6 @@ MenuItem Scaffold::buildMenu()
         L"Height", {L"Follow", L"Manual", L"On enable"},
         [this] { return static_cast<int>(m_height); }, [this](int at) {
             m_height = static_cast<Height>(std::clamp(at, 0, 2));
-
             if (enabled()) {
                 captureHeight();
             } else {
@@ -287,7 +279,6 @@ MenuItem Scaffold::buildMenu()
             log().info(L"Scaffold: fixed Y set to {}", m_manualY);
         },
         true, static_cast<float>(kMinY), static_cast<float>(kMaxY));
-
     fixedY.available = [this] { return m_height == Height::Manual; };
     children.push_back(std::move(fixedY));
 

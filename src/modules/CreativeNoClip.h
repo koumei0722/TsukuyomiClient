@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 
+#include "game/Abilities.h"
 #include "modules/Module.h"
 
 namespace tsukuyomi {
@@ -26,16 +27,14 @@ protected:
 private:
     CreativeNoClip() = default;
 
-    static constexpr long long kRestoreWindowMs = 300;
-
     static constexpr long long kFlyingLeadMs = 250;
 
     static bool mayFly(std::byte* layered);
 
-    void beginRestoreWindow();
-
     std::atomic<bool> m_active{false};
-    std::atomic<long long> m_restoreUntilMs{0};
+    std::atomic<bool> m_restorePending{false};
+
+    abilities::RestoreLedger m_ledger;
 
     std::atomic<long long> m_noClipFromMs{0};
 

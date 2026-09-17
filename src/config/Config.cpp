@@ -39,7 +39,6 @@ void Config::load()
         m_root = std::move(parsed);
         log().info(L"Config loaded");
     } catch (const nlohmann::json::exception& error) {
-
         log().warn(L"Could not read the config file ({}). Using defaults",
                    toUtf16(error.what()));
     }

@@ -14,6 +14,7 @@ enum class MenuItemKind {
     Keybind,
     Number,
     Action,
+    Text,
 };
 
 struct MenuItem {
@@ -41,6 +42,15 @@ struct MenuItem {
     std::function<int()> getChoice;
     std::function<void(int)> setChoice;
 
+    std::function<std::wstring()> getText;
+    std::function<void(std::wstring)> setText;
+
+    bool onPage = false;
+
+    int pageTab = 0;
+
+    bool opensPage = false;
+
     std::vector<MenuItem> children;
 
     std::wstring labelText() const { return label ? label() : std::wstring{}; }
@@ -57,15 +67,14 @@ MenuItem toggle(std::wstring title, std::function<bool()> isOn, std::function<vo
 MenuItem action(std::wstring title, std::function<void()> run);
 MenuItem cycle(std::wstring title, std::function<std::wstring()> valueText,
                std::function<void()> next);
-
 MenuItem choice(std::wstring title, std::vector<std::wstring> choices, std::function<int()> get,
                 std::function<void(int)> set);
-
 MenuItem keybind(std::wstring title, std::function<std::vector<int>()> get,
                  std::function<void(std::vector<int>)> set, std::vector<int> defaults = {});
-
 MenuItem number(std::wstring title, std::function<float()> get, std::function<void(float)> set,
                 bool integer, float min = 0.0f, float max = 0.0f);
+MenuItem text(std::wstring title, std::function<std::wstring()> get,
+              std::function<void(std::wstring)> set);
 
 }
 

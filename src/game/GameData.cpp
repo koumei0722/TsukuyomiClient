@@ -1,9 +1,12 @@
 #include "game/GameData.h"
 
+#include <format>
+
 #include <Windows.h>
 
 #include "core/Logger.h"
 #include "memory/Memory.h"
+#include "memory/Scanner.h"
 
 #include <algorithm>
 #include <cmath>
@@ -211,6 +214,287 @@ bool GameData::playerFeet(float& outX, float& outY, float& outZ) const
     return true;
 }
 
+bool GameData::rawPlayerPos(float& outX, float& outY, float& outZ) const
+{
+    return rawPosOf(m_player.load(std::memory_order_relaxed), outX, outY, outZ);
+}
+
+namespace {
+
+int gdAccessViolationFilter(unsigned long code)
+{
+    return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
+               ? EXCEPTION_EXECUTE_HANDLER
+               : EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool gdReadPointer(const void* at, void*& out)
+{
+    __try {
+        out = *reinterpret_cast<void* const*>(at);
+        return true;
+    } __except (gdAccessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
+}
+
+bool GameData::hasLivePlayer() const
+{
+    void* const p = m_player.load(std::memory_order_relaxed);
+    if (p == nullptr) {
+        return false;
+    }
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    if (!rawPosOf(p, x, y, z)) {
+        return false;
+    }
+    std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
+    if (ref != nullptr) {
+        const void* const vtable = memory::ripTarget(ref, 3);
+        void* head = nullptr;
+        if (vtable != nullptr && (!gdReadPointer(p, head) || head != vtable)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GameData::findPlayerFromClient(void* clientInstance)
+{
+    if (clientInstance == nullptr) {
+        return false;
+    }
+    std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
+    if (ref == nullptr) {
+        return false;
+    }
+    const void* const vtable = memory::ripTarget(ref, 3);
+    if (vtable == nullptr) {
+        return false;
+    }
+
+    constexpr std::size_t kSpan = 0x8000;
+    auto* const base = static_cast<std::byte*>(clientInstance);
+    for (std::size_t at = 0; at + sizeof(void*) <= kSpan; at += sizeof(void*)) {
+        void* candidate = nullptr;
+        if (!gdReadPointer(base + at, candidate) || candidate == nullptr) {
+            continue;
+        }
+        void* head = nullptr;
+        if (!gdReadPointer(candidate, head) || head != vtable) {
+            continue;
+        }
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        if (!rawPosOf(candidate, x, y, z)) {
+            continue;
+        }
+        constexpr float kWorldLimit = 3.0e7f;
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)
+            || std::fabs(x) > kWorldLimit || std::fabs(y) > kWorldLimit
+            || std::fabs(z) > kWorldLimit) {
+            continue;
+        }
+        m_player.store(candidate, std::memory_order_relaxed);
+        return true;
+    }
+    log().info(L"GameData: no player object inside ClientInstance {:#x} (span {:#x})",
+               reinterpret_cast<std::uintptr_t>(clientInstance),
+               kSpan);
+    return false;
+}
+
+bool GameData::adoptPlayerFromEntity(void* entityContext)
+{
+    if (entityContext == nullptr) {
+        return false;
+    }
+    const unsigned long long now = GetTickCount64();
+    const unsigned long long last = m_adoptAt.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 1000) {
+        return false;
+    }
+    m_adoptAt.store(now, std::memory_order_relaxed);
+
+    PlayerView view;
+    {
+        std::lock_guard lock(m_mutex);
+        if (!m_valid) {
+            return false;
+        }
+        view = m_view;
+    }
+
+    std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
+    if (ref == nullptr) {
+        return false;
+    }
+    const void* const vtable = memory::ripTarget(ref, 3);
+    if (vtable == nullptr) {
+        return false;
+    }
+
+    std::byte* candidate = nullptr;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    for (const std::ptrdiff_t back : {std::ptrdiff_t{0x08}, std::ptrdiff_t{0}}) {
+        auto* const guess = static_cast<std::byte*>(entityContext) - back;
+        void* head = nullptr;
+        if (!gdReadPointer(guess, head) || head != vtable) {
+            continue;
+        }
+        if (!rawPosOf(guess, x, y, z)) {
+            continue;
+        }
+        candidate = guess;
+        break;
+    }
+    if (candidate == nullptr) {
+        return false;
+    }
+    const float dx = x - view.x;
+    const float dy = y - view.y;
+    const float dz = z - view.z;
+    if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz)
+        || (dx * dx + dy * dy + dz * dz) > 1.0f) {
+        return false;
+    }
+    m_player.store(candidate, std::memory_order_relaxed);
+    return true;
+}
+
+int GameData::players(void* out[2]) const
+{
+    int n = 0;
+    void* const a = m_player.load(std::memory_order_relaxed);
+    void* const b = m_playerAlt.load(std::memory_order_relaxed);
+    if (a != nullptr) {
+        out[n++] = a;
+    }
+    if (b != nullptr && b != a) {
+        out[n++] = b;
+    }
+    return n;
+}
+
+bool GameData::rawPosOf(const void* player, float& outX, float& outY, float& outZ)
+{
+    if (player == nullptr) {
+        return false;
+    }
+    const auto* const at = static_cast<const char*>(player) + kPlayerPositionOffset;
+    if (!memory::isReadable(at, sizeof(float) * 3)) {
+        return false;
+    }
+    float position[3]{};
+    std::memcpy(position, at, sizeof(position));
+    constexpr float kWorldLimit = 3.0e7f;
+    for (const float value : position) {
+        if (!std::isfinite(value) || std::fabs(value) > kWorldLimit) {
+            return false;
+        }
+    }
+    outX = position[0];
+    outY = position[1];
+    outZ = position[2];
+    return true;
+}
+
+bool GameData::targetPosOf(const void* player, float& outX, float& outY, float& outZ)
+{
+    if (player == nullptr) {
+        return false;
+    }
+    const auto* const at = static_cast<const char*>(player) + kPlayerTargetPosOffset;
+    if (!memory::isReadable(at, sizeof(float) * 3)) {
+        return false;
+    }
+    float position[3]{};
+    std::memcpy(position, at, sizeof(position));
+    constexpr float kWorldLimit = 3.0e7f;
+    for (const float value : position) {
+        if (!std::isfinite(value) || std::fabs(value) > kWorldLimit) {
+            return false;
+        }
+    }
+    outX = position[0];
+    outY = position[1];
+    outZ = position[2];
+    return true;
+}
+
+bool GameData::writeRawPosOf(void* player, float x, float y, float z)
+{
+    if (player == nullptr) {
+        return false;
+    }
+    const float position[3] = {x, y, z};
+    auto* const at = static_cast<char*>(player) + kPlayerPositionOffset;
+    if (!memory::isWritable(at, sizeof(float) * 3)) {
+        return false;
+    }
+    std::memcpy(at, position, sizeof(position));
+
+    auto* const target = static_cast<char*>(player) + kPlayerTargetPosOffset;
+    if (memory::isWritable(target, kPlayerTargetPosSize)) {
+        std::memcpy(target, position, sizeof(position));
+        std::memcpy(target + sizeof(position), position, sizeof(position));
+    }
+    return true;
+}
+
+void GameData::setPlayerAlt(void* player)
+{
+    if (player == nullptr) {
+        return;
+    }
+    const auto* const at = static_cast<const char*>(player) + kPlayerPositionOffset;
+    if (!memory::isReadable(at, sizeof(float) * 3)) {
+        return;
+    }
+    float position[3]{};
+    std::memcpy(position, at, sizeof(position));
+    constexpr float kWorldLimit = 3.0e7f;
+    for (const float value : position) {
+        if (!std::isfinite(value) || std::fabs(value) > kWorldLimit) {
+            return;
+        }
+    }
+    m_playerAlt.store(player, std::memory_order_relaxed);
+}
+
+void* GameData::playerAlt() const
+{
+    return m_playerAlt.load(std::memory_order_relaxed);
+}
+
+bool GameData::writeRawPlayerPos(float x, float y, float z)
+{
+    void* const targets[2] = {m_player.load(std::memory_order_relaxed),
+                              m_playerAlt.load(std::memory_order_relaxed)};
+    const float position[3] = {x, y, z};
+    bool wrote = false;
+    for (int i = 0; i < 2; ++i) {
+        void* const self = targets[i];
+        if (self == nullptr || (i > 0 && self == targets[0])) {
+            continue;
+        }
+        auto* const at = static_cast<char*>(self) + kPlayerPositionOffset;
+        if (!memory::isWritable(at, sizeof(float) * 3)) {
+            continue;
+        }
+        std::memcpy(at, position, sizeof(position));
+        wrote = true;
+    }
+    return wrote;
+}
+
 bool GameData::playerFeetY(float& outY) const
 {
     void* const self = m_player.load(std::memory_order_relaxed);
@@ -223,7 +507,6 @@ bool GameData::playerFeetY(float& outY) const
     }
     float position[3]{};
     std::memcpy(position, at, sizeof(position));
-
     constexpr float kWorldLimit = 3.0e7f;
     for (const float value : position) {
         if (!std::isfinite(value) || std::fabs(value) > kWorldLimit) {

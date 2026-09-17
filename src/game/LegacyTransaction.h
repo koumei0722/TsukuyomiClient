@@ -17,7 +17,6 @@ public:
         kContainerInventory = 0,
         kContainerOffhand = 119,
         kContainerArmor = 120,
-
         kContainerPlayerUi = 124,
     };
 
@@ -59,9 +58,10 @@ private:
         std::uint8_t pad[3] = {};
         std::int32_t flags = 0;
     };
-    static_assert(sizeof(InventorySource) == 12, "InventorySource は 12 バイト");
+    static_assert(sizeof(InventorySource) == 12);
 
-    using MakeTransactionFn = void**(__fastcall*)(void** out, std::uint32_t type);
+    using MakeTransactionFn = void**(__fastcall*)(void** out, std::uint32_t type,
+                                                  const void* source);
     using MakeActionFn = void(__fastcall*)(void* self, const InventorySource* source,
                                            std::int32_t slot, const void* fromItem,
                                            const void* toItem);
@@ -83,7 +83,7 @@ private:
 
     static constexpr std::ptrdiff_t kSendVtableOffset = 0x720;
     static constexpr std::ptrdiff_t kNetManagerOffset = 0x1D8;
-    static constexpr std::ptrdiff_t kBeginRequestVtableOffset = 0x9D8;
+    static constexpr std::ptrdiff_t kBeginRequestVtableOffset = 0x9E8;
 
     MakeTransactionFn m_makeTransaction = nullptr;
     MakeActionFn m_makeAction = nullptr;
@@ -94,6 +94,8 @@ private:
     bool m_scansReady = false;
     bool m_warnedMissing = false;
     bool m_warnedPlayer = false;
+
+    bool m_faulted = false;
 };
 
 }

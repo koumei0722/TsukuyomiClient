@@ -44,19 +44,14 @@ private:
         std::uint8_t legacyContainer = 0;
         std::int32_t legacySlot = 0;
         std::byte* stack = nullptr;
-
         int notifySlot = -1;
-
         void* notifyContainer = nullptr;
     };
 
     enum class Plan {
         None,
-
         Swap,
-
         Split,
-
         Merge,
     };
 
@@ -100,7 +95,6 @@ private:
     static constexpr std::uint64_t kContainerHotbar = 28;
     static constexpr std::uint64_t kContainerInventory = 29;
     static constexpr std::uint64_t kContainerCursor = 59;
-
     static constexpr std::uint64_t kContainerOpened = 7;
 
     static constexpr std::ptrdiff_t kPendingOffset = 0x60;
@@ -142,13 +136,11 @@ private:
 
     static constexpr std::uintptr_t kScanFrom = 0x10000;
     static constexpr std::uintptr_t kScanTo = 0x7FFFFFFFFFFFull;
-
     static constexpr unsigned long long kScanRetryMs = 1000;
 
     static constexpr std::ptrdiff_t kScreenScanBytes = 0x4000;
     static constexpr std::ptrdiff_t kScreenPageBytes = 0x1000;
     static constexpr std::ptrdiff_t kInnerScanBytes = 0x400;
-
     static constexpr int kResolveBudget = 500000;
 
     static constexpr int kTraceCalls = 0;
@@ -232,7 +224,6 @@ private:
     static constexpr unsigned long long kBlockWindowMs = 2000;
 
     std::atomic<bool> m_notedOwn{false};
-
     std::atomic<bool> m_warnedPlaces{false};
 
     std::atomic<void*> m_openContainer{nullptr};
@@ -251,7 +242,6 @@ private:
     std::atomic<int> m_openContainerKind{-1};
 
     std::atomic<int> m_containerOpenProbes{kContainerOpenProbes};
-
     std::atomic<bool> m_warnedBusy{false};
 
     std::atomic<int> m_packetProbes{0};

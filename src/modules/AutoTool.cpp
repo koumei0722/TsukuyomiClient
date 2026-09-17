@@ -9,6 +9,8 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <format>
+#include <string>
 
 namespace tsukuyomi {
 
@@ -49,7 +51,6 @@ bool probeSlotSpeeds(void** itemSlot, std::byte* slotZero, void* savedItem, ptrd
             *itemSlot = slotZero + stride * slot;
             speeds[slot] = hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
         }
-
         *itemSlot = savedItem;
         return true;
     } __except (accessViolationFilter(GetExceptionCode())) {
@@ -58,6 +59,91 @@ bool probeSlotSpeeds(void** itemSlot, std::byte* slotZero, void* savedItem, ptrd
     }
 }
 
+bool readPointerGuarded(const void* address, void*& value)
+{
+    __try {
+        value = *static_cast<void* const*>(address);
+        return true;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
+struct ModuleRange {
+    const std::byte* base = nullptr;
+    size_t size = 0;
+
+    bool contains(const void* address) const
+    {
+        const auto* const value = static_cast<const std::byte*>(address);
+        return base != nullptr && value >= base && value < base + size;
+    }
+};
+
+const ModuleRange& mainModule()
+{
+    static const ModuleRange range = [] {
+        ModuleRange result;
+        const auto* const base = reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
+        if (base == nullptr) {
+            return result;
+        }
+        const auto* const dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+            return result;
+        }
+        const auto* const nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE) {
+            return result;
+        }
+        result.base = base;
+        result.size = nt->OptionalHeader.SizeOfImage;
+        return result;
+    }();
+    return range;
+}
+
+}
+
+bool AutoTool::looksLikeSlotArray(const std::byte* slotZero, ptrdiff_t stride, int slotCount)
+{
+    if (slotZero == nullptr) {
+        return false;
+    }
+
+    void* first = nullptr;
+    if (!readPointerGuarded(slotZero, first) || !mainModule().contains(first)) {
+        return false;
+    }
+    for (int slot = 1; slot < slotCount; ++slot) {
+        void* value = nullptr;
+        if (!readPointerGuarded(slotZero + stride * slot, value) || value != first) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AutoTool::resolveHotbar(std::byte*& out)
+{
+    void* const holder = m_holder.load(std::memory_order_acquire);
+    if (holder == nullptr) {
+        return false;
+    }
+    void* container = nullptr;
+    if (!readPointerGuarded(static_cast<std::byte*>(holder) + kContainerOffset, container)
+        || container == nullptr) {
+        return false;
+    }
+    auto* const slots = static_cast<std::byte*>(container) + kSlotsOffset;
+    if (!memory::isReadable(slots, static_cast<size_t>(kSlotStride) * kSlotCount)) {
+        return false;
+    }
+    if (!looksLikeSlotArray(slots, kSlotStride, kSlotCount)) {
+        return false;
+    }
+    out = slots;
+    return true;
 }
 
 static bool readSlotValue(void* holder, ptrdiff_t offset, int slotCount, int& slot)
@@ -120,7 +206,6 @@ void AutoTool::dropHolder(void* expected, const wchar_t* reason)
     dropped = m_holderAlt.compare_exchange_strong(current, nullptr, std::memory_order_acq_rel)
               || dropped;
     if (!dropped) {
-
         return;
     }
 
@@ -131,7 +216,6 @@ void AutoTool::dropHolder(void* expected, const wchar_t* reason)
 
 int AutoTool::readSelectedSlot()
 {
-
     void* const holder = m_holder.load(std::memory_order_acquire);
     if (holder == nullptr) {
         return -1;
@@ -233,11 +317,9 @@ void AutoTool::noteHolderChange(void* previous, void* current)
 
 void AutoTool::onSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
 {
-
     if (rcx != nullptr) {
         void* const previous = m_holder.exchange(rcx, std::memory_order_acq_rel);
         if (previous != rcx) {
-
             void* const alt = m_holderAlt.exchange(previous, std::memory_order_acq_rel);
 
             if (rcx != alt) {
@@ -250,7 +332,6 @@ void AutoTool::onSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
 
     {
         const std::lock_guard<std::mutex> lock(m_stateMutex);
-
         const bool guarded = m_switched || Clock::now() < m_guardUntil;
         if (!guarded && slot >= 0 && slot < kSlotCount) {
             m_manualSlot = slot;
@@ -263,10 +344,7 @@ void AutoTool::onSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
 float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
 {
 
-    const auto mode = reinterpret_cast<uintptr_t>(rdx);
-    const bool mining = (mode == 0xB || mode == 0x1);
-
-    if (!enabled() || !mining || rcx == nullptr) {
+    if (!enabled() || rcx == nullptr) {
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
 
@@ -284,20 +362,30 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
 
-    auto* const slotZero = static_cast<std::byte*>(savedItem) - kSlotStride * currentSlot;
+    std::byte* hotbar = nullptr;
+    const bool fromHolder = resolveHotbar(hotbar);
+    auto* const slotZero =
+        fromHolder ? hotbar : (static_cast<std::byte*>(savedItem) - kSlotStride * currentSlot);
 
-    if (!memory::isReadable(slotZero, static_cast<size_t>(kSlotStride) * kSlotCount)) {
-        dropHolder(m_holder.load(std::memory_order_acquire), L"slot array is out of range");
-        return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
+    if (!fromHolder) {
+        if (!memory::isReadable(slotZero, static_cast<size_t>(kSlotStride) * kSlotCount)) {
+            dropHolder(m_holder.load(std::memory_order_acquire), L"slot array is out of range");
+            return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
+        }
+
+        if (!looksLikeSlotArray(slotZero, kSlotStride, kSlotCount)) {
+            dropHolder(m_holder.load(std::memory_order_acquire),
+                       L"the hotbar does not look like an item stack array");
+            return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
+        }
     }
 
     float speeds[kSlotCount] = {};
     if (!probeSlotSpeeds(itemSlot, slotZero, savedItem, kSlotStride, kSlotCount, rcx, rdx, r8, r9,
                          speeds)) {
-
         dropHolder(m_holder.load(std::memory_order_acquire), L"probing faulted");
-        log().error(L"AutoTool: probing the hotbar faulted inside the game, disabling");
-        setEnabled(false);
+        log().warn(L"AutoTool: probing the hotbar faulted inside the game; "
+                   L"switch hotbar slots once to recover (the module stays on)");
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
 
@@ -341,6 +429,7 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
 
 void AutoTool::onUpdate()
 {
+
     {
         const std::lock_guard<std::mutex> lock(m_stateMutex);
         if (!m_switched) {
@@ -353,10 +442,16 @@ void AutoTool::onUpdate()
 
     const bool idle = (Clock::now() - lastQuery) > std::chrono::milliseconds(kIdleRestoreMs);
     const bool released = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0;
-
     const bool unfocused = !input::isInGameplay();
 
     if (idle || released || unfocused) {
+        m_restoreWanted.store(true, std::memory_order_release);
+    }
+}
+
+void AutoTool::onPlayerViewUpdate()
+{
+    if (m_restoreWanted.exchange(false, std::memory_order_acq_rel)) {
         restoreSlot();
     }
 }
@@ -365,7 +460,6 @@ void AutoTool::onEnabledChanged(bool enabled)
 {
     if (enabled) {
         if (m_holder.load(std::memory_order_acquire) == nullptr) {
-
             log().info(L"AutoTool: switch hotbar slots once to activate");
         }
     } else {

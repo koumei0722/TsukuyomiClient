@@ -18,7 +18,8 @@ public:
     void loadConfig(const nlohmann::json& section) override;
     void saveConfig(nlohmann::json& section) const override;
 
-    bool onBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra);
+    bool onBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra,
+                      bool simTick);
     void onPlayerViewUpdate();
 
     enum class Axis {

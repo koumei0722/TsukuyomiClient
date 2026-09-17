@@ -8,6 +8,7 @@
 #include "core/Version.h"
 #include "game/UiProbe.h"
 #include "hooks/Detours.h"
+#include "game/BlockRegistry.h"
 #include "hooks/HookManager.h"
 #include "input/Foreground.h"
 #include "memory/Scanner.h"
@@ -15,15 +16,25 @@
 #include "modules/AutoTool.h"
 #include "modules/CreativeNoClip.h"
 #include "modules/FastBlockPlacement.h"
+#include "modules/FastInventory.h"
 #include "modules/FastRightClick.h"
 #include "modules/FlySpeed.h"
 #include "modules/FreeCamera.h"
+#include "modules/Fullbright.h"
 #include "modules/GameModeSwitch.h"
 #include "modules/HandRestock.h"
 #include "modules/ModuleManager.h"
+#include "modules/NoRender.h"
 #include "modules/OffhandSwap.h"
 #include "modules/Scaffold.h"
+#include "modules/Schematica.h"
+#include "modules/Zoom.h"
+#include "render/BoxRenderer.h"
+#include "render/DiffAtlas.h"
+#include "render/FrameTrace.h"
+#include "render/GhostLayer.h"
 #include "render/Overlay.h"
+#include "render/WorldMesh.h"
 
 #include <chrono>
 #include <utility>
@@ -47,7 +58,6 @@ void Client::run(HMODULE self)
 
 void Client::registerModules()
 {
-
     ModuleManager::instance().registerModule(&FreeCamera::instance());
     ModuleManager::instance().registerModule(&FastBlockPlacement::instance());
     ModuleManager::instance().registerModule(&AntiDarkness::instance());
@@ -56,15 +66,22 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&CreativeNoClip::instance());
     ModuleManager::instance().registerModule(&FlySpeed::instance());
     ModuleManager::instance().registerModule(&FastRightClick::instance());
-    ModuleManager::instance().registerModule(&GameModeSwitch::instance());
     ModuleManager::instance().registerModule(&HandRestock::instance());
     ModuleManager::instance().registerModule(&OffhandSwap::instance());
+    ModuleManager::instance().registerModule(&Schematica::instance());
+
+    ModuleManager::instance().registerModule(&FastInventory::instance());
+    ModuleManager::instance().registerModule(&Fullbright::instance());
+    ModuleManager::instance().registerModule(&NoRender::instance());
+    ModuleManager::instance().registerModule(&Zoom::instance());
 }
 
 void Client::startup()
 {
     log().info(L"Tsukuyomi {} loaded", TSUKUYOMI_VERSION_W);
     log().info(L"Config and log directory: {}", paths::dataDir().wstring());
+
+    hooks::beModelsOn();
 
     Config::instance().load();
 
@@ -89,7 +106,6 @@ void Client::startup()
 
 void Client::loadHotkeys()
 {
-
     m_unloadKey.set({VK_END});
 
     Config::instance().eraseSection("console");
@@ -97,7 +113,6 @@ void Client::loadHotkeys()
 
 void Client::saveHotkeys()
 {
-
 }
 
 namespace {
@@ -116,10 +131,17 @@ void pumpThreadMessages()
 void Client::mainLoop()
 {
     while (!unloadRequested()) {
-
         pumpThreadMessages();
-        ModuleManager::instance().update();
 
+        if (!m_lateHooksDone) {
+            m_lateHooksDone = hooks::installLate();
+        }
+
+        frametrace::pump();
+        worldmesh::report();
+        atlas::report();
+
+        ModuleManager::instance().update();
         uiprobe::pumpSettingsToggle();
 
         if (uiprobe::takeSettingsDirty()) {
@@ -150,9 +172,20 @@ void Client::shutdown()
     log().setNotifier(nullptr);
 
     ModuleManager::instance().shutdown();
+
+    blocks::waitUntilIdle();
+
     render::shutdownOverlay();
 
+    ghost::shutdownGhostLayer();
+    boxes::shutdownDepth();
+    frametrace::shutdown();
+    worldmesh::shutdown();
+    atlas::shutdown();
+
     uiprobe::restoreKeyRows();
+
+    hooks::restoreMaterialBlend();
 
     HookManager::instance().shutdown();
 

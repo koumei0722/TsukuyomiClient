@@ -65,9 +65,7 @@ private:
 
     std::atomic<std::uint64_t> m_hovered{0};
     std::atomic<unsigned long long> m_seenAtMs{0};
-
     std::atomic<void*> m_controllerVtable{nullptr};
-
     std::atomic<const void*> m_controller{nullptr};
 };
 

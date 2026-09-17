@@ -120,7 +120,7 @@ private:
         std::uint8_t unused21[7] = {};
     };
 #pragma pack(pop)
-    static_assert(sizeof(SlotInfo) == 0x28, "SlotInfo のレイアウトが実測と合っていません");
+    static_assert(sizeof(SlotInfo) == 0x28);
 
     static SlotInfo makeSlotInfo(const SlotRef& ref, const NetId& net);
     static SlotInfo makeCursorInfo(const NetId& net);
@@ -128,18 +128,14 @@ private:
     static bool readStackAt(const void* stack, NetId& net, std::uint8_t& count);
 
     using BeginRequestFn = void(__fastcall*)(void* client, void* zero);
-
     using MakeTransferActionFn = void(__fastcall*)(void** outAction, const std::uint8_t* amount,
                                                   const void* src, const void* dst);
-
     using MakeSwapActionFn = void(__fastcall*)(void** outAction, const void* src, const void* dst);
     using AddRequestActionFn = void(__fastcall*)(void** clientHolder, void** action);
-
-    using EndRequestFn = void(__fastcall*)(void* guard);
+    using EndRequestFn = void(__fastcall*)(void* client);
 
     static constexpr std::uint64_t kContainerHotbar = 28;
     static constexpr std::uint64_t kContainerInventory = 29;
-
     static constexpr std::uint64_t kContainerOffhand = 34;
 
     static constexpr int kOffhandSlotIndex = 1;
@@ -149,12 +145,11 @@ private:
 
     static constexpr std::ptrdiff_t kSlotStride = 0x98;
     static constexpr std::ptrdiff_t kStackCountOffset = 0x22;
-
     static constexpr std::ptrdiff_t kStackNetValueOffset = 0x80;
     static constexpr std::ptrdiff_t kStackNetAltOffset = 0x88;
     static constexpr std::ptrdiff_t kStackNetTagOffset = 0x90;
 
-    static constexpr std::size_t kNetManagerVtableDisp = 16;
+    static constexpr std::size_t kNetManagerVtableDisp = 3;
 
     static constexpr std::ptrdiff_t kValidFlagOffset = 0x09;
     static constexpr std::ptrdiff_t kPendingOffset = 0x60;
@@ -164,13 +159,11 @@ private:
     static constexpr std::size_t kResponseEntrySize = 0x30;
     static constexpr std::ptrdiff_t kResponseResultOffset = 0x00;
     static constexpr std::ptrdiff_t kResponseRequestIdOffset = 0x10;
-
     static constexpr int kMaxResponseEntries = 64;
 
     BeginRequestFn m_beginRequest = nullptr;
     MakeTransferActionFn m_makeTakeAction = nullptr;
     MakeTransferActionFn m_makePlaceAction = nullptr;
-
     MakeSwapActionFn m_makeSwapAction = nullptr;
     AddRequestActionFn m_addRequestAction = nullptr;
     EndRequestFn m_endRequest = nullptr;
@@ -186,18 +179,14 @@ private:
     std::atomic<int> m_building{0};
 
     std::atomic<bool> m_warnedMissing{false};
-
     std::atomic<bool> m_warnedOccupied{false};
-
     std::atomic<bool> m_warnedNoSwap{false};
-
     std::atomic<bool> m_serverInventoryOpen{false};
     std::atomic<bool> m_warnedNotOpen{false};
 
     std::atomic<bool> m_openedByUs{false};
 
     std::atomic<void*> m_clientInstance{nullptr};
-
     std::atomic<void*> m_clientVtable{nullptr};
     std::atomic<bool> m_warnedNoClient{false};
     std::atomic<bool> m_warnedNoClose{false};
@@ -236,10 +225,8 @@ private:
     static constexpr std::uint8_t kInteractOpenInventory = 6;
 
     static constexpr int kContainerClosePacketId = 47;
-
     static constexpr std::size_t kContainerCloseSize = 0x38;
     static constexpr std::size_t kContainerCloseTypeOffset = 0x31;
-
     static constexpr std::uint8_t kContainerTypeNone = 0xF7;
 };
 

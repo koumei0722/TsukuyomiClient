@@ -38,7 +38,6 @@ bool isGameForeground(HWND ownWindow)
 
 bool isInGameplay()
 {
-
     if (!isGameForeground()) {
         return false;
     }

@@ -9,4 +9,6 @@ const std::filesystem::path& dataDir();
 std::filesystem::path configFile();
 std::filesystem::path logFile();
 
+std::filesystem::path schematicsDir();
+
 }

@@ -43,7 +43,6 @@ bool swapGuarded(SwapPayload& p, std::byte* temp, const void** faultPc,
                  const void** faultAddress)
 {
     __try {
-
         p.copyCtor(temp, p.a);
 
         *reinterpret_cast<void**>(temp) = *reinterpret_cast<void* const*>(p.a);
@@ -296,7 +295,6 @@ bool ItemStackOps::swap(void* a, void* b)
 
 bool ItemStackOps::notifySlotChanged(void* container, int slot)
 {
-
     if (container == nullptr || slot < 0) {
         return false;
     }
@@ -341,12 +339,10 @@ bool ItemStackOps::setNetIdValue(void* stack, std::int32_t value)
     if (!memory::isReadable(bytes, kStackSize)) {
         return false;
     }
-
     void* const vtable = *reinterpret_cast<void* const*>(bytes);
     if (vtable == nullptr || !mainModule().contains(vtable)) {
         return false;
     }
-
     if (static_cast<std::uint8_t>(bytes[kNetTagOffset]) != kSupportedTag) {
         return false;
     }
@@ -430,7 +426,6 @@ bool ItemStackOps::assignFrom(void* dst, const void* src)
     if (!memory::isWritable(target, kStackSize) || !memory::isReadable(source, kStackSize)) {
         return false;
     }
-
     void* const vtable = *reinterpret_cast<void* const*>(target);
     if (vtable == nullptr || vtable != *reinterpret_cast<void* const*>(source)
         || !mainModule().contains(vtable)) {
@@ -486,7 +481,6 @@ bool ItemStackOps::setCount(void* stack, std::uint8_t count)
 
 bool ItemStackOps::stash(const void* src)
 {
-
     discard();
     if (!cloneTo(m_stash, src)) {
         return false;
@@ -505,7 +499,6 @@ bool ItemStackOps::restore(void* dst)
     if (!memory::isReadable(target, kStackSize)) {
         return false;
     }
-
     void* const vtable = *reinterpret_cast<void* const*>(target);
     if (vtable == nullptr || vtable != *reinterpret_cast<void* const*>(m_stash)) {
         return false;
@@ -524,7 +517,6 @@ bool ItemStackOps::restore(void* dst)
     const void* faultPc = nullptr;
     const void* faultAddress = nullptr;
     const bool ok = restoreGuarded(payload, &faultPc, &faultAddress);
-
     m_hasStash = false;
     if (!ok) {
         const ModuleRange& module = mainModule();

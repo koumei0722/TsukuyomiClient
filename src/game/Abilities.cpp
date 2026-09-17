@@ -118,4 +118,72 @@ std::byte* slotOf(std::byte* layered, int index)
     return at(layered, kPlayerLayer, index);
 }
 
+void RestoreLedger::note(const void* who)
+{
+    if (who == nullptr) {
+        return;
+    }
+    for (size_t i = 0; i < kMax; ++i) {
+        if (m_who[i].load(std::memory_order_relaxed) == who) {
+            return;
+        }
+    }
+    for (size_t i = 0; i < kMax; ++i) {
+        const void* empty = nullptr;
+        if (m_who[i].compare_exchange_strong(empty, who, std::memory_order_relaxed)) {
+            m_dirty[i].store(false, std::memory_order_relaxed);
+            return;
+        }
+        if (m_who[i].load(std::memory_order_relaxed) == who) {
+            return;
+        }
+    }
+}
+
+void RestoreLedger::markAllDirty()
+{
+    for (size_t i = 0; i < kMax; ++i) {
+        if (m_who[i].load(std::memory_order_relaxed) != nullptr) {
+            m_dirty[i].store(true, std::memory_order_relaxed);
+        }
+    }
+}
+
+void RestoreLedger::clearDirty()
+{
+    for (size_t i = 0; i < kMax; ++i) {
+        m_dirty[i].store(false, std::memory_order_relaxed);
+    }
+}
+
+bool RestoreLedger::needsRestore(const void* who) const
+{
+    for (size_t i = 0; i < kMax; ++i) {
+        if (m_who[i].load(std::memory_order_relaxed) == who) {
+            return m_dirty[i].load(std::memory_order_relaxed);
+        }
+    }
+    return false;
+}
+
+void RestoreLedger::markClean(const void* who)
+{
+    for (size_t i = 0; i < kMax; ++i) {
+        if (m_who[i].load(std::memory_order_relaxed) == who) {
+            m_dirty[i].store(false, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+bool RestoreLedger::allClean() const
+{
+    for (size_t i = 0; i < kMax; ++i) {
+        if (m_dirty[i].load(std::memory_order_relaxed)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 }

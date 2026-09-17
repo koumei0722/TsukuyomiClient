@@ -34,12 +34,9 @@ void Module::setEnabled(bool value)
 
 void Module::update()
 {
-
     const bool toggleRequested = m_toggleKey.triggered();
-
     if (toggleRequested && input::isInGameplay()) {
         toggle();
-
         UiSound::instance().request();
     }
 
@@ -54,7 +51,6 @@ MenuItem Module::enabledItem()
 
 MenuItem Module::toggleKeyItem()
 {
-
     return menu::keybind(
         L"Toggle key", [this] { return m_toggleKey.combo(); },
         [this](std::vector<int> combo) {
@@ -82,7 +78,6 @@ void Module::loadConfig(const nlohmann::json& section)
     if (persistEnabled()) {
         const bool wanted = Config::getBool(section, "enabled", false);
         if (wanted) {
-
             m_enabled = true;
         }
     }

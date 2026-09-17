@@ -72,12 +72,7 @@ struct SendPayload {
     void (__fastcall* addAction)(void**, void**);
     void (__fastcall* end)(void*);
 
-    struct EndGuard {
-        void* client = nullptr;
-        unsigned char engaged = 0;
-    } endGuard;
     void* client;
-
     bool useSwap = false;
     const void* from;
     const void* cursorEmpty;
@@ -109,10 +104,8 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
             p.makeTake(&p.firstAction, p.amount, p.from, p.cursorEmpty);
         }
         if (p.firstAction == nullptr) {
-
             return false;
         }
-
         void* holderA = p.client;
         void* first = p.firstAction;
         p.addAction(&holderA, &first);
@@ -135,9 +128,7 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
             p.requestId = *reinterpret_cast<std::int32_t*>(req + 0x08);
         }
 
-        p.endGuard.client = p.client;
-        p.endGuard.engaged = 1;
-        p.end(&p.endGuard);
+        p.end(p.client);
         p.pendingAfterEnd = *reinterpret_cast<void**>(bytes + 0x60);
         return true;
     } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
@@ -156,7 +147,7 @@ bool notifyGuarded(void (*fn)(void*), void* client, const void** faultPc,
     }
 }
 
-constexpr std::size_t kSenderVtableOffset = 0x920;
+constexpr std::size_t kSenderVtableOffset = 0x928;
 constexpr std::size_t kSendVtableIndex = 2;
 
 bool sendPacketGuarded(void* client, void* packet, const std::byte* moduleBase,
@@ -229,7 +220,6 @@ ItemStackRequest& ItemStackRequest::instance()
 
 void ItemStackRequest::onScansReady()
 {
-
     if (m_scansReady.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -270,7 +260,6 @@ void ItemStackRequest::forget()
 
 int ItemStackRequest::packetId(void* packet)
 {
-
     if (packet == nullptr || !memory::isReadable(packet, sizeof(void*))) {
         return -1;
     }
@@ -285,14 +274,12 @@ int ItemStackRequest::packetId(void* packet)
 
 void ItemStackRequest::observePacket(void* packet)
 {
-
     const int id = packetId(packet);
 
     if (id == kInteractPacketId && memory::isReadable(packet, kInteractPacketSize)) {
         const auto* const bytes = static_cast<const std::uint8_t*>(packet);
         if (bytes[kInteractActionOffset] == kInteractOpenInventory) {
             m_serverInventoryOpen.store(true, std::memory_order_release);
-
         }
         return;
     }
@@ -301,9 +288,7 @@ void ItemStackRequest::observePacket(void* packet)
         const auto* const bytes = static_cast<const std::uint8_t*>(packet);
         if (bytes[kContainerCloseTypeOffset] == kContainerTypeNone) {
             m_serverInventoryOpen.store(false, std::memory_order_release);
-
             m_openedByUs.store(false, std::memory_order_release);
-
             if (packet != m_closeCopy
                 && readBytesGuarded(packet, m_closeCopy, sizeof(m_closeCopy))) {
                 m_hasCloseCopy.store(true, std::memory_order_release);
@@ -314,7 +299,6 @@ void ItemStackRequest::observePacket(void* packet)
 
 void ItemStackRequest::onNotifyInventoryOpen(void* client)
 {
-
     if (client == nullptr) {
         return;
     }
@@ -339,7 +323,6 @@ bool ItemStackRequest::suppressingInputReset() const
 bool ItemStackRequest::notifyServerInventoryOpen()
 {
     void* const client = m_clientInstance.load(std::memory_order_acquire);
-
     if (client == nullptr || !hooks::hasNotifyInventoryOpen()
         || !m_hasCloseCopy.load(std::memory_order_acquire)) {
         if (!m_warnedNoClient.exchange(true, std::memory_order_acq_rel)) {
@@ -457,10 +440,8 @@ std::byte* ItemStackRequest::findPacketHandle(std::byte* getId, const wchar_t* w
 
 bool ItemStackRequest::onContainerOpenHandle(void* packet, void* result)
 {
-
     if (packet != nullptr && memory::isReadable(packet, 0x80)
         && m_openPacketLogs.fetch_add(1, std::memory_order_acq_rel) < kOpenPacketLogLimit) {
-
         std::uint64_t words[10]{};
         std::memcpy(words, static_cast<const std::byte*>(packet) + 0x30, sizeof(words));
         log().info(L"ItemStackRequest: container-open packet +0x30 "
@@ -472,7 +453,6 @@ bool ItemStackRequest::onContainerOpenHandle(void* packet, void* result)
     if (m_suppressOpens.load(std::memory_order_acquire) <= 0 || result == nullptr) {
         return false;
     }
-
     if (GetTickCount64() > m_suppressUntilMs.load(std::memory_order_acquire)) {
         m_suppressOpens.store(0, std::memory_order_release);
         return false;
@@ -486,7 +466,6 @@ bool ItemStackRequest::onContainerOpenHandle(void* packet, void* result)
 
 void ItemStackRequest::rememberContainerOpenResult(const void* result)
 {
-
     if (result == nullptr || m_loggedOpenResult.load(std::memory_order_acquire)) {
         return;
     }
@@ -508,7 +487,6 @@ void ItemStackRequest::rememberContainerOpenResult(const void* result)
 
 void ItemStackRequest::onFrame()
 {
-
     const unsigned long long due = m_pendingCloseAtMs.load(std::memory_order_acquire);
     if (due == 0 || GetTickCount64() < due) {
         return;
@@ -565,7 +543,6 @@ ItemStackRequest::SlotRef ItemStackRequest::inventorySlot(const void* slots, int
     if (slots == nullptr || index < 0 || index >= kSlotCount) {
         return ref;
     }
-
     ref.container = index < kHotbarSlots ? kContainerHotbar : kContainerInventory;
     ref.slot = index;
     ref.stack = static_cast<const std::byte*>(slots) + index * kSlotStride;
@@ -594,7 +571,6 @@ ItemStackRequest::SlotInfo ItemStackRequest::makeSlotInfo(const SlotRef& ref, co
 
 ItemStackRequest::SlotInfo ItemStackRequest::makeCursorInfo(const NetId& net)
 {
-
     SlotInfo info;
     info.container = kContainerCursor;
     info.slot = 0;
@@ -646,13 +622,11 @@ void* ItemStackRequest::findNetManager()
                                 || region.Protect == PAGE_WRITECOPY)
                             && (region.Protect & PAGE_GUARD) == 0;
         if (usable) {
-
             auto* const end = base + (size & ~static_cast<std::size_t>(7));
             for (auto* p = base; p + sizeof(void*) <= end; p += sizeof(void*)) {
                 if (*reinterpret_cast<const std::byte* const*>(p) != vtable) {
                     continue;
                 }
-
                 std::uint8_t valid = 0;
                 if (!readU8Guarded(p + kValidFlagOffset, valid)) {
                     continue;
@@ -669,7 +643,6 @@ void* ItemStackRequest::netManager()
 {
     void* cached = m_client.load(std::memory_order_acquire);
     if (cached != nullptr) {
-
         void* head = nullptr;
         std::byte* const ref = Scanner::instance().address(Target::NetManagerVtableRef);
         if (ref != nullptr && readPointerGuarded(cached, head)
@@ -682,7 +655,6 @@ void* ItemStackRequest::netManager()
     void* const found = findNetManager();
     if (found != nullptr) {
         m_client.store(found, std::memory_order_release);
-
         m_openedByUs.store(false, std::memory_order_release);
         log().info(L"ItemStackRequest: net manager found at {:#x}",
                    reinterpret_cast<std::uintptr_t>(found));
@@ -729,7 +701,6 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
     if (!available() || a.stack == nullptr || b.stack == nullptr || a.stack == b.stack) {
         return false;
     }
-
     if (a.slot < 0 || a.slot > 0xFF || b.slot < 0 || b.slot > 0xFF) {
         return false;
     }
@@ -789,7 +760,6 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
 
     const bool alreadyOpen = m_serverInventoryOpen.load(std::memory_order_acquire);
     if (!alreadyOpen && !notifyServerInventoryOpen()) {
-
         if (!m_warnedNotOpen.exchange(true, std::memory_order_acq_rel)) {
             log().warn(L"ItemStackRequest: could not tell the server the inventory is open, "
                        L"the move is skipped");
@@ -890,7 +860,6 @@ void ItemStackRequest::onResponse(const void* entries)
                 static_cast<int>(static_cast<std::uint8_t>(raw[kResponseResultOffset]));
             m_responseResult.store(code, std::memory_order_release);
             m_responseId.store(id, std::memory_order_release);
-
             std::uint64_t words[kResponseEntrySize / sizeof(std::uint64_t)] = {};
             std::memcpy(words, raw, sizeof(words));
             log().info(L"ItemStackRequest: request {} answered with result {} "
@@ -908,7 +877,6 @@ bool ItemStackRequest::takeResponse(std::int32_t id, int& result)
         return false;
     }
     result = m_responseResult.load(std::memory_order_acquire);
-
     m_responseId.store(0, std::memory_order_release);
     return true;
 }

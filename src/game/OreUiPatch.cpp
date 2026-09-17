@@ -1,4 +1,6 @@
 #include "game/OreUiPatch.h"
+#include "hooks/Detours.h"
+#include "render/PackTexture.h"
 
 #include <Windows.h>
 
@@ -46,19 +48,21 @@ NtOpenFileFn g_realOpen = nullptr;
 constexpr wchar_t kNeedle[] = L"\\gui\\dist\\hbui\\index-";
 constexpr wchar_t kSuffix[] = L".js";
 
-constexpr wchar_t kStartScreenLeaf[] = L"start_screen.json";
+constexpr wchar_t kUiArchiveTail[] = L"\\resource_packs\\vanilla\\__brarchive\\ui.brarchive";
 
 std::wstring g_patchedNtPath;
 std::wstring g_startScreenNtPath;
 bool g_ready = false;
-
 volatile bool g_done = false;
 
-constexpr const char* kOwnIds[] = {"tk.k0", "tk.k1", "tk.k2",  "tk.k3", "tk.k4", "tk.k5",
-                                   "tk.k6", "tk.k7", "tk.k8",  "tk.k9", "tk.k10"};
+constexpr const char* kOwnIds[] = {
+    "tk.k0",  "tk.k1",  "tk.k2",  "tk.k3",  "tk.k4",  "tk.k5",  "tk.k6",  "tk.k7",
+    "tk.k8",  "tk.k9",  "tk.k10", "tk.k11", "tk.k12", "tk.k13", "tk.k14", "tk.k15",
+    "tk.k16", "tk.k17", "tk.k18", "tk.k19", "tk.k20", "tk.k21", "tk.k22", "tk.k23",
+    "tk.k24", "tk.k25", "tk.k26", "tk.k27", "tk.k28", "tk.k29", "tk.k30", "tk.k31"};
 constexpr int kOwnIdCount = static_cast<int>(sizeof(kOwnIds) / sizeof(kOwnIds[0]));
 
-constexpr char kAnchor[] = "\"keyboardAndMouse.inputGroup.standard\":hne,";
+constexpr char kAnchorHead[] = "\"keyboardAndMouse.inputGroup.standard\":";
 
 bool replaceOnce(std::vector<char>& blob, const char* from, const char* to)
 {
@@ -96,13 +100,13 @@ void note(const wchar_t* text)
 {
     static HANDLE file = INVALID_HANDLE_VALUE;
     if (file == INVALID_HANDLE_VALUE) {
-
         const std::wstring root = versionDir();
         if (root.empty()) {
             return;
         }
         CreateDirectoryW((root + L"\\Tsukuyomi").c_str(), nullptr);
         const std::wstring full = root + L"\\Tsukuyomi\\oreui-open.log";
+        DeleteFileW(full.c_str());
         file = CreateFileW(full.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (file == INVALID_HANDLE_VALUE) {
@@ -152,23 +156,6 @@ bool leafIsBundle(const wchar_t* text, size_t chars)
     return true;
 }
 
-bool endsWithJson(const wchar_t* text, size_t chars)
-{
-    static const wchar_t kEnd[] = L".json";
-    const size_t need = sizeof(kEnd) / sizeof(kEnd[0]) - 1;
-    if (chars < need) {
-        return false;
-    }
-    for (size_t i = 0; i < need; ++i) {
-        const wchar_t c = text[chars - need + i];
-        const wchar_t want = kEnd[i];
-        if (c != want && c != (want - 32)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool leafIs(const wchar_t* text, size_t chars, const wchar_t* leaf, size_t need)
 {
     size_t at = chars;
@@ -188,10 +175,41 @@ bool leafIs(const wchar_t* text, size_t chars, const wchar_t* leaf, size_t need)
     return true;
 }
 
+bool pathEndsWith(const wchar_t* text, size_t chars, const wchar_t* tail, size_t need)
+{
+    if (chars < need) {
+        return false;
+    }
+    for (size_t i = 0; i < need; ++i) {
+        wchar_t c = text[chars - need + i];
+        wchar_t want = tail[i];
+        if (c == L'/') {
+            c = L'\\';
+        }
+        if (want == L'/') {
+            want = L'\\';
+        }
+        if (c >= L'A' && c <= L'Z') {
+            c = static_cast<wchar_t>(c + 32);
+        }
+        if (want >= L'A' && want <= L'Z') {
+            want = static_cast<wchar_t>(want + 32);
+        }
+        if (c != want) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename Call>
 LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
 {
-
+    if (hooks::beModelsOn() && attrs != nullptr && attrs->ObjectName != nullptr
+        && attrs->ObjectName->Buffer != nullptr) {
+        pack::noteOpenedFile(attrs->ObjectName->Buffer,
+                             attrs->ObjectName->Length / sizeof(wchar_t));
+    }
     if (!g_ready || g_done || attrs == nullptr || attrs->ObjectName == nullptr
         || attrs->ObjectName->Buffer == nullptr) {
         return call();
@@ -202,9 +220,8 @@ LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
     const std::wstring* swapTo = nullptr;
     if (endsWithJs(text, chars) && leafIsBundle(text, chars)) {
         swapTo = &g_patchedNtPath;
-    } else if (endsWithJson(text, chars)
-               && leafIs(text, chars, kStartScreenLeaf,
-                         sizeof(kStartScreenLeaf) / sizeof(kStartScreenLeaf[0]) - 1)
+    } else if (pathEndsWith(text, chars, kUiArchiveTail,
+                            sizeof(kUiArchiveTail) / sizeof(kUiArchiveTail[0]) - 1)
                && !g_startScreenNtPath.empty()) {
         swapTo = &g_startScreenNtPath;
     }
@@ -224,7 +241,6 @@ LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
     attrs->ObjectName = saved;
     attrs->RootDirectory = savedRoot;
     if (result >= 0) {
-
         static volatile LONG told = 0;
         static volatile LONG toldTitle = 0;
         if (swapTo == &g_startScreenNtPath) {
@@ -236,7 +252,6 @@ LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
         }
         return result;
     }
-
     {
         wchar_t line[256]{};
         wsprintfW(line, L"[oreui] could not open our copy (%08X); retrying with the original name",
@@ -284,7 +299,6 @@ void* makeTrampoline(unsigned char* target, size_t stolen)
         return nullptr;
     }
     std::memcpy(pad, target, stolen);
-
     pad[stolen + 0] = 0xFF;
     pad[stolen + 1] = 0x25;
     pad[stolen + 2] = 0x00;
@@ -376,6 +390,27 @@ std::wstring versionDir()
     return full.substr(0, cut);
 }
 
+bool sameAsExistingCopy(const std::wstring& path, const std::vector<char>& made)
+{
+    WIN32_FILE_ATTRIBUTE_DATA have{};
+    if (made.empty() || GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &have) == 0
+        || have.nFileSizeHigh != 0 || have.nFileSizeLow != made.size()) {
+        return false;
+    }
+    HANDLE const in = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (in == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    std::vector<char> existing(made.size());
+    DWORD got = 0;
+    const BOOL read =
+        ReadFile(in, existing.data(), static_cast<DWORD>(existing.size()), &got, nullptr);
+    CloseHandle(in);
+    return read != 0 && got == made.size()
+           && std::memcmp(existing.data(), made.data(), made.size()) == 0;
+}
+
 }
 
 bool patchReady() { return g_ready; }
@@ -392,7 +427,6 @@ bool installEarlyFileHook()
     if (g_hooked) {
         return true;
     }
-
     note(L"[oreui] installing the file-open hook");
     const bool a = hookOne("NtCreateFile", reinterpret_cast<void*>(&detourNtCreateFile),
                            reinterpret_cast<void**>(&g_realCreate), g_savedCreate,
@@ -414,9 +448,24 @@ void removeEarlyFileHook()
     g_hooked = false;
 }
 
+constexpr std::uint8_t kArchiveMagic[8] = {0x7D, 0x27, 0x25, 0xB1, 0xA0, 0x52, 0x70, 0x26};
+constexpr std::size_t kArchiveRecord = 256;
+constexpr std::size_t kArchiveOffsetAt = 0xF8;
+
+std::uint32_t readU32(const std::vector<char>& blob, std::size_t at)
+{
+    std::uint32_t value = 0;
+    std::memcpy(&value, blob.data() + at, sizeof(value));
+    return value;
+}
+
+void writeU32(std::vector<char>& blob, std::size_t at, std::uint32_t value)
+{
+    std::memcpy(blob.data() + at, &value, sizeof(value));
+}
+
 bool buildPatchedStartScreen()
 {
-
     g_startScreenNtPath.clear();
 
     const std::wstring root = versionDir();
@@ -424,11 +473,11 @@ bool buildPatchedStartScreen()
         return false;
     }
     const std::wstring source =
-        root + L"\\data\\resource_packs\\vanilla\\ui\\start_screen.json";
+        root + L"\\data\\resource_packs\\vanilla\\__brarchive\\ui.brarchive";
     HANDLE const in = CreateFileW(source.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (in == INVALID_HANDLE_VALUE) {
-        note(L"[oreui] start_screen.json is missing");
+        note(L"[oreui] ui.brarchive is missing");
         return false;
     }
     LARGE_INTEGER size{};
@@ -437,123 +486,172 @@ bool buildPatchedStartScreen()
     DWORD got = 0;
     const BOOL read = ReadFile(in, blob.data(), static_cast<DWORD>(blob.size()), &got, nullptr);
     CloseHandle(in);
-    if (read == 0 || got != blob.size()) {
-        note(L"[oreui] cannot read start_screen.json");
+    if (read == 0 || got != blob.size() || blob.size() < 0x10) {
+        note(L"[oreui] cannot read ui.brarchive");
+        return false;
+    }
+    if (std::memcmp(blob.data(), kArchiveMagic, sizeof(kArchiveMagic)) != 0) {
+        note(L"[oreui] ui.brarchive has an unexpected header");
         return false;
     }
 
-    static const char kAnchor[] =
-        "\"version\": {\n"
-        "    \"type\": \"panel\",\n"
-        "    \"anchor_from\": \"top_right\",\n"
-        "    \"anchor_to\": \"top_right\",\n"
-        "    \"size\": [ \"50%\", \"100%\" ],\n"
-        "    \"controls\": [\n";
+    const std::uint32_t count = readU32(blob, 8);
+    const std::size_t base = 0x10 + static_cast<std::size_t>(count) * kArchiveRecord;
+    if (count == 0 || count > 4096 || base > blob.size()) {
+        note(L"[oreui] ui.brarchive has an unexpected table");
+        return false;
+    }
+
+    std::uint32_t target = count;
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const std::size_t at = 0x10 + static_cast<std::size_t>(k) * kArchiveRecord;
+        const auto nameLen = static_cast<unsigned char>(blob[at]);
+        if (nameLen == 0 || nameLen > kArchiveOffsetAt - 1) {
+            continue;
+        }
+        if (std::string_view(blob.data() + at + 1, nameLen) == "start_screen.json") {
+            target = k;
+            break;
+        }
+    }
+    if (target == count) {
+        note(L"[oreui] start_screen.json is not in ui.brarchive");
+        return false;
+    }
+
+    const std::size_t rec = 0x10 + static_cast<std::size_t>(target) * kArchiveRecord;
+    const std::uint32_t oldOffset = readU32(blob, rec + kArchiveOffsetAt);
+    const std::uint32_t oldSize = readU32(blob, rec + kArchiveOffsetAt + 4);
+    if (base + oldOffset + oldSize > blob.size()) {
+        note(L"[oreui] the start_screen entry points outside the archive");
+        return false;
+    }
+    std::string json(blob.data() + base + oldOffset, oldSize);
+
     static const char kAdded[] =
-        "      {\n"
-        "        \"tsukuyomi_version\": {\n"
-        "          \"type\": \"label\",\n"
-        "          \"color\": \"$main_header_text_color\",\n"
-        "          \"layer\": 2,\n"
-        "          \"text\": \"Tsukuyomi v" TSUKUYOMI_VERSION "\",\n"
-        "          \"size\": [ \"default\", 10 ],\n"
-        "          \"max_size\": [ \"100%\", \"100%\" ],\n"
-        "          \"anchor_from\": \"top_right\",\n"
-        "          \"anchor_to\": \"top_right\",\n"
-        "          \"offset\": [ 0, -12 ]\n"
-        "        }\n"
-        "      },\n"
-        "      {\n"
-        "        \"tsukuyomi_version_background\": {\n"
-        "          \"type\": \"image\",\n"
-        "          \"texture\": \"textures/ui/Black\",\n"
-        "          \"anchor_from\": \"top_right\",\n"
-        "          \"anchor_to\": \"top_right\",\n"
-        "          \"offset\": [ 1, -13 ],\n"
-        "          \"alpha\": 0.6,\n"
-        "          \"size\": [ \"100%sm + 2px\", \"100%sm + 2px\" ],\n"
-        "          \"layer\": 1\n"
-        "        }\n"
-        "      },\n";
-    static const char kLabelBlock[] =
-        "      {\n"
-        "        \"label\": {\n"
-        "          \"type\": \"label\",\n"
-        "          \"color\": \"$main_header_text_color\",\n"
-        "          \"layer\": 2,\n"
-        "          \"text\": \"#version\",\n"
-        "          \"size\": [ \"default\", 10 ],\n"
-        "          \"max_size\": [ \"100%\", \"100%\" ],\n"
-        "          \"anchor_from\": \"top_right\",\n"
-        "          \"anchor_to\": \"top_right\",\n"
-        "          \"bindings\": [\n"
-        "            {\n"
-        "              \"binding_name\": \"#version\"\n"
-        "            }\n"
-        "          ]\n"
-        "        }\n"
-        "      },\n";
-    static const char kLabelWrapped[] =
-        "      {\n"
-        "        \"tsukuyomi_mc_line\": {\n"
-        "          \"type\": \"stack_panel\",\n"
-        "          \"orientation\": \"horizontal\",\n"
-        "          \"size\": [ \"100%c\", 10 ],\n"
-        "          \"anchor_from\": \"top_right\",\n"
-        "          \"anchor_to\": \"top_right\",\n"
-        "          \"controls\": [\n"
-        "            {\n"
-        "              \"tsukuyomi_mc_name\": {\n"
-        "                \"type\": \"label\",\n"
-        "                \"color\": \"$main_header_text_color\",\n"
-        "                \"layer\": 2,\n"
-        "                \"text\": \"Minecraft \"\n"
-        "              }\n"
-        "            },\n"
-        "            {\n"
-        "              \"label\": {\n"
-        "                \"type\": \"label\",\n"
-        "                \"color\": \"$main_header_text_color\",\n"
-        "                \"layer\": 2,\n"
-        "                \"text\": \"#version\",\n"
-        "                \"bindings\": [\n"
-        "                  {\n"
-        "                    \"binding_name\": \"#version\"\n"
-        "                  }\n"
-        "                ]\n"
-        "              }\n"
-        "            }\n"
-        "          ]\n"
-        "        }\n"
-        "      },\n";
-
-    toLf(blob);
-    const std::string with = std::string(kAnchor) + kAdded;
-    if (!replaceOnce(blob, kAnchor, with.c_str())) {
-        note(L"[oreui] could not find where to insert the version line (different game version?)");
+        "{\"tsukuyomi_version\":{\"type\":\"label\","
+        "\"color\":\"$main_header_text_color\",\"layer\":2,"
+        "\"text\":\"Tsukuyomi v" TSUKUYOMI_VERSION "\","
+        "\"size\":[\"default\",10],\"max_size\":[\"100%\",\"100%\"],"
+        "\"anchor_from\":\"top_right\",\"anchor_to\":\"top_right\","
+        "\"offset\":[0,-12]}},"
+        "{\"tsukuyomi_version_background\":{\"type\":\"image\","
+        "\"texture\":\"textures/ui/Black\","
+        "\"anchor_from\":\"top_right\",\"anchor_to\":\"top_right\","
+        "\"offset\":[1,-13],\"alpha\":0.6,"
+        "\"size\":[\"100%sm + 2px\",\"100%sm + 2px\"],\"layer\":1}},";
+    const std::size_t panel = json.find("\"version\":{");
+    if (panel == std::string::npos) {
+        note(L"[oreui] could not find the version panel (different game version?)");
+        return false;
+    }
+    const std::size_t controls = json.find("\"controls\":[", panel);
+    if (controls == std::string::npos) {
+        note(L"[oreui] the version panel has no controls (different game version?)");
         return false;
     }
 
-    if (!replaceOnce(blob, kLabelBlock, kLabelWrapped)) {
-        note(L"[oreui] could not find the game version label (different game version?)");
-        return false;
+    static const char kLabelWrapped[] =
+        "{\"tsukuyomi_mc_line\":{\"type\":\"stack_panel\","
+        "\"orientation\":\"horizontal\",\"size\":[\"100%c\",10],"
+        "\"anchor_from\":\"top_right\",\"anchor_to\":\"top_right\","
+        "\"controls\":["
+        "{\"tsukuyomi_mc_name\":{\"type\":\"label\","
+        "\"color\":\"$main_header_text_color\",\"layer\":2,"
+        "\"text\":\"Minecraft \"}},"
+        "{\"label\":{\"type\":\"label\","
+        "\"color\":\"$main_header_text_color\",\"layer\":2,"
+        "\"text\":\"#version\","
+        "\"bindings\":[{\"binding_name\":\"#version\"}]}}"
+        "]}}";
+    if (json.find("tsukuyomi_mc_line") == std::string::npos) {
+        const std::size_t label = json.find("{\"label\":{", controls);
+        if (label == std::string::npos) {
+            note(L"[oreui] could not find the game version label (different game version?)");
+            return false;
+        }
+        std::size_t at = label;
+        int depth = 0;
+        bool inText = false;
+        for (; at < json.size(); ++at) {
+            const char c = json[at];
+            if (inText) {
+                if (c == '\\') {
+                    ++at;
+                } else if (c == '"') {
+                    inText = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inText = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                --depth;
+                if (depth == 0) {
+                    ++at;
+                    break;
+                }
+            }
+        }
+        if (depth != 0) {
+            note(L"[oreui] the version label is not a closed object");
+            return false;
+        }
+        json.replace(label, at - label, kLabelWrapped);
+    }
+
+    if (json.find("tsukuyomi_version") == std::string::npos) {
+        json.insert(json.find("\"controls\":[", json.find("\"version\":{"))
+                        + sizeof("\"controls\":[") - 1,
+                    kAdded);
+    }
+
+    std::vector<char> made;
+    made.reserve(blob.size() + json.size());
+    made.insert(made.end(), blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(base));
+    std::uint32_t cursor = 0;
+    for (std::uint32_t k = 0; k < count; ++k) {
+        const std::size_t at = 0x10 + static_cast<std::size_t>(k) * kArchiveRecord;
+        const std::uint32_t off = readU32(blob, at + kArchiveOffsetAt);
+        const std::uint32_t len = readU32(blob, at + kArchiveOffsetAt + 4);
+        if (base + off + len > blob.size()) {
+            note(L"[oreui] an entry points outside the archive");
+            return false;
+        }
+        writeU32(made, at + kArchiveOffsetAt, cursor);
+        if (k == target) {
+            writeU32(made, at + kArchiveOffsetAt + 4, static_cast<std::uint32_t>(json.size()));
+            made.insert(made.end(), json.begin(), json.end());
+            cursor += static_cast<std::uint32_t>(json.size());
+        } else {
+            made.insert(made.end(), blob.begin() + static_cast<std::ptrdiff_t>(base + off),
+                        blob.begin() + static_cast<std::ptrdiff_t>(base + off + len));
+            cursor += len;
+        }
     }
 
     const std::wstring outDir = root + L"\\Tsukuyomi\\ui";
     CreateDirectoryW((root + L"\\Tsukuyomi").c_str(), nullptr);
     CreateDirectoryW(outDir.c_str(), nullptr);
-    const std::wstring outPath = outDir + L"\\start_screen.json";
+    const std::wstring outPath = outDir + L"\\ui.brarchive";
+    if (sameAsExistingCopy(outPath, made)) {
+        g_startScreenNtPath = L"\\??\\" + outPath;
+        note(L"[oreui] the title archive copy is already up to date");
+        return true;
+    }
     HANDLE const out = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                    FILE_ATTRIBUTE_NORMAL, nullptr);
     if (out == INVALID_HANDLE_VALUE) {
-        note(L"[oreui] cannot create the start_screen.json copy");
+        note(L"[oreui] cannot create the ui.brarchive copy");
         return false;
     }
     DWORD wrote = 0;
-    const BOOL ok = WriteFile(out, blob.data(), static_cast<DWORD>(blob.size()), &wrote, nullptr);
+    const BOOL ok = WriteFile(out, made.data(), static_cast<DWORD>(made.size()), &wrote, nullptr);
     CloseHandle(out);
-    if (ok == 0 || wrote != blob.size()) {
-        note(L"[oreui] cannot write the start_screen.json copy");
+    if (ok == 0 || wrote != made.size()) {
+        note(L"[oreui] cannot write the ui.brarchive copy");
         return false;
     }
     g_startScreenNtPath = L"\\??\\" + outPath;
@@ -598,16 +696,25 @@ bool buildPatchedBundle()
     }
 
     const std::string_view haystack(blob.data(), blob.size());
-    const size_t at = haystack.find(kAnchor);
+    const size_t at = haystack.find(kAnchorHead);
     if (at == std::string_view::npos) {
         note(L"[oreui] could not find where to insert (different game version?)");
         return false;
     }
+    const size_t valueAt = at + sizeof(kAnchorHead) - 1;
+    const size_t comma = haystack.find(',', valueAt);
+    if (comma == std::string_view::npos || comma <= valueAt || comma - valueAt > 24) {
+        note(L"[oreui] the key group entry has an unexpected shape");
+        return false;
+    }
+    const std::string groupName(haystack.substr(valueAt, comma - valueAt));
     std::string body;
     for (const char* id : kOwnIds) {
         body += '"';
         body += id;
-        body += "\":hne,";
+        body += "\":";
+        body += groupName;
+        body += ",";
     }
     std::vector<char> made;
     made.reserve(blob.size() + body.size());
@@ -616,29 +723,15 @@ bool buildPatchedBundle()
     made.insert(made.end(), blob.begin() + static_cast<std::ptrdiff_t>(at), blob.end());
     blob.swap(made);
 
-    if (!replaceOnce(blob, "return n.createElement(r.Mount,{when:s},"
-                           "n.createElement(Lte,{id:e,type:\"ResetButton\"",
-                     "return n.createElement(r.Mount,{when:(0,r.useFacetMap)("
-                     "((a,b)=>a&&\"tk-hide\"!==b),[],[s,d])},"
-                     "n.createElement(Lte,{id:e,type:\"ResetButton\"")) {
-        note(L"[oreui] could not find the reset-button hook point (different game version?)");
-        return false;
-    }
-
     const std::wstring outDir = root + L"\\Tsukuyomi\\hbui";
     CreateDirectoryW((root + L"\\Tsukuyomi").c_str(), nullptr);
     CreateDirectoryW(outDir.c_str(), nullptr);
     const std::wstring outPath = outDir + L"\\" + name;
-
-    {
-        WIN32_FILE_ATTRIBUTE_DATA have{};
-        if (GetFileAttributesExW(outPath.c_str(), GetFileExInfoStandard, &have) != 0
-            && have.nFileSizeHigh == 0 && have.nFileSizeLow == blob.size()) {
-            g_patchedNtPath = L"\\??\\" + outPath;
-            g_ready = true;
-            note((L"[oreui] the copy already exists " + g_patchedNtPath).c_str());
-            return true;
-        }
+    if (sameAsExistingCopy(outPath, blob)) {
+        g_patchedNtPath = L"\\??\\" + outPath;
+        g_ready = true;
+        note((L"[oreui] the copy is already up to date " + g_patchedNtPath).c_str());
+        return true;
     }
     HANDLE const out = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                                    FILE_ATTRIBUTE_NORMAL, nullptr);

@@ -1,5 +1,10 @@
 #include "render/Overlay.h"
 
+#include "render/WorldMesh.h"
+
+#include "render/BoxRenderer.h"
+#include "render/FrameTrace.h"
+
 #include "core/Logger.h"
 #include "game/GameModeIds.h"
 #include "hooks/HookManager.h"
@@ -108,9 +113,7 @@ LRESULT CALLBACK subclassProc(HWND window, UINT message, WPARAM wParam, LPARAM l
     case WM_ENTERSIZEMOVE:
     case WM_EXITSIZEMOVE:
     case WM_DISPLAYCHANGE:
-
         {
-
             g_resumeAtFrame.store(g_frameIndex.load(std::memory_order_relaxed)
                                       + kFramesAfterResize,
                                   std::memory_order_release);
@@ -240,7 +243,6 @@ bool createDevice()
 
     ID3D12CommandQueue* const queue = g_gameQueue.load(std::memory_order_relaxed);
     if (queue == nullptr) {
-
         return false;
     }
 
@@ -335,7 +337,6 @@ bool ensureFonts(UINT height)
         if (FAILED(created)) {
             return created;
         }
-
         out->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         out->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         return S_OK;
@@ -373,6 +374,7 @@ void drawContents(float width, float height)
                              g_selectionMode.load(std::memory_order_relaxed));
     }
 
+    boxes::draw(g_res.d2dContext.Get(), width, height);
 }
 
 void drawOverlay(IDXGISwapChain* swapChain)
@@ -401,7 +403,6 @@ void drawOverlay(IDXGISwapChain* swapChain)
     ComPtr<ID3D12Resource> backBuffer;
     if (FAILED(swapChain3->GetBuffer(swapChain3->GetCurrentBackBufferIndex(),
                                      IID_PPV_ARGS(&backBuffer)))) {
-
         return;
     }
 
@@ -454,7 +455,6 @@ void drawOverlay(IDXGISwapChain* swapChain)
     }
 
     if (drawResult == D2DERR_RECREATE_TARGET) {
-
         releaseAll();
     } else if (FAILED(drawResult)) {
         reportFailure(L"drawing", drawResult);
@@ -465,8 +465,11 @@ void drawOverlay(IDXGISwapChain* swapChain)
 
 void tryDraw(IDXGISwapChain* swapChain)
 {
-
     const unsigned int frame = g_frameIndex.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    boxes::onPresent();
+    frametrace::onPresent();
+    worldmesh::onPresent();
 
     if (!g_active.load(std::memory_order_acquire)) {
         return;
@@ -475,19 +478,17 @@ void tryDraw(IDXGISwapChain* swapChain)
     if (const unsigned int resumeAt = g_resumeAtFrame.load(std::memory_order_acquire);
         resumeAt != 0) {
         if (frame < resumeAt) {
-
             if (g_deviceLive.load(std::memory_order_relaxed)) {
                 const std::lock_guard<std::mutex> lock(g_resourceMutex);
                 releaseAll();
             }
             return;
         }
-
         g_resumeAtFrame.store(0, std::memory_order_relaxed);
         g_idleFrames = 0;
     }
 
-    if (!g_selectionVisible.load(std::memory_order_acquire)) {
+    if (!g_selectionVisible.load(std::memory_order_acquire) && !boxes::wantsDraw()) {
         if (g_deviceLive.load(std::memory_order_relaxed)
             && ++g_idleFrames > kIdleFramesBeforeRelease) {
             const std::lock_guard<std::mutex> lock(g_resourceMutex);
@@ -555,7 +556,6 @@ void __stdcall detourExecuteCommandLists(ID3D12CommandQueue* queue, UINT count,
                                          ID3D12CommandList* const* lists)
 {
     if (queue != nullptr && g_gameQueue.load(std::memory_order_relaxed) == nullptr) {
-
         if (queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
             g_gameQueue.store(queue, std::memory_order_relaxed);
 
@@ -566,6 +566,7 @@ void __stdcall detourExecuteCommandLists(ID3D12CommandQueue* queue, UINT count,
         }
     }
 
+    frametrace::onExecute(queue, count, lists);
     if (g_executeCommandLists != nullptr) {
         g_executeCommandLists(queue, count, lists);
     }
@@ -722,7 +723,6 @@ bool installOverlayHooks()
 
 void setGameModeSelection(bool visible, int selectedMode)
 {
-
     g_selectionMode.store(selectedMode, std::memory_order_relaxed);
     g_selectionVisible.store(visible, std::memory_order_release);
 }

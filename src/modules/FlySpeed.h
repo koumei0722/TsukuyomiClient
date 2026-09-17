@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 
+#include "game/Abilities.h"
 #include "modules/Module.h"
 
 namespace tsukuyomi {
@@ -28,23 +29,21 @@ protected:
 private:
     FlySpeed() = default;
 
-    static constexpr long long kRestoreWindowMs = 300;
-
     static constexpr float kMinSpeed = 0.0f;
     static constexpr float kMaxHorizontal = 2.0f;
     static constexpr float kMaxVertical = 20.0f;
 
     static constexpr float kEpsilon = 1.0e-6f;
 
-    void beginRestoreWindow();
-
-    static void applyOne(std::byte* layered, int index, float wanted);
+    static bool applyOne(std::byte* layered, int index, float wanted);
 
     std::atomic<float> m_horizontal{0.05f};
     std::atomic<float> m_vertical{1.0f};
 
     std::atomic<bool> m_active{false};
-    std::atomic<long long> m_restoreUntilMs{0};
+    std::atomic<bool> m_restorePending{false};
+
+    abilities::RestoreLedger m_ledger;
 
     bool m_reported = false;
 };

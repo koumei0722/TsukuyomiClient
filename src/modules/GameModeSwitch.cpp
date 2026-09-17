@@ -47,19 +47,16 @@ const wchar_t* GameModeSwitch::modeName(int mode)
 
 void GameModeSwitch::onSetGameMode(void* self, int mode, int extra)
 {
-
     (void)extra;
 
     if (self != nullptr) {
         const long long now = nowMs();
         void* const previous = m_self.exchange(self, std::memory_order_acq_rel);
         if (previous != self) {
-
             m_selfAltCapturedMs.store(m_selfCapturedMs.load(std::memory_order_relaxed),
                                       std::memory_order_relaxed);
             m_selfAlt.store(previous, std::memory_order_release);
         }
-
         m_selfCapturedMs.store(now, std::memory_order_relaxed);
     }
 
@@ -79,7 +76,6 @@ void GameModeSwitch::onSetGameMode(void* self, int mode, int extra)
 
 int GameModeSwitch::switchTarget() const
 {
-
     const int previous = m_previous.load(std::memory_order_relaxed);
     if (gamemode::isSelectable(previous)) {
         return previous;
@@ -89,7 +85,6 @@ int GameModeSwitch::switchTarget() const
 
 int GameModeSwitch::nextInCycle(int mode)
 {
-
     for (size_t i = 0; i < std::size(gamemode::kCycle); ++i) {
         if (gamemode::kCycle[i] == mode) {
             return gamemode::kCycle[(i + 1) % std::size(gamemode::kCycle)];
@@ -114,7 +109,6 @@ bool GameModeSwitch::modifiersDown(const Hotkey& key)
 
 int GameModeSwitch::spectatorTarget() const
 {
-
     if (m_current.load(std::memory_order_relaxed) != kSpectator) {
         return kSpectator;
     }
@@ -129,7 +123,6 @@ bool GameModeSwitch::hasTarget()
     }
     if (!m_warnedNoSelf) {
         m_warnedNoSelf = true;
-
         log().warn(L"GameModeSwitch: waiting for the player. Re-enter the world, "
                    L"or use /gamemode once (not needed if you inject before entering)");
     }
@@ -143,20 +136,17 @@ void GameModeSwitch::request(Request wanted)
 
 void GameModeSwitch::publishSelection() const
 {
-
     render::setGameModeSelection(m_selecting.load(std::memory_order_relaxed),
                                  m_selected.load(std::memory_order_relaxed));
 }
 
 void GameModeSwitch::onUpdate()
 {
-
     const bool wantsSwitch = m_switchKey.triggered();
     const bool wantsSpectator = m_spectatorKey.triggered();
     const bool modifiers = modifiersDown(m_switchKey);
 
     if (!enabled() || !input::isInGameplay()) {
-
         m_selecting.store(false, std::memory_order_relaxed);
         publishSelection();
         return;
@@ -170,10 +160,8 @@ void GameModeSwitch::onUpdate()
 
     if (wantsSwitch && hasTarget()) {
         if (!modifiers) {
-
             request(Request::Switch);
         } else {
-
             const bool wasSelecting = m_selecting.exchange(true, std::memory_order_relaxed);
             const int next = wasSelecting
                                  ? nextInCycle(m_selected.load(std::memory_order_relaxed))
@@ -193,17 +181,14 @@ void GameModeSwitch::onUpdate()
 
 void GameModeSwitch::onPlayerViewUpdate()
 {
-
     const long long now = nowMs();
     const long long last = m_lastViewMs.exchange(now, std::memory_order_relaxed);
     if (last != 0 && now - last > kViewGapMs) {
-
         m_request.store(Request::None, std::memory_order_relaxed);
         m_selecting.store(false, std::memory_order_relaxed);
         m_selected.store(kUnknown, std::memory_order_relaxed);
 
         if (m_selfCapturedMs.load(std::memory_order_relaxed) > last) {
-
             if (m_selfAltCapturedMs.load(std::memory_order_relaxed) <= last) {
                 m_selfAlt.store(nullptr, std::memory_order_relaxed);
             }
@@ -238,7 +223,6 @@ void GameModeSwitch::applyRequest(Request wanted)
         break;
 
     case Request::Commit: {
-
         const int selected = m_selected.load(std::memory_order_relaxed);
         if (selected != kUnknown) {
             apply(selected);
@@ -254,14 +238,12 @@ void GameModeSwitch::applyRequest(Request wanted)
 
 void GameModeSwitch::apply(int mode)
 {
-
     if (m_self.load(std::memory_order_acquire) == nullptr) {
         return;
     }
 
     const int current = m_current.load(std::memory_order_relaxed);
     if (current == mode) {
-
         log().info(L"GameModeSwitch: already {}", modeName(mode));
         return;
     }
@@ -335,7 +317,6 @@ void GameModeSwitch::saveConfig(nlohmann::json& section) const
 
 void GameModeSwitch::onScansReady()
 {
-
     CommandRequest::instance().onScansReady();
 
 }

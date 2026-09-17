@@ -62,4 +62,16 @@ std::filesystem::path logFile()
     return dir.empty() ? std::filesystem::path{} : dir / L"Tsukuyomi.log";
 }
 
+std::filesystem::path schematicsDir()
+{
+    const auto& dir = dataDir();
+    if (dir.empty()) {
+        return {};
+    }
+    std::filesystem::path out = dir / L"schematics";
+    std::error_code ec;
+    std::filesystem::create_directories(out, ec);
+    return out;
+}
+
 }

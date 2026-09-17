@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <vector>
 
 namespace tsukuyomi {
@@ -23,6 +24,7 @@ private:
 
     bool m_initialized = false;
     std::vector<void*> m_targets;
+    std::recursive_mutex m_lock;
 };
 
 }

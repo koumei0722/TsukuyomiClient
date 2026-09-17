@@ -30,8 +30,8 @@ private:
     void saveHotkeys();
 
     HMODULE m_self = nullptr;
-
     bool m_settingsSavePending = false;
+    bool m_lateHooksDone = false;
     std::chrono::steady_clock::time_point m_settingsSaveAt{};
 
     std::atomic<bool> m_unloadRequested{false};

@@ -59,7 +59,6 @@ void UiSound::onScansReady()
     if (g_playSound != nullptr) {
         return;
     }
-
     void* const target = Scanner::instance().address(Target::PlaySound);
     if (target == nullptr) {
         log().warn(L"UiSound: the sound function was not found; the toggle will be silent");
@@ -74,11 +73,56 @@ void UiSound::request()
     m_wanted.store(true, std::memory_order_relaxed);
 }
 
+bool UiSound::selfIsAlive(const void* self)
+{
+    if (self == nullptr || !memory::isReadable(self, kSelfSize)) {
+        return false;
+    }
+    const auto* const base = static_cast<const char*>(self);
+
+    const void* control = nullptr;
+    std::memcpy(&control, base + kControlBlock, sizeof(control));
+    if (control == nullptr || !memory::isReadable(control, 1)) {
+        return false;
+    }
+    unsigned char valid = 0;
+    std::memcpy(&valid, control, sizeof(valid));
+    if (valid == 0) {
+        return false;
+    }
+
+    const void* player = nullptr;
+    std::memcpy(&player, base + kSoundPlayer, sizeof(player));
+    if (player == nullptr || !memory::isReadable(player, sizeof(void*))) {
+        return false;
+    }
+    const void* vtable = nullptr;
+    std::memcpy(&vtable, player, sizeof(vtable));
+    if (vtable == nullptr || !memory::isReadable(vtable, 0x18) || !memory::inGameModule(vtable)) {
+        return false;
+    }
+    return true;
+}
+
 void UiSound::onPlayed(void* self, const void* name, const void* position, float a, float b,
                        bool c, const void* extra)
 {
     (void)name;
-    if (m_ready.load(std::memory_order_acquire) || self == nullptr) {
+    if (self == nullptr) {
+        return;
+    }
+
+    void* const before = m_self.exchange(self, std::memory_order_release);
+    if (before != self) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            log().info(L"UiSound: remembered how the game plays a sound ({:#x} <- {:#x})",
+                       reinterpret_cast<std::uintptr_t>(self),
+                       reinterpret_cast<std::uintptr_t>(before));
+        }
+    }
+
+    if (m_ready.load(std::memory_order_acquire)) {
         return;
     }
     if (position == nullptr || extra == nullptr || !memory::isReadable(position, sizeof(m_position))
@@ -90,10 +134,7 @@ void UiSound::onPlayed(void* self, const void* name, const void* position, float
     m_a = a;
     m_b = b;
     m_c = c;
-    m_self.store(self, std::memory_order_release);
     m_ready.store(true, std::memory_order_release);
-    log().info(L"UiSound: remembered how the game plays a sound ({:#x})",
-               reinterpret_cast<std::uintptr_t>(self));
 }
 
 void UiSound::pump()
@@ -105,13 +146,21 @@ void UiSound::pump()
         return;
     }
     void* const self = m_self.load(std::memory_order_acquire);
-    if (self == nullptr || !memory::isReadable(self, 0x1200)) {
+    if (!selfIsAlive(self)) {
+        void* expected = self;
+        m_self.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
+                                       std::memory_order_relaxed);
+        static std::atomic<int> said{0};
+        if (self != nullptr && said.fetch_add(1, std::memory_order_relaxed) < 8) {
+            log().info(L"UiSound: the remembered sound source ({:#x}) is gone; it will be "
+                       L"learned again the next time the game plays one",
+                       reinterpret_cast<std::uintptr_t>(self));
+        }
         return;
     }
-
     alignas(16) unsigned char position[16]{};
     std::memcpy(position, m_position, sizeof(position));
-    std::memcpy(position, static_cast<const char*>(self) + 0x11b8, sizeof(float) * 3);
+    std::memcpy(position, static_cast<const char*>(self) + kListener, sizeof(float) * 3);
 
     const SsoString name = makeString("random.click");
     g_playSound(self, &name, position, m_a, m_b, m_c, m_extra);

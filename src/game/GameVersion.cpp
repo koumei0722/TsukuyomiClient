@@ -65,7 +65,6 @@ void logOnce()
             log().info(L"Game version {} (same as the version the signatures were taken from)",
                        version);
         } else {
-
             log().info(L"Game version {} (signatures were taken from {})",
                        version, kSignatureSource);
         }

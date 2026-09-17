@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 
 namespace tsukuyomi::abilities {
@@ -42,5 +43,26 @@ bool readInt(const void* address, int& value);
 bool writeInt(void* address, int value);
 bool readFloat(const void* address, float& value);
 bool writeFloat(void* address, float value);
+
+class RestoreLedger {
+public:
+    void note(const void* who);
+
+    void markAllDirty();
+
+    void clearDirty();
+
+    bool needsRestore(const void* who) const;
+
+    void markClean(const void* who);
+
+    bool allClean() const;
+
+private:
+    static constexpr size_t kMax = 8;
+
+    std::atomic<const void*> m_who[kMax]{};
+    std::atomic<bool> m_dirty[kMax]{};
+};
 
 }

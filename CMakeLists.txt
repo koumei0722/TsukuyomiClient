@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Tsukuyomi
-    VERSION 2.1.0
+    VERSION 2.2.0
     LANGUAGES CXX)
+
+if(NOT MSVC)
+    message(FATAL_ERROR "")
+endif()
 
 enable_language(ASM_MASM)
 
@@ -45,11 +49,16 @@ target_link_libraries(Tsukuyomi PRIVATE
     libhat::libhat
     d2d1
     dwrite
-    dwmapi)
+    dwmapi
+    comdlg32
+    ole32)
 
 target_compile_options(Tsukuyomi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    $<$<COMPILE_LANGUAGE:CXX>:/W4>
     $<$<COMPILE_LANGUAGE:CXX>:/permissive->)
+
+target_link_options(Tsukuyomi PRIVATE /MAP)
 
 target_compile_definitions(Tsukuyomi PRIVATE
     UNICODE
@@ -59,4 +68,5 @@ target_compile_definitions(Tsukuyomi PRIVATE
     TSUKUYOMI_VERSION="${PROJECT_VERSION}")
 
 set_target_properties(Tsukuyomi PROPERTIES
+    OUTPUT_NAME "Tsukuyomi"
     PREFIX "")
