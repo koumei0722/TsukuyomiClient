@@ -12,6 +12,8 @@ std::wstring name(int virtualKey);
 
 std::wstring comboName(std::span<const int> combo);
 
+bool parseCombo(const std::wstring& text, std::vector<int>& out);
+
 bool isModifier(int virtualKey);
 
 bool isComboDown(std::span<const int> combo);

@@ -10,7 +10,6 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include <Windows.h>
@@ -21,6 +20,7 @@
 #include "game/ItemIcon.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
+#include "render/BoxMesher.h"
 
 namespace tsukuyomi::blocks {
 
@@ -476,6 +476,8 @@ const void* stateVariant(const void* block, const std::vector<WantedState>& want
 namespace {
 
 std::atomic<bool> g_ghostOn{false};
+std::atomic<bool> g_ghostArmed{false};
+std::atomic<bool> g_worldDropped{false};
 std::int32_t g_ghostMin[3] = {};
 std::int32_t g_ghostMax[3] = {};
 std::atomic<float> g_ghostAlpha{0.45F};
@@ -504,8 +506,6 @@ std::atomic<bool> g_ghostMaskUsable{false};
 
 std::vector<std::uint16_t> g_drawCells;
 
-std::vector<std::uint8_t> g_drawOrient;
-std::atomic<const std::uint8_t*> g_drawOrientPtr{nullptr};
 std::vector<std::uint16_t> g_drawCells2;
 
 std::vector<std::uint16_t> g_wantCells;
@@ -528,7 +528,6 @@ std::atomic<std::size_t> g_drawCellsCount{0};
 std::atomic<const void* const*> g_drawPalettePtr{nullptr};
 std::atomic<std::size_t> g_drawPaletteCount{0};
 std::atomic<const void*> g_air{nullptr};
-std::atomic<const void*> g_boxBlock{nullptr};
 std::int32_t g_lastMin[3] = {0, 0, 0};
 std::int32_t g_lastMax[3] = {0, 0, 0};
 std::atomic<unsigned long long> g_lastBoundsAt{0};
@@ -560,13 +559,11 @@ void retireDrawCells()
         g_retiredCells.clear();
         g_retiredDiff.clear();
         g_drawCells.clear();
-        g_drawOrient.clear();
         g_drawCells2.clear();
         g_diffCells.clear();
         g_wantCells.clear();
         g_wantCells2.clear();
         g_drawCells.shrink_to_fit();
-        g_drawOrient.shrink_to_fit();
         g_drawCells2.shrink_to_fit();
         g_diffCells.shrink_to_fit();
         g_wantCells.shrink_to_fit();
@@ -580,8 +577,6 @@ void retireDrawCells()
     g_retiredCells.push_back(std::move(g_wantCells));
     g_retiredCells.push_back(std::move(g_wantCells2));
     g_retiredDiff.push_back(std::move(g_diffCells));
-    g_retiredDiff.push_back(std::move(g_drawOrient));
-    g_drawOrient = {};
     g_drawCells = {};
     g_drawCells2 = {};
     g_wantCells = {};
@@ -631,7 +626,6 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
     }
 
     g_drawCellsPtr.store(nullptr, std::memory_order_release);
-    g_drawOrientPtr.store(nullptr, std::memory_order_release);
     g_drawCells2Ptr.store(nullptr, std::memory_order_release);
     g_diffCellsPtr.store(nullptr, std::memory_order_release);
     g_wantCellsPtr.store(nullptr, std::memory_order_release);
@@ -643,34 +637,36 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
     const bool usable = cells > 0 && cells <= kGhostCellLimit;
     g_ghostMaskUsable.store(usable, std::memory_order_relaxed);
     if (!usable && cells > 0) {
-        log().warn(L"Schematica: {} cells is too many to drop collision (limit {})", cells,
-                   kGhostCellLimit);
+        log().warn(L"Schematica: {} cells is over the limit of {}, so no ghost or "
+                   L"color box can be drawn for this schematic (and its collision is kept)",
+                   cells, kGhostCellLimit);
     }
 
     if (usable) {
         g_drawCells.assign(static_cast<std::size_t>(cells), 0);
-        g_drawOrient.assign(static_cast<std::size_t>(cells), 0);
         g_drawCells2.assign(static_cast<std::size_t>(cells), 0);
         g_diffCells.assign(static_cast<std::size_t>(cells), 0);
         g_wantCells.assign(static_cast<std::size_t>(cells), 0);
         g_wantCells2.assign(static_cast<std::size_t>(cells), 0);
         g_drawCellsCount.store(g_drawCells.size(), std::memory_order_relaxed);
         g_drawCellsPtr.store(g_drawCells.data(), std::memory_order_release);
-        g_drawOrientPtr.store(g_drawOrient.data(), std::memory_order_release);
         g_drawCells2Ptr.store(g_drawCells2.data(), std::memory_order_release);
         g_diffCellsPtr.store(g_diffCells.data(), std::memory_order_release);
         g_wantCellsPtr.store(g_wantCells.data(), std::memory_order_release);
         g_wantCells2Ptr.store(g_wantCells2.data(), std::memory_order_release);
     }
 
-    if (sx > 0 && sy > 0 && sz > 0) {
+    const bool valid = sx > 0 && sy > 0 && sz > 0;
+    g_ghostArmed.store(valid, std::memory_order_release);
+    if (valid) {
         g_ghostOn.store(true, std::memory_order_release);
     }
 }
 
 void clearGhostRegion()
 {
-    if (!g_ghostOn.exchange(false, std::memory_order_acq_rel)) {
+    g_ghostOn.store(false, std::memory_order_release);
+    if (!g_ghostArmed.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
     for (int i = 0; i < 3; ++i) {
@@ -824,31 +820,6 @@ void noteRealLayer(const void* block, int layer)
     slot->layer.store(static_cast<std::uint8_t>(layer), std::memory_order_relaxed);
 }
 
-std::mutex g_yawMutex;
-std::unordered_map<const void*, float> g_yaw;
-
-void noteGhostYaw(const void* block, float yawDeg)
-{
-    if (block == nullptr || !std::isfinite(yawDeg)) {
-        return;
-    }
-    const std::lock_guard<std::mutex> lock{g_yawMutex};
-    if (g_yaw.size() > 4096) {
-        g_yaw.clear();
-    }
-    g_yaw[block] = yawDeg;
-}
-
-float ghostYaw(const void* block)
-{
-    if (block == nullptr) {
-        return 0.0F;
-    }
-    const std::lock_guard<std::mutex> lock{g_yawMutex};
-    const auto it = g_yaw.find(block);
-    return it != g_yaw.end() ? it->second : 0.0F;
-}
-
 int realLayer(const void* block)
 {
     if (block == nullptr) {
@@ -876,31 +847,6 @@ bool hasBlockEntity(const void* block)
         return false;
     }
     return kind != 0;
-}
-
-namespace {
-constexpr std::size_t kBeCacheSlots = 64;
-struct BeCacheSlot {
-    std::atomic<const void*> key{nullptr};
-    std::atomic<bool> value{false};
-};
-BeCacheSlot g_beCache[kBeCacheSlots];
-}
-
-bool hasBlockEntityFast(const void* block)
-{
-    if (block == nullptr) {
-        return false;
-    }
-    const std::size_t at =
-        (reinterpret_cast<std::uintptr_t>(block) >> 4) % kBeCacheSlots;
-    if (g_beCache[at].key.load(std::memory_order_acquire) == block) {
-        return g_beCache[at].value.load(std::memory_order_relaxed);
-    }
-    const bool answer = hasBlockEntity(block);
-    g_beCache[at].value.store(answer, std::memory_order_relaxed);
-    g_beCache[at].key.store(block, std::memory_order_release);
-    return answer;
 }
 
 namespace {
@@ -1104,42 +1050,48 @@ __declspec(noinline) bool callLookupByName(ItemLookupByNameFn fn, void* registry
     }
 }
 
-int stackSizeOfItemName(const std::string& name, std::string* gotName)
+const void* lookupItemByName(const std::string& name)
 {
-    if (gotName != nullptr) {
-        gotName->clear();
-    }
     ItemLookupByNameFn fn = g_lookupByName.load(std::memory_order_acquire);
     if (fn == nullptr) {
         fn = Scanner::instance().addressAs<ItemLookupByNameFn>(Target::ItemRegistryLookupByName);
         if (fn == nullptr) {
-            return 0;
+            return nullptr;
         }
         g_lookupByName.store(fn, std::memory_order_release);
     }
     void* const registry = itemRegistryPtr();
     if (registry == nullptr || !memory::isReadable(registry, 0x60) || name.empty()) {
-        return 0;
+        return nullptr;
     }
     StringView view{name.c_str(), name.size()};
     int flag = 0;
     void* counter = nullptr;
     if (!callLookupByName(fn, registry, &counter, &flag, &view) || counter == nullptr
         || !memory::isReadable(counter, 0x10)) {
-        return 0;
+        return nullptr;
     }
     void* item = nullptr;
     std::memcpy(&item, static_cast<unsigned char*>(counter) + kCounterObject, sizeof(item));
+    if (memory::isWritable(static_cast<unsigned char*>(counter) + kCounterWeak, 4)) {
+        _InterlockedDecrement(reinterpret_cast<volatile long*>(
+            static_cast<unsigned char*>(counter) + kCounterWeak));
+    }
+    return item;
+}
+
+int stackSizeOfItemName(const std::string& name, std::string* gotName)
+{
+    if (gotName != nullptr) {
+        gotName->clear();
+    }
+    const void* const item = lookupItemByName(name);
     int size = 0;
     if (item != nullptr && memory::isReadable(item, kItemMaxStackAt + 1)) {
         size = *(static_cast<const unsigned char*>(item) + kItemMaxStackAt);
         if (gotName != nullptr) {
             readStdString(static_cast<const unsigned char*>(item) + kItemNameAt, *gotName);
         }
-    }
-    if (memory::isWritable(static_cast<unsigned char*>(counter) + kCounterWeak, 4)) {
-        _InterlockedDecrement(reinterpret_cast<volatile long*>(
-            static_cast<unsigned char*>(counter) + kCounterWeak));
     }
     return (size >= 1 && size <= 64) ? size : 0;
 }
@@ -1237,6 +1189,11 @@ bool maxStackSizeOf(const char* name, const void* block, int& out)
     return true;
 }
 
+const void* itemByName(const std::string& name)
+{
+    return lookupItemByName(name);
+}
+
 bool blockItemIdAux(const void* block, std::int32_t& out)
 {
     out = 0;
@@ -1286,42 +1243,6 @@ void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size
         return;
     }
     target[at] = static_cast<std::uint16_t>(entry + 1);
-}
-
-void setGhostCellOrient(std::int32_t x, std::int32_t y, std::int32_t z, float yawDeg,
-                        int pitchQuarters)
-{
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at) || at >= g_drawOrient.size()) {
-        return;
-    }
-    int step = static_cast<int>(std::lround(yawDeg / 22.5F));
-    step = ((step % 16) + 16) % 16;
-    const int pitch = ((pitchQuarters % 4) + 4) % 4;
-    g_drawOrient[at] = static_cast<std::uint8_t>(0x80 | (pitch << 4) | step);
-}
-
-bool ghostOrientAt(std::int32_t x, std::int32_t y, std::int32_t z, float& yawDeg,
-                   int& pitchQuarters)
-{
-    yawDeg = 0.0F;
-    pitchQuarters = 0;
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return false;
-    }
-    const std::uint8_t* const table = g_drawOrientPtr.load(std::memory_order_acquire);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    if (table == nullptr || at >= count) {
-        return false;
-    }
-    const std::uint8_t packed = table[at];
-    if ((packed & 0x80u) == 0) {
-        return false;
-    }
-    yawDeg = static_cast<float>(packed & 0x0Fu) * 22.5F;
-    pitchQuarters = static_cast<int>((packed >> 4) & 0x03u);
-    return true;
 }
 
 bool dropGhostCell(std::int32_t x, std::int32_t y, std::int32_t z)
@@ -1467,7 +1388,7 @@ DiffColor diffCellAt(std::int32_t x, std::int32_t y, std::int32_t z)
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     if (cells != nullptr && count != 0 && at < count) {
         const std::uint8_t raw = cells[at];
-        if (raw <= static_cast<std::uint8_t>(DiffColor::State)) {
+        if (raw <= kDiffColorMax) {
             found = static_cast<DiffColor>(raw);
         }
     }
@@ -1485,7 +1406,7 @@ DiffKind diffKindOf(const void* real, const void* want, bool wantAir)
         return DiffKind::UnknownWorld;
     }
     if (wantAir) {
-        return real != air ? DiffKind::Wrong : DiffKind::Match;
+        return real != air ? DiffKind::Extra : DiffKind::Match;
     }
     if (real == air) {
         return DiffKind::Missing;
@@ -1525,6 +1446,8 @@ DiffColor colorOfDiffKind(DiffKind kind)
         return DiffColor::Wrong;
     case DiffKind::State:
         return DiffColor::State;
+    case DiffKind::Extra:
+        return DiffColor::Extra;
     case DiffKind::Match:
     case DiffKind::UnknownWorld:
     case DiffKind::UnknownWant:
@@ -1587,11 +1510,14 @@ void clearDiffCells()
 }
 
 std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
-                             std::size_t* dropped)
+                             std::size_t* dropped, const double* eye, int* keptRadius)
 {
     out.clear();
     if (dropped != nullptr) {
         *dropped = 0;
+    }
+    if (keptRadius != nullptr) {
+        *keptRadius = -1;
     }
     if (!g_ghostOn.load(std::memory_order_acquire)) {
         return 0;
@@ -1599,66 +1525,148 @@ std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
     g_drawReaders.fetch_add(1, std::memory_order_acquire);
     const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_acquire);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    if (cells != nullptr && count != 0) {
-        const std::int32_t minX = g_ghostMin[0];
-        const std::int32_t minY = g_ghostMin[1];
-        const std::int32_t minZ = g_ghostMin[2];
-        const std::uint64_t sy = static_cast<std::uint64_t>(g_ghostMax[1] - minY);
-        const std::uint64_t sz = static_cast<std::uint64_t>(g_ghostMax[2] - minZ);
-        if (sy != 0 && sz != 0) {
-            const std::uint64_t plane = sy * sz;
-            const std::uint64_t sx = (plane != 0) ? (count / plane) : 0;
-            const auto lit = [](std::uint8_t v) {
-                return v != 0 && v <= static_cast<std::uint8_t>(DiffColor::State);
-            };
-            const bool layered = g_layerOn.load(std::memory_order_acquire);
+    const std::int32_t minX = g_ghostMin[0];
+    const std::int32_t minY = g_ghostMin[1];
+    const std::int32_t minZ = g_ghostMin[2];
+    const std::size_t sy = static_cast<std::size_t>(g_ghostMax[1] - minY);
+    const std::size_t sz = static_cast<std::size_t>(g_ghostMax[2] - minZ);
+    const std::size_t plane = sy * sz;
+    const std::size_t sx = (cells != nullptr && plane != 0) ? count / plane : 0;
+    if (sx != 0) {
+        std::vector<std::uint8_t> showX(sx, 1);
+        std::vector<std::uint8_t> showY(sy, 1);
+        std::vector<std::uint8_t> showZ(sz, 1);
+        if (g_layerOn.load(std::memory_order_acquire)) {
             const int layerAxis = g_layerAxis.load(std::memory_order_relaxed);
             const std::int32_t layerLo = g_layerLo.load(std::memory_order_relaxed);
             const std::int32_t layerHi = g_layerHi.load(std::memory_order_relaxed);
-            const auto shown = [&](std::uint64_t ax, std::uint64_t ay, std::uint64_t az) {
-                if (!layered) {
-                    return true;
-                }
-                const std::int32_t v =
-                    (layerAxis == 0)
-                        ? minX + static_cast<std::int32_t>(ax)
-                        : ((layerAxis == 2) ? minZ + static_cast<std::int32_t>(az)
-                                            : minY + static_cast<std::int32_t>(ay));
-                return v >= layerLo && v <= layerHi;
-            };
-            for (std::size_t at = 0; at < count; ++at) {
-                const std::uint8_t raw = cells[at];
-                if (raw == 0 || raw > static_cast<std::uint8_t>(DiffColor::State)) {
-                    continue;
-                }
-                const std::uint64_t dx = static_cast<std::uint64_t>(at) / plane;
-                const std::uint64_t rest = static_cast<std::uint64_t>(at) % plane;
-                const std::uint64_t dy = rest / sz;
-                const std::uint64_t dz = rest % sz;
-                if (!shown(dx, dy, dz)) {
-                    continue;
-                }
-                if (out.size() >= limit) {
-                    if (dropped != nullptr) {
-                        ++*dropped;
-                    }
-                    continue;
-                }
-                DiffBox box;
-                box.x = minX + static_cast<std::int32_t>(dx);
-                box.y = minY + static_cast<std::int32_t>(dy);
-                box.z = minZ + static_cast<std::int32_t>(dz);
-                box.color = static_cast<DiffColor>(raw);
-                box.hidden = sx > 2 && dx > 0 && dx + 1 < sx && dy > 0 && dy + 1 < sy
-                             && dz > 0 && dz + 1 < sz && lit(cells[at - plane])
-                             && lit(cells[at + plane]) && lit(cells[at - sz])
-                             && lit(cells[at + sz]) && lit(cells[at - 1])
-                             && lit(cells[at + 1])
-                             && shown(dx - 1, dy, dz) && shown(dx + 1, dy, dz)
-                             && shown(dx, dy - 1, dz) && shown(dx, dy + 1, dz)
-                             && shown(dx, dy, dz - 1) && shown(dx, dy, dz + 1);
-                out.push_back(box);
+            std::vector<std::uint8_t>& axis =
+                (layerAxis == 0) ? showX : ((layerAxis == 2) ? showZ : showY);
+            const std::int32_t base = (layerAxis == 0) ? minX : ((layerAxis == 2) ? minZ : minY);
+            for (std::size_t i = 0; i < axis.size(); ++i) {
+                const std::int32_t v = base + static_cast<std::int32_t>(i);
+                axis[i] = (v >= layerLo && v <= layerHi) ? 1 : 0;
             }
+        }
+        const auto lit = [](std::uint8_t v) {
+            return static_cast<unsigned>(v) - 1u < static_cast<unsigned>(kDiffColorMax);
+        };
+        std::size_t litCount = 0;
+        for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
+            for (std::size_t dy = 0; dy < sy; ++dy) {
+                const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
+                for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
+                    litCount += (lit(cells[at]) && rowShown && showZ[dz] != 0) ? 1 : 0;
+                }
+            }
+        }
+        constexpr std::size_t kRadiusBuckets = 4096;
+        const bool nearest = eye != nullptr && litCount > limit;
+        std::vector<float> offX;
+        std::vector<float> offY;
+        std::vector<float> offZ;
+        std::size_t nearestRadius = 0;
+        boxmesh::RadiusCut cut;
+        if (nearest) {
+            const auto squares = [](std::vector<float>& to, std::size_t n, std::int32_t from,
+                                    double center) {
+                to.resize(n);
+                for (std::size_t i = 0; i < n; ++i) {
+                    const double d =
+                        static_cast<double>(from + static_cast<std::int32_t>(i)) + 0.5 - center;
+                    to[i] = static_cast<float>(d * d);
+                }
+            };
+            squares(offX, sx, minX, eye[0]);
+            squares(offY, sy, minY, eye[1]);
+            squares(offZ, sz, minZ, eye[2]);
+            const float least = *std::min_element(offX.begin(), offX.end())
+                                + *std::min_element(offY.begin(), offY.end())
+                                + *std::min_element(offZ.begin(), offZ.end());
+            nearestRadius = static_cast<std::size_t>(std::sqrt(least));
+            std::vector<std::size_t> histogram(kRadiusBuckets, 0);
+            for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
+                for (std::size_t dy = 0; dy < sy; ++dy) {
+                    const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
+                    const float rowD = offX[dx] + offY[dy];
+                    for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
+                        if (!lit(cells[at]) || !rowShown || showZ[dz] == 0) {
+                            continue;
+                        }
+                        const auto whole = static_cast<std::size_t>(std::sqrt(rowD + offZ[dz]));
+                        const std::size_t bucket = whole > nearestRadius ? whole - nearestRadius : 0;
+                        ++histogram[(std::min)(bucket, kRadiusBuckets - 1)];
+                    }
+                }
+            }
+            cut = boxmesh::radiusCut(histogram, limit);
+        }
+        std::size_t partialLeft = cut.partial;
+        out.reserve((std::min)(litCount, limit));
+        for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
+            for (std::size_t dy = 0; dy < sy; ++dy) {
+                const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
+                const float rowD = nearest ? offX[dx] + offY[dy] : 0.0F;
+                for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
+                    const std::uint8_t raw = cells[at];
+                    if (!lit(raw) || !rowShown || showZ[dz] == 0) {
+                        continue;
+                    }
+                    if (nearest) {
+                        const auto whole = static_cast<std::size_t>(std::sqrt(rowD + offZ[dz]));
+                        std::size_t bucket = whole > nearestRadius ? whole - nearestRadius : 0;
+                        bucket = (std::min)(bucket, kRadiusBuckets - 1);
+                        if (bucket > cut.full || (bucket == cut.full && partialLeft == 0)) {
+                            if (dropped != nullptr) {
+                                ++*dropped;
+                            }
+                            continue;
+                        }
+                        if (bucket == cut.full) {
+                            --partialLeft;
+                        }
+                    }
+                    if (out.size() >= limit) {
+                        if (dropped != nullptr) {
+                            ++*dropped;
+                        }
+                        continue;
+                    }
+                    std::uint8_t covered = 0;
+                    const bool columnShown = showX[dx] != 0 && showZ[dz] != 0;
+                    if (dy > 0 && lit(cells[at - sz]) && showY[dy - 1] != 0 && columnShown) {
+                        covered |= 0x01;
+                    }
+                    if (dy + 1 < sy && lit(cells[at + sz]) && showY[dy + 1] != 0 && columnShown) {
+                        covered |= 0x02;
+                    }
+                    if (dz > 0 && lit(cells[at - 1]) && showZ[dz - 1] != 0 && rowShown) {
+                        covered |= 0x04;
+                    }
+                    if (dz + 1 < sz && lit(cells[at + 1]) && showZ[dz + 1] != 0 && rowShown) {
+                        covered |= 0x08;
+                    }
+                    if (dx > 0 && lit(cells[at - plane]) && showX[dx - 1] != 0 && showY[dy] != 0
+                        && showZ[dz] != 0) {
+                        covered |= 0x10;
+                    }
+                    if (dx + 1 < sx && lit(cells[at + plane]) && showX[dx + 1] != 0
+                        && showY[dy] != 0 && showZ[dz] != 0) {
+                        covered |= 0x20;
+                    }
+                    DiffBox box;
+                    box.x = minX + static_cast<std::int32_t>(dx);
+                    box.y = minY + static_cast<std::int32_t>(dy);
+                    box.z = minZ + static_cast<std::int32_t>(dz);
+                    box.color = static_cast<DiffColor>(raw);
+                    box.covered = covered;
+                    box.hidden = covered == 0x3F;
+                    out.push_back(box);
+                }
+            }
+        }
+        if (nearest && keptRadius != nullptr && dropped != nullptr && *dropped != 0) {
+            *keptRadius = static_cast<int>(nearestRadius + cut.full);
         }
     }
     g_drawReaders.fetch_sub(1, std::memory_order_release);
@@ -1908,29 +1916,23 @@ bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z)
     return found;
 }
 
-void setBoxBlock(const void* block)
-{
-    g_boxBlock.store(block, std::memory_order_release);
-}
-
-const void* boxBlock()
-{
-    return g_boxBlock.load(std::memory_order_acquire);
-}
-
-void setMeshBoxes(bool on)
-{
-    g_meshBoxes.store(on, std::memory_order_release);
-}
-
-bool meshBoxesOn()
-{
-    return g_meshBoxes.load(std::memory_order_acquire);
-}
-
 void setAirBlock(const void* air)
 {
     g_air.store(air, std::memory_order_release);
+}
+
+void dropWorldBlocks()
+{
+    g_ghostOn.store(false, std::memory_order_release);
+    g_drawPalettePtr.store(nullptr, std::memory_order_release);
+    g_drawPaletteCount.store(0, std::memory_order_relaxed);
+    g_air.store(nullptr, std::memory_order_release);
+    g_worldDropped.store(true, std::memory_order_release);
+}
+
+bool takeWorldDropped()
+{
+    return g_worldDropped.exchange(false, std::memory_order_acq_rel);
 }
 
 const void* airBlock()

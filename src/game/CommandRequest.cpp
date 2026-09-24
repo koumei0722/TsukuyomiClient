@@ -4,6 +4,7 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <cstring>
 
 #include "core/Logger.h"
@@ -169,28 +170,51 @@ void CommandRequest::onEntityContext(void* entityContext)
     }
     auto* const player = static_cast<std::byte*>(entityContext) - kEntityContextOffset;
     if (!hasVtable(player, Target::PlayerVtableRef, kPlayerVtableDisp)) {
-        GameData::instance().setPlayerAlt(player);
-        if (!m_warnedBadPlayer.exchange(true, std::memory_order_acq_rel)) {
-            void* head = nullptr;
-            readPointerGuarded(player, head);
-            log().info(L"CommandRequest: skipped a game mode target whose owner is not the "
-                       L"local player (vtable rva {:#x})",
-                       mainModule().rvaOf(head));
-        }
+        const bool kept = GameData::instance().setPlayerAlt(player);
+        void* head = nullptr;
+        readPointerGuarded(player, head);
+        noteOtherTarget(head, GameData::instance().isServerPlayer(player), kept);
         return;
     }
 
     GameData::instance().setPlayer(player);
 
-    if (m_player.exchange(player, std::memory_order_acq_rel) != player) {
+    if (void* const previous = m_player.exchange(player, std::memory_order_acq_rel);
+        previous != player) {
         m_sender.store(nullptr, std::memory_order_release);
         m_warnedNoPlayer.store(false, std::memory_order_release);
         m_nextSenderWarnMs.store(0, std::memory_order_release);
         m_nextPlayerWarnMs.store(0, std::memory_order_release);
-        blockwrite::noteWorldChanged();
-        log().info(L"CommandRequest: player found at {:#x}",
-                   reinterpret_cast<std::uintptr_t>(player));
+        constexpr unsigned long long kLiveViewMs = 2000;
+        const unsigned long long sinceView = GameData::instance().msSinceView();
+        const bool leftAWorld = previous != nullptr || sinceView > kLiveViewMs;
+        blockwrite::noteWorldChanged(leftAWorld);
+        log().info(L"CommandRequest: player found at {:#x} ({}; last view {} ms ago)",
+                   reinterpret_cast<std::uintptr_t>(player),
+                   leftAWorld ? L"came from another world" : L"first seen in this world",
+                   sinceView == ~0ULL ? -1LL : static_cast<long long>(sinceView));
     }
+}
+
+void CommandRequest::noteOtherTarget(const void* vtable, bool serverType, bool kept)
+{
+    const std::size_t used = (std::min)(m_otherTargetCount.load(std::memory_order_acquire), kOtherTargetLogs);
+    for (std::size_t i = 0; i < used; ++i) {
+        if (m_otherTargetVtables[i].load(std::memory_order_relaxed) == vtable) {
+            return;
+        }
+    }
+    const std::size_t at = m_otherTargetCount.fetch_add(1, std::memory_order_acq_rel);
+    if (at >= kOtherTargetLogs) {
+        return;
+    }
+    m_otherTargetVtables[at].store(vtable, std::memory_order_relaxed);
+    log().info(L"CommandRequest: skipped a game mode target whose owner is not the local player "
+               L"(vtable rva {:#x}; {})",
+               mainModule().rvaOf(vtable),
+               kept         ? L"remembered as the server-side player of this local world"
+               : serverType ? L"a ServerPlayer whose position is unreadable, so it is not remembered"
+                            : L"not a ServerPlayer, so it is not remembered");
 }
 
 int CommandRequest::scoreSender(const std::byte* candidate)

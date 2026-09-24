@@ -1,5 +1,7 @@
 #include "modules/Schematica.h"
 
+#include "config/WriteSwitches.h"
+
 #include "render/BoxRenderer.h"
 #include "render/WorldMesh.h"
 
@@ -11,6 +13,7 @@
 #include <cwctype>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <format>
 #include <string>
@@ -25,11 +28,13 @@
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "modules/FreeCamera.h"
+#include "modules/HandRestock.h"
 #include "core/Paths.h"
 #include "core/Perf.h"
 #include "core/Strings.h"
 #include "game/BlockRegistry.h"
 #include "hooks/Detours.h"
+#include "hooks/HookManager.h"
 #include "game/BlockWrite.h"
 #include "game/GameData.h"
 #include "game/Rotation.h"
@@ -42,87 +47,6 @@
 namespace tsukuyomi {
 
 namespace {
-
-int pitchFromStates(const std::vector<structure::StateValue>& states, bool fromEntity)
-{
-    for (const structure::StateValue& one : states) {
-        if (one.tag == nbt::Tag::String) {
-            if (one.name == "minecraft:facing_direction" || one.name == "facing") {
-                if (one.text == "down") {
-                    return 2;
-                }
-                if (one.text == "up") {
-                    return 0;
-                }
-                return fromEntity ? 1 : 0;
-            }
-            continue;
-        }
-        if (one.name == "facing_direction" || one.name == "block_face"
-            || one.name == "minecraft:block_face" || one.name == "facing") {
-            if (one.number == 0) {
-                return 2;
-            }
-            if (one.number == 1) {
-                return 0;
-            }
-            if (one.number >= 2 && one.number <= 5) {
-                return fromEntity ? 1 : 0;
-            }
-        }
-    }
-    return 0;
-}
-
-float yawFromStates(const std::vector<structure::StateValue>& states)
-{
-    for (const structure::StateValue& one : states) {
-        if (one.tag == nbt::Tag::String) {
-            if (one.name == "minecraft:cardinal_direction"
-                || one.name == "minecraft:facing_direction" || one.name == "orientation"
-                || one.name == "torch_facing_direction" || one.name == "facing") {
-                if (one.text == "north") {
-                    return 0.0F;
-                }
-                if (one.text == "south") {
-                    return 180.0F;
-                }
-                if (one.text == "west") {
-                    return 270.0F;
-                }
-                if (one.text == "east") {
-                    return 90.0F;
-                }
-            }
-            continue;
-        }
-        if (one.name == "facing_direction" || one.name == "coral_direction"
-            || one.name == "block_face" || one.name == "minecraft:block_face"
-            || one.name == "facing") {
-            switch (one.number) {
-            case 2:
-                return 0.0F;
-            case 3:
-                return 180.0F;
-            case 4:
-                return 270.0F;
-            case 5:
-                return 90.0F;
-            default:
-                break;
-            }
-            continue;
-        }
-        if (one.name == "direction" || one.name == "weirdo_direction") {
-            return static_cast<float>(one.number % 4) * 90.0F;
-        }
-        if (one.name == "ground_sign_direction" || one.name == "rotation") {
-            const float deg = static_cast<float>(one.number % 16) * 22.5F;
-            return deg >= 360.0F ? deg - 360.0F : deg;
-        }
-    }
-    return 0.0F;
-}
 
 constexpr std::size_t kMaxFiles = 32;
 
@@ -220,8 +144,6 @@ void Schematica::scanFiles()
                     fresh->posZ.store(old->posZ.load());
                     fresh->rotation.store(old->rotation.load());
                     fresh->loaded = std::move(old->loaded);
-                    fresh->paletteBlocks = std::move(old->paletteBlocks);
-                    fresh->paletteBase = old->paletteBase;
                     fresh->ready = old->ready;
                     fresh->sizeX.store(old->sizeX.load());
                     fresh->sizeY.store(old->sizeY.load());
@@ -513,8 +435,6 @@ static bool playerBlockPos(int& outX, int& outY, int& outZ)
             y = fy;
             z = fz;
             ok = true;
-        } else {
-            static std::atomic<unsigned> told{0};
         }
     }
     outX = static_cast<int>(std::floor(x));
@@ -530,6 +450,33 @@ static int layerOfPlayer(int axis, bool& ok)
     int z = 0;
     ok = playerBlockPos(x, y, z);
     return (axis == 0) ? x : ((axis == 2) ? z : y);
+}
+
+void Schematica::setLayerMode(int mode)
+{
+    const int want = std::clamp(mode, 0, kLayerModeCount - 1);
+    if (m_layerMode.load(std::memory_order_relaxed) == want) {
+        return;
+    }
+    if (want == kLayerRange && m_layerMin.load() == 0 && m_layerMax.load() == 0) {
+        m_layerMin.store(m_layerValue.load());
+        m_layerMax.store(m_layerValue.load());
+    }
+    m_layerMode.store(want, std::memory_order_relaxed);
+    m_layerVersion.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Schematica::setLayerAxis(int axis)
+{
+    const int want = std::clamp(axis, 0, 2);
+    if (m_layerAxis.load(std::memory_order_relaxed) == want) {
+        return;
+    }
+    m_layerAxis.store(want, std::memory_order_relaxed);
+    m_layerValue.store(clampLayerValue(want, m_layerValue.load()));
+    m_layerMin.store(clampLayerValue(want, m_layerMin.load()));
+    m_layerMax.store(clampLayerValue(want, m_layerMax.load()));
+    m_layerVersion.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Schematica::stepLayer(int delta)
@@ -655,8 +602,95 @@ void Schematica::applyLayerFilter()
         }
     }
     if (!ask.empty()) {
-        hooks::requestChunkRebuilds(ask);
+        const std::uint64_t seq = hooks::requestChunkRebuilds(ask);
+        const std::lock_guard<std::mutex> guard(m_mutex);
+        m_layerAskChunks = std::move(ask);
+        m_layerAskSeq = seq;
+        m_layerAskAt = GetTickCount64();
+        m_layerAskTries = 0;
+        m_layerAskRound = 1;
     }
+}
+
+void Schematica::checkLayerRebuilds(unsigned long long now)
+{
+    if (m_layerAskAt == 0 || now - m_layerAskAt < kLayerCheckMs) {
+        return;
+    }
+    const std::size_t asked = m_layerAskChunks.size();
+    std::size_t rebuilt = 0;
+    std::size_t stale = 0;
+    std::size_t noRecord = 0;
+    std::int32_t staleAt[3] = {0, 0, 0};
+    for (const std::array<std::int32_t, 3>& one : m_layerAskChunks) {
+        std::uint32_t tries = 0;
+        std::uint64_t built = 0;
+        if (!hooks::chunkLastBuildBoxTries(one[0], one[1], one[2], tries, &built)) {
+            ++noRecord;
+            continue;
+        }
+        if (built > m_layerAskSeq) {
+            ++rebuilt;
+            continue;
+        }
+        if (stale == 0) {
+            staleAt[0] = one[0] << 4;
+            staleAt[1] = one[1] << 4;
+            staleAt[2] = one[2] << 4;
+        }
+        ++stale;
+    }
+    if (stale == 0) {
+        m_layerAskChunks.clear();
+        m_layerAskChunks.shrink_to_fit();
+        m_layerAskAt = 0;
+        m_layerAskTries = 0;
+        log().info(L"Schematica: the layer view change reached every chunk ({} rebuilt / {} "
+                   L"never built of {} asked, {} round(s))",
+                   rebuilt,
+                   noRecord,
+                   asked,
+                   m_layerAskRound);
+        return;
+    }
+    std::vector<std::array<std::int32_t, 3>> again;
+    again.reserve(stale);
+    for (const std::array<std::int32_t, 3>& one : m_layerAskChunks) {
+        std::uint32_t tries = 0;
+        std::uint64_t built = 0;
+        if (hooks::chunkLastBuildBoxTries(one[0], one[1], one[2], tries, &built)
+            && built <= m_layerAskSeq) {
+            again.push_back(one);
+        }
+    }
+    if (m_layerAskTries + 1 < kLayerAskTries && !again.empty()) {
+        ++m_layerAskTries;
+        ++m_layerAskRound;
+        log().info(L"Schematica: {} of the {} chunk(s) of the layer view change are still "
+                   L"showing the old layers, so they are asked again (round {})",
+                   again.size(),
+                   asked,
+                   m_layerAskRound);
+        m_layerAskSeq = hooks::requestChunkRebuilds(again);
+        m_layerAskChunks = std::move(again);
+        m_layerAskAt = now;
+        return;
+    }
+    m_layerAskChunks.clear();
+    m_layerAskChunks.shrink_to_fit();
+    m_layerAskAt = 0;
+    m_layerAskTries = 0;
+    log().warn(L"Schematica: {} of the {} chunk(s) asked for the layer view change were not "
+               L"rebuilt after {} round(s), so they still show the ghosts of the other layers "
+               L"({} rebuilt / {} never built; the first one starts at {},{},{})",
+               stale,
+               asked,
+               m_layerAskRound,
+               rebuilt,
+               noRecord,
+               staleAt[0],
+               staleAt[1],
+               staleAt[2]);
 }
 
 bool Schematica::deleteArmed() const
@@ -696,15 +730,44 @@ std::vector<Schematica::MaterialRow> Schematica::blueprintMaterials(std::size_t 
     if (at >= m_blueprints.size()) {
         return out;
     }
+    out.reserve(std::min<std::size_t>(limit, m_blueprints[at]->materials.size()));
     const auto& src = m_blueprints[at]->materials;
-    if (kinds != nullptr) {
-        *kinds = src.size();
+    std::map<std::string, std::size_t> missingByName;
+    const bool missingKnown = m_diffTallyLaps.load(std::memory_order_relaxed) != 0;
+    if (missingKnown) {
+        for (std::size_t e = 0;
+             e < m_missingByEntryDone.size() && e < m_missingNamesDone.size(); ++e) {
+            if (m_missingByEntryDone[e] != 0) {
+                missingByName[m_missingNamesDone[e]] += m_missingByEntryDone[e];
+            }
+        }
     }
-    out.reserve(std::min(limit, src.size()));
-    for (std::size_t i = 0; i < src.size() && i < limit; ++i) {
+    const int listType = m_materialListType.load(std::memory_order_relaxed);
+    std::size_t shown = 0;
+    for (std::size_t i = 0; i < src.size(); ++i) {
         MaterialRow row;
         row.name = toUtf16(src[i].first);
         row.count = src[i].second;
+        row.ignored = (m_ignoredMaterials.count(src[i].first) != 0);
+        row.missingKnown = missingKnown;
+        if (const auto found = missingByName.find(src[i].first); found != missingByName.end()) {
+            row.missing = found->second;
+        }
+        row.availableKnown = m_availableKnown;
+        if (const auto found = m_availableByName.find(src[i].first);
+            found != m_availableByName.end()) {
+            row.available = found->second;
+        }
+        if (row.ignored) {
+            continue;
+        }
+        if (listType == kMaterialMissing && missingKnown && row.missing == 0) {
+            continue;
+        }
+        ++shown;
+        if (out.size() >= limit) {
+            continue;
+        }
         if (const auto icon = m_iconIds.find(src[i].first); icon != m_iconIds.end()) {
             row.iconIdAux = icon->second;
             row.hasIcon = true;
@@ -714,14 +777,287 @@ std::vector<Schematica::MaterialRow> Schematica::blueprintMaterials(std::size_t 
         }
         out.push_back(std::move(row));
     }
+    if (kinds != nullptr) {
+        *kinds = shown;
+    }
     return out;
 }
 
-void Schematica::diffTally(std::size_t (&out)[6]) const
+void Schematica::refreshAvailableCounts()
 {
-    for (std::size_t i = 0; i < 6; ++i) {
-        out[i] = m_diffTally[i];
+    const unsigned long long now = GetTickCount64();
+    const bool asked = m_materialRefreshWanted.exchange(false, std::memory_order_relaxed);
+    if (!asked && now - m_availableAt < 1000) {
+        return;
     }
+    m_availableAt = now;
+
+    std::map<const void*, const std::string*> nameByLegacy;
+    {
+        std::lock_guard<std::mutex> guard(m_mutex);
+        for (std::size_t i = 0; i < m_paletteLegacy.size() && i < m_paletteNames.size(); ++i) {
+            if (m_paletteLegacy[i] != nullptr) {
+                nameByLegacy.emplace(m_paletteLegacy[i], &m_paletteNames[i]);
+            }
+        }
+    }
+    if (nameByLegacy.empty()) {
+        std::lock_guard<std::mutex> guard(m_filesMutex);
+        m_availableByName.clear();
+        m_availableKnown = false;
+        return;
+    }
+
+    std::map<std::string, std::size_t> counted;
+    const bool ok = HandRestock::instance().forEachInventorySlot(
+        [&](const void* block, int count) {
+            if (block == nullptr || count <= 0) {
+                return;
+            }
+            const void* const legacy = blocks::legacyOfFast(block);
+            if (legacy == nullptr) {
+                return;
+            }
+            const auto found = nameByLegacy.find(legacy);
+            if (found != nameByLegacy.end()) {
+                counted[*found->second] += static_cast<std::size_t>(count);
+            }
+        });
+
+    std::lock_guard<std::mutex> guard(m_filesMutex);
+    m_availableByName = std::move(counted);
+    m_availableKnown = ok;
+}
+
+void Schematica::cycleMaterialListType()
+{
+    const int next =
+        (m_materialListType.load(std::memory_order_relaxed) + 1) % kMaterialListTypeCount;
+    m_materialListType.store(next, std::memory_order_relaxed);
+}
+
+void Schematica::toggleMaterialIgnored(const std::wstring& name)
+{
+    const std::string key = toUtf8(name);
+    if (key.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(m_filesMutex);
+    if (const auto found = m_ignoredMaterials.find(key); found != m_ignoredMaterials.end()) {
+        m_ignoredMaterials.erase(found);
+        log().info(L"Schematica: material {} is shown again", name);
+        return;
+    }
+    m_ignoredMaterials.insert(key);
+    log().info(L"Schematica: material {} is ignored", name);
+}
+
+void Schematica::clearIgnoredMaterials()
+{
+    std::lock_guard<std::mutex> guard(m_filesMutex);
+    if (m_ignoredMaterials.empty()) {
+        return;
+    }
+    log().info(L"Schematica: cleared {} ignored material(s)", m_ignoredMaterials.size());
+    m_ignoredMaterials.clear();
+}
+
+std::size_t Schematica::ignoredMaterialCount() const
+{
+    std::lock_guard<std::mutex> guard(m_filesMutex);
+    return m_ignoredMaterials.size();
+}
+
+bool Schematica::writeMaterialList(std::size_t at, std::wstring& outPath)
+{
+    std::wstring name;
+    {
+        std::lock_guard<std::mutex> guard(m_filesMutex);
+        if (at >= m_blueprints.size()) {
+            return false;
+        }
+        name = m_blueprints[at]->name;
+    }
+    std::size_t kinds = 0;
+    const std::vector<MaterialRow> rows = blueprintMaterials(at, 4096, &kinds);
+
+    std::error_code ec;
+    const std::filesystem::path dir = paths::schematicsDir().parent_path() / "material-lists";
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        log().warn(L"Schematica: could not make {} ({})", dir.wstring(), toUtf16(ec.message()));
+        return false;
+    }
+    std::wstring safe = name;
+    for (wchar_t& ch : safe) {
+        if (std::wcschr(L"\\/:*?\"<>|", ch) != nullptr) {
+            ch = L'_';
+        }
+    }
+    const std::filesystem::path path = dir / (safe + L".txt");
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        log().warn(L"Schematica: could not write {}", path.wstring());
+        return false;
+    }
+    out << "Material list for " << toUtf8(name) << "\r\n";
+    out << "Item\tTotal\tMissing\tAvailable\r\n";
+    for (const MaterialRow& row : rows) {
+        out << toUtf8(row.name) << '\t' << row.count << '\t';
+        if (row.missingKnown) {
+            out << row.missing;
+        } else {
+            out << '-';
+        }
+        out << '\t';
+        if (row.availableKnown) {
+            out << row.available;
+        } else {
+            out << '-';
+        }
+        out << "\r\n";
+    }
+    out.close();
+    outPath = path.wstring();
+    log().info(L"Schematica: wrote the material list to {}", outPath);
+    return true;
+}
+
+void Schematica::diffTally(std::size_t (&out)[blocks::kDiffKindCount]) const
+{
+    const bool done = m_diffTallyLaps.load(std::memory_order_relaxed) != 0;
+    for (std::size_t i = 0; i < blocks::kDiffKindCount; ++i) {
+        out[i] = done ? m_diffTallyDone[i] : m_diffTally[i];
+    }
+}
+
+void Schematica::closeDiffTally()
+{
+    for (std::size_t i = 0; i < blocks::kDiffKindCount; ++i) {
+        m_diffTallyDone[i] = m_diffTally[i];
+        m_diffTally[i] = 0;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_filesMutex);
+        m_missingByEntryDone = m_missingByEntry;
+        m_missingNamesDone = m_paletteNames;
+    }
+    std::fill(m_missingByEntry.begin(), m_missingByEntry.end(), 0);
+    m_diffByEntryDone = m_diffByEntry;
+    std::fill(m_diffByEntry.begin(), m_diffByEntry.end(), 0);
+    m_diffTallyLaps.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Schematica::logDrawDiag(unsigned long long now)
+{
+    (void)now;
+    std::size_t overlayStacked = 0;
+    std::size_t overlayMissed = 0;
+    hooks::overlayStats(overlayStacked, overlayMissed);
+    log().info(L"Schematica: faces since injection - ghost {} / layer swap {} / empty chunk "
+               L"answered {} (the color boxes are drawn by the overlay/name-tag "
+               L"materials - see the WorldMesh line); overlay on mismatched cells since the "
+               L"last line - stacked {} / stacked nothing {}",
+               blocks::ghostHitCount(blocks::GhostHook::Tessellate),
+               blocks::ghostHitCount(blocks::GhostHook::Layer),
+               blocks::ghostHitCount(blocks::GhostHook::Filled),
+               overlayStacked,
+               overlayMissed);
+
+    std::size_t ask[9] = {};
+    hooks::askBuildStats(ask);
+    std::size_t preds = 0;
+    std::size_t scans = 0;
+    std::size_t getBlockGhost = 0;
+    std::size_t getBlockCalls = 0;
+    hooks::hotPathStats(preds, scans, getBlockGhost, getBlockCalls);
+    log().info(L"Schematica: chunk rebuild asks since the last line - forced round(s) {} / "
+               L"records found {} / skipped as already built {} / forced near booked {} refused "
+               L"{} / forced far booked {} refused {} / normal booked {} refused {}; the \"is "
+               L"this chunk empty\" hooks were asked {} time(s) (storage) and {} time(s) "
+               L"(visibility scan); getBlock {} of {}",
+               ask[0], ask[1], ask[2], ask[3], ask[4], ask[5], ask[6], ask[7], ask[8],
+               preds, scans, getBlockGhost, getBlockCalls);
+
+    std::size_t re[9] = {};
+    hooks::chunkRebuildStats(re);
+    log().info(L"Schematica: chunk rebuild retries since the last line - queued {} / done "
+               L"(build seen) {} / tried {} / waited (no record) {} / gave up {} / still "
+               L"waiting {} / booked {} refused {} / empty flag cleared {}",
+               re[0], re[1], re[2], re[3], re[4], re[5], re[6], re[7], re[8]);
+
+    if (m_diffTallyLaps.load(std::memory_order_relaxed) == 0 || m_diffByEntryDone.empty()) {
+        return;
+    }
+    struct Row {
+        std::size_t missing = 0;
+        std::size_t wrong = 0;
+        std::size_t state = 0;
+        std::size_t match = 0;
+        std::size_t unknown = 0;
+        std::size_t bad() const { return missing + wrong + state; }
+    };
+    std::map<std::string, Row> byName;
+    const auto at = [this](std::size_t base, blocks::DiffKind kind) {
+        return m_diffByEntryDone[base + static_cast<std::size_t>(kind)];
+    };
+    for (std::size_t e = 0; e < m_paletteNames.size(); ++e) {
+        const std::size_t base = e * blocks::kDiffKindCount;
+        if (base + blocks::kDiffKindCount > m_diffByEntryDone.size()) {
+            break;
+        }
+        Row& row = byName[m_paletteNames[e]];
+        row.match += at(base, blocks::DiffKind::Match);
+        row.missing += at(base, blocks::DiffKind::Missing);
+        row.wrong += at(base, blocks::DiffKind::Wrong);
+        row.state += at(base, blocks::DiffKind::State);
+        row.unknown += at(base, blocks::DiffKind::UnknownWorld)
+                       + at(base, blocks::DiffKind::UnknownWant);
+    }
+    std::vector<std::pair<std::string, Row>> rows;
+    rows.reserve(byName.size());
+    std::size_t kinds = 0;
+    for (const auto& [name, row] : byName) {
+        if (row.missing + row.wrong + row.state + row.match + row.unknown == 0) {
+            continue;
+        }
+        if (row.bad() != 0) {
+            ++kinds;
+        }
+        rows.emplace_back(name, row);
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        if (a.second.bad() != b.second.bad()) {
+            return a.second.bad() > b.second.bad();
+        }
+        return a.second.match > b.second.match;
+    });
+    static constexpr std::string_view kVanilla{"minecraft:"};
+    std::wstring line;
+    for (std::size_t i = 0; i < rows.size() && i < kDiagTopEntries; ++i) {
+        if (!line.empty()) {
+            line += L", ";
+        }
+        std::string_view name{rows[i].first};
+        if (name.starts_with(kVanilla)) {
+            name.remove_prefix(kVanilla.size());
+        }
+        line += std::format(L"{} {}/{}/{}/{}",
+                            toUtf16(name),
+                            rows[i].second.missing,
+                            rows[i].second.wrong,
+                            rows[i].second.state,
+                            rows[i].second.match);
+        if (rows[i].second.unknown != 0) {
+            line += std::format(L" (world not read {})", rows[i].second.unknown);
+        }
+    }
+    log().info(L"Schematica: materials as missing/wrong/state/match - {} ({} of the {} "
+               L"material(s) differ from the world; showing the {} with the most differences)",
+               line.empty() ? std::wstring{L"(none)"} : line,
+               kinds,
+               rows.size(),
+               (std::min)(rows.size(), kDiagTopEntries));
 }
 
 bool Schematica::deleteBlueprint(std::size_t at)
@@ -803,236 +1139,480 @@ std::size_t Schematica::healStaleChunks(unsigned long long now)
     return ask.size();
 }
 
-std::uint64_t Schematica::packCell(std::int32_t x, std::int32_t y, std::int32_t z)
+std::vector<Schematica::PrepEntry> Schematica::snapshotVisible(bool& needLoad)
 {
-    const std::uint64_t ux = static_cast<std::uint32_t>(x) & 0x1FFFFFu;
-    const std::uint64_t uy = static_cast<std::uint32_t>(y) & 0x1FFFFFu;
-    const std::uint64_t uz = static_cast<std::uint32_t>(z) & 0x1FFFFFu;
-    return (ux << 42) | (uy << 21) | uz;
-}
-
-void Schematica::loadVisible()
-{
-    const perf::Scope perfScope{perf::Slot::Load};
-    std::vector<Blueprint*> want;
-    {
-        std::lock_guard<std::mutex> guard(m_filesMutex);
-        for (const auto& one : m_blueprints) {
-            if (one->visible.load()) {
-                want.push_back(one.get());
-            } else if (one->ready) {
-                one->loaded = structure::Structure{};
-                one->paletteBlocks.clear();
+    needLoad = false;
+    std::vector<PrepEntry> out;
+    const std::filesystem::path dir = paths::schematicsDir();
+    std::lock_guard<std::mutex> guard(m_filesMutex);
+    for (const auto& one : m_blueprints) {
+        if (!one->visible.load()) {
+            if (one->ready || one->loaded) {
+                one->loaded.reset();
                 one->ready = false;
             }
+            continue;
+        }
+        PrepEntry entry;
+        entry.name = one->name;
+        entry.path = dir / one->fileName;
+        entry.x = one->posX.load();
+        entry.y = one->posY.load();
+        entry.z = one->posZ.load();
+        entry.rotation = one->rotation.load() & 3;
+        if (one->ready && one->loaded) {
+            entry.data = one->loaded;
+        } else {
+            needLoad = true;
+        }
+        out.push_back(std::move(entry));
+    }
+    return out;
+}
+
+std::vector<schematic::Placement> Schematica::placementsOf(const std::vector<PrepEntry>& entries)
+{
+    std::vector<schematic::Placement> out;
+    out.reserve(entries.size());
+    for (const PrepEntry& one : entries) {
+        if (!one.data) {
+            continue;
+        }
+        schematic::Placement placed;
+        placed.data = one.data;
+        placed.x = one.x;
+        placed.y = one.y;
+        placed.z = one.z;
+        placed.rotation = one.rotation;
+        out.push_back(std::move(placed));
+    }
+    schematic::assignPaletteBases(out);
+    return out;
+}
+
+namespace {
+
+bool samePalette(const std::vector<schematic::Placement>& a,
+                 const std::vector<schematic::Placement>& b)
+{
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].data != b[i].data || (a[i].rotation & 3) != (b[i].rotation & 3)
+            || a[i].paletteBase != b[i].paletteBase) {
+            return false;
         }
     }
+    return true;
+}
 
-    for (Blueprint* const one : want) {
-        if (one->ready) {
-            continue;
-        }
-        const std::filesystem::path path = paths::schematicsDir() / one->fileName;
-        structure::LoadResult got = structure::loadFile(path);
-        if (!got.ok()) {
-            log().warn(L"Schematica: could not read {} ({})", one->name, toUtf16(got.why));
-            one->loaded = structure::Structure{};
-            one->ready = false;
-            continue;
-        }
-        std::size_t solid = 0;
-        std::vector<std::size_t> perEntry(got.value.palette.size(), 0);
-        for (const std::int32_t entry : got.value.blocks) {
-            if (entry >= 0 && static_cast<std::size_t>(entry) < got.value.palette.size()
-                && got.value.palette[static_cast<std::size_t>(entry)].name
-                       != "minecraft:air") {
-                ++solid;
-                ++perEntry[static_cast<std::size_t>(entry)];
-            }
-        }
-        std::map<std::string, std::size_t> byName;
-        for (std::size_t e = 0; e < perEntry.size(); ++e) {
-            if (perEntry[e] != 0) {
-                byName[got.value.palette[e].name] += perEntry[e];
-            }
-        }
-        std::vector<std::pair<std::string, std::size_t>> materials(byName.begin(), byName.end());
-        std::sort(materials.begin(), materials.end(),
-                  [](const auto& a, const auto& b) {
-                      return (a.second != b.second) ? (a.second > b.second) : (a.first < b.first);
-                  });
-        log().info(L"Schematica: loaded {} ({}x{}x{}, {} palette entries, {} solid blocks)",
-                   one->name, got.value.sizeX, got.value.sizeY, got.value.sizeZ,
-                   got.value.palette.size(), solid);
-        one->sizeX.store(got.value.sizeX, std::memory_order_relaxed);
-        one->sizeY.store(got.value.sizeY, std::memory_order_relaxed);
-        one->sizeZ.store(got.value.sizeZ, std::memory_order_relaxed);
-        one->solidCount.store(solid, std::memory_order_relaxed);
+}
+
+void Schematica::requestPrepare(unsigned purposes)
+{
+    m_prepWant |= purposes;
+    if (!m_prepBusy) {
+        startPrepare();
+    }
+    if (m_paletteStale) {
+        resolvePalette(m_live);
+    }
+}
+
+void Schematica::pollPrepare()
+{
+    if (m_prepBusy) {
+        std::unique_ptr<PrepareJob> done;
         {
-            std::lock_guard<std::mutex> guard(m_filesMutex);
-            one->materials = std::move(materials);
+            std::lock_guard<std::mutex> guard(m_workMutex);
+            done = std::move(m_workDone);
         }
-        one->loaded = std::move(got.value);
-        one->ready = true;
+        if (done) {
+            m_prepBusy = false;
+            installPrepared(std::move(done));
+        }
     }
-
-    resolvePalette();
-    {
-        std::lock_guard<std::mutex> guard(m_mutex);
-        rebuildCells();
+    if (!m_prepBusy && m_prepWant != 0) {
+        startPrepare();
     }
 }
 
-Schematica::Box Schematica::unionBox() const
+void Schematica::startPrepare()
 {
-    Box all;
-    bool first = true;
-    for (const Box& one : m_boxes) {
-        if (first) {
-            all = one;
-            first = false;
+    const unsigned purposes = m_prepWant;
+    if (purposes == 0 || m_prepBusy) {
+        return;
+    }
+    m_prepWant = 0;
+    bool needLoad = false;
+    std::vector<PrepEntry> entries = snapshotVisible(needLoad);
+    m_prepHasVisible = !entries.empty();
+
+    if (!needLoad) {
+        std::vector<schematic::Placement> placements = placementsOf(entries);
+        const std::vector<schematic::LayoutKey> key = schematic::layoutOf(placements);
+        const bool unchanged = key == m_cellsKey
+                               && (key.empty() ? m_cells.empty() : !m_cells.empty());
+        if (unchanged) {
+            const perf::Scope perfScope{perf::Slot::Install};
+            const bool paletteSame = samePalette(placements, m_live);
+            m_live = std::move(placements);
+            if ((purposes & kPrepReload) != 0 || m_paletteStale || !paletteSame) {
+                resolvePalette(m_live);
+            }
+            if ((purposes & (kPrepReload | kPrepRedraw)) != 0) {
+                log().info(L"Schematica: {} blueprint(s) / {} cell(s) (unchanged, reused)",
+                           m_live.size(),
+                           m_cells.size());
+            }
+            m_cellsDirty.store(false, std::memory_order_relaxed);
+            finishPrepared(purposes);
+            return;
+        }
+    }
+
+    auto job = std::make_unique<PrepareJob>();
+    job->purposes = purposes;
+    job->entries = std::move(entries);
+    job->prevKey = m_cellsKey;
+    job->prevHasCells = !m_cells.empty();
+    job->startedAt = GetTickCount64();
+    std::size_t toRead = 0;
+    for (const PrepEntry& one : job->entries) {
+        if (!one.data) {
+            ++toRead;
+        }
+    }
+    if (!ensureWorker()) {
+        runPrepareJob(*job);
+        installPrepared(std::move(job));
+        return;
+    }
+    log().info(L"Schematica: preparing {} blueprint(s) in the background ({} file(s) to read)",
+               job->entries.size(),
+               toRead);
+    m_prepBusy = true;
+    postJob(std::move(job));
+}
+
+void Schematica::runPrepareJob(PrepareJob& job)
+{
+    const unsigned long long began = GetTickCount64();
+    for (PrepEntry& one : job.entries) {
+        if (one.data) {
             continue;
         }
-        all.x0 = std::min(all.x0, one.x0);
-        all.y0 = std::min(all.y0, one.y0);
-        all.z0 = std::min(all.z0, one.z0);
-        all.x1 = std::max(all.x1, one.x1);
-        all.y1 = std::max(all.y1, one.y1);
-        all.z1 = std::max(all.z1, one.z1);
-    }
-    return all;
-}
-
-void Schematica::rebuildCells()
-{
-    const perf::Scope perfScope{perf::Slot::Cells};
-    m_cells.clear();
-    m_cellAt.clear();
-    m_boxes.clear();
-    m_chunkCells.clear();
-
-    std::vector<Blueprint*> live;
-    {
-        std::lock_guard<std::mutex> guard(m_filesMutex);
-        for (const auto& one : m_blueprints) {
-            if (one->visible.load() && one->ready && one->loaded.valid()) {
-                live.push_back(one.get());
-            }
+        if (m_workCancel.load(std::memory_order_relaxed)) {
+            job.cancelled = true;
+            return;
+        }
+        const perf::Scope perfScope{perf::Slot::Load};
+        one.result = schematic::loadBlueprint(one.path);
+        one.loadedNow = true;
+        if (one.result.ok()) {
+            one.data = one.result.data;
         }
     }
-    if (live.empty()) {
+    const unsigned long long loaded = GetTickCount64();
+    job.loadMs = loaded - began;
+
+    job.placements = placementsOf(job.entries);
+    job.key = schematic::layoutOf(job.placements);
+    const bool unchanged = job.key == job.prevKey
+                           && (job.key.empty() ? !job.prevHasCells : job.prevHasCells);
+    if (!unchanged) {
+        auto cells = std::make_unique<schematic::CellSet>();
+        const perf::Scope perfScope{perf::Slot::Cells};
+        if (!schematic::buildCells(job.placements, *cells, &m_workCancel)) {
+            job.cancelled = true;
+            return;
+        }
+        job.cells = std::move(cells);
+    }
+    job.cellsMs = GetTickCount64() - loaded;
+}
+
+void Schematica::installPrepared(std::unique_ptr<PrepareJob> job)
+{
+    const perf::Scope perfScope{perf::Slot::Install};
+    if (!job || job->cancelled || m_shuttingDown.load(std::memory_order_relaxed)) {
         return;
     }
 
-    std::size_t overlapped = 0;
-    for (std::size_t which = 0; which < live.size(); ++which) {
-        Blueprint& bp = *live[which];
-        const std::int32_t x0 = bp.posX.load();
-        const std::int32_t y0 = bp.posY.load();
-        const std::int32_t z0 = bp.posZ.load();
-        const int quarters = bp.rotation.load() & 3;
-        {
-            const rotation::Footprint foot =
-                rotation::rotatedFootprint(quarters, x0, z0, bp.loaded.sizeX, bp.loaded.sizeZ);
-            m_boxes.push_back(Box{foot.x0, y0, foot.z0, foot.x1, y0 + bp.loaded.sizeY, foot.z1});
-        }
-
-        const std::int32_t sizeY = bp.loaded.sizeY;
-        const std::int32_t sizeZ = bp.loaded.sizeZ;
-        const std::size_t total = bp.loaded.blocks.size();
-        m_cells.reserve(m_cells.size() + total);
-        m_cellAt.reserve(m_cellAt.size() + total);
-        for (std::size_t at = 0; at < total; ++at) {
-            const std::int32_t entry = bp.loaded.blocks[at];
-            if (entry >= 0 && static_cast<std::size_t>(entry) >= bp.loaded.palette.size()) {
-                continue;
-            }
-            const std::int32_t local = static_cast<std::int32_t>(at);
-            const std::int32_t lz = local % sizeZ;
-            const std::int32_t ly = (local / sizeZ) % sizeY;
-            const std::int32_t lx = local / (sizeZ * sizeY);
-
-            static const std::string kAirName{"minecraft:air"};
-            const std::string& name =
-                entry < 0 ? kAirName
-                          : bp.loaded.palette[static_cast<std::size_t>(entry)].name;
-            Cell cell;
-            {
-                std::int32_t rx = lx;
-                std::int32_t rz = lz;
-                rotation::rotateLocal(quarters, lx, lz, rx, rz);
-                cell.x = x0 + rx;
-                cell.y = y0 + ly;
-                cell.z = z0 + rz;
-            }
-            cell.entry = (name == "minecraft:air")
-                             ? kAirCell
-                             : bp.paletteBase + static_cast<std::size_t>(entry);
-            cell.owner = static_cast<int>(which);
-            cell.name = &name;
-            if (cell.entry != kAirCell && at < bp.loaded.blocks2.size()) {
-                const std::int32_t second = bp.loaded.blocks2[at];
-                if (second >= 0
-                    && static_cast<std::size_t>(second) < bp.loaded.palette.size()
-                    && bp.loaded.palette[static_cast<std::size_t>(second)].name
-                           != "minecraft:air") {
-                    cell.entry2 =
-                        static_cast<std::int32_t>(bp.paletteBase)
-                        + second;
-                }
-            }
-            if (hooks::beModelsOn() && cell.entry != kAirCell
-                && static_cast<std::size_t>(entry) < bp.loaded.palette.size()) {
-                const auto& states = bp.loaded.palette[static_cast<std::size_t>(entry)].states;
-                cell.yaw = yawFromStates(states);
-                cell.pitch = pitchFromStates(states, false);
-                const auto& fields = bp.loaded.entityAt(lx, ly, lz);
-                if (!fields.empty()) {
-                    const float beYaw = yawFromStates(fields);
-                    const int bePitch = pitchFromStates(fields, true);
-                    if (beYaw != 0.0F || bePitch != 0) {
-                        cell.yaw = beYaw;
-                        cell.pitch = bePitch;
-                    }
-                }
-                if (quarters != 0) {
-                    cell.yaw = std::fmod(cell.yaw + 90.0F * static_cast<float>(quarters), 360.0F);
-                }
-            }
-            const std::uint64_t key = packCell(cell.x, cell.y, cell.z);
-            if (m_cellAt.find(key) != m_cellAt.end()) {
-                ++overlapped;
-                continue;
-            }
-            m_cellAt.emplace(key, m_cells.size());
-            m_chunkCells[packCell(cell.x >> 4, cell.y >> 4, cell.z >> 4)].push_back(
-                static_cast<std::uint32_t>(m_cells.size()));
-            m_cells.push_back(cell);
-        }
-    }
-    m_region = unionBox();
-    log().info(L"Schematica: {} blueprint(s) / {} cell(s){}",
-               live.size(),
-               m_cells.size(),
-               overlapped != 0 ? std::format(L" ({} dropped as overlapping)", overlapped)
-                               : std::wstring{});
-}
-
-void Schematica::resolvePalette()
-{
-    std::vector<Blueprint*> live;
+    struct LoadNote {
+        std::wstring name;
+        const schematic::Loaded* result = nullptr;
+        std::size_t paletteSize = 0;
+    };
+    std::vector<LoadNote> notes;
     {
         std::lock_guard<std::mutex> guard(m_filesMutex);
-        for (const auto& one : m_blueprints) {
-            if (one->visible.load() && one->ready) {
-                live.push_back(one.get());
+        for (PrepEntry& one : job->entries) {
+            if (!one.loadedNow) {
+                continue;
+            }
+            notes.push_back(LoadNote{one.name, &one.result,
+                                     one.result.data ? one.result.data->palette.size() : 0});
+            Blueprint* found = nullptr;
+            for (const auto& bp : m_blueprints) {
+                if (bp->name == one.name) {
+                    found = bp.get();
+                    break;
+                }
+            }
+            if (found == nullptr) {
+                continue;
+            }
+            if (!one.result.ok()) {
+                if (!found->ready) {
+                    found->loaded.reset();
+                }
+                continue;
+            }
+            found->sizeX.store(one.result.sizeX, std::memory_order_relaxed);
+            found->sizeY.store(one.result.sizeY, std::memory_order_relaxed);
+            found->sizeZ.store(one.result.sizeZ, std::memory_order_relaxed);
+            found->solidCount.store(one.result.solid, std::memory_order_relaxed);
+            found->materials = one.result.materials;
+            if (found->visible.load() && !found->ready) {
+                found->loaded = one.data;
+                found->ready = true;
             }
         }
     }
+    for (const LoadNote& one : notes) {
+        const schematic::Loaded& got = *one.result;
+        if (!got.ok()) {
+            if (got.sizeX > 0 && got.sizeY > 0 && got.sizeZ > 0) {
+                const std::size_t volume = static_cast<std::size_t>(got.sizeX)
+                                           * static_cast<std::size_t>(got.sizeY)
+                                           * static_cast<std::size_t>(got.sizeZ);
+                log().warn(L"Schematica: could not read {} ({}) - {}x{}x{} = {} cells", one.name,
+                           toUtf16(got.why != nullptr ? got.why : "?"), got.sizeX, got.sizeY,
+                           got.sizeZ, volume);
+            } else {
+                log().warn(L"Schematica: could not read {} ({})", one.name,
+                           toUtf16(got.why != nullptr ? got.why : "?"));
+            }
+            continue;
+        }
+        log().info(L"Schematica: loaded {} ({}x{}x{}, {} palette entries, {} solid blocks)",
+                   one.name, got.sizeX, got.sizeY, got.sizeZ, one.paletteSize, got.solid);
+    }
 
+    bool needLoad = false;
+    std::vector<PrepEntry> nowEntries = snapshotVisible(needLoad);
+    std::vector<schematic::Placement> placements = placementsOf(nowEntries);
+    const std::vector<schematic::LayoutKey> key = schematic::layoutOf(placements);
+    if (key != job->key) {
+        log().info(L"Schematica: the layout changed while it was being prepared, so it is "
+                   L"prepared again");
+        m_prepWant |= job->purposes;
+        postTrash(std::move(job->cells));
+        return;
+    }
+
+    const std::size_t overlapped = job->cells ? job->cells->overlapped : 0;
+    const bool rebuilt = job->cells != nullptr;
+    if (rebuilt) {
+        installCells(std::move(job->cells));
+    }
+    const bool paletteSame = samePalette(placements, m_live);
+    m_live = std::move(placements);
+    if ((job->purposes & kPrepReload) != 0 || m_paletteStale || !paletteSame) {
+        resolvePalette(m_live);
+    }
+    m_cellsDirty.store(false, std::memory_order_relaxed);
+    log().info(L"Schematica: {} blueprint(s) / {} cell(s){}{} - prepared in the background in "
+               L"{} ms (read {} ms / cells {} ms)",
+               m_live.size(),
+               m_cells.size(),
+               overlapped != 0 ? std::format(L" ({} dropped as overlapping)", overlapped)
+                               : std::wstring{},
+               rebuilt ? L"" : L" (unchanged, reused)",
+               GetTickCount64() - job->startedAt,
+               job->loadMs,
+               job->cellsMs);
+    finishPrepared(job->purposes);
+}
+
+void Schematica::installCells(std::unique_ptr<schematic::CellSet> cells)
+{
+    {
+        std::lock_guard<std::mutex> guard(m_mutex);
+        m_cells.swap(cells->cells);
+        m_cellAt.swap(cells->cellAt);
+        m_boxes.swap(cells->boxes);
+        m_chunkCells.swap(cells->chunkCells);
+        m_cellsKeep.swap(cells->keep);
+        std::swap(m_region, cells->region);
+        m_cellsKey = cells->key;
+    }
+    postTrash(std::move(cells));
+}
+
+void Schematica::finishPrepared(unsigned purposes)
+{
+    if ((purposes & kPrepReload) != 0) {
+        m_drawnUpTo = 0;
+        m_drawnPlaced = 0;
+        m_waitedLogged = false;
+        m_firstLogged = false;
+        m_anchorLogged = false;
+        m_diffUpTo = 0;
+        m_diffLaps = 0;
+        m_diffLoggedAt = 0;
+        for (std::size_t& one : m_diffTally) {
+            one = 0;
+        }
+        m_diffTallyLaps.store(0, std::memory_order_relaxed);
+        m_lapTagChunks.clear();
+        m_lapColorChunks.clear();
+        {
+            std::lock_guard<std::mutex> guard(m_mutex);
+            m_chunkChanges.clear();
+        }
+        hooks::clearChunkBoxTries();
+        if (m_placed.empty()) {
+            if (enabled()) {
+                m_drawPending.store(true, std::memory_order_relaxed);
+            }
+        } else {
+            m_clearedUpTo = 0;
+            m_clearPending.store(true, std::memory_order_relaxed);
+        }
+    }
+    if ((purposes & kPrepRedraw) != 0) {
+        m_redrawPending.store(true, std::memory_order_relaxed);
+    }
+}
+
+unsigned long __stdcall Schematica::workerThreadMain(void* param)
+{
+    static_cast<Schematica*>(param)->workerMain();
+    return 0;
+}
+
+bool Schematica::ensureWorker()
+{
+    std::lock_guard<std::mutex> guard(m_workMutex);
+    if (m_workThread != nullptr) {
+        return true;
+    }
+    if (m_workStop) {
+        return false;
+    }
+    const HANDLE thread =
+        CreateThread(nullptr, 0, &Schematica::workerThreadMain, this, 0, nullptr);
+    if (thread == nullptr) {
+        log().warn(L"Schematica: could not start the background loader thread (error {}), "
+                   L"so schematics are prepared on the game thread",
+                   GetLastError());
+        return false;
+    }
+    m_workThread = thread;
+    return true;
+}
+
+void Schematica::workerMain()
+{
+    for (;;) {
+        std::unique_ptr<PrepareJob> job;
+        std::vector<std::unique_ptr<schematic::CellSet>> trash;
+        {
+            std::unique_lock<std::mutex> lock(m_workMutex);
+            m_workCv.wait(lock, [this] {
+                return m_workStop || m_workJob != nullptr || !m_workTrash.empty();
+            });
+            trash.swap(m_workTrash);
+            job = std::move(m_workJob);
+            if (m_workStop && job == nullptr && trash.empty()) {
+                return;
+            }
+        }
+        trash.clear();
+        if (job != nullptr) {
+            runPrepareJob(*job);
+            std::lock_guard<std::mutex> guard(m_workMutex);
+            m_workDone = std::move(job);
+        }
+    }
+}
+
+void Schematica::postJob(std::unique_ptr<PrepareJob> job)
+{
+    {
+        std::lock_guard<std::mutex> guard(m_workMutex);
+        m_workJob = std::move(job);
+    }
+    m_workCv.notify_one();
+}
+
+void Schematica::postTrash(std::unique_ptr<schematic::CellSet> trash)
+{
+    if (!trash) {
+        return;
+    }
+    if (!ensureWorker()) {
+        trash.reset();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_workMutex);
+        m_workTrash.push_back(std::move(trash));
+    }
+    m_workCv.notify_one();
+}
+
+void Schematica::stopWorker()
+{
+    HANDLE thread = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(m_workMutex);
+        m_workStop = true;
+        thread = static_cast<HANDLE>(m_workThread);
+        m_workThread = nullptr;
+    }
+    m_workCancel.store(true, std::memory_order_relaxed);
+    m_workCv.notify_all();
+    if (thread == nullptr) {
+        return;
+    }
+    const DWORD waited = WaitForSingleObject(thread, 30000);
+    if (waited != WAIT_OBJECT_0) {
+        log().warn(L"Schematica: the background loader thread did not stop in 30 s");
+    }
+    CloseHandle(thread);
+    std::unique_ptr<PrepareJob> job;
+    std::unique_ptr<PrepareJob> done;
+    std::vector<std::unique_ptr<schematic::CellSet>> trash;
+    {
+        std::lock_guard<std::mutex> guard(m_workMutex);
+        job = std::move(m_workJob);
+        done = std::move(m_workDone);
+        trash.swap(m_workTrash);
+    }
+}
+
+void Schematica::resolvePalette(const std::vector<schematic::Placement>& live)
+{
+    {
+        bool anyData = false;
+        for (const schematic::Placement& bp : live) {
+            anyData = anyData || static_cast<bool>(bp.data);
+        }
+        if (!anyData && m_cells.empty() && m_placed.empty()) {
+            m_paletteStale = false;
+            return;
+        }
+    }
     std::vector<std::string> wanted;
-    for (const Blueprint* const bp : live) {
-        for (const structure::PaletteEntry& entry : bp->loaded.palette) {
+    for (const schematic::Placement& bp : live) {
+        if (!bp.data) {
+            continue;
+        }
+        for (const structure::PaletteEntry& entry : bp.data->palette) {
             if (!entry.name.empty()
                 && std::find(wanted.begin(), wanted.end(), entry.name) == wanted.end()) {
                 wanted.push_back(entry.name);
@@ -1047,9 +1627,6 @@ void Schematica::resolvePalette()
     }
     if (std::find(wanted.begin(), wanted.end(), std::string{kPokeBlock}) == wanted.end()) {
         wanted.emplace_back(kPokeBlock);
-    }
-    if (std::find(wanted.begin(), wanted.end(), std::string{kBoxBlock}) == wanted.end()) {
-        wanted.emplace_back(kBoxBlock);
     }
 
     blocks::Table table;
@@ -1075,8 +1652,11 @@ void Schematica::resolvePalette()
     if (blocks::calibrateItemIds()) {
         std::unordered_map<std::string, std::int32_t> icons;
         std::size_t missingIcons = 0;
-        for (const Blueprint* const bp : live) {
-            for (const structure::PaletteEntry& entry : bp->loaded.palette) {
+        for (const schematic::Placement& bp : live) {
+            if (!bp.data) {
+                continue;
+            }
+            for (const structure::PaletteEntry& entry : bp.data->palette) {
                 if (entry.name.empty() || entry.name == "minecraft:air"
                     || icons.find(entry.name) != icons.end()) {
                     continue;
@@ -1102,8 +1682,11 @@ void Schematica::resolvePalette()
     {
         std::unordered_map<std::string, int> stacks;
         std::size_t missingStacks = 0;
-        for (const Blueprint* const bp : live) {
-            for (const structure::PaletteEntry& entry : bp->loaded.palette) {
+        for (const schematic::Placement& bp : live) {
+            if (!bp.data) {
+                continue;
+            }
+            for (const structure::PaletteEntry& entry : bp.data->palette) {
                 if (entry.name.empty() || entry.name == "minecraft:air"
                     || stacks.find(entry.name) != stacks.end()) {
                     continue;
@@ -1114,14 +1697,7 @@ void Schematica::resolvePalette()
                     && blocks::maxStackSizeOf(entry.name.c_str(), found->second, size)) {
                     const int guess = stackcount::maxStackSize(entry.name);
                     if (guess < size) {
-                        if (static std::atomic<int> told{0};
-                            told.fetch_add(1, std::memory_order_relaxed) < 20) {
-                        }
                         size = guess;
-                    } else if (guess != size) {
-                        if (static std::atomic<int> told2{0};
-                            told2.fetch_add(1, std::memory_order_relaxed) < 20) {
-                        }
                     }
                     stacks.emplace(entry.name, size);
                 } else {
@@ -1143,12 +1719,11 @@ void Schematica::resolvePalette()
     const auto air = table.find("minecraft:air");
     const auto ghost = table.find(kGhostBlock);
     const auto poke = table.find(kPokeBlock);
-    const auto box = table.find(kBoxBlock);
 
     std::vector<const void*> merged;
     std::vector<std::string> mergedKeys;
+    std::vector<std::string> mergedNames;
     std::size_t withStates = 0;
-    std::size_t withYaw = 0;
     std::size_t changed = 0;
     std::size_t unresolvedTotal = 0;
     std::size_t slots = 0;
@@ -1156,9 +1731,13 @@ void Schematica::resolvePalette()
     std::size_t rotatedTurned = 0;
     std::size_t rotatedSame = 0;
     std::size_t rotatedFailed = 0;
-    for (Blueprint* const bp : live) {
-        const structure::Structure& loaded = bp->loaded;
-        const int quarters = bp->rotation.load() & 3;
+    bool baseDrift = false;
+    for (const schematic::Placement& bp : live) {
+        if (!bp.data) {
+            continue;
+        }
+        const structure::Structure& loaded = *bp.data;
+        const int quarters = bp.rotation & 3;
         if (quarters != 0) {
             ++rotatedPrints;
         }
@@ -1227,24 +1806,22 @@ void Schematica::resolvePalette()
                 resolved[i] = picked;
             }
             turnSlot(i);
-            float yaw = yawFromStates(states);
-            if (quarters != 0) {
-                yaw = std::fmod(yaw + 90.0F * static_cast<float>(quarters), 360.0F);
-            }
-            if (yaw != 0.0F) {
-                blocks::noteGhostYaw(resolved[i], yaw);
-                ++withYaw;
-            }
         }
         slots += resolved.size();
-        bp->paletteBase = merged.size();
+        if (bp.paletteBase != merged.size()) {
+            baseDrift = true;
+        }
         merged.insert(merged.end(), resolved.begin(), resolved.end());
         for (const structure::PaletteEntry& entry : loaded.palette) {
             mergedKeys.push_back(quarters != 0
                                      ? entry.key() + " (rot " + std::to_string(quarters * 90) + ")"
                                      : entry.key());
+            mergedNames.push_back(entry.name);
         }
-        bp->paletteBlocks = std::move(resolved);
+    }
+    if (baseDrift) {
+        log().error(L"Schematica: the palette slots do not line up with the cell list "
+                    L"(internal error) - some blocks may be drawn as the wrong kind");
     }
 
     std::lock_guard<std::mutex> guard(m_mutex);
@@ -1253,15 +1830,18 @@ void Schematica::resolvePalette()
     m_poke = poke == table.end() ? m_ghost : poke->second;
     m_paletteBlocks = std::move(merged);
     m_paletteKeys = std::move(mergedKeys);
+    m_paletteNames = std::move(mergedNames);
+    m_paletteLegacy.assign(m_paletteBlocks.size(), nullptr);
+    for (std::size_t i = 0; i < m_paletteBlocks.size(); ++i) {
+        m_paletteLegacy[i] = blocks::legacyOfFast(m_paletteBlocks[i]);
+    }
+    m_missingByEntry.assign(m_paletteBlocks.size(), 0);
+    m_missingByEntryDone.assign(m_paletteBlocks.size(), 0);
+    m_diffByEntry.assign(m_paletteBlocks.size() * blocks::kDiffKindCount, 0);
+    m_diffByEntryDone.assign(m_paletteBlocks.size() * blocks::kDiffKindCount, 0);
     m_palette = std::move(table);
 
     blocks::setAirBlock(m_air);
-
-    blocks::setBoxBlock(box == table.end() ? nullptr : box->second);
-    if (box == table.end()) {
-        log().warn(L"Schematica: could not resolve {} - no color boxes will be shown",
-                   toUtf16(kBoxBlock));
-    }
 
     {
         std::vector<const void*> all;
@@ -1282,7 +1862,7 @@ void Schematica::resolvePalette()
             log().warn(L"Schematica: could not list the block table - nothing will be placed");
         }
     }
-
+    m_paletteStale = false;
 }
 
 namespace {
@@ -1438,14 +2018,19 @@ void Schematica::onScansReady()
     m_pendingFile.clear();
     log().info(L"Schematica: {} file(s) in {}", m_files.size(),
                paths::schematicsDir().wstring());
+    if (enabled()) {
+        m_reloadPending.store(true, std::memory_order_relaxed);
+    }
 }
 
 void Schematica::shutdown()
 {
     m_shuttingDown.store(true, std::memory_order_relaxed);
+    stopWorker();
     if (!enabled()) {
         return;
     }
+    m_enabledAtShutdown.store(true, std::memory_order_relaxed);
     setEnabled(false);
 
     constexpr int kWaitMs = 1500;
@@ -1463,10 +2048,6 @@ void Schematica::shutdown()
         return;
     }
     log().warn(L"Schematica: the cleanup did not finish in time; restoring directly");
-    {
-        std::lock_guard<std::mutex> guard(m_mutex);
-        restoreGhostBlockEntities();
-    }
     blocks::clearGhostRegion();
     const std::size_t back = blockwrite::restoreAll();
     if (back > 0) {
@@ -1487,25 +2068,6 @@ void Schematica::noteGhostCellFreed(std::int32_t x, std::int32_t y, std::int32_t
     m_freedPending.store(true, std::memory_order_relaxed);
 }
 
-void Schematica::noteActorCellTaken(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (m_actorLive.load(std::memory_order_relaxed) == 0) {
-        return;
-    }
-    if (!blocks::ghostInside(x, y, z)) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> guard(m_takenMutex);
-        if (m_takenCells.size() >= kTakenLimit) {
-            m_takenOverflow = true;
-        } else {
-            m_takenCells.push_back(blockwrite::BlockPos{x, y, z});
-        }
-    }
-    m_takenPending.store(true, std::memory_order_relaxed);
-}
-
 void Schematica::onEnabledChanged(bool enabled)
 {
     m_drawPending.store(false, std::memory_order_relaxed);
@@ -1518,7 +2080,7 @@ void Schematica::onEnabledChanged(bool enabled)
 
 void Schematica::onUpdate()
 {
-    if (m_pageKey.triggered() && input::isInGameplay()) {
+    if (m_pageKey.triggered() && input::isInGameplay() && !writes::blocked("Schematica:page")) {
         m_pageRequested.store(true, std::memory_order_relaxed);
     }
     const bool up = m_layerUpKey.triggered();
@@ -1532,60 +2094,27 @@ void Schematica::onUpdate()
     }
 }
 
-static bool boxSelfDrawAlways()
-{
-    static int mode = 0;
-    if (mode == 0) {
-        std::error_code ec;
-        mode = std::filesystem::exists(paths::dataDir() / L"diag-box-self.txt", ec) ? 1 : 2;
-    }
-    return mode == 1;
-}
-
-static bool noGhostActors()
-{
-    if (!hooks::beModelsOn()) {
-        return true;
-    }
-    static int mode = 0;
-    if (mode == 0) {
-        std::error_code ec;
-        const bool none = std::filesystem::exists(paths::dataDir() / L"diag-noactor.txt", ec);
-        mode = none ? 1 : 2;
-    }
-    return mode == 1;
-}
-
-static bool keepGhostActors()
-{
-    static int mode = 0;
-    if (mode == 0) {
-        std::error_code ec;
-        mode = std::filesystem::exists(paths::dataDir() / L"diag-keepactor.txt", ec) ? 1 : 2;
-    }
-    return mode == 1;
-}
-
 void Schematica::onPlayerViewUpdate()
 {
     perf::endFrame();
     perf::maybeReport();
     const perf::Scope perfAll{perf::Slot::Schematica};
 
+    const bool dropped = blocks::takeWorldDropped();
     if (const std::uint64_t generation = blockwrite::regionGeneration();
-        generation != m_regionGeneration) {
+        generation != m_regionGeneration || dropped) {
         const bool first = (m_regionGeneration == 0);
         m_regionGeneration = generation;
-        if (!first) {
+        if (!first || dropped) {
             {
                 const std::lock_guard<std::mutex> guard(m_mutex);
-                m_actorPlaced.clear();
-                syncActorLive();
-                m_actorRegion = nullptr;
                 m_placed.clear();
                 m_ghostChunks.clear();
                 m_learnedKeys.clear();
                 m_chunkChanges.clear();
+                m_layerAskChunks.clear();
+                m_layerAskAt = 0;
+                m_layerAskTries = 0;
                 m_earlyRegion.clear();
             }
             blocks::clearGhostRegion();
@@ -1596,9 +2125,11 @@ void Schematica::onPlayerViewUpdate()
             m_lapColorChunks.clear();
             m_worldSettleUntil = GetTickCount64() + kWorldSettleMs;
             log().info(L"Schematica: the world changed, so what was remembered is dropped "
-                       L"(generation {} / placing again after {} ms)",
+                       L"(generation {} / placing again after {} ms{})",
                        generation,
-                       kWorldSettleMs);
+                       kWorldSettleMs,
+                       dropped ? L" / the blocks had already stopped answering" : L"");
+            m_paletteStale = true;
             if (enabled()) {
                 m_reloadPending.store(true, std::memory_order_relaxed);
             }
@@ -1621,50 +2152,22 @@ void Schematica::onPlayerViewUpdate()
         m_clearPending.store(true, std::memory_order_relaxed);
     }
     if (m_reloadPending.exchange(false, std::memory_order_relaxed)) {
-        loadVisible();
-        m_drawnUpTo = 0;
-        m_drawnPlaced = 0;
-        m_waitedLogged = false;
-        m_firstLogged = false;
-        m_anchorLogged = false;
-        m_reloadAsked = false;
-        m_boxReloadTries = 0;
-        m_boxReloadAt = 0;
-        m_boxesPlacedLogged = false;
-        m_boxesGaveUpLogged = false;
-        m_boxesPlacedAt = 0;
-        m_diffUpTo = 0;
-        m_diffLaps = 0;
-        m_diffLoggedAt = 0;
-        for (std::size_t& one : m_diffTally) {
-            one = 0;
+        if (!m_prepBusy && m_prepWant == 0) {
+            m_loadStartedAt = GetTickCount64();
         }
-        m_diffActors.clear();
-        m_lapTagChunks.clear();
-        m_lapColorChunks.clear();
-        {
-            std::lock_guard<std::mutex> guard(m_mutex);
-            m_chunkChanges.clear();
-        }
-        hooks::clearChunkBoxTries();
-        if (m_placed.empty()) {
-            m_drawPending.store(true, std::memory_order_relaxed);
-        } else {
-            m_clearedUpTo = 0;
-            m_clearPending.store(true, std::memory_order_relaxed);
-        }
+        requestPrepare(kPrepReload);
     }
+    pollPrepare();
+    m_ghostWanted.store(!m_cells.empty() || !m_placed.empty()
+                            || (m_prepBusy && m_prepHasVisible),
+                        std::memory_order_relaxed);
     if (const unsigned long long at = m_posChangedAt.load(std::memory_order_relaxed);
         at != 0 && GetTickCount64() - at >= kPosSettleMs) {
         m_posChangedAt.store(0, std::memory_order_relaxed);
-        m_cellsDirty.store(true, std::memory_order_relaxed);
-        m_redrawPending.store(true, std::memory_order_relaxed);
-    }
-    if (const unsigned long long learned = hooks::lastModelLearnedAt();
-        learned != 0 && learned != m_modelRedrawnAt && enabled()
-        && GetTickCount64() - learned >= kModelSettleMs) {
-        m_modelRedrawnAt = learned;
-        m_redrawPending.store(true, std::memory_order_relaxed);
+        if (!m_prepBusy && m_prepWant == 0) {
+            m_loadStartedAt = GetTickCount64();
+        }
+        requestPrepare(kPrepRedraw);
     }
     if (m_redrawPending.exchange(false, std::memory_order_relaxed) && enabled()) {
         m_clearedUpTo = 0;
@@ -1674,59 +2177,13 @@ void Schematica::onPlayerViewUpdate()
     applyLayerFilter();
 
     {
-        static int armed = 0;
-        if (armed == 0) {
-            std::error_code ec;
-            armed = std::filesystem::exists(paths::dataDir() / L"diag-xray.txt", ec) ? 1 : 2;
-        }
-        if (armed == 1) {
-            static bool was = false;
-            const bool down = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-            if (down && !was) {
-                const bool now = !m_diffXray.load(std::memory_order_relaxed);
-                m_diffXray.store(now, std::memory_order_relaxed);
-                log().info(L"Schematica: x-ray mode {}", now ? L"ON" : L"OFF");
-                m_boxModeChanged.store(true, std::memory_order_relaxed);
-            }
-            was = down;
-        }
-    }
-
-    {
-        static int armed = 0;
-        if (armed == 0) {
-            std::error_code ec;
-            armed = std::filesystem::exists(paths::dataDir() / L"diag-boxes.txt", ec) ? 1 : 2;
-        }
-        if (armed == 1) {
-            static bool was = false;
-            const bool down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-            if (down && !was) {
-                const bool now = !m_diffBoxes.load(std::memory_order_relaxed);
-                m_diffBoxes.store(now, std::memory_order_relaxed);
-                log().info(L"Schematica: color boxes {}", now ? L"ON" : L"OFF");
-            }
-            was = down;
-        }
-    }
-
-    {
         const bool wantBoxes = enabled() && blocks::ghostOn()
                                && m_diffBoxes.load(std::memory_order_relaxed);
         const bool xray = m_diffXray.load(std::memory_order_relaxed);
-        const bool selfDrawAlways = boxSelfDrawAlways() || worldmesh::active(xray);
-        boxes::setStyle(selfDrawAlways ? wantBoxes : (wantBoxes && xray),
+        boxes::setStyle(wantBoxes,
                         static_cast<float>(m_boxAlpha.load(std::memory_order_relaxed))
                             / 100.0F,
                         xray);
-        const bool wantMesh = !selfDrawAlways && wantBoxes && !xray;
-        if (wantMesh) {
-            m_meshBoxesArmed.store(true, std::memory_order_relaxed);
-        }
-        if (blocks::meshBoxesOn() != wantMesh) {
-            blocks::setMeshBoxes(wantMesh);
-            m_boxModeChanged.store(true, std::memory_order_relaxed);
-        }
         const bool wantOverlay =
             enabled() && m_ghostOverMismatch.load(std::memory_order_relaxed);
         if (blocks::ghostOverMismatchOn() != wantOverlay) {
@@ -1791,20 +2248,9 @@ void Schematica::onPlayerViewUpdate()
             }
             return;
         }
-        if (m_actorPending.load(std::memory_order_relaxed)) {
-            std::lock_guard<std::mutex> guard(m_mutex);
-            placeGhostBlockEntities();
-            return;
-        }
         if (blocks::ghostOn()) {
-            if (m_rebuiltPending.exchange(false, std::memory_order_relaxed)) {
-                reviewRebuiltChunks();
-            }
             if (m_freedPending.exchange(false, std::memory_order_relaxed)) {
                 restoreFreedCells();
-            }
-            if (m_takenPending.exchange(false, std::memory_order_relaxed)) {
-                fixTakenActorCells();
             }
             {
                 const unsigned long long now = GetTickCount64();
@@ -1813,6 +2259,35 @@ void Schematica::onPlayerViewUpdate()
                     std::lock_guard<std::mutex> guard(m_mutex);
                     m_learnedLate += learnRegionSubChunks(true);
                     m_healAsked += healStaleChunks(now);
+                    checkLayerRebuilds(now);
+                    if (m_learnMissed != 0 && now - m_learnLogAt >= kLearnLogMs) {
+                        m_learnLogAt = now;
+                        log().info(
+                            L"Schematica: the game does not keep the blocks of {} of the {} "
+                            L"chunk(s) the schematic covers, so no color box can be decided "
+                            L"there (the nearest one is {} block(s) from the camera at "
+                            L"{},{},{}, the farthest readable one {}; the game answered \"no "
+                            L"chunk\" for {} / skipped as the rest of those columns {} / "
+                            L"outside the world {} / other {}; {} chunk(s) were only read "
+                            L"because we asked again with the looser \"still being finished\" "
+                            L"rule)",
+                            m_learnMissed,
+                            m_learnTotal,
+                            m_learnMissedNear < 0.0 ? -1 : static_cast<int>(m_learnMissedNear),
+                            m_learnMissedAt[0],
+                            m_learnMissedAt[1],
+                            m_learnMissedAt[2],
+                            m_learnKeptFar < 0.0 ? -1 : static_cast<int>(m_learnKeptFar),
+                            m_learnMissedNotLoaded,
+                            m_learnMissedByColumn,
+                            m_learnMissedOutside,
+                            m_learnMissedOther,
+                            blockwrite::findSubChunkLooseHits());
+                    }
+                    if (now - m_diagLogAt >= kDiagLogMs) {
+                        m_diagLogAt = now;
+                        logDrawDiag(now);
+                    }
                 }
             }
             {
@@ -1821,6 +2296,7 @@ void Schematica::onPlayerViewUpdate()
                 publishBoxesLive();
             }
             maybeRenudge();
+            refreshAvailableCounts();
         }
         return;
     }
@@ -1840,10 +2316,18 @@ void Schematica::onPlayerViewUpdate()
         return;
     }
 
-    std::lock_guard<std::mutex> guard(m_mutex);
-    if (m_drawnUpTo == 0 && m_cellsDirty.exchange(false, std::memory_order_relaxed)) {
-        rebuildCells();
+    if (m_drawnUpTo == 0 && !HookManager::instance().groupEnabled(HookGroup::Ghost)) {
+        return;
     }
+    if (m_drawnUpTo == 0) {
+        if (m_cellsDirty.exchange(false, std::memory_order_relaxed)) {
+            requestPrepare(kPrepCells);
+        }
+        if (m_prepBusy) {
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> guard(m_mutex);
     if (m_cells.empty() || m_palette.empty()) {
         m_drawPending.store(false, std::memory_order_relaxed);
         return;
@@ -1875,8 +2359,6 @@ void Schematica::onPlayerViewUpdate()
         m_earlyRegion.clear();
         hooks::clearStorageMarks();
         m_ghostChunks.clear();
-        m_actorCells.clear();
-
         blocks::setGhostRegion(m_anchorX, m_anchorY, m_anchorZ,
                                m_regionSizeX, m_regionSizeY, m_regionSizeZ,
                                static_cast<float>(m_alpha.load()) / 100.0F);
@@ -1886,73 +2368,53 @@ void Schematica::onPlayerViewUpdate()
     }
 
     const std::size_t total = m_cells.size();
-    const std::size_t stop = std::min(total, m_drawnUpTo + kPerFrame);
     std::size_t placed = 0;
     const perf::Scope perfDraw{perf::Slot::Draw};
 
     blockwrite::beginPlacement(m_air);
 
-    for (std::size_t at = m_drawnUpTo; at < stop; ++at) {
-
-        const Cell& cell = m_cells[at];
-        const blockwrite::BlockPos where{cell.x, cell.y, cell.z};
-
-        if (cell.entry == kAirCell) {
-            blocks::setGhostWantAir(where.x, where.y, where.z);
-            continue;
+    LARGE_INTEGER frequency{};
+    LARGE_INTEGER started{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&started);
+    const long long budgetTicks =
+        (frequency.QuadPart * static_cast<long long>(kDrawBudgetMs)) / 1000LL;
+    std::size_t at = m_drawnUpTo;
+    while (at < total) {
+        const std::size_t batchEnd = std::min(total, at + kDrawBatch);
+        for (; at < batchEnd; ++at) {
+            if (drawCell(at)) {
+                ++placed;
+            }
         }
-        const std::size_t entry = cell.entry;
-        static const std::string kNoName;
-        const std::string& name = cell.name != nullptr ? *cell.name : kNoName;
-        const void* const block = blockFor(name, entry);
-        if (block == nullptr) {
-            continue;
-        }
-
-        {
-            blocks::setGhostWantCell(where.x, where.y, where.z, entry);
-            if (cell.entry2 >= 0) {
-                blocks::setGhostWantCell(where.x, where.y, where.z,
-                                         static_cast<std::size_t>(cell.entry2), 1);
-            }
-
-            if (const void* const real = blockwrite::readWorldAt(where.x, where.y, where.z);
-                real != nullptr && real != m_air) {
-                continue;
-            }
-            blocks::setGhostCellBlock(where.x, where.y, where.z, entry);
-            if (cell.yaw != 0.0F || cell.pitch != 0) {
-                blocks::setGhostCellOrient(where.x, where.y, where.z, cell.yaw, cell.pitch);
-            }
-            if (cell.entry2 >= 0) {
-                blocks::setGhostCellBlock(where.x, where.y, where.z,
-                                          static_cast<std::size_t>(cell.entry2), 1);
-            }
-            if (blocks::hasBlockEntity(block)) {
-                m_actorCells.emplace_back(where, block);
-            }
-            ++placed;
-            if (!m_firstLogged) {
-                m_firstLogged = true;
-                log().info(L"Schematica: first block {} at {} {} {} -> drawing only",
-                           toUtf16(name),
-                           where.x,
-                           where.y,
-                           where.z);
-            }
+        LARGE_INTEGER now{};
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - started.QuadPart >= budgetTicks) {
+            break;
         }
     }
-
+    const std::size_t stop = at;
     blockwrite::endPlacement();
 
     m_drawnUpTo = stop;
     const std::size_t placedTotal = m_drawnPlaced + placed;
     if (m_drawnUpTo >= total) {
         m_drawPending.store(false, std::memory_order_relaxed);
+        publishBoxes(true);
+        closeDiffTally();
+        m_diffUpTo = 0;
+        m_diffDropped = 0;
+        m_diffRestored = 0;
+        m_diffChanged = 0;
+        m_diffWater = 0;
+        m_diffWaterUnknown = 0;
+        m_diffWorldWater = 0;
+        m_diffWantWater = 0;
+        m_lapTagChunks.clear();
+        m_lapColorChunks.clear();
         rebuildGhostChunkList();
         std::size_t poked = dirtyChunks(1);
         poked += dirtyChunks(2);
-        m_prunedUpTo = 0;
         m_pruneDelay = kPruneDelayFrames;
         m_prunePending.store(true, std::memory_order_relaxed);
         log().info(L"Schematica: {} cell(s) / poked {} chunk(s) ({} {} {}) / {} chunk mesh "
@@ -1969,292 +2431,42 @@ void Schematica::onPlayerViewUpdate()
     m_drawnPlaced += placed;
 }
 
-Schematica::ActorPlace Schematica::placeOneGhostActor(void* region,
-                                                      const blockwrite::BlockPos& where,
-                                                      const void* block)
+bool Schematica::drawCell(std::size_t at)
 {
-    if (!blocks::ghostCell(where.x, where.y, where.z)) {
-        return ActorPlace::NoGhost;
+    const Cell& cell = m_cells[at];
+
+    if (cell.entry == kAirCell) {
+        blocks::setGhostWantAir(cell.x, cell.y, cell.z);
+        diffCell(at, false);
+        return false;
     }
-    if (!keepGhostActors() && hooks::modelBoxedForBlock(block)) {
-        return ActorPlace::Learned;
-    }
-    for (const PlacedActor& one : m_actorPlaced) {
-        if (one.at.x == where.x && one.at.y == where.y && one.at.z == where.z) {
-            return ActorPlace::Already;
+    const std::size_t entry = cell.entry;
+    static const std::string kNoName;
+    const std::string& name = cell.name != nullptr ? *cell.name : kNoName;
+    const void* const block = blockFor(name, entry);
+    if (block != nullptr) {
+        blocks::setGhostWantCell(cell.x, cell.y, cell.z, entry);
+        if (cell.entry2 >= 0) {
+            blocks::setGhostWantCell(cell.x, cell.y, cell.z,
+                                     static_cast<std::size_t>(cell.entry2), 1);
         }
     }
-    blockwrite::StorageSpot spot;
-    if (!blockwrite::placeGhostActor(region, where, block, m_air, &spot)) {
-        return ActorPlace::Refused;
+    const blocks::DiffKind kind = diffCell(at, false);
+    if (kind != blocks::DiffKind::Missing || block == nullptr) {
+        return false;
     }
-    if (spot.subChunk == nullptr) {
-        blockwrite::placeAtRegion(region, where, m_air);
-        return ActorPlace::Leftover;
+    if (!m_firstLogged) {
+        m_firstLogged = true;
+        log().info(L"Schematica: first block {} at {} {} {} -> drawing only",
+                   toUtf16(name),
+                   cell.x,
+                   cell.y,
+                   cell.z);
     }
-    m_actorPlaced.push_back(PlacedActor{where, block});
-    syncActorLive();
-    m_actorRegion = region;
-    return ActorPlace::Placed;
+    return true;
 }
 
-void Schematica::placeGhostBlockEntities()
-{
-    const perf::Scope perfScope{perf::Slot::PlaceActors};
-    m_actorPending.store(false, std::memory_order_relaxed);
-    if (noGhostActors()) {
-        return;
-    }
-    if (m_actorCells.empty()) {
-        return;
-    }
-    void* const region = blockwrite::renderRegion();
-    if (region == nullptr) {
-        m_actorPending.store(true, std::memory_order_relaxed);
-        return;
-    }
-    if (m_air == nullptr) {
-        log().warn(L"Schematica: not placing block entities (there is no air block object)");
-        return;
-    }
-    std::size_t placed = 0;
-    std::size_t dropped = 0;
-    std::size_t refused = 0;
-    std::size_t leftover = 0;
-    std::size_t already = 0;
-    std::size_t learned = 0;
-    for (const auto& [where, block] : m_actorCells) {
-        switch (placeOneGhostActor(region, where, block)) {
-        case ActorPlace::Placed:
-            ++placed;
-            break;
-        case ActorPlace::NoGhost:
-            ++dropped;
-            break;
-        case ActorPlace::Refused:
-            ++refused;
-            break;
-        case ActorPlace::Leftover:
-            ++leftover;
-            break;
-        case ActorPlace::Already:
-            ++already;
-            break;
-        case ActorPlace::Learned:
-            ++learned;
-            break;
-        }
-    }
-}
-
-std::size_t Schematica::forgetPlacedActors(
-    const std::vector<std::pair<blockwrite::BlockPos, const void*>>& cells)
-{
-    std::size_t gone = 0;
-    for (const auto& [where, block] : cells) {
-        (void)block;
-        const auto tail = std::remove_if(
-            m_actorPlaced.begin(), m_actorPlaced.end(),
-            [&where](const PlacedActor& one) {
-                return one.at.x == where.x && one.at.y == where.y
-                       && one.at.z == where.z;
-            });
-        gone += static_cast<std::size_t>(std::distance(tail, m_actorPlaced.end()));
-        m_actorPlaced.erase(tail, m_actorPlaced.end());
-    }
-    syncActorLive();
-    return gone;
-}
-
-void Schematica::restoreFreedActors(
-    const std::vector<std::pair<blockwrite::BlockPos, const void*>>& cells)
-{
-    if (noGhostActors()) {
-        return;
-    }
-    void* const region = blockwrite::renderRegion();
-    if (region == nullptr || m_air == nullptr) {
-        log().warn(L"Schematica: cannot put the {} broken ghost cell(s) back (renderer region "
-                   L"{} / air {})",
-                   cells.size(),
-                   region != nullptr,
-                   m_air != nullptr);
-        return;
-    }
-    if (m_actorRegion != nullptr && region != m_actorRegion) {
-        m_actorPlaced.clear();
-        syncActorLive();
-        m_actorRegion = nullptr;
-    }
-    forgetPlacedActors(cells);
-    std::size_t placed = 0;
-    std::size_t dropped = 0;
-    std::size_t refused = 0;
-    std::size_t leftover = 0;
-    std::size_t already = 0;
-    std::size_t learned = 0;
-    for (const auto& [where, block] : cells) {
-        switch (placeOneGhostActor(region, where, block)) {
-        case ActorPlace::Placed:
-            ++placed;
-            break;
-        case ActorPlace::NoGhost:
-            ++dropped;
-            break;
-        case ActorPlace::Refused:
-            ++refused;
-            break;
-        case ActorPlace::Leftover:
-            ++leftover;
-            break;
-        case ActorPlace::Already:
-            ++already;
-            break;
-        case ActorPlace::Learned:
-            ++learned;
-            break;
-        }
-    }
-}
-
-void Schematica::fixTakenActorCells()
-{
-    const perf::Scope perfScope{perf::Slot::FixTaken};
-    std::vector<blockwrite::BlockPos> cells;
-    bool all = false;
-    {
-        std::lock_guard<std::mutex> guard(m_takenMutex);
-        cells.swap(m_takenCells);
-        all = m_takenOverflow;
-        m_takenOverflow = false;
-    }
-    if (cells.empty() && !all) {
-        return;
-    }
-    std::lock_guard<std::mutex> guard(m_mutex);
-    if (m_cells.empty() || !blocks::ghostOn() || m_actorPlaced.empty()) {
-        return;
-    }
-    void* const region = blockwrite::renderRegion();
-    if (region == nullptr || m_air == nullptr) {
-        return;
-    }
-    if (m_actorRegion != nullptr && region != m_actorRegion) {
-        m_actorPlaced.clear();
-        syncActorLive();
-        m_actorRegion = nullptr;
-        return;
-    }
-    if (all) {
-        cells.clear();
-        cells.reserve(m_actorPlaced.size());
-        for (const PlacedActor& one : m_actorPlaced) {
-            cells.push_back(one.at);
-        }
-    }
-    std::size_t fixed = 0;
-    std::size_t notOurs = 0;
-    std::size_t empty = 0;
-    std::size_t sameKind = 0;
-    std::size_t refused = 0;
-    std::size_t lost = 0;
-    for (const blockwrite::BlockPos& at : cells) {
-        const auto found = std::find_if(
-            m_actorPlaced.begin(), m_actorPlaced.end(), [&at](const PlacedActor& one) {
-                return one.at.x == at.x && one.at.y == at.y && one.at.z == at.z;
-            });
-        if (found == m_actorPlaced.end()) {
-            ++notOurs;
-            continue;
-        }
-        const void* const ghost = found->block;
-        const void* const real = blockwrite::readWorldAt(at.x, at.y, at.z);
-        if (real == nullptr || real == m_air) {
-            ++empty;
-            continue;
-        }
-        if (const void* const legacy = blocks::legacyOfFast(real);
-            legacy != nullptr && legacy == blocks::legacyOfFast(ghost)) {
-            m_actorPlaced.erase(found);
-            syncActorLive();
-            ++sameKind;
-            continue;
-        }
-        bool wroteGhost = false;
-        if (!blocks::hasBlockEntityFast(real)) {
-            if (ghost == nullptr || !blockwrite::placeAtRegion(region, at, ghost)) {
-                ++refused;
-                continue;
-            }
-            wroteGhost = true;
-        }
-        if (!blockwrite::placeAtRegion(region, at, m_air)) {
-            if (wroteGhost) {
-                blockwrite::placeAtRegion(region, at, real);
-            }
-            ++refused;
-            continue;
-        }
-        if (!blockwrite::placeAtRegion(region, at, real)) {
-            log().warn(L"Schematica: could not write the real block back ({},{},{})",
-                       at.x,
-                       at.y,
-                       at.z);
-            ++lost;
-        }
-        blocks::dropGhostCell(at.x, at.y, at.z);
-        blocks::noteWorldBlockAt(at.x, at.y, at.z, real);
-        m_actorPlaced.erase(found);
-        syncActorLive();
-        ++fixed;
-    }
-    if (fixed != 0 || sameKind != 0 || refused != 0 || lost != 0) {
-    }
-}
-
-void Schematica::restoreGhostBlockEntities()
-{
-    m_actorPending.store(false, std::memory_order_relaxed);
-    if (m_actorPlaced.empty()) {
-        return;
-    }
-    void* const region = blockwrite::renderRegion();
-    if (region != nullptr && region != m_actorRegion) {
-        m_actorPlaced.clear();
-        syncActorLive();
-        m_actorRegion = nullptr;
-        return;
-    }
-    if (region == nullptr || m_air == nullptr) {
-        log().warn(L"Schematica: could not put {} block entit(ies) back (the renderer region "
-                   L"is not there yet)",
-                   m_actorPlaced.size());
-        return;
-    }
-    std::size_t back = 0;
-    std::size_t kept = 0;
-    std::size_t fallback = 0;
-    for (const PlacedActor& one : m_actorPlaced) {
-        const bool ghost = blocks::ghostCell(one.at.x, one.at.y, one.at.z);
-        const void* const real = blockwrite::readWorldAt(one.at.x, one.at.y, one.at.z);
-        if (!ghost || (real != nullptr && real != m_air)) {
-            ++kept;
-            continue;
-        }
-        if (blockwrite::removeGhostActor(region, one.at, one.block, m_air)) {
-            ++back;
-        } else if (blockwrite::placeAtRegion(region, one.at, m_air)) {
-            ++back;
-            ++fallback;
-        }
-    }
-    log().info(L"Schematica: put {} block entit(ies) back", back);
-    m_actorPlaced.clear();
-    syncActorLive();
-    m_actorRegion = nullptr;
-}
-
-void Schematica::diffCell(std::size_t at, bool early)
+blocks::DiffKind Schematica::diffCell(std::size_t at, bool early)
 {
     const Cell& cell = m_cells[at];
     const bool wantAir = (cell.entry == kAirCell);
@@ -2294,9 +2506,20 @@ void Schematica::diffCell(std::size_t at, bool early)
             ++m_diffWater;
         }
         ++m_diffTally[static_cast<std::size_t>(kind)];
+        if (kind == blocks::DiffKind::Missing && !wantAir
+            && cell.entry < m_missingByEntry.size()) {
+            ++m_missingByEntry[cell.entry];
+        }
+        if (!wantAir) {
+            const std::size_t at2 =
+                cell.entry * blocks::kDiffKindCount + static_cast<std::size_t>(kind);
+            if (at2 < m_diffByEntry.size()) {
+                ++m_diffByEntry[at2];
+            }
+        }
     }
     if (kind == blocks::DiffKind::UnknownWorld) {
-        return;
+        return kind;
     }
     if (kind == blocks::DiffKind::Missing) {
         if (blocks::restoreGhostCellFromWant(wx, wy, wz)) {
@@ -2305,15 +2528,9 @@ void Schematica::diffCell(std::size_t at, bool early)
                 ++m_diffRestored;
                 noteLapChunk(m_lapTagChunks, wx, wy, wz);
             }
-            if (want != nullptr && blocks::hasBlockEntity(want)) {
-                m_diffActors.emplace_back(blockwrite::BlockPos{wx, wy, wz}, want);
-            }
         }
     }
     if (blocks::setDiffCell(wx, wy, wz, blocks::colorOfDiffKind(kind))) {
-        if (blocks::meshBoxesOn()) {
-            noteChunkChange(wx, wy, wz);
-        }
         if (!early) {
             ++m_diffChanged;
             noteLapChunk(m_lapColorChunks, wx, wy, wz);
@@ -2327,6 +2544,7 @@ void Schematica::diffCell(std::size_t at, bool early)
             noteLapChunk(m_lapTagChunks, wx, wy, wz);
         }
     }
+    return kind;
 }
 
 void Schematica::diffStep()
@@ -2346,7 +2564,6 @@ void Schematica::diffStep()
     }
     m_diffUpTo = 0;
     ++m_diffLaps;
-    const unsigned long long now = GetTickCount64();
     const bool boxesOn = m_diffBoxes.load(std::memory_order_relaxed);
     if (m_diffDropped > 0 || m_diffRestored > 0 || (boxesOn && m_diffChanged > 0)) {
         dirtyChunks(3);
@@ -2373,51 +2590,6 @@ void Schematica::diffStep()
     }
     m_lapTagChunks.clear();
     m_lapColorChunks.clear();
-    if (!m_diffActors.empty()) {
-        restoreFreedActors(m_diffActors);
-        m_diffActors.clear();
-    }
-    if (m_boxReloadTries < kBoxReloadTries && blocks::meshBoxesOn() && enabled()
-        && blocks::ghostOn() && !m_shuttingDown.load(std::memory_order_relaxed)
-        && (m_diffTally[1] + m_diffTally[2] + m_diffTally[3]) > 0
-        && blocks::ghostHitCount(blocks::GhostHook::Box) == 0
-        && (m_boxReloadAt == 0 || now - m_boxReloadAt >= kBoxReloadRetryMs)) {
-        if (FreeCamera::instance().borrowForChunkReload()) {
-            m_boxReloadAt = now;
-            ++m_boxReloadTries;
-        }
-    }
-
-    if (blocks::meshBoxesOn() && enabled() && blocks::ghostOn()) {
-        const std::size_t placed = blocks::ghostHitCount(blocks::GhostHook::Box);
-        const PlayerView view = GameData::instance().playerView();
-        const bool got = GameData::instance().hasPlayerView();
-        const float px = view.x;
-        const float py = view.y;
-        const float pz = view.z;
-        if (m_boxesPlacedAt == 0) {
-            m_boxesPlacedAt = now;
-        }
-        const bool waitedEnough = now - m_boxesPlacedAt >= kBoxesPlacedWaitMs;
-        if (placed != 0 && !m_boxesPlacedLogged && (got || waitedEnough)) {
-            m_boxesPlacedLogged = true;
-        } else if (placed == 0 && m_boxReloadTries >= kBoxReloadTries
-                   && !m_boxesGaveUpLogged && (got || waitedEnough)) {
-            m_boxesGaveUpLogged = true;
-            log().warn(L"Schematica: no color box landed after rebuilding the chunks {} times "
-                       L"(blueprint ({},{},{}) / player ({},{},{}) / cyan {} red {} orange {})",
-                       m_boxReloadTries,
-                       m_anchorX,
-                       m_anchorY,
-                       m_anchorZ,
-                       got ? static_cast<int>(px) : -9999,
-                       got ? static_cast<int>(py) : -9999,
-                       got ? static_cast<int>(pz) : -9999,
-                       m_diffTally[1],
-                       m_diffTally[2],
-                       m_diffTally[3]);
-        }
-    }
 
     const bool boxesMoved =
         (m_diffChanged > 0 || m_diffDropped > 0 || m_diffRestored > 0);
@@ -2428,9 +2600,7 @@ void Schematica::diffStep()
     if (boxesMoved) {
         publishBoxes(false);
     }
-    for (std::size_t& one : m_diffTally) {
-        one = 0;
-    }
+    closeDiffTally();
     m_diffWater = 0;
     m_diffWaterUnknown = 0;
     m_diffWorldWater = 0;
@@ -2441,11 +2611,33 @@ void Schematica::publishBoxesLive()
 {
     const std::size_t wrote = blocks::takeDiffCellChanges();
     if (wrote != 0) {
-        if (!m_boxLiveDirty) {
-            m_boxLiveSince = GetTickCount64();
-        }
         m_boxLiveDirty = true;
-        m_boxLiveCells += wrote;
+    }
+    double eye[3] = {};
+    const bool haveEye = boxEye(eye);
+    if (m_boxListCut && !m_boxLiveDirty && haveEye && !m_boxListEyeValid) {
+        m_boxLiveDirty = true;
+    } else if (m_boxListCut && !m_boxLiveDirty && haveEye) {
+        double d2 = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            const double d = eye[k] - m_boxListEye[k];
+            d2 += d * d;
+        }
+        double away = 0.0;
+        if (std::int32_t mn[3] = {}, mx[3] = {}; blocks::ghostBounds(mn, mx)) {
+            double a2 = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                const double lo = static_cast<double>(mn[k]);
+                const double hi = static_cast<double>(mx[k]);
+                const double d = eye[k] < lo ? lo - eye[k] : (eye[k] > hi ? eye[k] - hi : 0.0);
+                a2 += d * d;
+            }
+            away = std::sqrt(a2);
+        }
+        const double step = (std::max)(kBoxRecenterBlocks, away * kBoxRecenterShare);
+        if (d2 > step * step) {
+            m_boxLiveDirty = true;
+        }
     }
     if (!m_boxLiveDirty) {
         return;
@@ -2456,7 +2648,6 @@ void Schematica::publishBoxesLive()
     }
     m_boxLiveAt = now;
     m_boxLiveDirty = false;
-    m_boxLiveCells = 0;
     publishBoxes(false, true);
 }
 
@@ -2465,10 +2656,11 @@ void Schematica::publishBoxes(bool force, bool changed)
     const perf::Scope perfScope{perf::Slot::Publish};
     if (!force && !boxes::boxesOn()) {
         ++m_boxSkipped;
+        m_boxListCut = false;
         return;
     }
     const std::size_t now = m_diffTally[1] * 1000003u + m_diffTally[2] * 1009u
-                            + m_diffTally[3];
+                            + m_diffTally[3] + m_diffTally[6] * 7919u;
     const unsigned long long at = GetTickCount64();
     if (!force && !changed && now == m_boxSignature && at - m_boxPublishedAt < kBoxPublishMs) {
         ++m_boxSkipped;
@@ -2480,56 +2672,96 @@ void Schematica::publishBoxes(bool force, bool changed)
 
     std::vector<blocks::DiffBox> list;
     std::size_t dropped = 0;
-    blocks::collectDiffBoxes(list, kBoxLimit, &dropped);
+    double eye[3] = {};
+    const bool haveEye = boxEye(eye);
+    int keptRadius = -1;
+    blocks::collectDiffBoxes(list, kBoxLimit, &dropped, haveEye ? eye : nullptr, &keptRadius);
+    m_boxListCut = dropped != 0;
+    m_boxListEyeValid = keptRadius >= 0;
+    std::copy(eye, eye + 3, m_boxListEye);
     if (dropped != 0) {
-        log().warn(L"Schematica: too many boxes, dropped {} (limit {})", dropped, kBoxLimit);
+        if (at - m_boxDropLoggedAt >= kBoxDropLogMs || m_boxDropLoggedAt == 0) {
+            m_boxDropLoggedAt = at;
+            if (keptRadius >= 0) {
+                log().warn(L"Schematica: too many boxes, dropped {} (limit {}), keeping those "
+                           L"within {} block(s) of the camera ({},{},{})",
+                           dropped,
+                           kBoxLimit,
+                           keptRadius,
+                           static_cast<int>(std::floor(eye[0])),
+                           static_cast<int>(std::floor(eye[1])),
+                           static_cast<int>(std::floor(eye[2])));
+            } else {
+                log().warn(L"Schematica: too many boxes, dropped {} (limit {})", dropped,
+                           kBoxLimit);
+            }
+        }
     }
     boxes::setBoxes(std::move(list));
+}
+
+bool Schematica::boxEye(double out[3])
+{
+    if (FreeCamera::instance().borrowing()) {
+        if (!m_boxLastEyeValid) {
+            return false;
+        }
+        std::copy(m_boxLastEye, m_boxLastEye + 3, out);
+        return true;
+    }
+    const auto keep = [this, out](double x, double y, double z) {
+        if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+            return false;
+        }
+        out[0] = x;
+        out[1] = y;
+        out[2] = z;
+        std::copy(out, out + 3, m_boxLastEye);
+        m_boxLastEyeValid = true;
+        return true;
+    };
+    if (float eye[3] = {}, vp[16] = {}; boxes::cameraSnapshot(eye, vp)) {
+        if (keep(eye[0], eye[1], eye[2])) {
+            return true;
+        }
+    }
+    if (GameData::instance().hasPlayerView()) {
+        const PlayerView view = GameData::instance().playerView();
+        return keep(view.x, view.y, view.z);
+    }
+    return false;
 }
 
 void Schematica::pruneStep()
 {
     const perf::Scope perfScope{perf::Slot::Prune};
-    const std::size_t total = m_cells.size();
-    if (m_air == nullptr || total == 0) {
-        m_prunePending.store(false, std::memory_order_relaxed);
-        return;
-    }
-    const std::size_t stop = std::min(total, m_prunedUpTo + kPrunePerFrame);
-    for (std::size_t at = m_prunedUpTo; at < stop; ++at) {
-        const Cell& cell = m_cells[at];
-        if (cell.entry == kAirCell) {
-            continue;
-        }
-        const std::int32_t wx = cell.x;
-        const std::int32_t wy = cell.y;
-        const std::int32_t wz = cell.z;
-
-        const void* const real = blockwrite::readWorldAt(wx, wy, wz);
-        if (real != nullptr && real != m_air) {
-            blocks::dropGhostCell(wx, wy, wz);
-            ++m_prunedDropped;
-        }
-    }
-    m_prunedUpTo = stop;
-    if (m_prunedUpTo < total) {
-        return;
-    }
     m_prunePending.store(false, std::memory_order_relaxed);
-    m_actorPending.store(true, std::memory_order_relaxed);
-    std::size_t poked = m_prunedDropped > 0 ? dirtyChunks(4) : 0;
-    rebuildGhostChunkList();
-    poked += dirtyChunks(5);
-    if (!m_reloadAsked) {
-        m_reloadAsked = true;
-        FreeCamera::instance().borrowForChunkReload();
+    if (m_air == nullptr || m_cells.empty()) {
+        return;
     }
-    log().info(L"Schematica: dropped {} cell(s) that are already filled ({} chunk(s) asked "
-               L"again / {} chunk(s) remembered)",
-               m_prunedDropped,
+    rebuildGhostChunkList();
+    const std::size_t poked = dirtyChunks(5);
+    {
+        std::vector<std::array<std::int32_t, 3>> chunks;
+        chunks.reserve(m_ghostChunks.size());
+        for (const blockwrite::BlockPos& at : m_ghostChunks) {
+            chunks.push_back({at.x >> 4, at.y >> 4, at.z >> 4});
+        }
+        hooks::requestChunkRebuilds(chunks);
+    }
+    const unsigned long long elapsed =
+        m_loadStartedAt != 0 ? GetTickCount64() - m_loadStartedAt : 0;
+    log().info(L"Schematica: ready in {} ms ({} cell(s) / cyan {} red {} orange {} pink {} / "
+               L"world not read {} / {} chunk(s) asked again / {} chunk(s) remembered)",
+               elapsed,
+               m_cells.size(),
+               m_diffTallyDone[1],
+               m_diffTallyDone[2],
+               m_diffTallyDone[3],
+               m_diffTallyDone[6],
+               m_diffTallyDone[4],
                poked,
                blockwrite::knownSubChunkCount());
-    m_prunedDropped = 0;
 }
 
 std::size_t Schematica::dirtyChunks(int who, bool askAll)
@@ -2562,6 +2794,7 @@ std::size_t Schematica::dirtyChunks(int who, bool askAll)
 
     std::size_t poked = 0;
     std::unordered_set<std::uint64_t> missedColumns;
+    hooks::beginStorageArmBatch();
     for (const blockwrite::BlockPos& chunk : m_ghostChunks) {
         const std::uint64_t column =
             (static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunk.x)) << 32)
@@ -2580,6 +2813,7 @@ std::size_t Schematica::dirtyChunks(int who, bool askAll)
         hooks::armStorageHooks(sub, chunk.x, chunk.y, chunk.z);
         learnBothSides(chunk.x, chunk.y, chunk.z, region, sub);
     }
+    hooks::endStorageArmBatch();
 
     if (askAll) {
         hooks::requestGhostChunkBuild();
@@ -2726,126 +2960,6 @@ void Schematica::maybeRenudge()
     dirtyChunks(6);
 }
 
-void Schematica::noteChunkRebuilt(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    static std::atomic<int> told{0};
-    const bool on = enabled();
-    if (!on) {
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> guard(m_rebuiltMutex);
-        if (!m_rebuiltChunks.empty()) {
-            const blockwrite::BlockPos& last = m_rebuiltChunks.back();
-            if (last.x == x && last.y == y && last.z == z) {
-                return;
-            }
-        }
-        if (m_rebuiltChunks.size() >= kRebuiltLimit) {
-            return;
-        }
-        m_rebuiltChunks.push_back(blockwrite::BlockPos{x, y, z});
-    }
-    m_rebuiltPending.store(true, std::memory_order_relaxed);
-}
-
-void Schematica::reviewRebuiltChunks()
-{
-    const perf::Scope perfScope{perf::Slot::Review};
-    if (!hooks::beModelsOn()) {
-        std::lock_guard<std::mutex> guard(m_rebuiltMutex);
-        m_rebuiltChunks.clear();
-        return;
-    }
-    std::vector<blockwrite::BlockPos> chunks;
-    {
-        std::lock_guard<std::mutex> guard(m_rebuiltMutex);
-        chunks.swap(m_rebuiltChunks);
-    }
-    if (chunks.empty()) {
-        return;
-    }
-    std::vector<blockwrite::BlockPos> cells;
-    {
-        std::lock_guard<std::mutex> guard(m_mutex);
-        if (m_cells.empty() || !blocks::ghostOn()) {
-            return;
-        }
-        static const std::string kNoName;
-        for (const Cell& cell : m_cells) {
-            if (cell.entry == kAirCell) {
-                continue;
-            }
-            const std::int32_t cx = cell.x >> 4 << 4;
-            const std::int32_t cy = cell.y >> 4 << 4;
-            const std::int32_t cz = cell.z >> 4 << 4;
-            bool hit = false;
-            for (const blockwrite::BlockPos& one : chunks) {
-                if (one.x == cx && one.y == cy && one.z == cz) {
-                    hit = true;
-                    break;
-                }
-            }
-            if (!hit) {
-                continue;
-            }
-            const void* const block =
-                blockFor(cell.name != nullptr ? *cell.name : kNoName, cell.entry);
-            if (block == nullptr || !blocks::hasBlockEntity(block)) {
-                continue;
-            }
-            cells.push_back(blockwrite::BlockPos{cell.x, cell.y, cell.z});
-        }
-    }
-    if (cells.empty()) {
-        static std::atomic<int> toldEmpty{0};
-        if (toldEmpty.fetch_add(1, std::memory_order_relaxed) < 12) {
-            std::wstring got;
-            for (const blockwrite::BlockPos& one : chunks) {
-                got += std::format(L"({},{},{}) ", one.x, one.y, one.z);
-            }
-            std::wstring want;
-            {
-                std::lock_guard<std::mutex> guard(m_mutex);
-                std::vector<blockwrite::BlockPos> seen;
-                for (const Cell& c : m_cells) {
-                    if (c.entry == kAirCell) {
-                        continue;
-                    }
-                    const blockwrite::BlockPos o{c.x >> 4 << 4, c.y >> 4 << 4,
-                                                 c.z >> 4 << 4};
-                    bool dup = false;
-                    for (const blockwrite::BlockPos& s : seen) {
-                        if (s.x == o.x && s.y == o.y && s.z == o.z) {
-                            dup = true;
-                            break;
-                        }
-                    }
-                    if (!dup) {
-                        seen.push_back(o);
-                    }
-                }
-                for (const blockwrite::BlockPos& o : seen) {
-                    want += std::format(L"({},{},{}) ", o.x, o.y, o.z);
-                }
-            }
-        }
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> guard(m_freedMutex);
-        for (const blockwrite::BlockPos& one : cells) {
-            if (m_freedCells.size() >= kFreedLimit) {
-                m_redrawPending.store(true, std::memory_order_relaxed);
-                break;
-            }
-            m_freedCells.push_back(one);
-        }
-    }
-    m_freedPending.store(true, std::memory_order_relaxed);
-    static std::atomic<int> told{0};
-}
-
 void Schematica::restoreFreedCells()
 {
     const perf::Scope perfScope{perf::Slot::Restore};
@@ -2869,13 +2983,12 @@ void Schematica::restoreFreedCells()
     std::size_t back = 0;
     std::size_t already = 0;
     std::size_t needRebuild = 0;
-    std::vector<std::pair<blockwrite::BlockPos, const void*>> actors;
     for (const blockwrite::BlockPos& one : cells) {
-        const auto found = m_cellAt.find(packCell(one.x, one.y, one.z));
-        if (found == m_cellAt.end() || found->second >= m_cells.size()) {
+        const std::size_t found = m_cellAt.find(one.x, one.y, one.z);
+        if (found == schematic::CellIndex::kNone || found >= m_cells.size()) {
             continue;
         }
-        const Cell& cell = m_cells[found->second];
+        const Cell& cell = m_cells[found];
         if (cell.entry == kAirCell) {
             continue;
         }
@@ -2887,9 +3000,6 @@ void Schematica::restoreFreedCells()
         static const std::string kNoName;
         const void* const block =
             blockFor(cell.name != nullptr ? *cell.name : kNoName, entry);
-        if (block != nullptr && blocks::hasBlockEntity(block)) {
-            actors.emplace_back(one, block);
-        }
         if (blocks::ghostCell(one.x, one.y, one.z)) {
             ++already;
             if (block != nullptr && blocks::hasBlockEntity(block)) {
@@ -2898,12 +3008,6 @@ void Schematica::restoreFreedCells()
             continue;
         }
         blocks::setGhostCellBlock(one.x, one.y, one.z, entry);
-        if (found->second < m_cells.size()) {
-            const Cell& c = m_cells[found->second];
-            if (c.yaw != 0.0F || c.pitch != 0) {
-                blocks::setGhostCellOrient(one.x, one.y, one.z, c.yaw, c.pitch);
-            }
-        }
         {
             const std::int32_t second = cell.entry2;
             if (second >= 0) {
@@ -2917,9 +3021,6 @@ void Schematica::restoreFreedCells()
         rebuildGhostChunkList();
         dirtyChunks(7);
     } else if (already != 0) {
-    }
-    if (!actors.empty()) {
-        restoreFreedActors(actors);
     }
 }
 
@@ -2953,25 +3054,72 @@ std::size_t Schematica::learnRegionSubChunks(bool judgeNew)
     }
     std::size_t learned = 0;
     std::size_t judged = 0;
+    double eye[3] = {};
+    const bool haveEye = boxEye(eye);
+    std::size_t missed = 0;
+    std::size_t seen = 0;
+    std::size_t missedNotLoaded = 0;
+    std::size_t missedByColumn = 0;
+    std::size_t missedOutside = 0;
+    std::size_t missedOther = 0;
+    double missedNear = -1.0;
+    double keptFar = -1.0;
+    std::int32_t missedAt[3] = {0, 0, 0};
+    const auto boxDistance = [&eye](const blockwrite::BlockPos& chunk) {
+        double d2 = 0.0;
+        const double lo[3] = {static_cast<double>(chunk.x), static_cast<double>(chunk.y),
+                              static_cast<double>(chunk.z)};
+        for (int k = 0; k < 3; ++k) {
+            const double hi = lo[k] + 16.0;
+            const double d = eye[k] < lo[k] ? lo[k] - eye[k] : (eye[k] > hi ? eye[k] - hi : 0.0);
+            d2 += d * d;
+        }
+        return std::sqrt(d2);
+    };
+    const auto noteMissed = [&](const blockwrite::BlockPos& chunk) {
+        ++missed;
+        if (!haveEye) {
+            return;
+        }
+        const double d = boxDistance(chunk);
+        if (missedNear < 0.0 || d < missedNear) {
+            missedNear = d;
+            missedAt[0] = chunk.x;
+            missedAt[1] = chunk.y;
+            missedAt[2] = chunk.z;
+        }
+    };
     std::unordered_set<std::uint64_t> missedColumns;
     for (const blockwrite::BlockPos& chunk : regionChunkList()) {
         const std::uint64_t column =
             (static_cast<std::uint64_t>(static_cast<std::uint32_t>(chunk.x)) << 32)
             | static_cast<std::uint32_t>(chunk.z);
         const std::uint64_t chunkKey = packCell(chunk.x >> 4, chunk.y >> 4, chunk.z >> 4);
+        ++seen;
         if (missedColumns.find(column) != missedColumns.end()) {
             blockwrite::forgetSubChunkAt(chunk.x, chunk.y, chunk.z);
             m_learnedKeys.erase(chunkKey);
+            ++missedByColumn;
+            noteMissed(chunk);
             continue;
         }
         void* const sub = blockwrite::findSubChunk(region, chunk.x, chunk.y, chunk.z);
         if (sub == nullptr) {
             if (blockwrite::lastFindWasMissingChunk()) {
                 missedColumns.insert(column);
+                ++missedNotLoaded;
+            } else if (blockwrite::lastFindWasOutsideWorld()) {
+                ++missedOutside;
+            } else {
+                ++missedOther;
             }
             blockwrite::forgetSubChunkAt(chunk.x, chunk.y, chunk.z);
             m_learnedKeys.erase(chunkKey);
+            noteMissed(chunk);
             continue;
+        }
+        if (haveEye) {
+            keptFar = (std::max)(keptFar, boxDistance(chunk));
         }
         const auto [known, inserted] = m_learnedKeys.try_emplace(chunkKey, sub);
         const bool fresh = inserted || known->second != sub;
@@ -2996,6 +3144,15 @@ std::size_t Schematica::learnRegionSubChunks(bool judgeNew)
             ++m_relearnChunks;
         }
     }
+    m_learnMissed = missed;
+    m_learnTotal = seen;
+    m_learnMissedNotLoaded = missedNotLoaded;
+    m_learnMissedByColumn = missedByColumn;
+    m_learnMissedOutside = missedOutside;
+    m_learnMissedOther = missedOther;
+    m_learnMissedNear = missedNear;
+    m_learnKeptFar = keptFar;
+    std::copy(missedAt, missedAt + 3, m_learnMissedAt);
     return learned;
 }
 
@@ -3003,9 +3160,8 @@ void Schematica::rebuildGhostChunkList()
 {
     std::vector<blockwrite::BlockPos> next;
     if (blocks::ghostOn()) {
-        const bool boxes = blocks::meshBoxesOn();
         for (const blockwrite::BlockPos& at : regionChunkList()) {
-            if (boxes || blocks::ghostSubChunkOccupied(at.x, at.y, at.z)) {
+            if (blocks::ghostSubChunkOccupied(at.x, at.y, at.z)) {
                 next.push_back(at);
             }
         }
@@ -3039,20 +3195,15 @@ void Schematica::clearStep()
 
     const bool hadDrawing = !m_cells.empty();
     const bool hadGhosts = !m_ghostChunks.empty();
-    const bool hadMeshBoxes = m_meshBoxesArmed.load(std::memory_order_relaxed);
-    restoreGhostBlockEntities();
     blocks::clearGhostRegion();
     hooks::clearStorageMarks();
-    if (hadMeshBoxes && hadDrawing && !hadGhosts) {
-        m_ghostChunks = regionChunkList();
-    }
     if (hadDrawing) {
         const std::size_t poked = dirtyChunks(8);
         if (poked > 0) {
             log().info(L"Schematica: cleared the drawing-only blocks (poked {} chunks)", poked);
         }
     }
-    if (m_placed.empty() && (hadGhosts || hadMeshBoxes) && m_air != nullptr
+    if (m_placed.empty() && hadGhosts && m_air != nullptr
         && m_poke != nullptr && m_regionSizeX > 0) {
         bool poked = false;
         const std::int32_t x1 = m_anchorX + m_regionSizeX;
@@ -3093,27 +3244,28 @@ void Schematica::clearStep()
         }
     }
     m_placed.clear();
-    m_actorCells.clear();
-    m_diffActors.clear();
     m_clearedUpTo = 0;
     m_prunePending.store(false, std::memory_order_relaxed);
-    m_prunedUpTo = 0;
-    m_prunedDropped = 0;
     m_clearPending.store(false, std::memory_order_relaxed);
 
     if (enabled()) {
         m_drawnUpTo = 0;
         m_drawnPlaced = 0;
         m_firstLogged = false;
+        m_diffUpTo = 0;
+        for (std::size_t& one : m_diffTally) {
+            one = 0;
+        }
+        m_diffWater = 0;
+        m_diffWaterUnknown = 0;
+        m_diffWorldWater = 0;
+        m_diffWantWater = 0;
         m_drawPending.store(true, std::memory_order_relaxed);
         return;
     }
 
-    if ((hadGhosts || hadMeshBoxes) && !m_shuttingDown.load(std::memory_order_relaxed)) {
+    if (hadGhosts && !m_shuttingDown.load(std::memory_order_relaxed)) {
         FreeCamera::instance().borrowForChunkReload();
-    }
-    if (!enabled()) {
-        m_meshBoxesArmed.store(false, std::memory_order_relaxed);
     }
 }
 
@@ -3127,16 +3279,21 @@ MenuItem Schematica::buildMenu()
     {
         MenuItem open = menu::action(L"Settings page", [] {});
         open.opensPage = true;
+        open.hidden = writes::blocked("Schematica:page");
         open.value = [] { return std::wstring(L"Open"); };
         children.push_back(std::move(open));
     }
 
-    children.push_back(menu::keybind(
-        L"Page key", [this] { return m_pageKey.combo(); },
-        [this](std::vector<int> combo) {
-            m_pageKey.set(std::move(combo));
-            log().info(L"Schematica: page key set to {}", m_pageKey.name());
-        }));
+    {
+        MenuItem pageKey = menu::keybind(
+            L"Page key", [this] { return m_pageKey.combo(); },
+            [this](std::vector<int> combo) {
+                m_pageKey.set(std::move(combo));
+                log().info(L"Schematica: page key set to {}", m_pageKey.name());
+            });
+        pageKey.hidden = writes::blocked("Schematica:page");
+        children.push_back(std::move(pageKey));
+    }
 
     children.push_back(menu::keybind(
         L"Layer up key", [this] { return m_layerUpKey.combo(); },
@@ -3164,32 +3321,8 @@ MenuItem Schematica::buildMenu()
         children.push_back(menu::text(
             label, [&value] { return std::format(L"{}", value.load()); },
             [&value, low, high, after](std::wstring typed) {
-                size_t at = 0;
-                while (at < typed.size() && typed[at] == L' ') {
-                    ++at;
-                }
-                const size_t begin = at;
-                if (at < typed.size() && (typed[at] == L'-' || typed[at] == L'+')) {
-                    ++at;
-                }
-                const size_t digits = at;
-                while (at < typed.size() && typed[at] >= L'0' && typed[at] <= L'9') {
-                    ++at;
-                }
-                if (at == digits) {
-                    return;
-                }
-                const size_t last = at;
-                while (at < typed.size() && typed[at] == L' ') {
-                    ++at;
-                }
-                if (at != typed.size()) {
-                    return;
-                }
                 int got = 0;
-                try {
-                    got = std::stoi(typed.substr(begin, last - begin));
-                } catch (const std::exception&) {
+                if (!parseTypedInt(typed, got)) {
                     return;
                 }
                 value.store(std::clamp(got, low, high));
@@ -3219,6 +3352,7 @@ MenuItem Schematica::buildMenu()
             },
             true, static_cast<float>(kMinAlpha), static_cast<float>(kMaxAlpha));
         item.onPage = true;
+        item.hidden = writes::blocked("Schematica:boxes");
         children.push_back(std::move(item));
     }
 
@@ -3230,6 +3364,7 @@ MenuItem Schematica::buildMenu()
                 m_diffBoxes.store(on, std::memory_order_relaxed);
             });
         item.onPage = true;
+        item.hidden = writes::blocked("Schematica:boxes");
         children.push_back(std::move(item));
     }
     {
@@ -3240,6 +3375,7 @@ MenuItem Schematica::buildMenu()
                                  std::memory_order_relaxed);
             });
         item.onPage = true;
+        item.hidden = writes::blocked("Schematica:boxes");
         children.push_back(std::move(item));
     }
     {
@@ -3291,34 +3427,11 @@ MenuItem Schematica::buildMenu()
                 if (at < 0) {
                     return;
                 }
-                std::size_t pos = 0;
-                while (pos < typed.size() && typed[pos] == L' ') {
-                    ++pos;
-                }
-                const std::size_t begin = pos;
-                if (pos < typed.size() && (typed[pos] == L'-' || typed[pos] == L'+')) {
-                    ++pos;
-                }
-                const std::size_t digits = pos;
-                while (pos < typed.size() && typed[pos] >= L'0' && typed[pos] <= L'9') {
-                    ++pos;
-                }
-                if (pos == digits) {
+                int got = 0;
+                if (!parseTypedInt(typed, got)) {
                     return;
                 }
-                const std::size_t last = pos;
-                while (pos < typed.size() && typed[pos] == L' ') {
-                    ++pos;
-                }
-                if (pos != typed.size()) {
-                    return;
-                }
-                try {
-                    setBlueprintPos(static_cast<std::size_t>(at), axis,
-                                    std::stoi(typed.substr(begin, last - begin)));
-                } catch (const std::exception&) {
-                    return;
-                }
+                setBlueprintPos(static_cast<std::size_t>(at), axis, got);
             }));
         children.back().onPage = true;
         children.back().pageTab = 1;
@@ -3599,6 +3712,9 @@ void Schematica::loadConfig(const nlohmann::json& section)
 void Schematica::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
+    if (m_enabledAtShutdown.load(std::memory_order_relaxed)) {
+        section["enabled"] = true;
+    }
 
     section["opacity"] = m_alpha.load();
     section["diffBoxes"] = m_diffBoxes.load();

@@ -31,7 +31,7 @@ public:
 protected:
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return false; }
+    bool persistEnabled() const override { return true; }
 
 private:
     FastBlockPlacement() = default;

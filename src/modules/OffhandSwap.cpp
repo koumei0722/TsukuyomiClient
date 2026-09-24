@@ -137,18 +137,6 @@ void OffhandSwap::onScansReady()
 
 }
 
-void OffhandSwap::onSetSelectedSlot(void* holder)
-{
-    if (holder == nullptr) {
-        return;
-    }
-
-    void* const previous = m_holder.exchange(holder, std::memory_order_acq_rel);
-    if (previous != holder) {
-        m_holderAlt.store(previous, std::memory_order_release);
-    }
-}
-
 void OffhandSwap::onUpdate()
 {
     const bool wants = m_swapKey.triggered();
@@ -213,6 +201,18 @@ void OffhandSwap::onPlayerViewUpdate()
         return;
     }
 
+    const unsigned long long requestedAt = m_requestedAtMs.load(std::memory_order_relaxed);
+    if (const unsigned long long nowMs = GetTickCount64(); nowMs > requestedAt + kStaleRequestMs) {
+        int expected = slot;
+        if (m_requestedSlot.compare_exchange_strong(expected, kNoRequest, std::memory_order_acq_rel,
+                                                    std::memory_order_acquire)) {
+            log().warn(L"OffhandSwap: dropped a swap pressed {} ms ago (the game left the world or a menu was open "
+                       L"before it could run)",
+                       nowMs - requestedAt);
+        }
+        return;
+    }
+
     if (m_pending.active || m_netIdFix.active) {
         if (GetTickCount64() < m_requestedAtMs.load(std::memory_order_relaxed) + kQueueWaitMs) {
             return;
@@ -255,6 +255,17 @@ void OffhandSwap::servePending()
         return;
     }
 
+    StackView current;
+    if (!m_pending.haveHand || HandRestock::instance().ownClientHolder() != m_pending.holder
+        || !readStack(m_pending.hand[0], current) || current.item != m_pending.handItem
+        || current.netValue != m_pending.handValue || current.count != m_pending.handCount) {
+        log().warn(L"OffhandSwap: the server refused the swap (result {}) but slot {} no longer holds what was "
+                   L"swapped in, so it is not put back",
+                   result, m_pending.selected);
+        ItemStackOps::instance().discard();
+        m_pending = Pending{};
+        return;
+    }
     const bool restored = ItemStackOps::instance().restore(m_pending.hand[0]);
 
     m_pending = Pending{};
@@ -278,6 +289,7 @@ void OffhandSwap::onInventoryContent(const void* payload)
     const auto* const base = static_cast<const std::byte*>(payload);
     const int containerId =
         static_cast<int>(*reinterpret_cast<const std::int8_t*>(base + kPacketContainerIdOffset));
+    ItemStackRequest::instance().noteInventoryContent(containerId);
     if (containerId != kOffhandContainerId) {
         return;
     }
@@ -297,14 +309,26 @@ void OffhandSwap::onInventoryContent(const void* payload)
     std::memcpy(&item, entry + kEntryItemOffset, sizeof(item));
     std::memcpy(&netId, entry + kEntryNetIdOffset, sizeof(netId));
     if (item == nullptr || netId <= 0) {
-        log().info(L"OffhandSwap: the server sent an empty offhand");
+        if (m_loggedOffhandNetId.exchange(0, std::memory_order_relaxed) != 0) {
+            log().info(L"OffhandSwap: the server sent an empty offhand");
+        }
         return;
     }
 
-    m_offhandNetId.store(netId, std::memory_order_relaxed);
-    const unsigned int serial = m_offhandSerial.fetch_add(1, std::memory_order_release) + 1;
+    unsigned int serial = 0;
+    {
+        const std::lock_guard<std::mutex> lock(m_offhandLock);
+        m_offhand.netId = netId;
+        m_offhand.atMs = GetTickCount64();
+        serial = ++m_offhand.serial;
+        if (m_offhandWatch.armed && m_offhandWatch.first.serial == 0) {
+            m_offhandWatch.first = m_offhand;
+        }
+    }
 
-    log().info(L"OffhandSwap: the server sent the offhand (net id {}, packet {})", netId, serial);
+    if (m_loggedOffhandNetId.exchange(netId, std::memory_order_relaxed) != netId) {
+        log().info(L"OffhandSwap: the server sent the offhand (net id {}, packet {})", netId, serial);
+    }
 }
 
 void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
@@ -326,7 +350,12 @@ void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
     }
     m_netIdFix.slot = slot;
     m_netIdFix.offhand = hands.offhand;
-    m_netIdFix.serial = m_offhandSerial.load(std::memory_order_acquire);
+    {
+        const std::lock_guard<std::mutex> lock(m_offhandLock);
+        m_netIdFix.serial = m_offhand.serial;
+        m_offhandWatch = OffhandWatch{};
+        m_offhandWatch.armed = true;
+    }
     m_netIdFix.giveUpAtMs = GetTickCount64() + kNetIdWaitMs;
     m_netIdFix.active = true;
 
@@ -334,10 +363,25 @@ void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
     readStack(hands.offhand, offhandView);
     m_netIdFix.handValue = handView.netValue;
     m_netIdFix.offhandValue = offhandView.netValue;
+    m_netIdFix.handItem = handView.item;
+    m_netIdFix.offhandItem = offhandView.item;
+    m_netIdFix.holder = hands.holder;
 
     log().info(L"OffhandSwap: waiting for the server ({}, slot {}, net ids {} / {}, packet {})",
                (m_netIdFix.hand != nullptr) ? L"lining up" : L"gate only", slot,
                m_netIdFix.handValue, m_netIdFix.offhandValue, m_netIdFix.serial);
+}
+
+OffhandSwap::OffhandArrival OffhandSwap::latestOffhand() const
+{
+    const std::lock_guard<std::mutex> lock(m_offhandLock);
+    return m_offhand;
+}
+
+OffhandSwap::OffhandArrival OffhandSwap::firstOffhandSinceArmed() const
+{
+    const std::lock_guard<std::mutex> lock(m_offhandLock);
+    return m_offhandWatch.first;
 }
 
 void OffhandSwap::serveNetIdFix()
@@ -346,7 +390,9 @@ void OffhandSwap::serveNetIdFix()
         return;
     }
 
-    if (m_offhandSerial.load(std::memory_order_acquire) == m_netIdFix.serial) {
+    const OffhandArrival first = firstOffhandSinceArmed();
+    const OffhandArrival arrival = latestOffhand();
+    if (first.serial == 0) {
         if (GetTickCount64() >= m_netIdFix.giveUpAtMs) {
             if (m_netIdFix.hand == nullptr) {
                 log().warn(L"OffhandSwap: the server did not send the offhand back after "
@@ -363,7 +409,22 @@ void OffhandSwap::serveNetIdFix()
         return;
     }
 
-    const std::int32_t offhandNetId = m_offhandNetId.load(std::memory_order_relaxed);
+    const std::int32_t offhandNetId = arrival.netId;
+
+    if (const unsigned long long arrivedAt = first.atMs; arrivedAt > m_netIdFix.giveUpAtMs) {
+        log().warn(L"OffhandSwap: the offhand arrived {} ms after the wait for slot {} ran out (the world may have "
+                   L"changed, or the server was late); not lining anything up",
+                   arrivedAt - m_netIdFix.giveUpAtMs, m_netIdFix.slot);
+        m_netIdFix = NetIdFix{};
+        return;
+    }
+    if (HandRestock::instance().ownClientHolder() != m_netIdFix.holder) {
+        log().warn(L"OffhandSwap: your inventory is not the one slot {} was swapped in (the world may have changed); "
+                   L"not lining anything up",
+                   m_netIdFix.slot);
+        m_netIdFix = NetIdFix{};
+        return;
+    }
 
     const bool serverHeldNetIds = (offhandNetId == m_netIdFix.handValue);
     const bool serverMovedNetIds = (offhandNetId == m_netIdFix.offhandValue);
@@ -372,6 +433,7 @@ void OffhandSwap::serveNetIdFix()
 
     StackView offhandView;
     if (readStack(m_netIdFix.offhand, offhandView) && offhandView.item != nullptr
+        && offhandView.item == m_netIdFix.offhandItem && offhandView.netValue == m_netIdFix.offhandValue
         && offhandView.netValue != offhandWanted
         && ItemStackOps::instance().setNetIdValue(m_netIdFix.offhand, offhandWanted)) {
         log().info(L"OffhandSwap: lined the offhand up with the server (net id {} -> {})",
@@ -394,6 +456,12 @@ void OffhandSwap::serveNetIdFix()
 
     StackView handView;
     if (!readStack(m_netIdFix.hand, handView) || handView.item == nullptr) {
+        m_netIdFix = NetIdFix{};
+        return;
+    }
+    if (handView.item != m_netIdFix.handItem || handView.netValue != m_netIdFix.handValue) {
+        log().info(L"OffhandSwap: slot {} no longer holds what was swapped in (net id {} -> {}), leaving it alone",
+                   m_netIdFix.slot, m_netIdFix.handValue, handView.netValue);
         m_netIdFix = NetIdFix{};
         return;
     }
@@ -488,7 +556,8 @@ bool OffhandSwap::resolve(void* holder, Hands& out) const
     }
 
     void* slots = nullptr;
-    if (!readPointerGuarded(static_cast<std::byte*>(container) + kSlotsOffset, slots)) {
+    if (!readPointerGuarded(static_cast<std::byte*>(container) + kSlotsOffset, slots)
+        || !looksLikeHeapObject(slots)) {
         return false;
     }
     auto* const array = static_cast<std::byte*>(slots);
@@ -555,8 +624,8 @@ bool OffhandSwap::apply(int slot)
 
     Hands hands[2];
     int count = 0;
-    void* const holders[2] = {m_holder.load(std::memory_order_acquire),
-                              m_holderAlt.load(std::memory_order_acquire)};
+    void* holders[2] = {};
+    HandRestock::instance().ownHolders(holders[0], holders[1]);
     for (void* const holder : holders) {
         Hands resolved;
         if (!resolve(holder, resolved)) {
@@ -657,6 +726,13 @@ bool OffhandSwap::apply(int slot)
             m_pending.offhand[i] = hands[i].offhand;
         }
         m_pending.giveUpAtMs = GetTickCount64() + kResponseWaitMs;
+        if (StackView placed; count > 0 && readStack(m_pending.hand[0], placed)) {
+            m_pending.haveHand = true;
+            m_pending.handItem = placed.item;
+            m_pending.handValue = placed.netValue;
+            m_pending.handCount = placed.count;
+            m_pending.holder = hands[0].holder;
+        }
 
         if (applied == 0) {
             log().warn(L"OffhandSwap: the request went out but the client side could not be "

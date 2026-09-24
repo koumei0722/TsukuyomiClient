@@ -604,6 +604,13 @@ void noteSubChunkAt(int baseX, int baseY, int baseZ, void* subChunk)
         return;
     }
     if (g_subChunkCount.load(std::memory_order_acquire) >= kSubChunkSlots) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            log().warn(L"BlockWrite: ran out of position-to-SubChunk slots ({} chunks) while "
+                       L"learning the chunks the schematic covers; the blocks of the chunks "
+                       L"past this cannot be read, so no ghost or color box is decided there",
+                       kSubChunkSlots);
+        }
         return;
     }
     const std::size_t slot = g_subChunkCount.fetch_add(1, std::memory_order_acq_rel);
@@ -713,8 +720,19 @@ void forgetSubChunks()
     g_subChunkCount.store(0, std::memory_order_release);
 }
 
-void noteWorldChanged()
+void noteWorldChanged(bool leftAWorld)
 {
+    if (leftAWorld) {
+        const bool wasShown = blocks::ghostOn();
+        blocks::dropWorldBlocks();
+        {
+            std::lock_guard<std::mutex> guard(g_knownLock);
+            g_known.clear();
+        }
+        log().info(L"Schematica: left a world, so the blocks from there are no longer "
+                   L"answered (the schematic was {})",
+                   wasShown ? L"shown" : L"not shown");
+    }
     forgetSubChunks();
     g_renderRegion.store(nullptr, std::memory_order_relaxed);
     g_renderRegionSeen.store(0, std::memory_order_relaxed);
@@ -834,98 +852,11 @@ const void* onSubChunkWrite(void* subChunk, unsigned int layer, unsigned int ind
     return block;
 }
 
-bool placeGhostActor(void* region, const BlockPos& at, const void* block, const void* air,
-                     StorageSpot* spot)
-{
-    if (spot != nullptr) {
-        *spot = StorageSpot{};
-    }
-    if (region == nullptr || block == nullptr || air == nullptr) {
-        return false;
-    }
-    if (!regionIsAlive(region)) {
-        return false;
-    }
-    if (findSubChunk(region, at.x, at.y, at.z) == nullptr) {
-        return false;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::BlockSourceSetBlock) || !scanner.found(Target::SubChunkSetBlock)) {
-        return false;
-    }
-    const auto setBlock = scanner.addressAs<RegionSetBlockFn>(Target::BlockSourceSetBlock);
-    const auto setStorage = scanner.addressAs<SubChunkSetFn>(Target::SubChunkSetBlock);
-    if (setBlock == nullptr || setStorage == nullptr) {
-        return false;
-    }
-
-    const int pos[3] = {at.x, at.y, at.z};
-    t_renderSubChunk = nullptr;
-    t_renderIndex = 0;
-
-    beginSelfWrite();
-    beginRenderWrite();
-    const bool ok = callRegionSetBlock(setBlock, region, pos, block,
-                                       g_mode.load(std::memory_order_relaxed),
-                                       g_updateFlags.load(std::memory_order_relaxed),
-                                       g_actor.load(std::memory_order_relaxed));
-    void* const sub = t_renderSubChunk;
-    const unsigned int index = t_renderIndex;
-    if (ok && sub != nullptr && index == subChunkIndex(at.x, at.y, at.z)) {
-        setStorage(sub, 0, index, air);
-        if (spot != nullptr) {
-            spot->subChunk = sub;
-            spot->index = index;
-        }
-    }
-    endRenderWrite();
-    endSelfWrite();
-    t_renderSubChunk = nullptr;
-    return ok;
-}
-
-bool removeGhostActor(void* region, const BlockPos& at, const void* block, const void* air)
-{
-    if (region == nullptr || block == nullptr || air == nullptr) {
-        return false;
-    }
-    if (!regionIsAlive(region)) {
-        return false;
-    }
-    void* const sub = findSubChunk(region, at.x, at.y, at.z);
-    if (sub == nullptr) {
-        return false;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::BlockSourceSetBlock) || !scanner.found(Target::SubChunkSetBlock)) {
-        return false;
-    }
-    const auto setBlock = scanner.addressAs<RegionSetBlockFn>(Target::BlockSourceSetBlock);
-    const auto setStorage = scanner.addressAs<SubChunkSetFn>(Target::SubChunkSetBlock);
-    if (setBlock == nullptr || setStorage == nullptr) {
-        return false;
-    }
-    const unsigned int index = subChunkIndex(at.x, at.y, at.z);
-    const int pos[3] = {at.x, at.y, at.z};
-    beginSelfWrite();
-    beginRenderWrite();
-    setStorage(sub, 0, index, block);
-    const bool ok = callRegionSetBlock(setBlock, region, pos, air,
-                                       g_mode.load(std::memory_order_relaxed),
-                                       g_updateFlags.load(std::memory_order_relaxed),
-                                       g_actor.load(std::memory_order_relaxed));
-    if (!ok) {
-        setStorage(sub, 0, index, air);
-    }
-    endRenderWrite();
-    endSelfWrite();
-    return ok;
-}
-
 namespace {
 using GetChunkAtFn = void*(__fastcall*)(void*, const int*);
 
 std::atomic<std::size_t> g_findWhy[kFindWhyCount] = {};
+std::atomic<std::size_t> g_looseHits{0};
 
 void noteFindWhy(std::size_t which)
 {
@@ -955,6 +886,30 @@ void findSubChunkStats(std::size_t out[kFindWhyCount])
     }
 }
 
+std::size_t findSubChunkLooseHits()
+{
+    return g_looseHits.load(std::memory_order_relaxed);
+}
+
+constexpr std::ptrdiff_t kSourceLoose = 0x1c;
+
+__declspec(noinline) void* getChunkLoose(GetChunkAtFn fn, std::uint8_t* bs, const int at[3])
+{
+    const std::uint8_t was = bs[kSourceLoose];
+    if (was != 0) {
+        return nullptr;
+    }
+    bs[kSourceLoose] = 1;
+    void* got = nullptr;
+    __try {
+        got = fn(bs, at);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        got = nullptr;
+    }
+    bs[kSourceLoose] = was;
+    return got;
+}
+
 __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
 {
     t_lastWasMissingChunk = false;
@@ -982,7 +937,13 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
         }
         const int base = y >> 4 << 4;
         const int at[3] = {x >> 4 << 4, base, z >> 4 << 4};
-        auto* const chunk = static_cast<std::uint8_t*>(getChunkAt(bs, at));
+        auto* chunk = static_cast<std::uint8_t*>(getChunkAt(bs, at));
+        if (chunk == nullptr) {
+            chunk = static_cast<std::uint8_t*>(getChunkLoose(getChunkAt, bs, at));
+            if (chunk != nullptr) {
+                g_looseHits.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (chunk == nullptr) {
             noteFindWhy(4);
             t_lastWasMissingChunk = true;

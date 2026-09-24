@@ -49,6 +49,17 @@ public:
 
     void forget();
 
+    void noteInventoryContent(int containerId)
+    {
+        if (containerId == 0) {
+            m_inventoryContentSerial.fetch_add(1, std::memory_order_release);
+        }
+    }
+    std::uint32_t inventoryContentSerial() const
+    {
+        return m_inventoryContentSerial.load(std::memory_order_acquire);
+    }
+
     void observePacket(void* packet);
 
     static int packetId(void* packet);
@@ -65,7 +76,12 @@ public:
 
     static std::byte* findContainerOpenReader();
 
-    bool onContainerOpenHandle(void* packet, void* result);
+    bool suppressionPending();
+    bool captureOpenShell(const void* packet, std::byte* shell);
+    bool takeInventoryOpen(void* packet, const void* result, const std::byte* shell);
+    static constexpr std::ptrdiff_t kOpenShellOffset = 0x30;
+    static constexpr std::size_t kOpenShellBytes = 0x18;
+    static constexpr int kContainerTypeInventory = -1;
 
     void rememberContainerOpenResult(const void* result);
 
@@ -86,14 +102,19 @@ public:
 private:
     ItemStackRequest() = default;
 
+    bool synthesizeClose();
+
     bool notifyServerInventoryOpen();
 
     bool closeServerInventory();
+
+    bool reopenForPlayer();
 
     bool sendSwap(const SlotRef& a, const SlotRef& b);
 
     static std::byte* findPacketHandle(std::byte* getId, const wchar_t* what,
                                        std::ptrdiff_t vtableOffset);
+    static std::byte* findPacketVtable(std::byte* getId);
 
     void* findNetManager();
 
@@ -171,8 +192,15 @@ private:
     std::atomic<bool> m_scansReady{false};
 
     std::atomic<std::int32_t> m_lastRequestId{0};
-    std::atomic<std::int32_t> m_responseId{0};
-    std::atomic<int> m_responseResult{-1};
+    static constexpr int kTrackedRequests = 8;
+    std::atomic<std::int32_t> m_sentIds[kTrackedRequests]{};
+    std::atomic<unsigned> m_sentNext{0};
+    std::atomic<std::int32_t> m_answerIds[kTrackedRequests]{};
+    std::atomic<int> m_answerResults[kTrackedRequests]{};
+    std::atomic<bool> m_answerTaken[kTrackedRequests]{};
+    std::atomic<unsigned> m_answerNext{0};
+    bool isOurRequest(std::int32_t id) const;
+    bool wasAnswered(std::int32_t id) const;
 
     std::atomic<void*> m_client{nullptr};
 
@@ -199,6 +227,20 @@ private:
     std::atomic<int> m_suppressOpens{0};
     std::atomic<unsigned long long> m_suppressUntilMs{0};
 
+    std::atomic<std::int32_t> m_closeAfterRequestId{0};
+    std::atomic<unsigned long long> m_closeDeadlineMs{0};
+    std::atomic<std::int32_t> m_lastAnsweredId{0};
+    std::atomic<std::uint32_t> m_inventoryContentSerial{0};
+    std::atomic<bool> m_reopenForPlayer{false};
+    std::atomic<bool> m_playerClosed{false};
+    std::atomic<int> m_reopenLogs{0};
+
+    std::atomic<void*> m_closeVtable{nullptr};
+    std::byte m_packetHead[0x30]{};
+    std::atomic<bool> m_hasPacketHead{false};
+    std::atomic<bool> m_closeSynthetic{false};
+    std::atomic<bool> m_loggedRealClose{false};
+
     static constexpr std::size_t kOpenResultSize = 0x48;
     static constexpr std::ptrdiff_t kOpenResultTagOffset = 0x40;
 
@@ -207,8 +249,9 @@ private:
     std::atomic<unsigned long long> m_pendingCloseAtMs{0};
 
     static constexpr unsigned long long kCloseDelayMs = 200;
+    static constexpr unsigned long long kCloseFallbackMs = 3000;
 
-    static constexpr unsigned long long kSuppressWindowMs = 300;
+    static constexpr unsigned long long kSuppressWindowMs = 30000;
 
     std::atomic<int> m_openPacketLogs{0};
     static constexpr int kOpenPacketLogLimit = 6;

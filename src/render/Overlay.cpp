@@ -5,9 +5,11 @@
 #include "render/BoxRenderer.h"
 #include "render/FrameTrace.h"
 
+#include "core/FreezeWatch.h"
 #include "core/Logger.h"
 #include "game/GameModeIds.h"
 #include "hooks/HookManager.h"
+#include "hooks/HookCount.h"
 #include "render/GameModeOverlay.h"
 #include "ui/Theme.h"
 
@@ -374,7 +376,6 @@ void drawContents(float width, float height)
                              g_selectionMode.load(std::memory_order_relaxed));
     }
 
-    boxes::draw(g_res.d2dContext.Get(), width, height);
 }
 
 void drawOverlay(IDXGISwapChain* swapChain)
@@ -467,7 +468,6 @@ void tryDraw(IDXGISwapChain* swapChain)
 {
     const unsigned int frame = g_frameIndex.fetch_add(1, std::memory_order_relaxed) + 1;
 
-    boxes::onPresent();
     frametrace::onPresent();
     worldmesh::onPresent();
 
@@ -488,7 +488,7 @@ void tryDraw(IDXGISwapChain* swapChain)
         g_idleFrames = 0;
     }
 
-    if (!g_selectionVisible.load(std::memory_order_acquire) && !boxes::wantsDraw()) {
+    if (!g_selectionVisible.load(std::memory_order_acquire)) {
         if (g_deviceLive.load(std::memory_order_relaxed)
             && ++g_idleFrames > kIdleFramesBeforeRelease) {
             const std::lock_guard<std::mutex> lock(g_resourceMutex);
@@ -529,6 +529,8 @@ void logSwapChain(IDXGISwapChain* swapChain, bool viaPresent1)
 
 HRESULT __stdcall detourPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
+    TSUKUYOMI_HOOK_COUNT("Present");
+    freezewatch::notePresent();
     logSwapChain(swapChain, false);
 
     if ((flags & DXGI_PRESENT_TEST) == 0) {
@@ -544,6 +546,7 @@ HRESULT __stdcall detourPresent(IDXGISwapChain* swapChain, UINT syncInterval, UI
 HRESULT __stdcall detourPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags,
                                  const DXGI_PRESENT_PARAMETERS* parameters)
 {
+    TSUKUYOMI_HOOK_COUNT("Present1");
     logSwapChain(swapChain, true);
 
     if (g_present1 == nullptr) {
@@ -555,6 +558,7 @@ HRESULT __stdcall detourPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, 
 void __stdcall detourExecuteCommandLists(ID3D12CommandQueue* queue, UINT count,
                                          ID3D12CommandList* const* lists)
 {
+    TSUKUYOMI_HOOK_COUNT("ExecuteCommandLists");
     if (queue != nullptr && g_gameQueue.load(std::memory_order_relaxed) == nullptr) {
         if (queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
             g_gameQueue.store(queue, std::memory_order_relaxed);

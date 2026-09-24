@@ -141,12 +141,21 @@ Event make(std::uint16_t kind, const void* list, std::uint64_t a = 0, std::uint6
 }
 
 constexpr std::size_t kResetIndex = 10;
+constexpr std::size_t kDrawInstancedIndex = 12;
+constexpr std::size_t kDrawIndexedInstancedIndex = 13;
 constexpr std::size_t kResolveIndex = 19;
+constexpr std::size_t kSetPipelineStateIndex = 25;
+constexpr std::size_t kResourceBarrierIndex = 26;
 constexpr std::size_t kClearRtvIndex = 48;
 constexpr std::size_t kSetMarkerIndex = 56;
 constexpr std::size_t kBeginEventIndex = 57;
 constexpr std::size_t kEndEventIndex = 58;
 constexpr std::size_t kExecuteIndirectIndex = 59;
+constexpr std::size_t kCreateGraphicsPipelineStateIndex = 10;
+constexpr std::size_t kCloseIndex = 9;
+constexpr std::size_t kRsSetViewportsIndex = 21;
+constexpr std::size_t kOmSetRenderTargetsIndex = 46;
+constexpr std::size_t kClearDepthStencilViewIndex = 47;
 
 using ResetFn = HRESULT(__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
                                     ID3D12PipelineState*);
@@ -159,6 +168,13 @@ using EndEventFn = void(__stdcall*)(ID3D12GraphicsCommandList*);
 using ExecuteIndirectFn = void(__stdcall*)(ID3D12GraphicsCommandList*, ID3D12CommandSignature*,
                                            UINT, ID3D12Resource*, UINT64, ID3D12Resource*,
                                            UINT64);
+using ResourceBarrierFn = void(__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                           const D3D12_RESOURCE_BARRIER*);
+using DrawIndexedFn = void(__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, INT, UINT);
+using DrawFn = void(__stdcall*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT, UINT);
+using SetPipelineStateFn = void(__stdcall*)(ID3D12GraphicsCommandList*, ID3D12PipelineState*);
+using CreateGraphicsPipelineStateFn = HRESULT(__stdcall*)(
+    ID3D12Device*, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*, REFIID, void**);
 ResetFn g_reset = nullptr;
 ResolveFn g_resolve = nullptr;
 ClearRtvFn g_clearRtv = nullptr;
@@ -166,6 +182,11 @@ MarkerFn g_setMarker = nullptr;
 MarkerFn g_beginEvent = nullptr;
 EndEventFn g_endEvent = nullptr;
 ExecuteIndirectFn g_executeIndirect = nullptr;
+ResourceBarrierFn g_barrier = nullptr;
+DrawIndexedFn g_drawIndexed = nullptr;
+DrawFn g_draw = nullptr;
+SetPipelineStateFn g_setPso = nullptr;
+CreateGraphicsPipelineStateFn g_createGraphicsPso = nullptr;
 
 std::string markerText(UINT metadata, const void* data, UINT size)
 {
@@ -191,6 +212,108 @@ std::string markerText(UINT metadata, const void* data, UINT size)
         }
     }
     return out;
+}
+
+using OmSetRenderTargetsFn = void(__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                              const D3D12_CPU_DESCRIPTOR_HANDLE*, BOOL,
+                                              const D3D12_CPU_DESCRIPTOR_HANDLE*);
+using CloseFn = HRESULT(__stdcall*)(ID3D12GraphicsCommandList*);
+using RsSetViewportsFn = void(__stdcall*)(ID3D12GraphicsCommandList*, UINT,
+                                          const D3D12_VIEWPORT*);
+using ClearDsvFn = void(__stdcall*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+                                    D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+OmSetRenderTargetsFn g_om = nullptr;
+CloseFn g_close = nullptr;
+RsSetViewportsFn g_rsSetViewports = nullptr;
+ClearDsvFn g_clearDsv = nullptr;
+
+void __stdcall detourBarrier(ID3D12GraphicsCommandList* list, UINT count,
+                             const D3D12_RESOURCE_BARRIER* barriers)
+{
+    onBarrier(list, count, barriers);
+    if (g_barrier != nullptr) {
+        g_barrier(list, count, barriers);
+    }
+}
+
+void __stdcall detourDrawIndexed(ID3D12GraphicsCommandList* list, UINT indexCount,
+                                 UINT instanceCount, UINT startIndex, INT baseVertex,
+                                 UINT startInstance)
+{
+    onDraw(list, indexCount, instanceCount, true);
+    if (g_drawIndexed != nullptr) {
+        g_drawIndexed(list, indexCount, instanceCount, startIndex, baseVertex, startInstance);
+    }
+}
+
+void __stdcall detourDraw(ID3D12GraphicsCommandList* list, UINT vertexCount, UINT instanceCount,
+                          UINT startVertex, UINT startInstance)
+{
+    onDraw(list, vertexCount, instanceCount, false);
+    if (g_draw != nullptr) {
+        g_draw(list, vertexCount, instanceCount, startVertex, startInstance);
+    }
+}
+
+void __stdcall detourSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
+{
+    onSetPso(list, pso);
+    if (g_setPso != nullptr) {
+        g_setPso(list, pso);
+    }
+}
+
+HRESULT __stdcall detourCreateGraphicsPso(ID3D12Device* device,
+                                          const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc,
+                                          REFIID riid, void** out)
+{
+    const HRESULT hr = g_createGraphicsPso != nullptr
+                           ? g_createGraphicsPso(device, desc, riid, out)
+                           : E_FAIL;
+    if (SUCCEEDED(hr) && out != nullptr && *out != nullptr) {
+        notePso(static_cast<ID3D12PipelineState*>(*out), desc);
+    }
+    return hr;
+}
+
+void __stdcall detourOm(ID3D12GraphicsCommandList* list, UINT numRt,
+                        const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single,
+                        const D3D12_CPU_DESCRIPTOR_HANDLE* dsv)
+{
+    onOm(list, numRt,
+         (numRt > 0 && rtvs != nullptr) ? static_cast<std::uint64_t>(rtvs[0].ptr) : 0,
+         dsv != nullptr ? static_cast<std::uint64_t>(dsv->ptr) : 0);
+    if (g_om != nullptr) {
+        g_om(list, numRt, rtvs, single, dsv);
+    }
+}
+
+HRESULT __stdcall detourClose(ID3D12GraphicsCommandList* list)
+{
+    onClose(list);
+    return g_close != nullptr ? g_close(list) : S_OK;
+}
+
+void __stdcall detourRsSetViewports(ID3D12GraphicsCommandList* list, UINT count,
+                                    const D3D12_VIEWPORT* viewports)
+{
+    if (count > 0 && viewports != nullptr) {
+        onViewport(list, viewports[0].Width, viewports[0].Height, viewports[0].MinDepth,
+                   viewports[0].MaxDepth);
+    }
+    if (g_rsSetViewports != nullptr) {
+        g_rsSetViewports(list, count, viewports);
+    }
+}
+
+void __stdcall detourClearDsv(ID3D12GraphicsCommandList* list, D3D12_CPU_DESCRIPTOR_HANDLE dsv,
+                              D3D12_CLEAR_FLAGS flags, FLOAT depth, UINT8 stencil, UINT rects,
+                              const D3D12_RECT* rect)
+{
+    onClearDsv(list, static_cast<std::uint64_t>(dsv.ptr), static_cast<unsigned>(flags));
+    if (g_clearDsv != nullptr) {
+        g_clearDsv(list, dsv, flags, depth, stencil, rects, rect);
+    }
 }
 
 HRESULT __stdcall detourReset(ID3D12GraphicsCommandList* list, ID3D12CommandAllocator* allocator,
@@ -411,7 +534,7 @@ bool installHooks()
     bool ok = true;
     const auto hook = [&](std::size_t index, void* detour, void** original, const wchar_t* name) {
         void* const target = vtableEntry(list.Get(), index);
-        if (target == nullptr || !hooks.create(target, detour, original, name)) {
+        if (target == nullptr || !hooks.create(target, detour, original, name, HookGroup::Diag)) {
             ok = false;
         }
     };
@@ -429,6 +552,29 @@ bool installHooks()
          reinterpret_cast<void**>(&g_endEvent), L"D3D12EndEvent");
     hook(kExecuteIndirectIndex, reinterpret_cast<void*>(&detourExecuteIndirect),
          reinterpret_cast<void**>(&g_executeIndirect), L"D3D12ExecuteIndirect");
+    hook(kOmSetRenderTargetsIndex, reinterpret_cast<void*>(&detourOm),
+         reinterpret_cast<void**>(&g_om), L"D3D12OMSetRenderTargets");
+    hook(kCloseIndex, reinterpret_cast<void*>(&detourClose), reinterpret_cast<void**>(&g_close),
+         L"D3D12CommandListClose");
+    hook(kRsSetViewportsIndex, reinterpret_cast<void*>(&detourRsSetViewports),
+         reinterpret_cast<void**>(&g_rsSetViewports), L"D3D12RSSetViewports");
+    hook(kClearDepthStencilViewIndex, reinterpret_cast<void*>(&detourClearDsv),
+         reinterpret_cast<void**>(&g_clearDsv), L"D3D12ClearDepthStencilView");
+    hook(kResourceBarrierIndex, reinterpret_cast<void*>(&detourBarrier),
+         reinterpret_cast<void**>(&g_barrier), L"D3D12ResourceBarrier");
+    hook(kDrawIndexedInstancedIndex, reinterpret_cast<void*>(&detourDrawIndexed),
+         reinterpret_cast<void**>(&g_drawIndexed), L"D3D12DrawIndexedInstanced");
+    hook(kDrawInstancedIndex, reinterpret_cast<void*>(&detourDraw),
+         reinterpret_cast<void**>(&g_draw), L"D3D12DrawInstanced");
+    hook(kSetPipelineStateIndex, reinterpret_cast<void*>(&detourSetPso),
+         reinterpret_cast<void**>(&g_setPso), L"D3D12SetPipelineState");
+    void* const psoTarget = vtableEntry(device.Get(), kCreateGraphicsPipelineStateIndex);
+    if (psoTarget == nullptr
+        || !hooks.create(psoTarget, &detourCreateGraphicsPso,
+                         reinterpret_cast<void**>(&g_createGraphicsPso),
+                         L"D3D12CreateGraphicsPipelineState")) {
+        ok = false;
+    }
     log().info(L"FrameTrace: hooks installed ({})", ok ? L"all" : L"partly failed");
     return ok;
 }
@@ -488,10 +634,10 @@ void notePso(ID3D12PipelineState* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC*
     g_psos[pso] = std::move(info);
 }
 
-void onSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, bool swapped)
+void onSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso)
 {
     if (g_state.load(std::memory_order_relaxed) == kRecording) {
-        push(make(kSetPso, list, reinterpret_cast<std::uint64_t>(pso), swapped ? 1 : 0));
+        push(make(kSetPso, list, reinterpret_cast<std::uint64_t>(pso), 0));
     }
 }
 

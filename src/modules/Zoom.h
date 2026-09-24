@@ -90,6 +90,9 @@ private:
     static Zoom* s_hookOwner;
     HHOOK m_mouseHook = nullptr;
 
+    std::atomic<bool> m_mouseHookFailed{false};
+    bool m_mouseHookWarned = false;
+
     std::atomic<int> m_wheel{0};
 
     std::atomic<unsigned long long> m_wheelAt{0};

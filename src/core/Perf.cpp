@@ -32,10 +32,12 @@ std::atomic<unsigned long long> g_reportedAt{0};
 
 const wchar_t* const kNames[] = {
     L"Schematica",  L"load",       L"cells",      L"draw",      L"clear",
-    L"prune",       L"diff",       L"review",     L"restore",   L"fix-taken",
-    L"place-actors", L"dirty",     L"publish",    L"lookup",    L"tessellate",
+    L"prune",       L"diff",       L"restore",    L"dirty",     L"publish",
+    L"lookup",      L"tessellate",
     L"chunk-build", L"ask-builds",
     L"HandRestock", L"hr-resolve", L"hr-count",   L"hr-watch",  L"hr-client",
+    L"hr-own",
+    L"install",     L"hook-apply",
 };
 static_assert(sizeof(kNames) / sizeof(kNames[0]) == static_cast<std::size_t>(Slot::Count));
 

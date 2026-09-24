@@ -130,17 +130,6 @@ InventoryActionBridge& InventoryActionBridge::instance()
     return bridge;
 }
 
-void InventoryActionBridge::onSetSelectedSlot(void* holder)
-{
-    if (holder == nullptr) {
-        return;
-    }
-    void* const previous = m_holder.exchange(holder, std::memory_order_acq_rel);
-    if (previous != nullptr && previous != holder) {
-        m_holderAlt.store(previous, std::memory_order_release);
-    }
-}
-
 bool InventoryActionBridge::readSlot(const void* address, SlotView& out)
 {
     if (!memory::isReadable(address, sizeof(std::uint64_t) * 5)) {
@@ -339,10 +328,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
         return false;
     }
 
-    const bool trace = m_traceLeft.fetch_sub(1, std::memory_order_relaxed) > 0;
-    if (trace) {
-    }
-
     static constexpr char kContainerName[] = "container_items";
     static constexpr std::size_t kNameLength = sizeof(kContainerName) - 1;
     static_assert(kNameLength <= kShortStringCapacity);
@@ -357,8 +342,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     std::memcpy(query + kQueryIndexOffset, &index, sizeof(index));
 
     std::byte* const first = callGetItemGuarded(fn, resolver, query);
-    if (trace) {
-    }
     if (first == nullptr || !memory::isReadable(first, kStackSize)) {
         return false;
     }
@@ -366,8 +349,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     void* screenObject = nullptr;
     const bool gotScreen =
         readPointer(resolver, kResolverScreenOffset, screenObject) && screenObject != nullptr;
-    if (trace) {
-    }
     if (!gotScreen) {
         return false;
     }
@@ -375,8 +356,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     Places places;
     const bool gotPlaces = resolve(places) && places.container != nullptr
                            && memory::isReadable(places.container, sizeof(void*));
-    if (trace) {
-    }
     if (!gotPlaces) {
         return false;
     }
@@ -412,9 +391,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
         ++copyCount;
     }
 
-    if (trace) {
-    }
-
     const unsigned long long now = GetTickCount64();
     if (now < m_nextScanMs.load(std::memory_order_relaxed)) {
         return false;
@@ -431,8 +407,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
             std::byte* const slots = findSlots(box, copyCount, first);
             if (slots == nullptr) {
                 return false;
-            }
-            if (trace) {
             }
             out.container = box;
             out.slots = slots;
@@ -480,8 +454,6 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     std::byte* const collection = findCollection(first, kContainerName, kNameLength);
     if (collection == nullptr) {
         m_nextScanMs.store(now + kScanRetryMs, std::memory_order_relaxed);
-        if (trace) {
-        }
         return false;
     }
     void* found = nullptr;
@@ -490,13 +462,9 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
     const bool gotContainer =
         gotModel && containerFrom(candidate, ownNotify, places.container, found);
     std::byte* const slots = gotContainer ? findSlots(found, copyCount, first) : nullptr;
-    if (trace) {
-    }
     if (slots == nullptr) {
         m_nextScanMs.store(now + kScanRetryMs, std::memory_order_relaxed);
         return false;
-    }
-    if (trace) {
     }
     out.container = found;
     out.slots = slots;
@@ -511,8 +479,7 @@ bool InventoryActionBridge::resolveOpenContainer(OpenContainer& out) const
 
 bool InventoryActionBridge::resolve(Places& out) const
 {
-    void* const holders[] = {m_holder.load(std::memory_order_acquire),
-                             m_holderAlt.load(std::memory_order_acquire)};
+    void* const holders[] = {m_ownHolder.load(std::memory_order_acquire)};
 
     for (void* const holder : holders) {
         if (holder == nullptr) {
@@ -699,16 +666,6 @@ bool InventoryActionBridge::shouldBlockPacket(void* packet)
         return false;
     }
 
-    if constexpr (kRequestPacketId < 0) {
-        const int seen = m_packetProbes.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (seen <= kPacketProbeLimit) {
-            log().info(L"InventoryActionBridge: a packet of type {} went out while a move "
-                       L"was being replaced",
-                       id);
-        }
-        return false;
-    }
-
     if (id != kRequestPacketId) {
         return false;
     }
@@ -854,8 +811,8 @@ void InventoryActionBridge::onAddRequestAction(void* const* clientHolder, void* 
             if (!resolve(places)) {
                 skipped = L"the inventory could not be reached";
                 if (!m_warnedPlaces.exchange(true, std::memory_order_acq_rel)) {
-                    log().warn(L"InventoryActionBridge: could not reach the inventory, "
-                               L"switch your hotbar slot once (1-9)");
+                    log().warn(L"InventoryActionBridge: could not reach your inventory (it is told apart by "
+                               L"HandRestock); the move is left to the game");
                 }
             } else if (!translate(places, open, openId, src, a)
                        || !translate(places, open, openId, dst, b)) {
@@ -1017,7 +974,7 @@ void InventoryActionBridge::onContainerOpen(void* packet)
     }
     if (packet == nullptr
         || !memory::isReadable(static_cast<const std::byte*>(packet) + kOpenIdOffset,
-                               kOpenPeekBytes)) {
+                               kOpenKindOffset + 1)) {
         return;
     }
     const auto* const base = static_cast<const std::byte*>(packet);
@@ -1025,21 +982,15 @@ void InventoryActionBridge::onContainerOpen(void* packet)
     const int kind = static_cast<int>(static_cast<std::uint8_t>(base[kOpenKindOffset]));
     m_openContainerId.store(id, std::memory_order_release);
     m_openContainerKind.store(kind, std::memory_order_release);
-
-    if (m_containerOpenProbes.fetch_sub(1, std::memory_order_relaxed) > 0) {
-        std::uint64_t words[kOpenPeekBytes / sizeof(std::uint64_t)] = {};
-        std::memcpy(words, base + kOpenIdOffset, sizeof(words));
-        log().info(L"InventoryActionBridge: container-open id {} kind {} "
-                   L"({:#x} {:#x} {:#x} {:#x} {:#x} {:#x})",
-                   id, kind, words[0], words[1], words[2], words[3], words[4], words[5]);
-    }
 }
 
 void InventoryActionBridge::onFrame()
 {
     if (!bridgeActive()) {
+        m_ownHolder.store(nullptr, std::memory_order_release);
         return;
     }
+    m_ownHolder.store(HandRestock::instance().ownClientHolder(), std::memory_order_release);
 
     OpenContainer open;
     void* const reached = resolveOpenContainer(open) ? open.container : nullptr;

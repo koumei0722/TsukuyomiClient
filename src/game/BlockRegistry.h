@@ -8,6 +8,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "game/SchematicLimits.h"
+
 namespace tsukuyomi::blocks {
 
 using Table = std::unordered_map<std::string, const void*>;
@@ -47,17 +49,12 @@ std::vector<std::array<std::int32_t, 3>> ghostBlockEntityCells();
 
 inline constexpr int kGhostLayer = 3;
 
-inline constexpr std::size_t kGhostCellLimit = 1u << 22;
+inline constexpr std::size_t kGhostCellLimit = kMaxSchematicCells;
 
 void setGhostPalette(std::vector<const void*> blocks);
 
 void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
                        int layer = 0);
-
-void setGhostCellOrient(std::int32_t x, std::int32_t y, std::int32_t z, float yawDeg,
-                        int pitchQuarters);
-bool ghostOrientAt(std::int32_t x, std::int32_t y, std::int32_t z, float& yawDeg,
-                   int& pitchQuarters);
 
 bool dropGhostCell(std::int32_t x, std::int32_t y, std::int32_t z);
 
@@ -72,7 +69,9 @@ enum class DiffColor : std::uint8_t {
     Missing = 1,
     Wrong = 2,
     State = 3,
+    Extra = 4,
 };
+inline constexpr std::uint8_t kDiffColorMax = static_cast<std::uint8_t>(DiffColor::Extra);
 
 bool setDiffCell(std::int32_t x, std::int32_t y, std::int32_t z, DiffColor color);
 
@@ -90,7 +89,9 @@ enum class DiffKind : std::uint8_t {
     State = 3,
     UnknownWorld = 4,
     UnknownWant = 5,
+    Extra = 6,
 };
+inline constexpr std::size_t kDiffKindCount = 7;
 
 DiffKind diffKindOf(const void* real, const void* want, bool wantAir);
 
@@ -110,16 +111,12 @@ struct DiffBox {
     std::int32_t z = 0;
     DiffColor color = DiffColor::None;
     bool hidden = false;
+    std::uint8_t covered = 0;
 };
 
-void setBoxBlock(const void* block);
-const void* boxBlock();
-
-void setMeshBoxes(bool on);
-bool meshBoxesOn();
-
 std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
-                             std::size_t* dropped);
+                             std::size_t* dropped, const double* eye = nullptr,
+                             int* keptRadius = nullptr);
 
 std::size_t appendStateVariants(const void* block, std::vector<const void*>& out);
 
@@ -144,17 +141,13 @@ void noteRealLayer(const void* block, int layer);
 
 int realLayer(const void* block);
 
-void noteGhostYaw(const void* block, float yawDeg);
-
-float ghostYaw(const void* block);
-
 bool hasBlockEntity(const void* block);
-
-bool hasBlockEntityFast(const void* block);
 
 bool calibrateItemIds();
 
 bool blockItemIdAux(const void* block, std::int32_t& out);
+
+const void* itemByName(const std::string& name);
 
 bool maxStackSizeOf(const char* name, const void* block, int& out);
 
@@ -162,6 +155,9 @@ bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z);
 
 void setAirBlock(const void* air);
 const void* airBlock();
+
+void dropWorldBlocks();
+bool takeWorldDropped();
 
 void waitUntilIdle();
 
@@ -183,10 +179,7 @@ enum class GhostHook : int {
     Alpha = 3,
     Aim = 4,
     Filled = 5,
-    Actor = 6,
-    Box = 7,
-    BoxMiss = 8,
-    Count = 9,
+    Count = 6,
 };
 void noteGhostHit(GhostHook which);
 

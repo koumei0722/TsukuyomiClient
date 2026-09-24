@@ -50,6 +50,16 @@ bool readBytesGuarded(const void* address, void* out, std::size_t size)
     }
 }
 
+bool writeBytesGuarded(void* address, const void* in, std::size_t size)
+{
+    __try {
+        std::memcpy(address, in, size);
+        return true;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
 int faultFilter(EXCEPTION_POINTERS* info, const void** faultPc, const void** faultAddress)
 {
     const unsigned long code = info->ExceptionRecord->ExceptionCode;
@@ -240,6 +250,17 @@ void ItemStackRequest::onScansReady()
                    m_endRequest != nullptr);
     }
 
+    if (std::byte* const getId = scanner.address(Target::ContainerCloseGetId); getId != nullptr) {
+        if (std::byte* const self = findPacketHandle(getId, L"container-close", sizeof(void*));
+            self == getId) {
+            m_closeVtable.store(findPacketVtable(getId), std::memory_order_release);
+        }
+    }
+    if (m_closeVtable.load(std::memory_order_acquire) == nullptr) {
+        log().warn(L"ItemStackRequest: the container-close vtable was not found; the inventory "
+                   L"must be opened once with E before refills can be sent");
+    }
+
     if (available() && !canSwap()) {
         log().warn(L"ItemStackRequest: makeSwapAction was not found, "
                    L"swapping two non-empty slots is unavailable");
@@ -280,6 +301,9 @@ void ItemStackRequest::observePacket(void* packet)
         const auto* const bytes = static_cast<const std::uint8_t*>(packet);
         if (bytes[kInteractActionOffset] == kInteractOpenInventory) {
             m_serverInventoryOpen.store(true, std::memory_order_release);
+            if (readBytesGuarded(packet, m_packetHead, sizeof(m_packetHead))) {
+                m_hasPacketHead.store(true, std::memory_order_release);
+            }
         }
         return;
     }
@@ -289,9 +313,21 @@ void ItemStackRequest::observePacket(void* packet)
         if (bytes[kContainerCloseTypeOffset] == kContainerTypeNone) {
             m_serverInventoryOpen.store(false, std::memory_order_release);
             m_openedByUs.store(false, std::memory_order_release);
+            if (packet != m_closeCopy) {
+                m_playerClosed.store(true, std::memory_order_release);
+            }
             if (packet != m_closeCopy
                 && readBytesGuarded(packet, m_closeCopy, sizeof(m_closeCopy))) {
                 m_hasCloseCopy.store(true, std::memory_order_release);
+                m_closeSynthetic.store(false, std::memory_order_release);
+                if (!m_loggedRealClose.exchange(true, std::memory_order_acq_rel)) {
+                    std::uint64_t words[sizeof(m_closeCopy) / sizeof(std::uint64_t)] = {};
+                    std::memcpy(words, m_closeCopy, sizeof(words));
+                    log().info(L"ItemStackRequest: a real inventory-close packet ({:#x} {:#x} {:#x} {:#x} "
+                               L"{:#x} {:#x} {:#x}); our vtable {:#x}",
+                               words[0], words[1], words[2], words[3], words[4], words[5], words[6],
+                               reinterpret_cast<std::uintptr_t>(m_closeVtable.load(std::memory_order_acquire)));
+                }
             }
         }
     }
@@ -301,6 +337,22 @@ void ItemStackRequest::onNotifyInventoryOpen(void* client)
 {
     if (client == nullptr) {
         return;
+    }
+    if (m_suppressOpens.exchange(0, std::memory_order_acq_rel) > 0) {
+        m_openedByUs.store(false, std::memory_order_release);
+        m_closeAfterRequestId.store(0, std::memory_order_release);
+        m_closeDeadlineMs.store(0, std::memory_order_release);
+        m_pendingCloseAtMs.store(0, std::memory_order_release);
+        log().info(L"ItemStackRequest: the inventory was opened with E while a refill was waiting, "
+                   L"so the reply is left for the screen");
+    } else if (m_openedByUs.load(std::memory_order_acquire)
+               && m_pendingCloseAtMs.load(std::memory_order_acquire) != 0) {
+        m_reopenForPlayer.store(true, std::memory_order_release);
+        m_pendingCloseAtMs.store(GetTickCount64(), std::memory_order_release);
+        if (m_reopenLogs.fetch_add(1, std::memory_order_acq_rel) < 3) {
+            log().info(L"ItemStackRequest: the inventory was opened with E right after a refill; it is "
+                       L"reopened once the server has answered the move");
+        }
     }
     void* vtable = nullptr;
     if (!readPointerGuarded(client, vtable) || vtable == nullptr) {
@@ -322,9 +374,21 @@ bool ItemStackRequest::suppressingInputReset() const
 
 bool ItemStackRequest::notifyServerInventoryOpen()
 {
+    if (m_clientInstance.load(std::memory_order_acquire) == nullptr) {
+        if (void* const fromInput = hooks::gameClientInstance(); fromInput != nullptr) {
+            void* vtable = nullptr;
+            if (readPointerGuarded(fromInput, vtable) && vtable != nullptr) {
+                m_clientInstance.store(fromInput, std::memory_order_release);
+                m_clientVtable.store(vtable, std::memory_order_release);
+                log().info(L"ItemStackRequest: client instance taken from the input handler ({:#x})",
+                           reinterpret_cast<std::uintptr_t>(fromInput));
+            }
+        }
+    }
     void* const client = m_clientInstance.load(std::memory_order_acquire);
-    if (client == nullptr || !hooks::hasNotifyInventoryOpen()
-        || !m_hasCloseCopy.load(std::memory_order_acquire)) {
+    const bool canClose = m_hasCloseCopy.load(std::memory_order_acquire)
+                          || m_closeVtable.load(std::memory_order_acquire) != nullptr;
+    if (client == nullptr || !hooks::hasNotifyInventoryOpen() || !canClose) {
         if (!m_warnedNoClient.exchange(true, std::memory_order_acq_rel)) {
             log().warn(L"ItemStackRequest: open and close your inventory once (E) so the mod "
                        L"can learn how to talk to the server about it, "
@@ -369,11 +433,62 @@ bool ItemStackRequest::notifyServerInventoryOpen()
         return false;
     }
 
-    m_openedByUs.store(true, std::memory_order_release);
+    if (!m_hasCloseCopy.load(std::memory_order_acquire) && !synthesizeClose()) {
+        log().warn(L"ItemStackRequest: could not build the inventory-close packet; the inventory may "
+                   L"not open with E until it is opened and closed once");
+    }
 
-    m_suppressOpens.store(1, std::memory_order_release);
+    m_openedByUs.store(true, std::memory_order_release);
+    m_playerClosed.store(false, std::memory_order_release);
+
+    m_suppressOpens.fetch_add(1, std::memory_order_acq_rel);
     m_suppressUntilMs.store(GetTickCount64() + kSuppressWindowMs, std::memory_order_release);
     return true;
+}
+
+bool ItemStackRequest::synthesizeClose()
+{
+    void* const vtable = m_closeVtable.load(std::memory_order_acquire);
+    if (vtable == nullptr || !m_hasPacketHead.load(std::memory_order_acquire)) {
+        return false;
+    }
+    std::byte built[sizeof(m_closeCopy)]{};
+    std::memcpy(built, m_packetHead, sizeof(m_packetHead));
+    std::memcpy(built, &vtable, sizeof(vtable));
+    std::memset(built + 0x2C, 0, 4);
+    built[0x30] = std::byte{0};
+    built[kContainerCloseTypeOffset] = std::byte{kContainerTypeNone};
+    built[0x32] = std::byte{0};
+    std::memcpy(m_closeCopy, built, sizeof(built));
+    m_closeSynthetic.store(true, std::memory_order_release);
+    m_hasCloseCopy.store(true, std::memory_order_release);
+    std::uint64_t words[sizeof(built) / sizeof(std::uint64_t)] = {};
+    std::memcpy(words, built, sizeof(words));
+    log().info(L"ItemStackRequest: built the inventory-close packet ourselves ({:#x} {:#x} {:#x} {:#x} "
+               L"{:#x} {:#x} {:#x})",
+               words[0], words[1], words[2], words[3], words[4], words[5], words[6]);
+    return true;
+}
+
+std::byte* ItemStackRequest::findPacketVtable(std::byte* getId)
+{
+    if (getId == nullptr) {
+        return nullptr;
+    }
+    static constexpr char kDigits[] = "0123456789ABCDEF";
+    const auto value = reinterpret_cast<std::uintptr_t>(getId);
+    char text[8 * 3];
+    for (int i = 0; i < 8; ++i) {
+        const auto byte = static_cast<unsigned>((value >> (i * 8)) & 0xFF);
+        text[i * 3] = kDigits[byte >> 4];
+        text[i * 3 + 1] = kDigits[byte & 0xF];
+        text[i * 3 + 2] = ' ';
+    }
+    const ScanHit hit = scanMainModule(std::string_view(text, sizeof(text) - 1), ".rdata");
+    if (hit.count != 1) {
+        return nullptr;
+    }
+    return hit.address - sizeof(void*);
 }
 
 std::byte* ItemStackRequest::findContainerOpenHandle()
@@ -438,30 +553,48 @@ std::byte* ItemStackRequest::findPacketHandle(std::byte* getId, const wchar_t* w
     return static_cast<std::byte*>(handle);
 }
 
-bool ItemStackRequest::onContainerOpenHandle(void* packet, void* result)
+bool ItemStackRequest::suppressionPending()
 {
-    if (packet != nullptr && memory::isReadable(packet, 0x80)
-        && m_openPacketLogs.fetch_add(1, std::memory_order_acq_rel) < kOpenPacketLogLimit) {
-        std::uint64_t words[10]{};
-        std::memcpy(words, static_cast<const std::byte*>(packet) + 0x30, sizeof(words));
-        log().info(L"ItemStackRequest: container-open packet +0x30 "
-                   L"({:#x} {:#x} {:#x} {:#x} {:#x} | {:#x} {:#x} {:#x} {:#x} {:#x})",
-                   words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-                   words[7], words[8], words[9]);
-    }
-
-    if (m_suppressOpens.load(std::memory_order_acquire) <= 0 || result == nullptr) {
+    if (m_suppressOpens.load(std::memory_order_acquire) <= 0) {
         return false;
     }
     if (GetTickCount64() > m_suppressUntilMs.load(std::memory_order_acquire)) {
         m_suppressOpens.store(0, std::memory_order_release);
         return false;
     }
-    m_suppressOpens.fetch_sub(1, std::memory_order_acq_rel);
-
-    std::memset(result, 0, kOpenResultSize);
-    static_cast<std::byte*>(result)[kOpenResultTagOffset] = std::byte{1};
     return true;
+}
+
+bool ItemStackRequest::captureOpenShell(const void* packet, std::byte* shell)
+{
+    return packet != nullptr && shell != nullptr
+           && readBytesGuarded(static_cast<const std::byte*>(packet) + kOpenShellOffset, shell,
+                               kOpenShellBytes);
+}
+
+bool ItemStackRequest::takeInventoryOpen(void* packet, const void* result, const std::byte* shell)
+{
+    if (packet == nullptr || result == nullptr || shell == nullptr) {
+        return false;
+    }
+    std::byte tag{};
+    std::uint8_t head[2]{};
+    if (!readBytesGuarded(static_cast<const std::byte*>(result) + kOpenResultTagOffset, &tag, 1)
+        || !readBytesGuarded(static_cast<const std::byte*>(packet) + kOpenShellOffset, head, sizeof(head))) {
+        return false;
+    }
+    const int windowId = head[0];
+    const int type = static_cast<std::int8_t>(head[1]);
+    const bool isInventory = tag != std::byte{0} && type == kContainerTypeInventory;
+    if (m_openPacketLogs.fetch_add(1, std::memory_order_acq_rel) < kOpenPacketLogLimit) {
+        log().info(L"ItemStackRequest: container-open (window {}, type {}) while a refill is waiting - {}",
+                   windowId, type, isInventory ? L"swallowed" : L"let through");
+    }
+    if (!isInventory) {
+        return false;
+    }
+    m_suppressOpens.fetch_sub(1, std::memory_order_acq_rel);
+    return writeBytesGuarded(static_cast<std::byte*>(packet) + kOpenShellOffset, shell, kOpenShellBytes);
 }
 
 void ItemStackRequest::rememberContainerOpenResult(const void* result)
@@ -487,15 +620,68 @@ void ItemStackRequest::rememberContainerOpenResult(const void* result)
 
 void ItemStackRequest::onFrame()
 {
+    const unsigned long long now = GetTickCount64();
     const unsigned long long due = m_pendingCloseAtMs.load(std::memory_order_acquire);
-    if (due == 0 || GetTickCount64() < due) {
+    if (due == 0 || now < due) {
         return;
     }
+    if (m_playerClosed.load(std::memory_order_acquire)) {
+        m_pendingCloseAtMs.store(0, std::memory_order_release);
+        m_closeAfterRequestId.store(0, std::memory_order_release);
+        m_closeDeadlineMs.store(0, std::memory_order_release);
+        m_suppressOpens.store(0, std::memory_order_release);
+        m_reopenForPlayer.store(false, std::memory_order_release);
+        return;
+    }
+    const std::int32_t waitFor = m_closeAfterRequestId.load(std::memory_order_acquire);
+    const bool answered = waitFor == 0 || wasAnswered(waitFor);
+    const unsigned long long deadline = m_closeDeadlineMs.load(std::memory_order_acquire);
+    if (!answered && deadline != 0 && now < deadline) {
+        return;
+    }
+    if (!answered) {
+        log().warn(L"ItemStackRequest: no reply to request {} after {} ms; telling the server the "
+                   L"inventory closed anyway", waitFor, kCloseFallbackMs);
+    }
     m_pendingCloseAtMs.store(0, std::memory_order_release);
-
-    m_suppressOpens.store(0, std::memory_order_release);
+    m_closeAfterRequestId.store(0, std::memory_order_release);
+    m_closeDeadlineMs.store(0, std::memory_order_release);
+    if (answered) {
+        m_suppressOpens.store(0, std::memory_order_release);
+    }
 
     closeServerInventory();
+    if (m_reopenForPlayer.exchange(false, std::memory_order_acq_rel)) {
+        reopenForPlayer();
+    }
+}
+
+bool ItemStackRequest::reopenForPlayer()
+{
+    void* const client = m_clientInstance.load(std::memory_order_acquire);
+    if (client == nullptr || !hooks::hasNotifyInventoryOpen()) {
+        return false;
+    }
+    void* vtable = nullptr;
+    if (!readPointerGuarded(client, vtable)
+        || vtable != m_clientVtable.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const void* faultPc = nullptr;
+    const void* faultAddress = nullptr;
+    if (!notifyGuarded(&hooks::callNotifyInventoryOpen, client, &faultPc, &faultAddress)) {
+        const ModuleRange& module = mainModule();
+        const auto rva = module.contains(faultPc)
+                             ? static_cast<std::size_t>(
+                                   static_cast<const std::byte*>(faultPc) - module.base)
+                             : 0;
+        log().error(L"ItemStackRequest: reopening the inventory for the player faulted "
+                    L"(pc rva {:#x}, touched {:#x}), dropping the client instance",
+                    rva, reinterpret_cast<std::uintptr_t>(faultAddress));
+        m_clientInstance.store(nullptr, std::memory_order_release);
+        return false;
+    }
+    return m_serverInventoryOpen.load(std::memory_order_acquire);
 }
 
 bool ItemStackRequest::closeServerInventory()
@@ -650,6 +836,14 @@ void* ItemStackRequest::netManager()
             return cached;
         }
         m_client.store(nullptr, std::memory_order_release);
+        m_lastRequestId.store(0, std::memory_order_release);
+        m_lastAnsweredId.store(0, std::memory_order_release);
+        for (auto& id : m_sentIds) {
+            id.store(0, std::memory_order_release);
+        }
+        for (auto& id : m_answerIds) {
+            id.store(0, std::memory_order_release);
+        }
     }
 
     void* const found = findNetManager();
@@ -798,6 +992,10 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
 
     if (m_openedByUs.load(std::memory_order_acquire)) {
         m_pendingCloseAtMs.store(GetTickCount64() + kCloseDelayMs, std::memory_order_release);
+        if (sent) {
+            m_closeAfterRequestId.store(payload.requestId, std::memory_order_release);
+        }
+        m_closeDeadlineMs.store(GetTickCount64() + kCloseFallbackMs, std::memory_order_release);
     }
 
     if (!sent) {
@@ -814,7 +1012,8 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
     }
 
     m_lastRequestId.store(payload.requestId, std::memory_order_release);
-    m_responseId.store(0, std::memory_order_release);
+    m_sentIds[m_sentNext.fetch_add(1, std::memory_order_acq_rel) % kTrackedRequests].store(
+        payload.requestId, std::memory_order_release);
 
     log().info(L"ItemStackRequest: {} {}:{} -> {}:{} (count {}, netId {} tag {}, "
                L"pending {:#x}->{:#x}->{:#x}, actions {}, request {}, screen {})",
@@ -855,30 +1054,70 @@ void ItemStackRequest::onResponse(const void* entries)
         }
         std::int32_t id = 0;
         std::memcpy(&id, raw + kResponseRequestIdOffset, sizeof(id));
-        if (id == wanted) {
+        if (id != 0 && isOurRequest(id)) {
             const int code =
                 static_cast<int>(static_cast<std::uint8_t>(raw[kResponseResultOffset]));
-            m_responseResult.store(code, std::memory_order_release);
-            m_responseId.store(id, std::memory_order_release);
+            const unsigned slot = m_answerNext.fetch_add(1, std::memory_order_acq_rel) % kTrackedRequests;
+            m_answerResults[slot].store(code, std::memory_order_release);
+            m_answerTaken[slot].store(false, std::memory_order_release);
+            m_answerIds[slot].store(id, std::memory_order_release);
+            m_lastAnsweredId.store(id, std::memory_order_release);
+            if (id == wanted && m_suppressOpens.exchange(0, std::memory_order_acq_rel) > 0) {
+                log().info(L"ItemStackRequest: request {} was answered before any container-open packet; "
+                           L"not waiting for one any more", id);
+            }
             std::uint64_t words[kResponseEntrySize / sizeof(std::uint64_t)] = {};
             std::memcpy(words, raw, sizeof(words));
             log().info(L"ItemStackRequest: request {} answered with result {} "
                        L"({:#x} {:#x} {:#x} {:#x} {:#x} {:#x})",
                        id, code, words[0], words[1], words[2], words[3], words[4], words[5]);
-            return;
         }
         it += kResponseEntrySize;
     }
 }
 
-bool ItemStackRequest::takeResponse(std::int32_t id, int& result)
+bool ItemStackRequest::isOurRequest(std::int32_t id) const
 {
-    if (id == 0 || m_responseId.load(std::memory_order_acquire) != id) {
+    for (const auto& sent : m_sentIds) {
+        if (sent.load(std::memory_order_acquire) == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ItemStackRequest::wasAnswered(std::int32_t id) const
+{
+    if (id == 0) {
         return false;
     }
-    result = m_responseResult.load(std::memory_order_acquire);
-    m_responseId.store(0, std::memory_order_release);
-    return true;
+    if (m_lastAnsweredId.load(std::memory_order_acquire) == id) {
+        return true;
+    }
+    for (const auto& answered : m_answerIds) {
+        if (answered.load(std::memory_order_acquire) == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ItemStackRequest::takeResponse(std::int32_t id, int& result)
+{
+    if (id == 0) {
+        return false;
+    }
+    for (int i = 0; i < kTrackedRequests; ++i) {
+        if (m_answerIds[i].load(std::memory_order_acquire) != id) {
+            continue;
+        }
+        if (m_answerTaken[i].exchange(true, std::memory_order_acq_rel)) {
+            return false;
+        }
+        result = m_answerResults[i].load(std::memory_order_acquire);
+        return true;
+    }
+    return false;
 }
 
 }

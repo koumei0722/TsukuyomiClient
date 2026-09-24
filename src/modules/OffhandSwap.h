@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 
@@ -24,8 +25,6 @@ public:
 
     bool legacyBridgeEnabled() const { return m_legacyBridge; }
     void onScansReady() override;
-
-    void onSetSelectedSlot(void* holder);
 
     void onPlayerViewUpdate();
 
@@ -84,13 +83,30 @@ private:
         std::int32_t handValue = 0;
         std::int32_t offhandValue = 0;
 
+        void* handItem = nullptr;
+        void* offhandItem = nullptr;
+        void* holder = nullptr;
+
         unsigned int serial = 0;
         unsigned long long giveUpAtMs = 0;
     };
     NetIdFix m_netIdFix;
 
-    std::atomic<std::int32_t> m_offhandNetId{0};
-    std::atomic<unsigned int> m_offhandSerial{0};
+    struct OffhandArrival {
+        std::int32_t netId = 0;
+        unsigned long long atMs = 0;
+        unsigned int serial = 0;
+    };
+    mutable std::mutex m_offhandLock;
+    OffhandArrival m_offhand;
+    OffhandArrival latestOffhand() const;
+    struct OffhandWatch {
+        bool armed = false;
+        OffhandArrival first;
+    };
+    OffhandWatch m_offhandWatch;
+    OffhandArrival firstOffhandSinceArmed() const;
+    std::atomic<std::int32_t> m_loggedOffhandNetId{-1};
 
     void serveNetIdFix();
 
@@ -114,6 +130,11 @@ private:
         int count = 0;
         int selected = -1;
         unsigned long long giveUpAtMs = 0;
+        bool haveHand = false;
+        void* handItem = nullptr;
+        std::int32_t handValue = 0;
+        std::uint8_t handCount = 0;
+        void* holder = nullptr;
     };
     Pending m_pending;
 
@@ -140,14 +161,13 @@ private:
 
     Hotkey m_swapKey;
 
-    std::atomic<void*> m_holder{nullptr};
-    std::atomic<void*> m_holderAlt{nullptr};
-
     std::atomic<int> m_requestedSlot{kNoRequest};
 
     std::atomic<unsigned long long> m_requestedAtMs{0};
 
     static constexpr unsigned long long kQueueWaitMs = 500;
+
+    static constexpr unsigned long long kStaleRequestMs = 2000;
 
     bool m_screenSwap = false;
     bool m_legacyBridge = false;

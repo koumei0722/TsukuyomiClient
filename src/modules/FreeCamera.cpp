@@ -2,23 +2,18 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
-#include "core/Paths.h"
 #include "game/GameData.h"
 #include "game/UiSound.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
 #include "input/Keys.h"
+#include "input/LowLevelHook.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
 #include <Windows.h>
 
-#include <TlHelp32.h>
-
-#include <filesystem>
-#include <fstream>
 #include <string>
-#include <system_error>
 
 #include <algorithm>
 #include <cmath>
@@ -71,24 +66,9 @@ bool peekMoveInputGuarded(std::byte* input, bool clearJump, MoveInputPeek* out)
     }
 }
 
-bool dropInputBitsGuarded(std::byte* input, std::uint32_t drop)
-{
-    __try {
-        *reinterpret_cast<std::uint32_t*>(input + 0x00) &= ~drop;
-        *reinterpret_cast<std::uint32_t*>(input + 0x10) &= ~drop;
-        *reinterpret_cast<std::uint64_t*>(input + 0x24) = 0;
-        *reinterpret_cast<std::uint64_t*>(input + 0x04) = 0;
-        return true;
-    } __except (accessViolationFilter(GetExceptionCode())) {
-        return false;
-    }
-}
-
-std::atomic<bool> g_markerWanted{false};
-
 bool takeMoveIntentGuarded(std::byte* out, float* took)
 {
-    const float put = g_markerWanted.load(std::memory_order_relaxed) ? 0.25f : 0.0f;
+    constexpr float put = 0.0f;
     __try {
         took[0] = *reinterpret_cast<float*>(out + 0x0);
         took[1] = *reinterpret_cast<float*>(out + 0x4);
@@ -98,15 +78,6 @@ bool takeMoveIntentGuarded(std::byte* out, float* took)
     } __except (accessViolationFilter(GetExceptionCode())) {
         return false;
     }
-}
-
-HMODULE currentModule()
-{
-    HMODULE module = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&currentModule), &module);
-    return module;
 }
 
 }
@@ -209,35 +180,6 @@ void FreeCamera::onMoveInput(void* input)
 
     m_inputSeenAt.store(GetTickCount64(), std::memory_order_release);
 
-    m_diagInputCalls.fetch_add(1, std::memory_order_relaxed);
-
-    if (enabled() && !m_posTraceArmed.load(std::memory_order_acquire)) {
-        std::error_code ec;
-        if (std::filesystem::exists(paths::dataDir() / L"diag-jumptrace.txt", ec)
-            || std::filesystem::exists(paths::dataDir() / L"diag-inputwrite.txt", ec)) {
-            armPosTrace(static_cast<std::byte*>(input) + 0x00);
-        }
-    }
-
-    if (enabled() && (posTraceWanted() || m_posTraceArmed.load(std::memory_order_acquire))) {
-        if (!m_posTraceArmed.load(std::memory_order_acquire)) {
-            void* const player = GameData::instance().player();
-            if (player != nullptr) {
-                std::error_code ec;
-                const bool target = std::filesystem::exists(
-                    paths::dataDir() / L"diag-postrace2.txt", ec);
-                armPosTrace(static_cast<std::byte*>(player)
-                            + (target ? GameData::kPlayerTargetPosOffset
-                                      : GameData::kPlayerPositionOffset));
-            }
-        } else {
-            const auto until = m_posTraceUntil.load(std::memory_order_acquire);
-            if (m_posTraceCount.load(std::memory_order_acquire) >= kPosTraceMax
-                || (until != 0 && GetTickCount64() >= until)) {
-                disarmPosTrace();
-            }
-        }
-    }
 }
 
 void FreeCamera::onMoveIntent(void* out, void* input)
@@ -245,21 +187,10 @@ void FreeCamera::onMoveIntent(void* out, void* input)
     if (out == nullptr || !enabled() || !input::isInGameplay()) {
         return;
     }
-    {
-        static std::atomic<bool> checked{false};
-        if (!checked.exchange(true, std::memory_order_acq_rel)) {
-            std::error_code ec;
-            g_markerWanted.store(
-                std::filesystem::exists(paths::dataDir() / L"diag-marker.txt", ec),
-                std::memory_order_release);
-        }
-    }
-
     float took[2]{};
     if (!takeMoveIntentGuarded(static_cast<std::byte*>(out), took)) {
         return;
     }
-    m_diagIntentCleared.fetch_add(1, std::memory_order_relaxed);
 
     if (std::isfinite(took[0]) && std::isfinite(took[1])
         && (took[0] != 0.0f || took[1] != 0.0f)) {
@@ -305,28 +236,6 @@ bool takeInputGatherGuarded(std::byte* out, std::uint32_t* bits, float* move)
     }
 }
 
-void FreeCamera::noteInputBits(std::uint32_t bits)
-{
-    static const bool wanted = [] {
-        std::error_code ec;
-        return std::filesystem::exists(paths::dataDir() / L"diag-inputbits.txt", ec);
-    }();
-    if (!wanted) {
-        return;
-    }
-    const int seen = m_srcSeen.load(std::memory_order_relaxed);
-    for (int i = 0; i < seen && i < kInputBitsSeenMax; ++i) {
-        if (m_srcSeenBits[i].load(std::memory_order_relaxed) == bits) {
-            return;
-        }
-    }
-    if (seen >= kInputBitsSeenMax) {
-        return;
-    }
-    m_srcSeenBits[seen].store(bits, std::memory_order_relaxed);
-    m_srcSeen.store(seen + 1, std::memory_order_relaxed);
-}
-
 void FreeCamera::onInputGatherBefore(void* out)
 {
     if (out == nullptr || !enabled() || !input::isInGameplay()) {
@@ -344,7 +253,6 @@ void FreeCamera::onInputGatherBefore(void* out)
     if ((bits & kRawSneakBit) != 0) {
         m_rawSeenMs[static_cast<size_t>(MoveKey::Down)].store(now, std::memory_order_relaxed);
     }
-    noteInputBits(bits);
 }
 
 void FreeCamera::onInputGather(void* out, void* src)
@@ -364,193 +272,6 @@ void FreeCamera::onInputGather(void* out, void* src)
         m_intentForward.store(move[1], std::memory_order_release);
         m_intentAt.store(GetTickCount64(), std::memory_order_release);
     }
-    m_diagIntentCleared.fetch_add(1, std::memory_order_relaxed);
-}
-
-FreeCamera* FreeCamera::s_posTraceOwner = nullptr;
-
-bool FreeCamera::posTraceWanted() const
-{
-    static const bool on = [] {
-        std::error_code ec;
-        return std::filesystem::exists(paths::dataDir() / L"diag-postrace.txt", ec);
-    }();
-    return on;
-}
-
-void FreeCamera::armPacketTrace(void* address)
-{
-    std::error_code ec;
-    if (!std::filesystem::exists(paths::dataDir() / L"diag-packtrace.txt", ec)) {
-        return;
-    }
-    if (m_posTraceArmed.load(std::memory_order_acquire)) {
-        return;
-    }
-    armPosTrace(address);
-}
-
-void FreeCamera::armPosTrace(void* address)
-{
-    if (m_posTraceArmed.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-    s_posTraceOwner = this;
-    m_posTraceCount.store(0, std::memory_order_release);
-    for (auto& slot : m_posTraceRips) {
-        slot.store(0, std::memory_order_relaxed);
-    }
-    m_posTraceUntil.store(GetTickCount64() + kPosTraceMs, std::memory_order_release);
-
-    if (m_posTraceVeh == nullptr) {
-        m_posTraceVeh = AddVectoredExceptionHandler(1, &FreeCamera::posTraceVeh);
-    }
-
-    std::error_code kEc;
-    const bool wantRead =
-        std::filesystem::exists(paths::dataDir() / L"diag-jumptrace.txt", kEc);
-    const unsigned long long kDr7 = wantRead ? 0x000F0001ull : 0x000D0001ull;
-    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    THREADENTRY32 te{};
-    te.dwSize = sizeof(te);
-    const DWORD pid = GetCurrentProcessId();
-    int armed = 0;
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != pid) {
-            continue;
-        }
-        const HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT
-                                         | THREAD_SUSPEND_RESUME,
-                                     FALSE, te.th32ThreadID);
-        if (th == nullptr) {
-            continue;
-        }
-        const bool self = te.th32ThreadID == GetCurrentThreadId();
-        if (!self) {
-            SuspendThread(th);
-        }
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-        if (GetThreadContext(th, &ctx)) {
-            ctx.Dr0 = reinterpret_cast<DWORD64>(address);
-            ctx.Dr7 = (ctx.Dr7 & ~0x000F0003ull) | kDr7;
-            if (SetThreadContext(th, &ctx)) {
-                ++armed;
-            }
-        }
-        if (!self) {
-            ResumeThread(th);
-        }
-        CloseHandle(th);
-    }
-    CloseHandle(snap);
-}
-
-void FreeCamera::disarmPosTrace()
-{
-    if (!m_posTraceArmed.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap != INVALID_HANDLE_VALUE) {
-        THREADENTRY32 te{};
-        te.dwSize = sizeof(te);
-        const DWORD pid = GetCurrentProcessId();
-        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid) {
-                continue;
-            }
-            const HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT
-                                             | THREAD_SUSPEND_RESUME,
-                                         FALSE, te.th32ThreadID);
-            if (th == nullptr) {
-                continue;
-            }
-            const bool self = te.th32ThreadID == GetCurrentThreadId();
-            if (!self) {
-                SuspendThread(th);
-            }
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(th, &ctx)) {
-                ctx.Dr0 = 0;
-                ctx.Dr7 &= ~0x000F0003ull;
-                SetThreadContext(th, &ctx);
-            }
-            if (!self) {
-                ResumeThread(th);
-            }
-            CloseHandle(th);
-        }
-        CloseHandle(snap);
-    }
-    if (m_posTraceVeh != nullptr) {
-        RemoveVectoredExceptionHandler(m_posTraceVeh);
-        m_posTraceVeh = nullptr;
-    }
-    std::wstring line;
-    const auto* const base = reinterpret_cast<const std::byte*>(GetModuleHandleW(nullptr));
-    const int count = m_posTraceCount.load(std::memory_order_acquire);
-    std::vector<std::pair<std::uintptr_t, int>> tally;
-    for (int i = 0; i < count && i < kPosTraceMax; ++i) {
-        const auto rip = m_posTraceRips[i].load(std::memory_order_relaxed);
-        if (rip == 0) {
-            continue;
-        }
-        const auto rva = static_cast<std::uintptr_t>(
-            reinterpret_cast<const std::byte*>(rip) - base);
-        bool found = false;
-        for (auto& one : tally) {
-            if (one.first == rva) {
-                ++one.second;
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
-            tally.emplace_back(rva, 1);
-        }
-    }
-    for (const auto& one : tally) {
-        line += std::format(L" {:#x}×{}", one.first, one.second);
-    }
-}
-
-void FreeCamera::notePosWrite(unsigned long long rip, unsigned long long rax,
-                              unsigned long long rsi)
-{
-    if (!memory::inGameModule(reinterpret_cast<const void*>(rip))) {
-        return;
-    }
-    const int at = m_posTraceCount.fetch_add(1, std::memory_order_acq_rel);
-    if (at < kPosTraceMax) {
-        m_posTraceRips[at].store(rip, std::memory_order_relaxed);
-        m_posTraceRax[at].store(rax, std::memory_order_relaxed);
-        m_posTraceRsi[at].store(rsi, std::memory_order_relaxed);
-    }
-}
-
-long __stdcall FreeCamera::posTraceVeh(struct _EXCEPTION_POINTERS* info)
-{
-    if (info == nullptr || info->ExceptionRecord == nullptr || info->ContextRecord == nullptr) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    if ((info->ContextRecord->Dr6 & 1ull) == 0) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    info->ContextRecord->Dr6 = 0;
-    if (s_posTraceOwner != nullptr) {
-        s_posTraceOwner->notePosWrite(info->ContextRecord->Rip,
-                                      info->ContextRecord->Rsi,
-                                      info->ContextRecord->Rcx);
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
 }
 
 bool FreeCamera::intentFresh() const
@@ -590,16 +311,16 @@ void FreeCamera::onScansReady()
 {
     if (std::byte* const base = Scanner::instance().address(Target::CameraUpdate);
         base != nullptr) {
-        m_patchX = makeNopPatch(base + kWriteX, kWriteSize);
-        m_patchY = makeNopPatch(base + kWriteY, kWriteSize);
-        m_patchZ = makeNopPatch(base + kWriteZ, kWriteSize);
+        m_patchX = makeNopPatch(base + kWriteX, kWriteSize, "FreeCamera.CameraPosition");
+        m_patchY = makeNopPatch(base + kWriteY, kWriteSize, "FreeCamera.CameraPosition");
+        m_patchZ = makeNopPatch(base + kWriteZ, kWriteSize, "FreeCamera.CameraPosition");
     }
 
     if (std::byte* const rot = Scanner::instance().address(Target::PlayerRotation);
         rot != nullptr) {
-        m_patchYaw = makeNopPatch(rot + kWriteYaw, kWriteYawSize);
-        m_patchPitch = makeNopPatch(rot + kWritePitch, kWritePitchSize);
-        m_patchYawFollow = makeNopPatch(rot + kWriteYawFollow, kWriteYawFollowSize);
+        m_patchYaw = makeNopPatch(rot + kWriteYaw, kWriteYawSize, "FreeCamera.BodyRotation");
+        m_patchPitch = makeNopPatch(rot + kWritePitch, kWritePitchSize, "FreeCamera.BodyRotation");
+        m_patchYawFollow = makeNopPatch(rot + kWriteYawFollow, kWriteYawFollowSize, "FreeCamera.BodyRotation");
     } else {
         log().warn(L"FreeCamera: the player rotation site was not found; "
                    L"the body will turn with the camera");
@@ -618,7 +339,7 @@ void FreeCamera::onScansReady()
             log().warn(L"FreeCamera: {} does not look like a movss; leaving it alone", what);
             return Patch{};
         }
-        return makeNopPatch(at, size);
+        return makeNopPatch(at, size, "FreeCamera.HeadRotation");
     };
 
     if (std::byte* const head = Scanner::instance().address(Target::PlayerHeadRotation);
@@ -646,8 +367,10 @@ void FreeCamera::onScansReady()
 
     if (std::byte* const view = Scanner::instance().address(Target::ViewPerspective);
         view != nullptr) {
-        m_patchPerspective = Patch(view, {std::byte{0xB8}, kThirdPersonBack, std::byte{0x00},
-                                          std::byte{0x00}, std::byte{0x00}, std::byte{0xC3}});
+        m_patchPerspective = Patch(view,
+                                   {std::byte{0xB8}, kThirdPersonBack, std::byte{0x00}, std::byte{0x00},
+                                    std::byte{0x00}, std::byte{0xC3}},
+                                   "FreeCamera.ThirdPerson");
     } else {
         log().warn(L"FreeCamera: the view perspective getter was not found; "
                    L"the view will stay in first person");
@@ -739,19 +462,32 @@ void FreeCamera::onUpdate()
 
 void FreeCamera::installKeyHook()
 {
-    if (m_keyHook != nullptr) {
+    if (m_keyHook != nullptr || m_keyHookFailed.load(std::memory_order_relaxed)) {
         return;
     }
 
     clearHeldKeys();
     s_hookOwner = this;
-    m_keyHook = SetWindowsHookExW(WH_KEYBOARD_LL, &FreeCamera::keyboardHookProc, currentModule(),
-                                  0);
+    const input::LowLevelHook hook =
+        input::installLowLevelHook(WH_KEYBOARD_LL, &FreeCamera::keyboardHookProc);
+    m_keyHook = hook.hook;
     if (m_keyHook == nullptr) {
         s_hookOwner = nullptr;
-        log().warn(L"FreeCamera: could not hook the keyboard (error {}). "
-                   L"The camera still moves, but the player will move with it",
-                   GetLastError());
+        m_keyHookFailed.store(true, std::memory_order_relaxed);
+        if (!m_keyHookWarned) {
+            m_keyHookWarned = true;
+            log().warn(L"FreeCamera: could not hook the keyboard (error {}, {} with the module). "
+                       L"The camera still moves, but the player will move with it. "
+                       L"Retrying only when FreeCamera is switched",
+                       hook.errorWithoutModule, hook.errorWithModule);
+        }
+        return;
+    }
+    if (hook.withModule) {
+        log().info(L"FreeCamera: hooked the keyboard with the module (error {} without it)",
+                   hook.errorWithoutModule);
+    } else {
+        log().info(L"FreeCamera: hooked the keyboard");
     }
 }
 
@@ -801,6 +537,8 @@ LRESULT CALLBACK FreeCamera::keyboardHookProc(int code, WPARAM wParam, LPARAM lP
 
 void FreeCamera::onEnabledChanged(bool enabled)
 {
+    m_keyHookFailed.store(false, std::memory_order_relaxed);
+
     if (enabled) {
         if (!GameData::instance().hasLivePlayer()) {
             GameData::instance().findPlayerFromClient(hooks::gameClientInstance());
@@ -888,7 +626,14 @@ bool FreeCamera::borrowForChunkReload()
     m_patchZ.apply();
     m_borrowSynced = false;
     m_borrowUntil = GetTickCount64() + kBorrowMs;
+    m_borrowActive.store(true, std::memory_order_release);
     return true;
+}
+
+bool FreeCamera::borrowing() const
+{
+    return m_borrowActive.load(std::memory_order_acquire)
+           || GetTickCount64() < m_borrowQuietUntil.load(std::memory_order_relaxed);
 }
 
 bool FreeCamera::applyBorrow(std::byte* cameraBase)
@@ -931,6 +676,8 @@ void FreeCamera::endBorrow(std::byte* cameraBase)
     m_patchZ.restore();
     m_borrowUntil = 0;
     m_borrowSynced = false;
+    m_borrowQuietUntil.store(GetTickCount64() + kBorrowQuietMs, std::memory_order_relaxed);
+    m_borrowActive.store(false, std::memory_order_release);
 }
 
 void FreeCamera::onCameraWrite(void* cameraBase)
@@ -990,9 +737,7 @@ void FreeCamera::onCameraWrite(void* cameraBase)
                             * (std::numbers::pi_v<float> / 180.0f);
         m_x += std::cos(angle) * speed * scale;
         m_z += std::sin(angle) * speed * scale;
-        if (byIntent) {
-            m_diagCamByIntent.fetch_add(1, std::memory_order_relaxed);
-        }
+
     }
 
     if (held(MoveKey::Up)) {
@@ -1000,19 +745,6 @@ void FreeCamera::onCameraWrite(void* cameraBase)
     }
     if (held(MoveKey::Down)) {
         m_y -= speed;
-    }
-
-    m_diagCamCalls.fetch_add(1, std::memory_order_relaxed);
-    if (offset < kNoMovement) {
-        m_diagCamMoved.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    if (offset < kNoMovement || held(MoveKey::Up) || held(MoveKey::Down)) {
-        const unsigned long long now = GetTickCount64();
-        if (now - m_camLoggedAt >= 300
-            && m_camLogged.fetch_add(1, std::memory_order_relaxed) < kCamLogLimit) {
-            m_camLoggedAt = now;
-        }
     }
 
     *x = m_x;

@@ -16,7 +16,7 @@ bool installHooks();
 bool recording();
 
 void notePso(ID3D12PipelineState* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc);
-void onSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso, bool swapped);
+void onSetPso(ID3D12GraphicsCommandList* list, ID3D12PipelineState* pso);
 void onOm(ID3D12GraphicsCommandList* list, unsigned numRt, std::uint64_t rtv0,
           std::uint64_t dsv);
 void onDraw(ID3D12GraphicsCommandList* list, unsigned count, unsigned instances, bool indexed);

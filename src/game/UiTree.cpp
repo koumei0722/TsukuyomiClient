@@ -117,6 +117,13 @@ const char* Arena::takeText(const char* utf8)
     char* const at = m_text + m_textAt;
     for (std::size_t i = 0; i < length; ++i) {
         const unsigned char ch = static_cast<unsigned char>(utf8[i]);
+        if (ch == 0xC2 && i + 1 < length
+            && static_cast<unsigned char>(utf8[i + 1]) == 0xA7) {
+            at[i] = static_cast<char>(0xC2);
+            at[i + 1] = static_cast<char>(0xA7);
+            ++i;
+            continue;
+        }
         at[i] = (ch >= 0x20 && ch <= 0x7E) ? static_cast<char>(ch) : '?';
     }
     at[length] = '\0';

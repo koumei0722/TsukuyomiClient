@@ -18,9 +18,13 @@ public:
 
     virtual bool available() const { return true; }
 
-    bool enabled() const { return m_enabled; }
+    bool enabled() const { return m_enabled && !m_writeBlocked; }
     void setEnabled(bool value);
     void toggle() { setEnabled(!m_enabled); }
+
+    virtual bool writeBlocked() const;
+    virtual void applyWriteBlock();
+    bool isWriteBlocked() const { return m_writeBlocked; }
 
     virtual MenuItem buildMenu();
 
@@ -49,6 +53,7 @@ protected:
 
 private:
     bool m_enabled = false;
+    bool m_writeBlocked = false;
 
     Hotkey m_toggleKey;
 };

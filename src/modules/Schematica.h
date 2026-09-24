@@ -1,10 +1,15 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,6 +17,7 @@
 
 #include "game/BlockRegistry.h"
 #include "game/BlockWrite.h"
+#include "game/SchematicCells.h"
 #include "game/Structure.h"
 #include "input/Hotkey.h"
 #include "modules/Module.h"
@@ -32,13 +38,16 @@ public:
 
     void onScansReady() override;
 
+    bool wantsGhostHooks() const
+    {
+        return enabled() && m_ghostWanted.load(std::memory_order_relaxed);
+    }
+
     void shutdown() override;
 
     void onPlayerViewUpdate();
 
     void noteGhostCellFreed(std::int32_t x, std::int32_t y, std::int32_t z);
-
-    void noteActorCellTaken(std::int32_t x, std::int32_t y, std::int32_t z);
 
 protected:
     Schematica() = default;
@@ -47,7 +56,7 @@ protected:
 
     void onUpdate() override;
 
-    bool persistEnabled() const override { return false; }
+    bool persistEnabled() const override { return true; }
 
 private:
 
@@ -77,9 +86,7 @@ private:
         std::atomic<int> posZ{0};
         std::atomic<int> rotation{0};
 
-        structure::Structure loaded;
-        std::vector<const void*> paletteBlocks;
-        std::size_t paletteBase = 0;
+        std::shared_ptr<const structure::Structure> loaded;
         bool ready = false;
 
         std::atomic<int> sizeX{0};
@@ -89,23 +96,9 @@ private:
         std::vector<std::pair<std::string, std::size_t>> materials;
     };
 
-    struct Cell {
-        std::int32_t x = 0;
-        std::int32_t y = 0;
-        std::int32_t z = 0;
-        std::size_t entry = 0;
-        std::int32_t entry2 = -1;
-        int owner = -1;
-        const std::string* name = nullptr;
-        float yaw = 0.0F;
-        int pitch = 0;
-    };
-    static constexpr std::size_t kAirCell = static_cast<std::size_t>(-1);
-
-    struct Box {
-        std::int32_t x0 = 0, y0 = 0, z0 = 0;
-        std::int32_t x1 = 0, y1 = 0, z1 = 0;
-    };
+    using Cell = schematic::Cell;
+    static constexpr std::size_t kAirCell = schematic::kAirCell;
+    using Box = schematic::Box;
 
 public:
     std::size_t blueprintCount() const;
@@ -135,6 +128,9 @@ public:
     void layerRangeOffsets(bool& on, int& axis, int& lo, int& hi) const;
     bool layerOrigin(int& x, int& y, int& z, std::wstring* name) const;
     int layerOriginOf(int axis) const;
+    void setLayerMode(int mode);
+    void setLayerAxis(int axis);
+
     void stepLayer(int delta);
     void setLayerHere();
 
@@ -146,6 +142,11 @@ public:
     struct MaterialRow {
         std::wstring name;
         std::size_t count = 0;
+        std::size_t missing = 0;
+        std::size_t available = 0;
+        bool missingKnown = false;
+        bool availableKnown = false;
+        bool ignored = false;
         std::int32_t iconIdAux = 0;
         bool hasIcon = false;
         int stackSize = 0;
@@ -153,7 +154,20 @@ public:
     std::vector<MaterialRow> blueprintMaterials(std::size_t at, std::size_t limit,
                                                 std::size_t* kinds = nullptr) const;
 
-    void diffTally(std::size_t (&out)[6]) const;
+    enum : int {
+        kMaterialAll = 0,
+        kMaterialMissing = 1,
+        kMaterialListTypeCount = 2,
+    };
+    int materialListType() const { return m_materialListType.load(std::memory_order_relaxed); }
+    void cycleMaterialListType();
+    void toggleMaterialIgnored(const std::wstring& name);
+    void clearIgnoredMaterials();
+    std::size_t ignoredMaterialCount() const;
+    void askMaterialRefresh() { m_materialRefreshWanted.store(true, std::memory_order_relaxed); }
+    bool writeMaterialList(std::size_t at, std::wstring& outPath);
+
+    void diffTally(std::size_t (&out)[blocks::kDiffKindCount]) const;
 
     std::atomic<unsigned long long> m_deleteArmedAt{0};
     std::wstring m_deleteArmedName;
@@ -177,18 +191,84 @@ private:
     int m_editing = -1;
 
     std::vector<Cell> m_cells;
-    std::unordered_map<std::uint64_t, std::size_t> m_cellAt;
+    schematic::CellIndex m_cellAt;
     std::vector<Box> m_boxes;
     Box m_region;
+    std::vector<std::shared_ptr<const structure::Structure>> m_cellsKeep;
     std::int32_t m_regionSizeX = 0;
     std::int32_t m_regionSizeY = 0;
     std::int32_t m_regionSizeZ = 0;
-    Box unionBox() const;
 
     std::atomic<bool> m_cellsDirty{true};
-    void loadVisible();
-    void rebuildCells();
-    static std::uint64_t packCell(std::int32_t x, std::int32_t y, std::int32_t z);
+
+    enum PreparePurpose : unsigned {
+        kPrepReload = 1u,
+        kPrepRedraw = 2u,
+        kPrepCells = 4u,
+    };
+    struct PrepEntry {
+        std::wstring name;
+        std::filesystem::path path;
+        std::shared_ptr<const structure::Structure> data;
+        int x = 0;
+        int y = 0;
+        int z = 0;
+        int rotation = 0;
+        bool loadedNow = false;
+        schematic::Loaded result;
+    };
+    struct PrepareJob {
+        unsigned purposes = 0;
+        std::vector<PrepEntry> entries;
+        std::vector<schematic::LayoutKey> prevKey;
+        bool prevHasCells = false;
+        std::vector<schematic::Placement> placements;
+        std::vector<schematic::LayoutKey> key;
+        std::unique_ptr<schematic::CellSet> cells;
+        bool cancelled = false;
+        unsigned long long loadMs = 0;
+        unsigned long long cellsMs = 0;
+        unsigned long long startedAt = 0;
+    };
+    void requestPrepare(unsigned purposes);
+    void pollPrepare();
+    bool prepareBusy() const { return m_prepBusy; }
+    void startPrepare();
+    std::vector<PrepEntry> snapshotVisible(bool& needLoad);
+    static std::vector<schematic::Placement> placementsOf(const std::vector<PrepEntry>& entries);
+    void installPrepared(std::unique_ptr<PrepareJob> job);
+    void installCells(std::unique_ptr<schematic::CellSet> cells);
+    void finishPrepared(unsigned purposes);
+    static unsigned long __stdcall workerThreadMain(void* param);
+    void workerMain();
+    void runPrepareJob(PrepareJob& job);
+    void postJob(std::unique_ptr<PrepareJob> job);
+    void postTrash(std::unique_ptr<schematic::CellSet> trash);
+    bool ensureWorker();
+    void stopWorker();
+
+    std::vector<schematic::Placement> m_live;
+    std::atomic<bool> m_ghostWanted{false};
+    bool m_prepHasVisible = false;
+    unsigned m_prepWant = 0;
+    bool m_prepBusy = false;
+    bool m_paletteStale = false;
+
+    std::mutex m_workMutex;
+    std::condition_variable m_workCv;
+    std::unique_ptr<PrepareJob> m_workJob;
+    std::unique_ptr<PrepareJob> m_workDone;
+    std::vector<std::unique_ptr<schematic::CellSet>> m_workTrash;
+    bool m_workStop = false;
+    bool m_workStarted = false;
+    std::atomic<bool> m_workCancel{false};
+    void* m_workThread = nullptr;
+
+    std::vector<schematic::LayoutKey> m_cellsKey;
+    static std::uint64_t packCell(std::int32_t x, std::int32_t y, std::int32_t z)
+    {
+        return schematic::packCell(x, y, z);
+    }
 
     mutable std::mutex m_filesMutex;
 
@@ -218,6 +298,14 @@ private:
     int m_layerAppliedAxis = 1;
     int m_layerAppliedLo = 0;
     int m_layerAppliedHi = 0;
+    static constexpr unsigned long long kLayerCheckMs = 8000;
+    static constexpr unsigned kLayerAskTries = 3;
+    std::vector<std::array<std::int32_t, 3>> m_layerAskChunks;
+    std::uint64_t m_layerAskSeq = 0;
+    unsigned long long m_layerAskAt = 0;
+    unsigned m_layerAskTries = 0;
+    unsigned m_layerAskRound = 0;
+    void checkLayerRebuilds(unsigned long long now);
     static int clampLayerValue(int axis, int value);
     void applyLayerFilter();
 
@@ -227,14 +315,16 @@ private:
 
     void pruneStep();
 
-    static constexpr std::size_t kPrunePerFrame = 64;
-
+    static constexpr int kPruneDelayFrames = 3;
     std::atomic<bool> m_prunePending{false};
-
-    static constexpr int kPruneDelayFrames = 90;
     int m_pruneDelay = 0;
-    std::size_t m_prunedUpTo = 0;
-    std::size_t m_prunedDropped = 0;
+
+    bool drawCell(std::size_t at);
+
+    static constexpr unsigned kDrawBudgetMs = 8;
+    static constexpr std::size_t kDrawBatch = 512;
+
+    unsigned long long m_loadStartedAt = 0;
 
     void diffStep();
 
@@ -244,7 +334,23 @@ private:
 
     std::size_t m_diffUpTo = 0;
 
-    std::size_t m_diffTally[6] = {};
+    std::size_t m_diffTally[blocks::kDiffKindCount] = {};
+    std::size_t m_diffTallyDone[blocks::kDiffKindCount] = {};
+    std::atomic<std::size_t> m_diffTallyLaps{0};
+    void closeDiffTally();
+
+    std::vector<std::string> m_paletteNames;
+    std::vector<const void*> m_paletteLegacy;
+    std::vector<std::size_t> m_missingByEntry;
+    std::vector<std::size_t> m_missingByEntryDone;
+    std::vector<std::string> m_missingNamesDone;
+    std::map<std::string, std::size_t> m_availableByName;
+    bool m_availableKnown = false;
+    std::atomic<bool> m_materialRefreshWanted{false};
+    unsigned long long m_availableAt = 0;
+    std::atomic<int> m_materialListType{kMaterialAll};
+    std::set<std::string> m_ignoredMaterials;
+    void refreshAvailableCounts();
 
     std::size_t m_diffWater = 0;
     std::size_t m_diffWaterUnknown = 0;
@@ -255,8 +361,6 @@ private:
 
     std::size_t m_diffRestored = 0;
 
-    std::vector<std::pair<blockwrite::BlockPos, const void*>> m_diffActors;
-
     std::size_t m_diffChanged = 0;
 
     std::unordered_set<std::uint64_t> m_lapTagChunks;
@@ -264,7 +368,7 @@ private:
     void noteLapChunk(std::unordered_set<std::uint64_t>& into, std::int32_t x, std::int32_t y,
                       std::int32_t z);
 
-    void diffCell(std::size_t at, bool early);
+    blocks::DiffKind diffCell(std::size_t at, bool early);
 
     std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> m_chunkCells;
     std::unordered_map<std::uint64_t, void*> m_learnedKeys;
@@ -308,7 +412,10 @@ private:
 
     void publishBoxesLive();
 
-    static constexpr std::size_t kBoxLimit = 500000;
+    static constexpr std::size_t kBoxLimit = static_cast<std::size_t>(-1);
+
+    unsigned long long m_boxDropLoggedAt = 0;
+    static constexpr unsigned long long kBoxDropLogMs = 30000;
 
     std::size_t m_boxSignature = 0;
     unsigned long long m_boxPublishedAt = 0;
@@ -319,10 +426,15 @@ private:
     bool m_boxLiveDirty = false;
     unsigned long long m_boxLiveAt = 0;
     static constexpr unsigned long long kBoxLiveMs = 100;
-    unsigned long long m_boxLiveSince = 0;
-    std::size_t m_boxLiveCells = 0;
-    int m_boxLiveLogged = 0;
-    static constexpr int kBoxLiveLogMax = 8;
+
+    bool m_boxListCut = false;
+    double m_boxListEye[3] = {};
+    bool m_boxListEyeValid = false;
+    static constexpr double kBoxRecenterBlocks = 16.0;
+    static constexpr double kBoxRecenterShare = 0.25;
+    bool boxEye(double out[3]);
+    double m_boxLastEye[3] = {};
+    bool m_boxLastEyeValid = false;
 
     std::size_t m_diffLaps = 0;
     unsigned long long m_diffLoggedAt = 0;
@@ -331,6 +443,25 @@ private:
     static constexpr std::size_t kDirtyCallers = 10;
     std::size_t m_dirtyFrom[kDirtyCallers]{};
     std::size_t m_learnedLate = 0;
+
+    std::size_t m_learnMissed = 0;
+    std::size_t m_learnTotal = 0;
+    std::size_t m_learnMissedNotLoaded = 0;
+    std::size_t m_learnMissedOutside = 0;
+    std::size_t m_learnMissedOther = 0;
+    std::size_t m_learnMissedByColumn = 0;
+    std::int32_t m_learnMissedAt[3] = {0, 0, 0};
+    double m_learnMissedNear = -1.0;
+    double m_learnKeptFar = -1.0;
+    unsigned long long m_learnLogAt = 0;
+    static constexpr unsigned long long kLearnLogMs = 30000;
+
+    std::vector<std::size_t> m_diffByEntry;
+    std::vector<std::size_t> m_diffByEntryDone;
+    unsigned long long m_diagLogAt = 0;
+    static constexpr unsigned long long kDiagLogMs = 30000;
+    static constexpr std::size_t kDiagTopEntries = 24;
+    void logDrawDiag(unsigned long long now);
 
     static constexpr unsigned long long kBoxModeRetryMs = 500;
     unsigned long long m_boxModeRetryAt = 0;
@@ -352,32 +483,7 @@ private:
     static constexpr std::size_t kFreedLimit = 4096;
 
 public:
-    void noteChunkRebuilt(std::int32_t x, std::int32_t y, std::int32_t z);
-
 private:
-    void reviewRebuiltChunks();
-
-    std::mutex m_rebuiltMutex;
-    std::vector<blockwrite::BlockPos> m_rebuiltChunks;
-    std::atomic<bool> m_rebuiltPending{false};
-    static constexpr std::size_t kRebuiltLimit = 64;
-
-    void fixTakenActorCells();
-
-    std::mutex m_takenMutex;
-    std::vector<blockwrite::BlockPos> m_takenCells;
-    std::atomic<bool> m_takenPending{false};
-    bool m_takenOverflow = false;
-    static constexpr std::size_t kTakenLimit = 4096;
-
-    std::atomic<std::size_t> m_actorLive{0};
-    void syncActorLive()
-    {
-        m_actorLive.store(m_actorPlaced.size(), std::memory_order_relaxed);
-    }
-
-    std::atomic<bool> m_meshBoxesArmed{false};
-
     std::vector<blockwrite::BlockPos> m_ghostChunks;
 
     void maybeRenudge();
@@ -404,9 +510,7 @@ private:
 
     static constexpr const char* kPokeBlock = "minecraft:structure_void";
 
-    static constexpr const char* kBoxBlock = "minecraft:stone";
-
-    void resolvePalette();
+    void resolvePalette(const std::vector<schematic::Placement>& live);
 
     std::atomic<bool> m_drawPending{false};
 
@@ -418,44 +522,12 @@ private:
 
     std::vector<blockwrite::BlockPos> m_placed;
 
-    std::vector<std::pair<blockwrite::BlockPos, const void*>> m_actorCells;
-
-    void placeGhostBlockEntities();
-    void restoreGhostBlockEntities();
-
-    enum class ActorPlace {
-        Placed,
-        NoGhost,
-        Refused,
-        Leftover,
-        Already,
-        Learned,
-    };
-
-    ActorPlace placeOneGhostActor(void* region, const blockwrite::BlockPos& where,
-                                  const void* block);
-
-    void restoreFreedActors(
-        const std::vector<std::pair<blockwrite::BlockPos, const void*>>& cells);
-
-    std::size_t forgetPlacedActors(
-        const std::vector<std::pair<blockwrite::BlockPos, const void*>>& cells);
-
-    struct PlacedActor {
-        blockwrite::BlockPos at;
-        const void* block = nullptr;
-    };
-    std::vector<PlacedActor> m_actorPlaced;
-
-    void* m_actorRegion = nullptr;
-
     std::uint64_t m_regionGeneration = 0;
 
     unsigned long long m_worldSettleUntil = 0;
 
     static constexpr unsigned long long kWorldSettleMs = 4000;
 
-    std::atomic<bool> m_actorPending{false};
     std::size_t m_clearedUpTo = 0;
 
     const void* m_air = nullptr;
@@ -478,8 +550,6 @@ private:
     bool m_firstLogged = false;
     bool m_anchorLogged = false;
 
-    bool m_reloadAsked = false;
-
     static constexpr int kBoxReloadTries = 4;
     static constexpr unsigned long long kBoxReloadRetryMs = 3000;
     int m_boxReloadTries = 0;
@@ -497,11 +567,11 @@ private:
 
     std::atomic<bool> m_shuttingDown{false};
 
+    std::atomic<bool> m_enabledAtShutdown{false};
+
     std::int32_t m_anchorX = 0;
     std::int32_t m_anchorY = 0;
     std::int32_t m_anchorZ = 0;
-
-    static constexpr std::size_t kPerFrame = 256;
 
     std::vector<std::wstring> m_files;
     std::vector<std::wstring> m_fileNames;
@@ -523,10 +593,6 @@ private:
 
     std::atomic<unsigned long long> m_posChangedAt{0};
     static constexpr unsigned long long kPosSettleMs = 800;
-
-    static constexpr unsigned long long kModelSettleMs = 700;
-
-    unsigned long long m_modelRedrawnAt = 0;
 
     static constexpr int kMinXZ = -30000000;
     static constexpr int kMaxXZ = 30000000;

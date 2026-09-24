@@ -13,6 +13,7 @@ public:
 
     void load();
     bool save();
+    bool saveIfChanged();
 
     nlohmann::json& section(std::string_view name);
 
@@ -26,6 +27,7 @@ private:
     Config() = default;
 
     nlohmann::json m_root = nlohmann::json::object();
+    std::string m_written;
 };
 
 }

@@ -51,4 +51,42 @@ std::wstring toUtf16(std::string_view text)
     return result;
 }
 
+bool parseTypedInt(std::wstring_view typed, int& out)
+{
+    size_t at = 0;
+    while (at < typed.size() && typed[at] == L' ') {
+        ++at;
+    }
+    bool negative = false;
+    if (at < typed.size() && (typed[at] == L'-' || typed[at] == L'+')) {
+        negative = (typed[at] == L'-');
+        ++at;
+    }
+    const size_t digits = at;
+    constexpr long long kLimit = static_cast<long long>((std::numeric_limits<int>::max)()) + 1;
+    long long magnitude = 0;
+    while (at < typed.size() && typed[at] >= L'0' && typed[at] <= L'9') {
+        magnitude = magnitude * 10 + (typed[at] - L'0');
+        if (magnitude > kLimit) {
+            return false;
+        }
+        ++at;
+    }
+    if (at == digits) {
+        return false;
+    }
+    while (at < typed.size() && typed[at] == L' ') {
+        ++at;
+    }
+    if (at != typed.size()) {
+        return false;
+    }
+    const long long value = negative ? -magnitude : magnitude;
+    if (value < (std::numeric_limits<int>::min)() || value > (std::numeric_limits<int>::max)()) {
+        return false;
+    }
+    out = static_cast<int>(value);
+    return true;
+}
+
 }

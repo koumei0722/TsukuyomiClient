@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Tsukuyomi
-    VERSION 2.2.0
+    VERSION 2.2.1
     LANGUAGES CXX)
 
 if(NOT MSVC)
@@ -22,6 +22,18 @@ CPMAddPackage(
     NAME minhook
     GITHUB_REPOSITORY TsudaKageyu/minhook
     GIT_TAG v1.3.4)
+
+include(cmake/minhook/PatchFreeze.cmake)
+set(TSUKUYOMI_MINHOOK_HOOK_C "${CMAKE_BINARY_DIR}/minhook-patched/hook.c")
+tsukuyomi_patch_minhook_freeze("${minhook_SOURCE_DIR}/src/hook.c" "${TSUKUYOMI_MINHOOK_HOOK_C}")
+get_target_property(_tsukuyomi_minhook_sources minhook SOURCES)
+list(FIND _tsukuyomi_minhook_sources "src/hook.c" _tsukuyomi_hook_c_index)
+if(_tsukuyomi_hook_c_index EQUAL -1)
+    message(FATAL_ERROR "")
+endif()
+list(REMOVE_AT _tsukuyomi_minhook_sources ${_tsukuyomi_hook_c_index})
+list(APPEND _tsukuyomi_minhook_sources "${TSUKUYOMI_MINHOOK_HOOK_C}")
+set_property(TARGET minhook PROPERTY SOURCES ${_tsukuyomi_minhook_sources})
 
 CPMAddPackage(
     NAME nlohmann_json

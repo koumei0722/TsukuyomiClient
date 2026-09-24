@@ -1,6 +1,5 @@
 #include "game/OreUiPatch.h"
-#include "hooks/Detours.h"
-#include "render/PackTexture.h"
+#include "config/WriteSwitches.h"
 
 #include <Windows.h>
 
@@ -64,36 +63,6 @@ constexpr int kOwnIdCount = static_cast<int>(sizeof(kOwnIds) / sizeof(kOwnIds[0]
 
 constexpr char kAnchorHead[] = "\"keyboardAndMouse.inputGroup.standard\":";
 
-bool replaceOnce(std::vector<char>& blob, const char* from, const char* to)
-{
-    const std::string_view haystack(blob.data(), blob.size());
-    const size_t at = haystack.find(from);
-    if (at == std::string_view::npos) {
-        return false;
-    }
-    const size_t fromLen = std::strlen(from);
-    const size_t toLen = std::strlen(to);
-    std::vector<char> made;
-    made.reserve(blob.size() + toLen);
-    made.insert(made.end(), blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(at));
-    made.insert(made.end(), to, to + toLen);
-    made.insert(made.end(), blob.begin() + static_cast<std::ptrdiff_t>(at + fromLen), blob.end());
-    blob.swap(made);
-    return true;
-}
-
-void toLf(std::vector<char>& blob)
-{
-    size_t out = 0;
-    for (size_t in = 0; in < blob.size(); ++in) {
-        if (blob[in] == '\r' && in + 1 < blob.size() && blob[in + 1] == '\n') {
-            continue;
-        }
-        blob[out++] = blob[in];
-    }
-    blob.resize(out);
-}
-
 std::wstring versionDir();
 
 void note(const wchar_t* text)
@@ -156,25 +125,6 @@ bool leafIsBundle(const wchar_t* text, size_t chars)
     return true;
 }
 
-bool leafIs(const wchar_t* text, size_t chars, const wchar_t* leaf, size_t need)
-{
-    size_t at = chars;
-    while (at > 0 && text[at - 1] != L'\\' && text[at - 1] != L'/') {
-        --at;
-    }
-    if (chars - at != need) {
-        return false;
-    }
-    for (size_t i = 0; i < need; ++i) {
-        const wchar_t c = text[at + i];
-        const wchar_t want = leaf[i];
-        if (c != want && c != (want - 32)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool pathEndsWith(const wchar_t* text, size_t chars, const wchar_t* tail, size_t need)
 {
     if (chars < need) {
@@ -205,11 +155,6 @@ bool pathEndsWith(const wchar_t* text, size_t chars, const wchar_t* tail, size_t
 template <typename Call>
 LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
 {
-    if (hooks::beModelsOn() && attrs != nullptr && attrs->ObjectName != nullptr
-        && attrs->ObjectName->Buffer != nullptr) {
-        pack::noteOpenedFile(attrs->ObjectName->Buffer,
-                             attrs->ObjectName->Length / sizeof(wchar_t));
-    }
     if (!g_ready || g_done || attrs == nullptr || attrs->ObjectName == nullptr
         || attrs->ObjectName->Buffer == nullptr) {
         return call();
@@ -413,7 +358,7 @@ bool sameAsExistingCopy(const std::wstring& path, const std::vector<char>& made)
 
 }
 
-bool patchReady() { return g_ready; }
+bool patchReady() { return g_ready && g_hooked; }
 
 const char* ownGroupId(int index)
 {
@@ -427,6 +372,14 @@ bool installEarlyFileHook()
     if (g_hooked) {
         return true;
     }
+    const bool allowCreate = writes::allowed(std::string_view("NtCreateFile"));
+    const bool allowOpen = writes::allowed(std::string_view("NtOpenFile"));
+    if (!allowCreate || !allowOpen) {
+        note(L"[oreui] the file-open hook is turned off in hooks.json");
+    }
+    if (!allowCreate || !allowOpen) {
+        return false;
+    }
     note(L"[oreui] installing the file-open hook");
     const bool a = hookOne("NtCreateFile", reinterpret_cast<void*>(&detourNtCreateFile),
                            reinterpret_cast<void**>(&g_realCreate), g_savedCreate,
@@ -439,12 +392,14 @@ bool installEarlyFileHook()
 
 void removeEarlyFileHook()
 {
-    if (!g_hooked) {
+    if (g_stolenCreate == 0 && g_stolenOpen == 0) {
         return;
     }
     g_ready = false;
     unhookOne("NtCreateFile", g_savedCreate, g_stolenCreate);
     unhookOne("NtOpenFile", g_savedOpen, g_stolenOpen);
+    g_stolenCreate = 0;
+    g_stolenOpen = 0;
     g_hooked = false;
 }
 

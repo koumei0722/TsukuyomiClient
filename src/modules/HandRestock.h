@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 
+#include "game/HolderTable.h"
 #include "game/ItemStackOps.h"
 #include "modules/Module.h"
 
@@ -26,10 +28,12 @@ public:
 
     void noteDeliberateMove();
 
+    bool forEachInventorySlot(const std::function<void(const void*, int)>& fn) const;
+
 protected:
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return false; }
+    bool persistEnabled() const override { return true; }
 
 private:
     HandRestock() = default;
@@ -51,6 +55,7 @@ private:
         std::uint16_t aux = 0;
         std::uint8_t count = 0;
         std::int32_t netValue = 0;
+        std::uint8_t netTag = 0xFF;
     };
 
     struct Inventory {
@@ -65,13 +70,29 @@ private:
         void* playerRaw = nullptr;
     };
 
-    bool resolve(void* holder, Inventory& out) const;
+    bool resolve(void* holder, Inventory& out, bool* faulted = nullptr) const;
+
+    struct Own {
+        Inventory client;
+        bool haveClient = false;
+        Inventory server;
+        bool haveServer = false;
+    };
+    bool resolveOwn(Own& out, bool wantServer, bool forOthers = false) const;
 
     bool resolveClient(Inventory& out) const;
 
-    bool isClientSidePlayer(void* player) const;
+public:
+    void ownHolders(void*& client, void*& server) const;
 
-    bool looksLikeInventory(std::byte* slots) const;
+    void* ownClientHolder() const;
+
+private:
+
+    bool isClientSidePlayer(void* player) const;
+    void* localPlayerVtable() const;
+
+    bool looksLikeInventory(std::byte* slots, bool* faulted = nullptr) const;
 
     bool readSlot(std::byte* slots, int index, SlotView& out) const;
 
@@ -122,6 +143,7 @@ private:
     static constexpr ptrdiff_t kAuxOffset = 0x20;
     static constexpr ptrdiff_t kCountOffset = 0x22;
     static constexpr ptrdiff_t kNetValueOffset = 0x80;
+    static constexpr ptrdiff_t kNetTagOffset = 0x90;
 
     static constexpr int kSettleMs = 200;
 
@@ -133,8 +155,23 @@ private:
 
     SwapSlotsFn m_swapSlots = nullptr;
 
-    std::atomic<void*> m_holder{nullptr};
-    std::atomic<void*> m_holderAlt{nullptr};
+    mutable std::atomic<void*> m_clientHolder{nullptr};
+    mutable HolderTable m_holders;
+    mutable void* m_lastGamePlayer = nullptr;
+    mutable std::atomic<void*> m_faultedHolder{nullptr};
+    std::ptrdiff_t m_inventoryDisp = 0;
+    struct FaultedPlayer {
+        std::atomic<void*> player{nullptr};
+        std::atomic<unsigned long long> serial{0};
+        std::atomic<unsigned long long> at{0};
+    };
+    static constexpr unsigned long long kFaultedPlayerForgetMs = 2000;
+    mutable FaultedPlayer m_faultedPlayers[2];
+    mutable std::atomic<unsigned int> m_faultedPlayerNext{0};
+    bool playerFaulted(void* player) const;
+    void notePlayerFaulted(void* player) const;
+    bool holderIsLocal(void* holder) const;
+    void* holderOfPlayer(void* player) const;
 
     struct HandState {
         void* container = nullptr;
@@ -156,6 +193,7 @@ private:
     struct Pending {
         bool active = false;
         int destSlot = -1;
+        void* container = nullptr;
         void* item = nullptr;
         void* block = nullptr;
         std::uint16_t aux = 0;
@@ -164,6 +202,12 @@ private:
 
         Clock::time_point at{};
         Clock::time_point giveUpAt{};
+
+        bool retry = false;
+        int attempts = 0;
+        bool waitContent = false;
+        std::uint32_t contentSerial = 0;
+        Clock::time_point contentDeadline{};
     };
     Pending m_pending[kSpotCount];
 
@@ -177,25 +221,44 @@ private:
         int sourceSlot = -1;
         int destSlot = -1;
         Clock::time_point giveUpAt{};
+        Pending retryAs;
+        std::uint32_t contentSerialAtSend = 0;
+        void* predItem = nullptr;
+        std::uint8_t predCount = 0;
     };
     Outstanding m_outstanding;
 
     alignas(void*) std::byte m_before[ItemStackOps::kStackBytes]{};
 
-    static constexpr int kResponseWaitMs = 1500;
+    static constexpr int kResponseWaitMs = 30000;
+
+    static constexpr int kRefusedRetryMs = 400;
+    static constexpr int kMaxRefusedRetries = 6;
+    static constexpr int kContentWaitMs = 20000;
+    static constexpr int kContentSettleMs = 1500;
+    static constexpr int kResultFailedToValidateSrcSlot = 49;
+    static constexpr int kResultFailedToValidateDstSlot = 50;
 
     bool m_warnedNoRequest = false;
     bool m_warnedNoPredict = false;
 
     bool m_clientSideKnown = false;
     bool m_loggedClientSide = false;
+    mutable bool m_loggedForeign = false;
+    mutable int m_loggedServerCopy = -1;
+    mutable int m_serverCopyLogs = 0;
 
-    mutable void* m_checkedHolder = nullptr;
-    mutable void* m_checkedContainer = nullptr;
-    mutable std::byte* m_checkedSlots = nullptr;
+    struct Checked {
+        void* holder = nullptr;
+        void* container = nullptr;
+        std::byte* slots = nullptr;
+    };
+    mutable Checked m_checked[HolderTable::kCapacity]{};
+    mutable std::size_t m_checkedNext = 0;
+    bool alreadyChecked(void* holder, void* container, std::byte* slots) const;
+    void rememberChecked(void* holder, void* container, std::byte* slots) const;
 
-    mutable void* m_localPlayerVtable = nullptr;
-    mutable bool m_localPlayerVtableTried = false;
+    std::atomic<void*> m_localPlayerVtable{nullptr};
 
     void watch(Spot spot, const Inventory& inventory, const SlotView& view);
 

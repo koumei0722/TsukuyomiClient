@@ -43,11 +43,6 @@ struct Structure {
 
     std::vector<std::int32_t> blocks2;
 
-    std::map<std::size_t, std::vector<StateValue>> entityStates;
-
-    const std::vector<StateValue>& entityAt(std::int32_t x, std::int32_t y,
-                                            std::int32_t z) const;
-
     bool valid() const { return sizeX > 0 && sizeY > 0 && sizeZ > 0 && !blocks.empty(); }
 
     std::size_t volume() const

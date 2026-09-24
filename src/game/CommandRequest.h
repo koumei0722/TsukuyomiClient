@@ -66,6 +66,8 @@ private:
 
     const void* makeOrigin();
 
+    void noteOtherTarget(const void* vtable, bool serverType, bool kept);
+
     SendCommandFn m_send = nullptr;
     MakeCommandOriginFn m_makeOrigin = nullptr;
 
@@ -78,7 +80,9 @@ private:
     char m_text[kMaxLength + 1]{};
 
     std::atomic<bool> m_warnedNoPlayer{false};
-    std::atomic<bool> m_warnedBadPlayer{false};
+    static constexpr std::size_t kOtherTargetLogs = 4;
+    std::atomic<const void*> m_otherTargetVtables[kOtherTargetLogs] = {};
+    std::atomic<std::size_t> m_otherTargetCount{0};
     std::atomic<unsigned long long> m_nextSenderWarnMs{0};
     std::atomic<unsigned long long> m_nextPlayerWarnMs{0};
     std::atomic<bool> m_loggedOrigin{false};

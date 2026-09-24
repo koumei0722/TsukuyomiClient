@@ -7,6 +7,7 @@
 #include "core/Logger.h"
 #include "game/GameVersion.h"
 #include "hooks/HookManager.h"
+#include "hooks/HookCount.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -22,6 +23,7 @@ PlaySoundFn g_playSound = nullptr;
 void __fastcall detourPlaySound(void* self, const void* name, const void* position, float a,
                                 float b, bool c, const void* extra)
 {
+    TSUKUYOMI_HOOK_COUNT("PlaySound");
     UiSound::instance().onPlayed(self, name, position, a, b, c, extra);
     if (g_playSound != nullptr) {
         g_playSound(self, name, position, a, b, c, extra);

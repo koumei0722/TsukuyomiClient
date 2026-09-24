@@ -192,6 +192,25 @@ const ModuleRange& mainModule()
     return range;
 }
 
+int writeNetIdGuarded(std::byte* bytes, const std::byte* moduleBase, std::size_t moduleSize,
+                      std::ptrdiff_t tagOffset, std::uint8_t supportedTag, std::ptrdiff_t idOffset,
+                      std::int32_t value, const void** faultPc, const void** faultAddress)
+{
+    __try {
+        const auto* const vtable = *reinterpret_cast<const std::byte* const*>(bytes);
+        if (vtable == nullptr || moduleBase == nullptr || vtable < moduleBase || vtable >= moduleBase + moduleSize) {
+            return 0;
+        }
+        if (static_cast<std::uint8_t>(bytes[tagOffset]) != supportedTag) {
+            return 0;
+        }
+        std::memcpy(bytes + idOffset, &value, sizeof(value));
+        return 1;
+    } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
+        return -1;
+    }
+}
+
 }
 
 ItemStackOps& ItemStackOps::instance()
@@ -336,19 +355,19 @@ bool ItemStackOps::setNetIdValue(void* stack, std::int32_t value)
         return false;
     }
     auto* const bytes = static_cast<std::byte*>(stack);
-    if (!memory::isReadable(bytes, kStackSize)) {
+    if (!memory::isWritable(bytes, kStackSize)) {
         return false;
     }
-    void* const vtable = *reinterpret_cast<void* const*>(bytes);
-    if (vtable == nullptr || !mainModule().contains(vtable)) {
-        return false;
+    const ModuleRange& module = mainModule();
+    const void* faultPc = nullptr;
+    const void* faultAddress = nullptr;
+    const int wrote = writeNetIdGuarded(bytes, module.base, module.size, kNetTagOffset, kSupportedTag, kNetIdOffset,
+                                        value, &faultPc, &faultAddress);
+    if (wrote < 0) {
+        log().warn(L"ItemStackOps: writing a net id faulted (touched {:#x}); nothing was written",
+                   reinterpret_cast<std::uintptr_t>(faultAddress));
     }
-    if (static_cast<std::uint8_t>(bytes[kNetTagOffset]) != kSupportedTag) {
-        return false;
-    }
-
-    std::memcpy(bytes + kNetIdOffset, &value, sizeof(value));
-    return true;
+    return wrote == 1;
 }
 
 bool ItemStackOps::cloneTo(void* dst, const void* src)

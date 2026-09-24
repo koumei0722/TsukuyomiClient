@@ -44,12 +44,15 @@ struct MenuItem {
 
     std::function<std::wstring()> getText;
     std::function<void(std::wstring)> setText;
+    bool textOnCommit = false;
 
     bool onPage = false;
 
     int pageTab = 0;
 
     bool opensPage = false;
+
+    bool hidden = false;
 
     std::vector<MenuItem> children;
 

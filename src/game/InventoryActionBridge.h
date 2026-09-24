@@ -12,8 +12,6 @@ class InventoryActionBridge {
 public:
     static InventoryActionBridge& instance();
 
-    void onSetSelectedSlot(void* holder);
-
     void onAddRequestAction(void* const* clientHolder, void* const* action);
 
     bool shouldBlockPacket(void* packet);
@@ -70,8 +68,6 @@ private:
     static constexpr int kQueueSize = 256;
 
     static constexpr int kRequestPacketId = 147;
-
-    static constexpr int kPacketProbeLimit = 12;
 
     static constexpr std::size_t kActionSize = 0x68;
     static constexpr std::ptrdiff_t kKindOffset = 0x08;
@@ -143,12 +139,8 @@ private:
     static constexpr std::ptrdiff_t kInnerScanBytes = 0x400;
     static constexpr int kResolveBudget = 500000;
 
-    static constexpr int kTraceCalls = 0;
-
     static constexpr std::ptrdiff_t kOpenIdOffset = 0x30;
     static constexpr std::ptrdiff_t kOpenKindOffset = 0x31;
-    static constexpr std::size_t kOpenPeekBytes = 0x30;
-    static constexpr int kContainerOpenProbes = 6;
 
     static constexpr std::ptrdiff_t kContentChangedVtableOffset = 0x110;
 
@@ -212,8 +204,7 @@ private:
 
     bool allowLog();
 
-    std::atomic<void*> m_holder{nullptr};
-    std::atomic<void*> m_holderAlt{nullptr};
+    std::atomic<void*> m_ownHolder{nullptr};
 
     Entry m_queue[kQueueSize];
     int m_queued = 0;
@@ -228,8 +219,6 @@ private:
 
     std::atomic<void*> m_openContainer{nullptr};
 
-    mutable std::atomic<int> m_traceLeft{kTraceCalls};
-
     mutable std::atomic<void*> m_openModel{nullptr};
 
     mutable std::atomic<void*> m_cachedContainer{nullptr};
@@ -241,10 +230,7 @@ private:
     std::atomic<int> m_openContainerId{-1};
     std::atomic<int> m_openContainerKind{-1};
 
-    std::atomic<int> m_containerOpenProbes{kContainerOpenProbes};
     std::atomic<bool> m_warnedBusy{false};
-
-    std::atomic<int> m_packetProbes{0};
 
     std::atomic<unsigned long long> m_windowStartMs{0};
     std::atomic<int> m_inWindow{0};

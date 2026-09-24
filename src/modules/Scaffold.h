@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 
 #include "modules/Module.h"
@@ -57,6 +58,8 @@ private:
 
     void captureHeight();
 
+    const wchar_t* readFeet(float& outX, float& outY, float& outZ) const;
+
     bool resolveY(float footY, int& outY) const;
 
     int squareRadius() const;
@@ -76,7 +79,7 @@ private:
 
     Pattern m_pattern = Pattern::Cross;
     Height m_height = Height::Follow;
-    int m_manualY = 64;
+    std::atomic<int> m_manualY{64};
 
     int m_capturedY = 0;
     bool m_hasCapturedY = false;
@@ -87,6 +90,8 @@ private:
     bool m_placing = false;
 
     bool m_warnedNoGameMode = false;
+
+    mutable bool m_warnedFeetFallback = false;
 
     Clock::time_point m_nextResend{};
     Clock::time_point m_nextLog{};

@@ -2,6 +2,7 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
+#include "core/Strings.h"
 #include "game/GameData.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
@@ -9,6 +10,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <format>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -93,25 +96,49 @@ void Scaffold::captureHeight()
         return;
     }
 
-    const GameData& data = GameData::instance();
-    if (!data.hasPlayerView()) {
+    if (!GameData::instance().hasPlayerView()) {
         return;
     }
 
+    float footX = 0.0f;
     float footY = 0.0f;
-    if (!data.playerFeetY(footY)) {
-        footY = data.playerView().y - GameData::kEyeHeight;
-    }
+    float footZ = 0.0f;
+    const wchar_t* const source = readFeet(footX, footY, footZ);
     m_capturedY = static_cast<int>(std::floor(footY)) - 1;
     m_hasCapturedY = true;
-    log().info(L"Scaffold: height locked to Y {}", m_capturedY);
+    log().info(L"Scaffold: height locked to Y {} (feet {:.3f} from {})", m_capturedY, footY,
+               source);
+}
+
+const wchar_t* Scaffold::readFeet(float& outX, float& outY, float& outZ) const
+{
+    const GameData& data = GameData::instance();
+    if (data.playerBoxFeet(outX, outY, outZ)) {
+        return L"hitbox";
+    }
+
+    const wchar_t* source = L"body eye - 1.62";
+    if (!data.playerFeet(outX, outY, outZ)) {
+        const PlayerView view = data.playerView();
+        outX = view.x;
+        outY = view.y - GameData::kEyeHeight;
+        outZ = view.z;
+        source = L"camera eye - 1.62";
+    }
+    if (!m_warnedFeetFallback) {
+        m_warnedFeetFallback = true;
+        log().warn(
+            L"Scaffold: hitbox not readable, using {} (assumes the eye is 1.62 above the feet)",
+            source);
+    }
+    return source;
 }
 
 bool Scaffold::resolveY(float footY, int& outY) const
 {
     switch (m_height) {
     case Height::Manual:
-        outY = m_manualY;
+        outY = m_manualY.load(std::memory_order_relaxed);
         return true;
 
     case Height::OnEnable:
@@ -180,15 +207,10 @@ void Scaffold::placeAll()
         return;
     }
 
-    const PlayerView view = data.playerView();
-    float footX = view.x;
-    float footY = view.y - GameData::kEyeHeight;
-    float footZ = view.z;
-    if (!data.playerFeet(footX, footY, footZ)) {
-        footX = view.x;
-        footY = view.y - GameData::kEyeHeight;
-        footZ = view.z;
-    }
+    float footX = 0.0f;
+    float footY = 0.0f;
+    float footZ = 0.0f;
+    const wchar_t* const source = readFeet(footX, footY, footZ);
 
     int planeY = 0;
     if (!resolveY(footY, planeY)) {
@@ -233,8 +255,9 @@ void Scaffold::placeAll()
 
     if (now >= m_nextLog) {
         m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-        log().info(L"Scaffold: {} Y {} ({}) at ({}, {}) {}/{} placed", patternName(), planeY,
-                   heightName(), center.x, center.z, placed, count);
+        log().info(L"Scaffold: {} Y {} ({}) at ({}, {}) {}/{} placed (feet {:.3f} from {})",
+                   patternName(), planeY, heightName(), center.x, center.z, placed, count, footY,
+                   source);
     }
 }
 
@@ -272,13 +295,19 @@ MenuItem Scaffold::buildMenu()
             }
         }));
 
-    MenuItem fixedY = menu::number(
-        L"Fixed Y", [this] { return static_cast<float>(m_manualY); },
-        [this](float value) {
-            m_manualY = std::clamp(static_cast<int>(value), kMinY, kMaxY);
-            log().info(L"Scaffold: fixed Y set to {}", m_manualY);
-        },
-        true, static_cast<float>(kMinY), static_cast<float>(kMaxY));
+    MenuItem fixedY = menu::text(
+        L"Fixed Y",
+        [this] { return std::format(L"{}", m_manualY.load(std::memory_order_relaxed)); },
+        [this](std::wstring typed) {
+            int value = 0;
+            if (!parseTypedInt(typed, value)) {
+                return;
+            }
+            value = std::clamp(value, kMinY, kMaxY);
+            if (m_manualY.exchange(value, std::memory_order_relaxed) != value) {
+                log().info(L"Scaffold: fixed Y set to {}", value);
+            }
+        });
     fixedY.available = [this] { return m_height == Height::Manual; };
     children.push_back(std::move(fixedY));
 
@@ -300,7 +329,8 @@ void Scaffold::loadConfig(const nlohmann::json& section)
         std::clamp(Config::getInt(section, "height", static_cast<int>(Height::Follow)), 0, 2);
     m_height = static_cast<Height>(height);
 
-    m_manualY = std::clamp(Config::getInt(section, "fixedY", 64), kMinY, kMaxY);
+    m_manualY.store(std::clamp(Config::getInt(section, "fixedY", 64), kMinY, kMaxY),
+                    std::memory_order_relaxed);
 }
 
 void Scaffold::saveConfig(nlohmann::json& section) const
@@ -308,13 +338,14 @@ void Scaffold::saveConfig(nlohmann::json& section) const
     Module::saveConfig(section);
     section["pattern"] = static_cast<int>(m_pattern);
     section["height"] = static_cast<int>(m_height);
-    section["fixedY"] = m_manualY;
+    section["fixedY"] = m_manualY.load(std::memory_order_relaxed);
 }
 
 void Scaffold::onEnabledChanged(bool enabled)
 {
     m_hasLastCenter = false;
     m_warnedNoGameMode = false;
+    m_warnedFeetFallback = false;
 
     m_nextLog = Clock::time_point{};
 

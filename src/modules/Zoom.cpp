@@ -4,6 +4,7 @@
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "input/Foreground.h"
+#include "input/LowLevelHook.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -40,15 +41,6 @@ std::size_t copyFloatsGuarded(const std::byte* at, float* out, std::size_t count
     return done;
 }
 
-HMODULE currentModule()
-{
-    HMODULE module = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
-                           | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       reinterpret_cast<LPCWSTR>(&currentModule), &module);
-    return module;
-}
-
 }
 
 Zoom* Zoom::s_hookOwner = nullptr;
@@ -71,7 +63,7 @@ void Zoom::onScansReady()
         const auto* const b = reinterpret_cast<const unsigned char*>(base + kWriteFov);
         if (memory::isReadable(base + kWriteFov, kWriteFovSize) && b[0] == 0xF3 && b[1] == 0x0F
             && b[2] == 0x11) {
-            m_patchFov = makeNopPatch(base + kWriteFov, kWriteFovSize);
+            m_patchFov = makeNopPatch(base + kWriteFov, kWriteFovSize, "Zoom.Fov");
         } else {
             log().warn(L"Zoom: the fov write is not a movss, so it is left alone (zoom may not "
                        L"work)");
@@ -83,7 +75,7 @@ void Zoom::onScansReady()
         const auto* const b = reinterpret_cast<const unsigned char*>(base + kWriteFov2);
         if (memory::isReadable(base + kWriteFov2, kWriteFov2Size) && b[0] == 0xF3 && b[1] == 0x41
             && b[2] == 0x0F && b[3] == 0x11) {
-            m_patchFov2 = makeNopPatch(base + kWriteFov2, kWriteFov2Size);
+            m_patchFov2 = makeNopPatch(base + kWriteFov2, kWriteFov2Size, "Zoom.Fov");
         } else {
             log().warn(L"Zoom: the second fov write is not a movss, so it is left alone");
         }
@@ -173,16 +165,29 @@ void Zoom::onEnabledChanged(bool enabled)
 
 void Zoom::installMouseHook()
 {
-    if (m_mouseHook != nullptr) {
+    if (m_mouseHook != nullptr || m_mouseHookFailed.load(std::memory_order_relaxed)) {
         return;
     }
     s_hookOwner = this;
-    m_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, &Zoom::mouseHookProc, currentModule(), 0);
+    const input::LowLevelHook hook = input::installLowLevelHook(WH_MOUSE_LL, &Zoom::mouseHookProc);
+    m_mouseHook = hook.hook;
     if (m_mouseHook == nullptr) {
         s_hookOwner = nullptr;
-        log().warn(L"Zoom: could not grab the mouse (error {}); the factor cannot be changed "
-                   L"with the wheel",
-                   GetLastError());
+        m_mouseHookFailed.store(true, std::memory_order_relaxed);
+        if (!m_mouseHookWarned) {
+            m_mouseHookWarned = true;
+            log().warn(L"Zoom: could not grab the mouse (error {}, {} with the module); the factor "
+                       L"cannot be changed with the wheel. Retrying only when Zoom is switched or "
+                       L"its key is cleared and set again",
+                       hook.errorWithoutModule, hook.errorWithModule);
+        }
+        return;
+    }
+    if (hook.withModule) {
+        log().info(L"Zoom: grabbed the mouse with the module (error {} without it)",
+                   hook.errorWithoutModule);
+    } else {
+        log().info(L"Zoom: grabbed the mouse");
     }
 }
 
@@ -193,6 +198,8 @@ void Zoom::removeMouseHook()
         m_mouseHook = nullptr;
     }
     s_hookOwner = nullptr;
+
+    m_mouseHookFailed.store(false, std::memory_order_relaxed);
 }
 
 LRESULT CALLBACK Zoom::mouseHookProc(int code, WPARAM wParam, LPARAM lParam)

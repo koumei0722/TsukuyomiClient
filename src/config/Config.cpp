@@ -37,6 +37,7 @@ void Config::load()
             return;
         }
         m_root = std::move(parsed);
+        m_written = m_root.dump(4);
         log().info(L"Config loaded");
     } catch (const nlohmann::json::exception& error) {
         log().warn(L"Could not read the config file ({}). Using defaults",
@@ -57,12 +58,22 @@ bool Config::save()
         return false;
     }
 
-    file << m_root.dump(4);
+    std::string text = m_root.dump(4);
+    file << text;
     if (!file.good()) {
         log().error(L"Error while writing the config file");
         return false;
     }
+    m_written = std::move(text);
     return true;
+}
+
+bool Config::saveIfChanged()
+{
+    if (m_root.dump(4) == m_written) {
+        return false;
+    }
+    return save();
 }
 
 nlohmann::json& Config::section(std::string_view name)

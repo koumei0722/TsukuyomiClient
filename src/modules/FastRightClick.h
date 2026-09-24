@@ -21,14 +21,19 @@ public:
     int onUseItemTransaction(void* gameMode, void* itemStack, int extra);
 
 protected:
-    bool persistEnabled() const override { return false; }
+    bool persistEnabled() const override { return true; }
 
 private:
     FastRightClick() = default;
 
     using Clock = std::chrono::steady_clock;
 
-    bool shouldRepeat() const;
+    bool shouldRepeat(void* gameMode) const;
+
+    static bool playerSneaking(void* gameMode);
+
+    static constexpr std::size_t kGameModePlayerOffset = 0x08;
+    static constexpr std::size_t kPlayerContextOffset = 0x08;
 
     void noteExtra(int extra);
 
@@ -44,6 +49,8 @@ private:
 
     int m_extraSinceLog = 0;
     Clock::time_point m_nextLog{};
+
+    mutable bool m_notSneakingLogged = false;
 };
 
 }

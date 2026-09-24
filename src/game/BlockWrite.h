@@ -28,11 +28,6 @@ struct StorageSpot {
     unsigned int index = 0;
 };
 
-bool placeGhostActor(void* region, const BlockPos& at, const void* block, const void* air,
-                     StorageSpot* spot);
-
-bool removeGhostActor(void* region, const BlockPos& at, const void* block, const void* air);
-
 bool nudgeRegion(void* region, const BlockPos& at, const void* block, const void* air,
                  void** outSubChunk, StorageSpot* hold);
 
@@ -40,6 +35,7 @@ void clearSpot(const StorageSpot& spot, const void* air);
 
 inline constexpr std::size_t kFindWhyCount = 12;
 void findSubChunkStats(std::size_t out[kFindWhyCount]);
+std::size_t findSubChunkLooseHits();
 
 bool lastFindWasMissingChunk();
 bool lastFindWasOutsideWorld();
@@ -74,7 +70,7 @@ void noteSubChunkAlt(int baseX, int baseY, int baseZ, void* subChunk);
 
 void forgetSubChunks();
 
-void noteWorldChanged();
+void noteWorldChanged(bool leftAWorld);
 
 void beginSelfWrite();
 void endSelfWrite();

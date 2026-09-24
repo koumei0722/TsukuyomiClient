@@ -2,8 +2,13 @@
 
 #include <Windows.h>
 
+#include <algorithm>
+#include <cstring>
+#include <optional>
+
 #include "core/Logger.h"
 #include "core/Perf.h"
+#include "game/GameData.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
 #include "memory/Memory.h"
@@ -145,6 +150,19 @@ void HandRestock::onScansReady()
     ItemStackRequest::instance().onScansReady();
 
     ItemStackOps::instance().onScansReady();
+
+    if (std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef); ref != nullptr) {
+        m_localPlayerVtable.store(memory::ripTarget(ref, kLocalPlayerVtableDisp), std::memory_order_release);
+    }
+    if (const std::byte* const site = Scanner::instance().address(Target::AnnouncedSlotSite);
+        site != nullptr && memory::isReadable(site, 7)) {
+        std::int32_t disp = 0;
+        std::memcpy(&disp, site + 3, sizeof(disp));
+        m_inventoryDisp = (disp > 0x100 && disp < 0x4000 && disp % 8 == 0) ? disp : 0;
+    }
+    log().info(L"HandRestock: telling your inventory apart by {} (inventory field +{:#x})",
+               m_localPlayerVtable.load() != nullptr ? L"the LocalPlayer type" : L"nothing (the newest holder is used)",
+               m_inventoryDisp);
 }
 
 void HandRestock::saveConfig(nlohmann::json& section) const
@@ -171,10 +189,13 @@ void HandRestock::onSetSelectedSlot(void* holder)
         return;
     }
 
-    void* const previous = m_holder.exchange(holder, std::memory_order_acq_rel);
-    if (previous != holder) {
-        m_holderAlt.store(previous, std::memory_order_release);
+    if (holderIsLocal(holder)) {
+        if (m_clientHolder.exchange(holder, std::memory_order_acq_rel) != holder) {
+            m_faultedHolder.store(nullptr, std::memory_order_release);
+        }
+        return;
     }
+    m_holders.record(holder);
 }
 
 void HandRestock::onPlayerViewUpdate()
@@ -277,8 +298,10 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
     }
 
     const Clock::time_point now = Clock::now();
+    m_pending[spot] = Pending{};
     m_pending[spot].active = true;
     m_pending[spot].destSlot = slot;
+    m_pending[spot].container = inventory.container;
     m_pending[spot].item = previous.item;
     m_pending[spot].block = previous.block;
     m_pending[spot].aux = previous.aux;
@@ -304,6 +327,21 @@ void HandRestock::servePending(Spot spot)
     if (now < m_pending[spot].at) {
         return;
     }
+    if (m_pending[spot].waitContent) {
+        const auto behind = static_cast<std::int32_t>(ItemStackRequest::instance().inventoryContentSerial()
+                                                       - m_pending[spot].contentSerial);
+        if (behind < 0 && now < m_pending[spot].contentDeadline) {
+            return;
+        }
+        m_pending[spot].waitContent = false;
+        m_pending[spot].at = now + std::chrono::milliseconds(kContentSettleMs);
+        return;
+    }
+
+    if (m_outstanding.active) {
+        m_pending[spot].giveUpAt = std::max(m_pending[spot].giveUpAt, now + std::chrono::milliseconds(kGiveUpMs));
+        return;
+    }
 
     if (now >= m_pending[spot].giveUpAt) {
         dropPending(spot, L"timed out before it could be sent");
@@ -321,6 +359,11 @@ void HandRestock::servePending(Spot spot)
         return;
     }
 
+    if (pending.container != nullptr && inventory.container != pending.container) {
+        dropPending(spot, L"your inventory is not the one it was found in (another world?)");
+        return;
+    }
+
     if (spot == kSpotHand && inventory.hand != pending.destSlot) {
         dropPending(spot, L"the selected hotbar slot changed while waiting");
         return;
@@ -334,7 +377,7 @@ void HandRestock::servePending(Spot spot)
     }
 
     const int totalNow = countItem(inventory, pending.item, pending.aux);
-    if (totalNow >= pending.totalBefore) {
+    if (!pending.retry && totalNow >= pending.totalBefore) {
         log().info(L"HandRestock: the {} went empty but the total did not drop ({} -> {}), "
                    L"treating it as a move, not a use",
                    (spot == kSpotHand) ? L"hand" : L"offhand", pending.totalBefore, totalNow);
@@ -365,6 +408,10 @@ void HandRestock::servePending(Spot spot)
 
     m_pending[spot] = Pending{};
     m_nextRefillAt[spot] = now + std::chrono::milliseconds(kCooldownMs);
+    if (m_outstanding.active) {
+        m_outstanding.retryAs = pending;
+        m_outstanding.retryAs.active = true;
+    }
 
     SlotView refilled;
     const bool reread = (spot == kSpotHand)
@@ -389,14 +436,17 @@ void HandRestock::servePending(Spot spot)
 
 bool HandRestock::emptyEverywhere(Spot spot, int destSlot) const
 {
-    void* const holders[2] = {m_holder.load(std::memory_order_acquire),
-                              m_holderAlt.load(std::memory_order_acquire)};
+    Own own;
+    if (!resolveOwn(own, true)) {
+        return false;
+    }
+    const Inventory* const inventories[2] = {&own.client, own.haveServer ? &own.server : nullptr};
     int seen = 0;
-    for (void* const holder : holders) {
-        Inventory inventory;
-        if (!resolve(holder, inventory)) {
+    for (const Inventory* const one : inventories) {
+        if (one == nullptr) {
             continue;
         }
+        const Inventory& inventory = *one;
         SlotView view;
         if (spot == kSpotHand) {
             if (!readSlot(inventory.slots, destSlot, view)) {
@@ -416,6 +466,34 @@ bool HandRestock::emptyEverywhere(Spot spot, int destSlot) const
         ++seen;
     }
     return seen > 0;
+}
+
+bool HandRestock::forEachInventorySlot(const std::function<void(const void*, int)>& fn) const
+{
+    if (!fn) {
+        return false;
+    }
+    Inventory inventory;
+    if (!resolveClient(inventory) || inventory.slots == nullptr) {
+        return false;
+    }
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        SlotView view;
+        if (!readSlot(inventory.slots, slot, view)) {
+            continue;
+        }
+        if (view.item == nullptr || view.count == 0) {
+            continue;
+        }
+        fn(view.block, static_cast<int>(view.count));
+    }
+    if (inventory.offhand != nullptr) {
+        SlotView view;
+        if (readStackAt(inventory.offhand, view) && view.item != nullptr && view.count > 0) {
+            fn(view.block, static_cast<int>(view.count));
+        }
+    }
+    return true;
 }
 
 int HandRestock::countItem(const Inventory& inventory, void* item, std::uint16_t aux) const
@@ -509,14 +587,23 @@ int HandRestock::findSource(const Inventory& inventory, const SlotView& wanted,
     return -1;
 }
 
-bool HandRestock::looksLikeInventory(std::byte* slots) const
+bool HandRestock::looksLikeInventory(std::byte* slots, bool* faulted) const
 {
-    if (slots == nullptr) {
+    if (faulted != nullptr) {
+        *faulted = false;
+    }
+    if (!memory::plausiblePointer(slots)) {
+        if (faulted != nullptr && slots != nullptr) {
+            *faulted = true;
+        }
         return false;
     }
 
     void* first = nullptr;
     if (!readPointerGuarded(slots, first)) {
+        if (faulted != nullptr) {
+            *faulted = true;
+        }
         return false;
     }
     if (!mainModule().contains(first)) {
@@ -525,7 +612,13 @@ bool HandRestock::looksLikeInventory(std::byte* slots) const
 
     for (int slot = 1; slot < kSlotCount; ++slot) {
         void* value = nullptr;
-        if (!readPointerGuarded(slots + kSlotStride * slot, value) || value != first) {
+        if (!readPointerGuarded(slots + kSlotStride * slot, value)) {
+            if (faulted != nullptr) {
+                *faulted = true;
+            }
+            return false;
+        }
+        if (value != first) {
             return false;
         }
     }
@@ -544,7 +637,8 @@ bool HandRestock::readStackAt(const std::byte* stack, SlotView& out) const
         || !readPointerGuarded(stack + kBlockOffset, view.block)
         || !readU16Guarded(stack + kAuxOffset, view.aux)
         || !readU8Guarded(stack + kCountOffset, view.count)
-        || !readIntGuarded(stack + kNetValueOffset, view.netValue)) {
+        || !readIntGuarded(stack + kNetValueOffset, view.netValue)
+        || !readU8Guarded(stack + kNetTagOffset, view.netTag)) {
         return false;
     }
     out = view;
@@ -559,40 +653,83 @@ bool HandRestock::readSlot(std::byte* slots, int index, SlotView& out) const
     return readStackAt(slots + kSlotStride * index, out);
 }
 
-bool HandRestock::resolve(void* holder, Inventory& out) const
+bool HandRestock::alreadyChecked(void* holder, void* container, std::byte* slots) const
 {
+    for (const Checked& one : m_checked) {
+        if (one.holder == holder && one.container == container && one.slots == slots) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HandRestock::rememberChecked(void* holder, void* container, std::byte* slots) const
+{
+    for (Checked& one : m_checked) {
+        if (one.holder == holder) {
+            one = Checked{holder, container, slots};
+            return;
+        }
+    }
+    m_checked[m_checkedNext] = Checked{holder, container, slots};
+    m_checkedNext = (m_checkedNext + 1) % std::size(m_checked);
+}
+
+bool HandRestock::resolve(void* holder, Inventory& out, bool* faulted) const
+{
+    if (faulted != nullptr) {
+        *faulted = false;
+    }
     if (holder == nullptr) {
         return false;
     }
+    const auto fault = [faulted] {
+        if (faulted != nullptr) {
+            *faulted = true;
+        }
+        return false;
+    };
 
     auto* const base = static_cast<std::byte*>(holder);
 
     int hand = -1;
-    if (!readIntGuarded(base + kSelectedSlotOffset, hand) || hand < 0 || hand >= kHotbarSlots) {
+    if (!readIntGuarded(base + kSelectedSlotOffset, hand)) {
+        return fault();
+    }
+    if (hand < 0 || hand >= kHotbarSlots) {
         return false;
     }
 
     void* container = nullptr;
-    if (!readPointerGuarded(base + kContainerOffset, container) || container == nullptr) {
+    if (!readPointerGuarded(base + kContainerOffset, container)) {
+        return fault();
+    }
+    if (container == nullptr) {
         return false;
+    }
+    if (!memory::plausiblePointer(container)) {
+        return fault();
     }
 
     void* slots = nullptr;
-    if (!readPointerGuarded(static_cast<std::byte*>(container) + kSlotsOffset, slots)
-        || slots == nullptr) {
+    if (!readPointerGuarded(static_cast<std::byte*>(container) + kSlotsOffset, slots)) {
+        return fault();
+    }
+    if (slots == nullptr) {
         return false;
+    }
+    if (!memory::plausiblePointer(slots)) {
+        return fault();
     }
 
     auto* const array = static_cast<std::byte*>(slots);
 
-    if (holder != m_checkedHolder || container != m_checkedContainer
-        || array != m_checkedSlots) {
-        if (!looksLikeInventory(array)) {
-            return false;
+    if (!alreadyChecked(holder, container, array)) {
+        bool unreadable = false;
+        if (!looksLikeInventory(array, &unreadable)) {
+            return unreadable ? fault() : false;
         }
-        m_checkedHolder = holder;
-        m_checkedContainer = container;
-        m_checkedSlots = array;
+        rememberChecked(holder, container, array);
     }
 
     out = Inventory{};
@@ -603,7 +740,7 @@ bool HandRestock::resolve(void* holder, Inventory& out) const
 
     void* player = nullptr;
     if (!readPointerGuarded(static_cast<std::byte*>(container) + kPlayerOffset, player)
-        || player == nullptr) {
+        || !memory::plausiblePointer(player)) {
         return true;
     }
 
@@ -638,49 +775,272 @@ bool HandRestock::isClientSidePlayer(void* player) const
     if (!readPointerGuarded(player, vtable) || vtable == nullptr) {
         return false;
     }
-    if (!m_localPlayerVtableTried) {
-        m_localPlayerVtableTried = true;
-        if (std::byte* const ref = Scanner::instance().address(Target::PlayerVtableRef);
-            ref != nullptr) {
-            m_localPlayerVtable = memory::ripTarget(ref, kLocalPlayerVtableDisp);
-        }
-    }
-    if (m_localPlayerVtable == nullptr) {
+    void* const local = localPlayerVtable();
+    return local != nullptr && vtable == local;
+}
+
+void* HandRestock::localPlayerVtable() const
+{
+    return m_localPlayerVtable.load(std::memory_order_acquire);
+}
+
+bool HandRestock::holderIsLocal(void* holder) const
+{
+    void* const local = localPlayerVtable();
+    if (holder == nullptr || local == nullptr) {
         return false;
     }
-    return vtable == m_localPlayerVtable;
+    void* container = nullptr;
+    void* player = nullptr;
+    void* vtable = nullptr;
+    return memory::plausiblePointer(holder)
+           && readPointerGuarded(static_cast<std::byte*>(holder) + kContainerOffset, container)
+           && memory::plausiblePointer(container)
+           && readPointerGuarded(static_cast<std::byte*>(container) + kPlayerOffset, player)
+           && memory::plausiblePointer(player) && readPointerGuarded(player, vtable) && vtable == local;
+}
+
+void* HandRestock::holderOfPlayer(void* player) const
+{
+    if (player == nullptr || m_inventoryDisp == 0) {
+        return nullptr;
+    }
+    if (playerFaulted(player)) {
+        return nullptr;
+    }
+    void* holder = nullptr;
+    if (!memory::plausiblePointer(player)) {
+        return nullptr;
+    }
+    if (!readPointerGuarded(static_cast<std::byte*>(player) + m_inventoryDisp, holder)) {
+        notePlayerFaulted(player);
+        return nullptr;
+    }
+    if (!memory::plausiblePointer(holder)) {
+        return nullptr;
+    }
+    return holder;
+}
+
+bool HandRestock::playerFaulted(void* player) const
+{
+    const unsigned long long serial = GameData::instance().playerSerial();
+    const unsigned long long now = GetTickCount64();
+    for (const FaultedPlayer& one : m_faultedPlayers) {
+        if (one.player.load(std::memory_order_acquire) == player && one.serial.load(std::memory_order_acquire) == serial
+            && now - one.at.load(std::memory_order_acquire) < kFaultedPlayerForgetMs) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void HandRestock::notePlayerFaulted(void* player) const
+{
+    if (player == nullptr) {
+        return;
+    }
+    const unsigned long long serial = GameData::instance().playerSerial();
+    FaultedPlayer& one = m_faultedPlayers[m_faultedPlayerNext.fetch_add(1, std::memory_order_relaxed) % 2];
+    one.serial.store(serial, std::memory_order_release);
+    one.at.store(GetTickCount64(), std::memory_order_release);
+    one.player.store(player, std::memory_order_release);
+}
+
+bool HandRestock::resolveOwn(Own& out, bool wantServer, bool forOthers) const
+{
+    const perf::Scope guard{forOthers ? perf::Slot::HrOwnLookup : perf::Slot::HrResolve};
+    out = Own{};
+
+    if (localPlayerVtable() == nullptr) {
+        void* holders[HolderTable::kCapacity] = {};
+        const std::size_t count = m_holders.snapshot(holders, HolderTable::kCapacity);
+        for (std::size_t i = 0; i < count; ++i) {
+            bool faulted = false;
+            if (resolve(holders[i], out.client, &faulted)) {
+                out.haveClient = true;
+                break;
+            }
+            if (faulted) {
+                m_holders.forget(holders[i]);
+            }
+        }
+        return out.haveClient;
+    }
+
+    const auto tryClient = [this, &out, forOthers](void* holder, void* expectedPlayer, bool* faultedOut) {
+        if (holder == nullptr || holder == m_faultedHolder.load(std::memory_order_acquire)) {
+            return false;
+        }
+        Inventory inventory;
+        bool faulted = false;
+        if (!resolve(holder, inventory, &faulted)) {
+            if (faultedOut != nullptr) {
+                *faultedOut = faulted;
+            }
+            return false;
+        }
+        bool client = false;
+        {
+            std::optional<perf::Scope> guard2;
+            if (!forOthers) {
+                guard2.emplace(perf::Slot::HrClientSide);
+            }
+            client = isClientSidePlayer(inventory.playerRaw);
+        }
+        if (!client || (expectedPlayer != nullptr && inventory.playerRaw != expectedPlayer)) {
+            return false;
+        }
+        out.client = inventory;
+        out.haveClient = true;
+        return true;
+    };
+    if (void* const gamePlayer = GameData::instance().player(); gamePlayer != nullptr && gamePlayer != m_lastGamePlayer) {
+        void* const holder = holderOfPlayer(gamePlayer);
+        bool faulted = false;
+        if (tryClient(holder, gamePlayer, &faulted)) {
+            m_lastGamePlayer = gamePlayer;
+            if (m_clientHolder.exchange(holder, std::memory_order_acq_rel) != holder) {
+                m_faultedHolder.store(nullptr, std::memory_order_release);
+            }
+            m_holders.forget(holder);
+            out = Own{};
+        } else if (faulted) {
+            notePlayerFaulted(gamePlayer);
+        }
+    }
+    void* const seat = m_clientHolder.load(std::memory_order_acquire);
+    bool seatFaulted = false;
+    if (!tryClient(seat, nullptr, &seatFaulted)) {
+        void* const player = GameData::instance().player();
+        void* found = nullptr;
+        bool gameFaulted = false;
+        if (void* const holder = holderOfPlayer(player); tryClient(holder, player, &gameFaulted)) {
+            found = holder;
+        } else {
+            if (gameFaulted) {
+                notePlayerFaulted(player);
+            }
+            void* holders[HolderTable::kCapacity] = {};
+            const std::size_t count = m_holders.snapshot(holders, HolderTable::kCapacity);
+            for (std::size_t i = 0; i < count && found == nullptr; ++i) {
+                bool faulted = false;
+                if (tryClient(holders[i], nullptr, &faulted)) {
+                    found = holders[i];
+                } else if (faulted) {
+                    m_holders.forget(holders[i]);
+                }
+            }
+        }
+        if (found != nullptr || seatFaulted) {
+            void* expected = seat;
+            m_clientHolder.compare_exchange_strong(expected, found, std::memory_order_acq_rel);
+        }
+        if (found != nullptr) {
+            m_holders.forget(found);
+        }
+    }
+    if (!out.haveClient) {
+        return false;
+    }
+    if (!wantServer) {
+        return true;
+    }
+
+    std::int32_t mine[kSlotCount] = {};
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        SlotView view;
+        if (readSlot(out.client.slots, slot, view) && view.item != nullptr && view.count > 0 && view.netTag == 0) {
+            mine[slot] = view.netValue;
+        }
+    }
+    const auto tryServer = [this, &out, &mine](void* holder) {
+        if (holder == nullptr || holder == out.client.holder) {
+            return false;
+        }
+        Inventory inventory;
+        bool faulted = false;
+        if (!resolve(holder, inventory, &faulted)) {
+            if (faulted) {
+                m_holders.forget(holder);
+            }
+            return false;
+        }
+        if (inventory.container == out.client.container || isClientSidePlayer(inventory.playerRaw)) {
+            return false;
+        }
+        const GameData& game = GameData::instance();
+        if (game.knowsServerPlayer() && !game.isServerPlayer(inventory.playerRaw)) {
+            return false;
+        }
+        if (m_inventoryDisp != 0 && holderOfPlayer(inventory.playerRaw) != holder) {
+            return false;
+        }
+        std::int32_t theirs[kSlotCount] = {};
+        for (int slot = 0; slot < kSlotCount; ++slot) {
+            SlotView view;
+            if (readSlot(inventory.slots, slot, view) && view.item != nullptr && view.count > 0 && view.netTag == 0) {
+                theirs[slot] = view.netValue;
+            }
+        }
+        if (!compareNetIds(mine, theirs, kSlotCount).sameOwner()) {
+            return false;
+        }
+        out.server = inventory;
+        out.haveServer = true;
+        return true;
+    };
+    if (!tryServer(holderOfPlayer(GameData::instance().playerAlt()))) {
+        void* holders[HolderTable::kCapacity] = {};
+        const std::size_t count = m_holders.snapshot(holders, HolderTable::kCapacity);
+        for (std::size_t i = 0; i < count; ++i) {
+            if (tryServer(holders[i])) {
+                break;
+            }
+        }
+        if (count > 0 && !m_loggedForeign) {
+            m_loggedForeign = true;
+            log().info(L"HandRestock: {} other slot holder(s) seen (other players, or the server-side copy in a local "
+                       L"world); only your own inventory is used",
+                       count);
+        }
+    }
+    if (m_loggedServerCopy != (out.haveServer ? 1 : 0) && m_serverCopyLogs < 6) {
+        m_loggedServerCopy = out.haveServer ? 1 : 0;
+        ++m_serverCopyLogs;
+        log().info(L"HandRestock: {}",
+                   out.haveServer ? L"found the server-side copy of your inventory (local world)"
+                                  : L"no server-side copy of your inventory (a remote server, or it could not be matched)");
+    }
+    return true;
 }
 
 bool HandRestock::resolveClient(Inventory& out) const
 {
-    const perf::Scope guard{perf::Slot::HrResolve};
-
-    void* const holders[2] = {m_holder.load(std::memory_order_acquire),
-                              m_holderAlt.load(std::memory_order_acquire)};
-
-    Inventory fallback;
-    bool haveFallback = false;
-
-    for (void* const holder : holders) {
-        Inventory inventory;
-        if (!resolve(holder, inventory)) {
-            continue;
-        }
-        if (!haveFallback) {
-            fallback = inventory;
-            haveFallback = true;
-        }
-        if (isClientSidePlayer(inventory.playerRaw)) {
-            out = inventory;
-            return true;
-        }
-    }
-
-    if (!haveFallback) {
+    Own own;
+    if (!resolveOwn(own, false)) {
         return false;
     }
-    out = fallback;
+    out = own.client;
     return true;
+}
+
+void HandRestock::ownHolders(void*& client, void*& server) const
+{
+    client = nullptr;
+    server = nullptr;
+    Own own;
+    if (!resolveOwn(own, true, true)) {
+        return;
+    }
+    client = own.client.holder;
+    server = own.haveServer ? own.server.holder : nullptr;
+}
+
+void* HandRestock::ownClientHolder() const
+{
+    Own own;
+    return resolveOwn(own, false, true) ? own.client.holder : nullptr;
 }
 
 bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destSlot,
@@ -717,28 +1077,20 @@ bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destS
     log().error(L"HandRestock: swapSlots faulted (pc rva {:#x}, touched {:#x}), dropping the holder",
                 rva, reinterpret_cast<uintptr_t>(faultAddress));
 
+    m_holders.forget(inventory.holder);
+    m_faultedHolder.store(inventory.holder, std::memory_order_release);
     void* expected = inventory.holder;
-    m_holder.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
-    expected = inventory.holder;
-    m_holderAlt.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
+    m_clientHolder.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
     return false;
 }
 
 bool HandRestock::outstandingStillValid() const
 {
-    void* const holders[2] = {m_holder.load(std::memory_order_acquire),
-                              m_holderAlt.load(std::memory_order_acquire)};
-    for (void* const holder : holders) {
-        Inventory inventory;
-        if (!resolve(holder, inventory) || inventory.container != m_outstanding.container) {
-            continue;
-        }
-        if (m_outstanding.source != inventory.slots + kSlotStride * m_outstanding.sourceSlot) {
-            continue;
-        }
-        return true;
+    Inventory inventory;
+    if (!resolveClient(inventory) || inventory.container != m_outstanding.container) {
+        return false;
     }
-    return false;
+    return m_outstanding.source == inventory.slots + kSlotStride * m_outstanding.sourceSlot;
 }
 
 bool HandRestock::rollbackOutstanding()
@@ -803,6 +1155,12 @@ void HandRestock::serveOutstanding()
 
     int result = 0;
     if (!ItemStackRequest::instance().takeResponse(m_outstanding.requestId, result)) {
+        if (!outstandingStillValid()) {
+            log().info(L"HandRestock: the world changed while waiting for refill request {}; stopped waiting",
+                       m_outstanding.requestId);
+            clearOutstanding();
+            return;
+        }
         if (Clock::now() >= m_outstanding.giveUpAt) {
             log().warn(L"HandRestock: the server did not answer refill request {}, "
                        L"the {} and the server may disagree",
@@ -817,13 +1175,76 @@ void HandRestock::serveOutstanding()
         return;
     }
 
-    const bool restored = rollbackOutstanding();
+    const Spot spot = m_outstanding.spot;
+    const int destSlot = m_outstanding.destSlot;
+    void* const container = m_outstanding.container;
+    Pending retryAs = m_outstanding.retryAs;
+    const std::uint32_t contentAtSend = m_outstanding.contentSerialAtSend;
+    bool intact = false;
+    {
+        Inventory now;
+        SlotView dest;
+        SlotView source;
+        if (resolveClient(now) && now.container == container
+            && ((spot == kSpotHand) ? readSlot(now.slots, destSlot, dest)
+                                    : (now.offhand != nullptr && readStackAt(now.offhand, dest)))
+            && readSlot(now.slots, m_outstanding.sourceSlot, source)) {
+            intact = dest.item == m_outstanding.predItem && dest.count == m_outstanding.predCount
+                     && (source.item == nullptr || source.count == 0);
+        }
+    }
+    const bool resent = !intact;
+    const bool restored = intact ? rollbackOutstanding() : true;
     clearOutstanding();
+    if (resent) {
+        log().info(L"HandRestock: the {} no longer shows the refill (the server resent the inventory or it was "
+                   L"moved), so nothing is put back", where);
+    }
 
     if (restored) {
-        log().warn(L"HandRestock: the server refused to refill the {} (result {}), "
-                   L"put the item back",
-                   where, result);
+        if (!resent) {
+            log().warn(L"HandRestock: the server refused to refill the {} (result {}), "
+                       L"put the item back",
+                       where, result);
+        } else {
+            log().warn(L"HandRestock: the server refused to refill the {} (result {})", where, result);
+        }
+        const bool behind = result == kResultFailedToValidateSrcSlot || result == kResultFailedToValidateDstSlot;
+        if (behind && retryAs.active && retryAs.attempts < kMaxRefusedRetries) {
+            const Clock::time_point now = Clock::now();
+            ++retryAs.attempts;
+            retryAs.retry = true;
+            retryAs.at = now + std::chrono::milliseconds(kRefusedRetryMs * retryAs.attempts);
+            retryAs.waitContent = true;
+            retryAs.contentSerial = contentAtSend + 1;
+            retryAs.contentDeadline = now + std::chrono::milliseconds(kContentWaitMs);
+            retryAs.giveUpAt = retryAs.contentDeadline + std::chrono::milliseconds(kGiveUpMs);
+            const bool sameNeed = m_pending[spot].active && m_pending[spot].destSlot == retryAs.destSlot
+                                  && m_pending[spot].item == retryAs.item && m_pending[spot].aux == retryAs.aux;
+            if (sameNeed) {
+                log().info(L"HandRestock: a newer refill of the {} for the same item is replaced by the retry", where);
+            } else if (m_pending[spot].active) {
+                log().info(L"HandRestock: a newer refill of the {} is already waiting, so the refused one is not "
+                           L"retried", where);
+                return;
+            }
+            m_pending[spot] = retryAs;
+            const int spotSlot = (spot == kSpotHand) ? destSlot : -1;
+            if (m_last[spot].container == container && m_last[spot].slot == spotSlot) {
+                HandState empty;
+                empty.container = container;
+                empty.slot = spotSlot;
+                m_last[spot] = empty;
+            }
+            log().info(L"HandRestock: the server looks behind, refilling the {} again {} "
+                       L"(attempt {} of {})",
+                       where,
+                       retryAs.waitContent ? L"after it resends the inventory" : L"shortly",
+                       retryAs.attempts, kMaxRefusedRetries);
+        } else if (behind) {
+            log().warn(L"HandRestock: gave up refilling the {} after {} refused attempt(s)", where,
+                       retryAs.attempts + 1);
+        }
         return;
     }
     log().error(L"HandRestock: the server refused to refill the {} (result {}) and the item could "
@@ -896,6 +1317,14 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
     m_outstanding.sourceSlot = sourceSlot;
     m_outstanding.destSlot = destSlot;
     m_outstanding.giveUpAt = Clock::now() + std::chrono::milliseconds(kResponseWaitMs);
+    m_outstanding.contentSerialAtSend = ItemStackRequest::instance().inventoryContentSerial();
+    {
+        SlotView predicted;
+        const bool read = (spot == kSpotHand) ? readSlot(inventory.slots, destSlot, predicted)
+                                              : (inventory.offhand != nullptr && readStackAt(inventory.offhand, predicted));
+        m_outstanding.predItem = read ? predicted.item : nullptr;
+        m_outstanding.predCount = read ? predicted.count : 0;
+    }
 
     return 1;
 }

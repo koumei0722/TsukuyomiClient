@@ -1,9 +1,12 @@
 #include "modules/Module.h"
 
 #include "game/UiSound.h"
+#include "game/UiProbe.h"
 
 #include "config/Config.h"
+#include "config/WriteSwitches.h"
 #include "core/Logger.h"
+#include "core/Strings.h"
 #include "input/Foreground.h"
 
 #include <utility>
@@ -21,6 +24,10 @@ void Module::setEnabled(bool value)
         log().warn(L"{} is not available on this version", name());
         return;
     }
+    if (value && m_writeBlocked) {
+        log().warn(L"{} needs a hook or patch that is turned off in hooks.json", name());
+        return;
+    }
 
     m_enabled = value;
     onEnabledChanged(m_enabled);
@@ -35,12 +42,33 @@ void Module::setEnabled(bool value)
 void Module::update()
 {
     const bool toggleRequested = m_toggleKey.triggered();
+    if (m_writeBlocked) {
+        onUpdate();
+        return;
+    }
     if (toggleRequested && input::isInGameplay()) {
         toggle();
         UiSound::instance().request();
+        if (persistEnabled()) {
+            uiprobe::markSettingsDirty();
+        }
     }
 
     onUpdate();
+}
+
+bool Module::writeBlocked() const
+{
+    return writes::blocked(toUtf8(name()));
+}
+
+void Module::applyWriteBlock()
+{
+    m_writeBlocked = writeBlocked();
+    if (m_writeBlocked) {
+        log().warn(L"{} is hidden: a hook or patch it needs is turned off in hooks.json{}", name(),
+                   m_enabled ? L" (its ON setting is kept)" : L"");
+    }
 }
 
 MenuItem Module::enabledItem()

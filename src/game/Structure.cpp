@@ -4,6 +4,7 @@
 #include <fstream>
 
 #include "game/Nbt.h"
+#include "game/SchematicLimits.h"
 
 namespace tsukuyomi::structure {
 
@@ -11,7 +12,7 @@ namespace {
 
 const std::string kEmptyName;
 
-constexpr std::size_t kMaxVolume = 4 * 1024 * 1024;
+constexpr std::size_t kMaxVolume = kMaxSchematicCells;
 
 bool readTriple(const nbt::Value* value, std::int32_t& x, std::int32_t& y, std::int32_t& z)
 {
@@ -120,18 +121,6 @@ std::size_t Structure::indexOf(std::int32_t x, std::int32_t y, std::int32_t z) c
     return at < blocks.size() ? at : blocks.size();
 }
 
-const std::vector<StateValue>& Structure::entityAt(std::int32_t x, std::int32_t y,
-                                                   std::int32_t z) const
-{
-    static const std::vector<StateValue> none;
-    const std::size_t at = indexOf(x, y, z);
-    if (at >= blocks.size()) {
-        return none;
-    }
-    const auto found = entityStates.find(at);
-    return found != entityStates.end() ? found->second : none;
-}
-
 const std::string& Structure::nameAt(std::int32_t x, std::int32_t y, std::int32_t z) const
 {
     const std::size_t at = indexOf(x, y, z);
@@ -218,65 +207,6 @@ LoadResult loadBytes(const char* bytes, std::size_t size)
         result.value.palette.push_back(std::move(entry));
     }
 
-    if (preset != nullptr) {
-        const nbt::Value* const posData =
-            preset->find("block_position_data", nbt::Tag::Compound);
-        if (posData != nullptr) {
-            for (const auto& [key, node] : posData->compound) {
-                if (!node || node->tag != nbt::Tag::Compound) {
-                    continue;
-                }
-                const nbt::Value* const data =
-                    node->find("block_entity_data", nbt::Tag::Compound);
-                if (data == nullptr) {
-                    continue;
-                }
-                std::size_t at = 0;
-                bool ok = !key.empty();
-                for (const char c : key) {
-                    if (c < '0' || c > '9' || at > volume) {
-                        ok = false;
-                        break;
-                    }
-                    at = at * 10 + static_cast<std::size_t>(c - '0');
-                }
-                if (!ok || at >= volume) {
-                    continue;
-                }
-                std::vector<StateValue> fields;
-                for (const auto& [name, field] : data->compound) {
-                    if (!field) {
-                        continue;
-                    }
-                    StateValue one;
-                    one.name = name;
-                    one.tag = field->tag;
-                    switch (field->tag) {
-                    case nbt::Tag::Byte:
-                    case nbt::Tag::Short:
-                    case nbt::Tag::Int:
-                    case nbt::Tag::Long:
-                        one.number = field->number;
-                        break;
-                    case nbt::Tag::String:
-                        one.text = field->text;
-                        break;
-                    default:
-                        continue;
-                    }
-                    fields.push_back(std::move(one));
-                }
-                if (!fields.empty()) {
-                    std::sort(fields.begin(), fields.end(),
-                              [](const StateValue& a, const StateValue& b) {
-                                  return a.name < b.name;
-                              });
-                    result.value.entityStates.emplace(at, std::move(fields));
-                }
-            }
-        }
-    }
-
     const nbt::Value* const layers = structureNode->find("block_indices", nbt::Tag::List);
     if (layers == nullptr || layers->list.empty()) {
         result.why = "no block indices";
@@ -297,7 +227,11 @@ LoadResult loadBytes(const char* bytes, std::size_t size)
         if (second != nullptr) {
             std::vector<std::int32_t> extra;
             if (readIntLayer(*second, volume, extra)) {
-                result.value.blocks2 = std::move(extra);
+                const bool used = std::any_of(extra.begin(), extra.end(),
+                                              [](const std::int32_t one) { return one >= 0; });
+                if (used) {
+                    result.value.blocks2 = std::move(extra);
+                }
             }
         }
     }

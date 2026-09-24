@@ -1,8 +1,14 @@
 #include "memory/Patch.h"
 
+#include "config/WriteSwitches.h"
+#include "core/Logger.h"
+#include "core/Strings.h"
+
 #include <Windows.h>
 
+#include <algorithm>
 #include <cstring>
+#include <string>
 #include <utility>
 
 namespace tsukuyomi {
@@ -31,10 +37,22 @@ bool writeBytes(std::byte* address, const std::byte* source, size_t size)
 
 }
 
-Patch::Patch(void* address, std::vector<std::byte> patched)
+Patch::Patch(void* address, std::vector<std::byte> patched, const char* name)
     : m_address(static_cast<std::byte*>(address))
     , m_patched(std::move(patched))
 {
+    if (name != nullptr) {
+        writes::noteUnknown(name);
+        if (!writes::allowed(std::string_view(name))) {
+            m_address = nullptr;
+            m_patched.clear();
+            static std::vector<std::string> told;
+            if (std::find(told.begin(), told.end(), name) == told.end()) {
+                told.emplace_back(name);
+                log().info(L"{} is turned off in hooks.json; not patched", toUtf16(name));
+            }
+        }
+    }
 }
 
 Patch::~Patch()
@@ -109,9 +127,9 @@ bool Patch::restore()
     return true;
 }
 
-Patch makeNopPatch(void* address, size_t size)
+Patch makeNopPatch(void* address, size_t size, const char* name)
 {
-    return Patch(address, std::vector<std::byte>(size, std::byte{0x90}));
+    return Patch(address, std::vector<std::byte>(size, std::byte{0x90}), name);
 }
 
 }

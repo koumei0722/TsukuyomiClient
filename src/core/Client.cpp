@@ -3,16 +3,20 @@
 #include "game/UiSound.h"
 
 #include "config/Config.h"
+#include "config/WriteSwitches.h"
+#include "core/FreezeWatch.h"
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "core/Version.h"
 #include "game/UiProbe.h"
 #include "hooks/Detours.h"
+#include "hooks/HookCount.h"
 #include "game/BlockRegistry.h"
+#include "game/GameData.h"
 #include "hooks/HookManager.h"
 #include "input/Foreground.h"
 #include "memory/Scanner.h"
-#include "modules/AntiDarkness.h"
+#include "modules/AntiEffect.h"
 #include "modules/AutoTool.h"
 #include "modules/CreativeNoClip.h"
 #include "modules/FastBlockPlacement.h"
@@ -28,11 +32,12 @@
 #include "modules/OffhandSwap.h"
 #include "modules/Scaffold.h"
 #include "modules/Schematica.h"
+#include "modules/InventoryHUD.h"
+#include "modules/ShulkerPreview.h"
 #include "modules/Zoom.h"
+#include "modules/ItemScroller.h"
 #include "render/BoxRenderer.h"
-#include "render/DiffAtlas.h"
 #include "render/FrameTrace.h"
-#include "render/GhostLayer.h"
 #include "render/Overlay.h"
 #include "render/WorldMesh.h"
 
@@ -60,7 +65,7 @@ void Client::registerModules()
 {
     ModuleManager::instance().registerModule(&FreeCamera::instance());
     ModuleManager::instance().registerModule(&FastBlockPlacement::instance());
-    ModuleManager::instance().registerModule(&AntiDarkness::instance());
+    ModuleManager::instance().registerModule(&AntiEffect::instance());
     ModuleManager::instance().registerModule(&AutoTool::instance());
     ModuleManager::instance().registerModule(&Scaffold::instance());
     ModuleManager::instance().registerModule(&CreativeNoClip::instance());
@@ -74,6 +79,9 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&Fullbright::instance());
     ModuleManager::instance().registerModule(&NoRender::instance());
     ModuleManager::instance().registerModule(&Zoom::instance());
+    ModuleManager::instance().registerModule(&ItemScroller::instance());
+    ModuleManager::instance().registerModule(&ShulkerPreview::instance());
+    ModuleManager::instance().registerModule(&InventoryHUD::instance());
 }
 
 void Client::startup()
@@ -81,25 +89,27 @@ void Client::startup()
     log().info(L"Tsukuyomi {} loaded", TSUKUYOMI_VERSION_W);
     log().info(L"Config and log directory: {}", paths::dataDir().wstring());
 
-    hooks::beModelsOn();
-
     Config::instance().load();
+    writes::finishStartup();
 
     HookManager::instance().initialize();
 
     Scanner::instance().scanAll();
 
+    GameData::instance().onScansReady();
+
     registerModules();
     ModuleManager::instance().loadConfig();
+    ModuleManager::instance().applyWriteBlocks();
     loadHotkeys();
-
-    uiprobe::installCrashProbe();
 
     UiSound::instance().onScansReady();
 
     hooks::installAll();
 
     ModuleManager::instance().onScansReady();
+
+    freezewatch::start();
 
     log().info(L"Settings are in Minecraft's settings screen under Tsukuyomi (END to unload)");
 }
@@ -130,6 +140,7 @@ void pumpThreadMessages()
 
 void Client::mainLoop()
 {
+    m_settingsCheckAt = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!unloadRequested()) {
         pumpThreadMessages();
 
@@ -137,9 +148,9 @@ void Client::mainLoop()
             m_lateHooksDone = hooks::installLate();
         }
 
+        hooks::reportHookCounts();
         frametrace::pump();
         worldmesh::report();
-        atlas::report();
 
         ModuleManager::instance().update();
         uiprobe::pumpSettingsToggle();
@@ -152,7 +163,14 @@ void Client::mainLoop()
             m_settingsSavePending = false;
             ModuleManager::instance().saveConfig();
             if (Config::instance().save()) {
-                log().info(L"Saved the values changed in the settings screen");
+                log().info(L"Saved the changed settings (settings screen / toggle key)");
+            }
+        }
+        if (!m_settingsSavePending && std::chrono::steady_clock::now() >= m_settingsCheckAt) {
+            m_settingsCheckAt = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            ModuleManager::instance().saveConfig();
+            if (Config::instance().saveIfChanged()) {
+                log().info(L"Saved the settings that changed outside the settings screen");
             }
         }
 
@@ -169,6 +187,10 @@ void Client::shutdown()
 {
     log().info(L"Shutting down");
 
+    freezewatch::stop();
+
+    hooks::freezeHookGroups();
+
     log().setNotifier(nullptr);
 
     ModuleManager::instance().shutdown();
@@ -177,19 +199,12 @@ void Client::shutdown()
 
     render::shutdownOverlay();
 
-    ghost::shutdownGhostLayer();
-    boxes::shutdownDepth();
     frametrace::shutdown();
     worldmesh::shutdown();
-    atlas::shutdown();
 
     uiprobe::restoreKeyRows();
 
-    hooks::restoreMaterialBlend();
-
     HookManager::instance().shutdown();
-
-    uiprobe::removeCrashProbe();
 
     saveHotkeys();
     ModuleManager::instance().saveConfig();

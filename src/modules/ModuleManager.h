@@ -15,6 +15,7 @@ public:
 
     void loadConfig();
     void saveConfig();
+    void applyWriteBlocks();
     void onScansReady();
     void update();
     void shutdown();

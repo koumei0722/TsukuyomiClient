@@ -62,6 +62,12 @@ std::filesystem::path logFile()
     return dir.empty() ? std::filesystem::path{} : dir / L"Tsukuyomi.log";
 }
 
+std::filesystem::path hooksFile()
+{
+    const auto& dir = dataDir();
+    return dir.empty() ? std::filesystem::path{} : dir / L"hooks.json";
+}
+
 std::filesystem::path schematicsDir()
 {
     const auto& dir = dataDir();

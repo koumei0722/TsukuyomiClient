@@ -31,6 +31,24 @@ bool callTransactionGuarded(void* gameMode, void* itemStack, int extra)
     }
 }
 
+using SneakingCheckFn = bool(__fastcall*)(void*);
+
+bool askSneakingGuarded(SneakingCheckFn check, void* gameMode, std::size_t playerOffset,
+                        std::size_t contextOffset, bool& sneaking)
+{
+    __try {
+        void* const player = *static_cast<void* const*>(
+            static_cast<void*>(static_cast<std::uint8_t*>(gameMode) + playerOffset));
+        if (player == nullptr) {
+            return false;
+        }
+        sneaking = check(static_cast<std::uint8_t*>(player) + contextOffset);
+        return true;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
 }
 
 FastRightClick& FastRightClick::instance()
@@ -41,8 +59,26 @@ FastRightClick& FastRightClick::instance()
 
 bool FastRightClick::available() const
 {
-    return Scanner::instance().found(Target::UseItem)
-           || Scanner::instance().found(Target::UseItemTransaction);
+    return (Scanner::instance().found(Target::UseItem)
+            || Scanner::instance().found(Target::UseItemTransaction))
+           && Scanner::instance().found(Target::SneakingCheck);
+}
+
+bool FastRightClick::playerSneaking(void* gameMode)
+{
+    if (gameMode == nullptr) {
+        return false;
+    }
+    const auto check = Scanner::instance().addressAs<SneakingCheckFn>(Target::SneakingCheck);
+    if (check == nullptr) {
+        return false;
+    }
+    bool sneaking = false;
+    if (!askSneakingGuarded(check, gameMode, kGameModePlayerOffset, kPlayerContextOffset,
+                            sneaking)) {
+        return false;
+    }
+    return sneaking;
 }
 
 void FastRightClick::saveConfig(nlohmann::json& section) const
@@ -53,9 +89,20 @@ void FastRightClick::saveConfig(nlohmann::json& section) const
     section.erase("intervalMs");
 }
 
-bool FastRightClick::shouldRepeat() const
+bool FastRightClick::shouldRepeat(void* gameMode) const
 {
-    return (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 && input::isInGameplay();
+    if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) == 0 || !input::isInGameplay()) {
+        return false;
+    }
+    if (!playerSneaking(gameMode)) {
+        if (!m_notSneakingLogged) {
+            m_notSneakingLogged = true;
+            log().info(L"FastRightClick: not sneaking, so this use is not repeated (it only "
+                       L"repeats while you sneak)");
+        }
+        return false;
+    }
+    return true;
 }
 
 void FastRightClick::noteExtra(int extra)
@@ -77,7 +124,7 @@ int FastRightClick::onUseItem(void* gameMode, void* itemStack, int extra)
 {
     const int result = hooks::callUseItem(gameMode, itemStack, extra);
 
-    if (m_repeating || m_inTransaction || !enabled() || !shouldRepeat()) {
+    if (m_repeating || m_inTransaction || !enabled() || !shouldRepeat(gameMode)) {
         return result;
     }
 
@@ -101,7 +148,7 @@ int FastRightClick::onUseItemTransaction(void* gameMode, void* itemStack, int ex
 
     const int result = hooks::callUseItemTransaction(gameMode, itemStack, extra);
 
-    if (m_repeating || !enabled() || !shouldRepeat()) {
+    if (m_repeating || !enabled() || !shouldRepeat(gameMode)) {
         m_inTransaction = wasInTransaction;
         return result;
     }

@@ -15,6 +15,8 @@ public:
 
     const wchar_t* name() const override { return L"NoRender"; }
     bool available() const override;
+    bool writeBlocked() const override;
+    void applyWriteBlock() override;
 
     MenuItem buildMenu() override;
     void loadConfig(const nlohmann::json& section) override;
@@ -41,13 +43,22 @@ public:
 
     bool fogSuppressed() const
     {
-        return enabled() && m_off[static_cast<std::size_t>(Stage::Fog)];
+        return enabled() && m_off[static_cast<std::size_t>(Stage::Fog)]
+               && !m_stageBlocked[static_cast<std::size_t>(Stage::Fog)];
     }
+
+    bool particlesSuppressed() const
+    {
+        return enabled() && m_off[static_cast<std::size_t>(Stage::Particles)]
+               && !m_stageBlocked[static_cast<std::size_t>(Stage::Particles)];
+    }
+
+    void noteStageBlocks();
 
 protected:
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return false; }
+    bool persistEnabled() const override { return true; }
 
     enum class OptionSlot {
         Terrain = 0,
@@ -71,6 +82,7 @@ private:
     void applyStages();
 
     bool m_off[kStageCount] = {};
+    bool m_stageBlocked[kStageCount] = {};
     std::vector<Patch> m_patches[kStageCount];
 
     bool m_byOption[kStageCount] = {};

@@ -62,12 +62,22 @@ void ModuleManager::shutdown()
     }
 }
 
+void ModuleManager::applyWriteBlocks()
+{
+    for (Module* module : m_modules) {
+        module->applyWriteBlock();
+    }
+}
+
 std::vector<MenuItem> ModuleManager::buildMenuItems()
 {
     std::vector<MenuItem> items;
     items.reserve(m_modules.size());
     for (Module* module : m_modules) {
         items.push_back(module->buildMenu());
+        if (module->isWriteBlocked()) {
+            items.back().hidden = true;
+        }
     }
     return items;
 }

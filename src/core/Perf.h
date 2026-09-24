@@ -10,10 +10,7 @@ enum class Slot : int {
     Clear,
     Prune,
     Diff,
-    Review,
     Restore,
-    FixTaken,
-    PlaceActors,
     Dirty,
     Publish,
     MeshLookup,
@@ -26,6 +23,10 @@ enum class Slot : int {
     HrCount,
     HrWatch,
     HrClientSide,
+    HrOwnLookup,
+
+    Install,
+    HookApply,
     Count
 };
 

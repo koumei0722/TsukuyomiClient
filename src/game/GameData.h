@@ -24,6 +24,8 @@ public:
     PlayerView playerView() const;
     bool hasPlayerView() const;
 
+    unsigned long long msSinceView() const;
+
     float yaw() const;
 
     void setGameMode(void* gameMode);
@@ -31,26 +33,33 @@ public:
 
     void setPlayer(void* player);
     void* player() const;
+    unsigned long long playerSerial() const;
 
-    void setPlayerAlt(void* player);
+    bool setPlayerAlt(void* player);
     void* playerAlt() const;
+
+    void onScansReady();
+    bool knowsServerPlayer() const;
+    bool isServerPlayer(const void* player) const;
 
     bool playerFeetY(float& outY) const;
 
     bool playerFeet(float& outX, float& outY, float& outZ) const;
 
+    bool playerBoxFeet(float& outX, float& outY, float& outZ) const;
+
+    static constexpr unsigned int kAabbShapeTypeId = 0xBAC1B3CFu;
+    static constexpr std::size_t kAabbShapeStride = 0x20;
+
     bool rawPlayerPos(float& outX, float& outY, float& outZ) const;
-    bool writeRawPlayerPos(float x, float y, float z);
 
     bool hasLivePlayer() const;
     bool findPlayerFromClient(void* clientInstance);
 
     bool adoptPlayerFromEntity(void* entityContext);
 
-    int players(void* out[2]) const;
     static bool rawPosOf(const void* player, float& outX, float& outY, float& outZ);
     static bool targetPosOf(const void* player, float& outX, float& outY, float& outZ);
-    static bool writeRawPosOf(void* player, float x, float y, float z);
 
     static constexpr float kEyeHeight = 1.62f;
 
@@ -75,8 +84,12 @@ private:
     std::atomic<void*> m_gameMode{nullptr};
 
     std::atomic<void*> m_player{nullptr};
-    std::atomic<void*> m_playerAlt{nullptr};
+    mutable std::atomic<void*> m_playerAlt{nullptr};
+    std::atomic<const void*> m_serverPlayerVtable{nullptr};
+    std::atomic<int> m_playerAltLogs{0};
+    std::atomic<unsigned long long> m_playerSerial{0};
     std::atomic<unsigned long long> m_adoptAt{0};
+    std::atomic<unsigned long long> m_viewAt{0};
 };
 
 }

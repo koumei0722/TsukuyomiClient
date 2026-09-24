@@ -1,8 +1,15 @@
 #include "hooks/HookManager.h"
 
+#include "config/WriteSwitches.h"
 #include "core/Logger.h"
+#include "core/Perf.h"
+#include "core/Strings.h"
 
 #include <MinHook.h>
+
+#include <algorithm>
+#include <string>
+#include <vector>
 
 namespace tsukuyomi {
 
@@ -23,6 +30,21 @@ const wchar_t* statusText(MH_STATUS status)
     case MH_ERROR_MEMORY_ALLOC:       return L"memory allocation failed";
     case MH_ERROR_MEMORY_PROTECT:     return L"memory protection change failed";
     default:                          return L"unknown error";
+    }
+}
+
+const wchar_t* groupName(HookGroup group)
+{
+    switch (group) {
+    case HookGroup::Always:     return L"always";
+    case HookGroup::Ghost:      return L"ghost";
+    case HookGroup::Diag:       return L"diag";
+    case HookGroup::Fullbright: return L"fullbright";
+    case HookGroup::Ability:    return L"ability";
+    case HookGroup::Tool:       return L"tool";
+    case HookGroup::Fog:        return L"fog";
+    case HookGroup::Particles:  return L"particles";
+    default:                    return L"?";
     }
 }
 
@@ -51,11 +73,21 @@ bool HookManager::initialize()
     return true;
 }
 
-bool HookManager::create(void* target, void* detour, void** original, const wchar_t* name)
+bool HookManager::create(void* target, void* detour, void** original, const wchar_t* name,
+                         HookGroup group)
 {
     const std::lock_guard<std::recursive_mutex> guard(m_lock);
     if (!m_initialized) {
         log().error(L"Cannot hook {} (MinHook not initialized)", name);
+        return false;
+    }
+    writes::noteUnknown(toUtf8(name));
+    if (!writes::allowed(name)) {
+        static std::vector<std::wstring> told;
+        if (std::find(told.begin(), told.end(), name) == told.end()) {
+            told.emplace_back(name);
+            log().info(L"{} is turned off in hooks.json; not hooked", name);
+        }
         return false;
     }
     if (target == nullptr) {
@@ -69,15 +101,22 @@ bool HookManager::create(void* target, void* detour, void** original, const wcha
         return false;
     }
 
-    status = MH_QueueEnableHook(target);
-    if (status != MH_OK) {
-        log().error(L"Failed to queue hook for {}: {}", name, statusText(status));
-        MH_RemoveHook(target);
-        return false;
+    const bool wantNow = m_groupOn[static_cast<std::size_t>(group)];
+    if (wantNow) {
+        status = MH_QueueEnableHook(target);
+        if (status != MH_OK) {
+            log().error(L"Failed to queue hook for {}: {}", name, statusText(status));
+            MH_RemoveHook(target);
+            return false;
+        }
     }
 
-    m_targets.push_back(target);
-    log().info(L"{} prepared", name);
+    m_entries.push_back(Entry{target, group});
+    if (group == HookGroup::Always) {
+        log().info(L"{} prepared", name);
+    } else {
+        log().info(L"{} prepared ({}{})", name, groupName(group), wantNow ? L", on" : L", off");
+    }
     return true;
 }
 
@@ -88,13 +127,80 @@ bool HookManager::applyQueued()
         return false;
     }
 
-    const MH_STATUS status = MH_ApplyQueued();
+    MH_STATUS status = MH_OK;
+    {
+        const perf::Scope perfScope{perf::Slot::HookApply};
+        status = MH_ApplyQueued();
+    }
     if (status != MH_OK) {
         log().error(L"Failed to enable hooks: {}", statusText(status));
         return false;
     }
 
-    log().success(L"{} hooks enabled", m_targets.size());
+    std::size_t on = 0;
+    for (const Entry& entry : m_entries) {
+        if (m_groupOn[static_cast<std::size_t>(entry.group)]) {
+            ++on;
+        }
+    }
+    log().success(L"{} hooks enabled ({} prepared)", on, m_entries.size());
+    return true;
+}
+
+bool HookManager::groupEnabled(HookGroup group) const
+{
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
+    return m_groupOn[static_cast<std::size_t>(group)];
+}
+
+std::size_t HookManager::groupSize(HookGroup group) const
+{
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
+    std::size_t count = 0;
+    for (const Entry& entry : m_entries) {
+        if (entry.group == group) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+bool HookManager::setGroupEnabled(HookGroup group, bool on)
+{
+    const std::lock_guard<std::recursive_mutex> guard(m_lock);
+    if (!m_initialized || group == HookGroup::Always) {
+        return false;
+    }
+    const auto index = static_cast<std::size_t>(group);
+    if (m_groupOn[index] == on) {
+        return true;
+    }
+    m_groupOn[index] = on;
+
+    std::size_t queued = 0;
+    for (const Entry& entry : m_entries) {
+        if (entry.group != group) {
+            continue;
+        }
+        const MH_STATUS status =
+            on ? MH_QueueEnableHook(entry.target) : MH_QueueDisableHook(entry.target);
+        if (status != MH_OK) {
+            log().warn(L"Could not queue a {} hook ({})", groupName(group), statusText(status));
+            continue;
+        }
+        ++queued;
+    }
+    MH_STATUS status = MH_OK;
+    {
+        const perf::Scope perfScope{perf::Slot::HookApply};
+        status = MH_ApplyQueued();
+    }
+    if (status != MH_OK) {
+        log().error(L"Failed to switch the {} hooks {}: {}", groupName(group),
+                    on ? L"on" : L"off", statusText(status));
+        return false;
+    }
+    log().info(L"Hooks: {} {} ({} hooks)", groupName(group), on ? L"on" : L"off", queued);
     return true;
 }
 
@@ -105,11 +211,13 @@ void HookManager::shutdown()
         return;
     }
 
-    for (void* target : m_targets) {
-        MH_DisableHook(target);
-        MH_RemoveHook(target);
+    if (const MH_STATUS status = MH_DisableHook(MH_ALL_HOOKS); status != MH_OK) {
+        log().warn(L"MinHook: disabling all hooks failed: {}", statusText(status));
     }
-    m_targets.clear();
+    for (const Entry& entry : m_entries) {
+        MH_RemoveHook(entry.target);
+    }
+    m_entries.clear();
 
     const MH_STATUS status = MH_Uninitialize();
     if (status != MH_OK) {

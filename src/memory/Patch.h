@@ -8,7 +8,7 @@ namespace tsukuyomi {
 class Patch {
 public:
     Patch() = default;
-    Patch(void* address, std::vector<std::byte> patched);
+    Patch(void* address, std::vector<std::byte> patched, const char* name = nullptr);
     ~Patch();
 
     Patch(const Patch&) = delete;
@@ -33,6 +33,6 @@ private:
     bool m_applied = false;
 };
 
-Patch makeNopPatch(void* address, size_t size);
+Patch makeNopPatch(void* address, size_t size, const char* name = nullptr);
 
 }
