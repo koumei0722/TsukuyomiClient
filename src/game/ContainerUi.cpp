@@ -1,7 +1,10 @@
 #include "game/ContainerUi.h"
+#include "game/EnchantKey.h"
 
 #include "game/BlockRegistry.h"
 #include "game/GameCallable.h"
+
+#include "hooks/Detours.h"
 
 #include "core/Logger.h"
 #include "core/Strings.h"
@@ -308,19 +311,16 @@ const BindSlot* slotOf(const GameCallable* self)
 
 bool __fastcall invokeBool(GameCallable* self)
 {
-    ++g_stats.bindCalls;
     const BindSlot* s = slotOf(self);
     return s != nullptr && s->fn != 0 && reinterpret_cast<BoolGetter>(s->fn)(s->arg);
 }
 int __fastcall invokeInt(GameCallable* self)
 {
-    ++g_stats.bindCalls;
     const BindSlot* s = slotOf(self);
     return (s != nullptr && s->fn != 0) ? reinterpret_cast<IntGetter>(s->fn)(s->arg) : 0;
 }
 void* __fastcall invokeText(void* ret, GameCallable* self)
 {
-    ++g_stats.bindCalls;
     char text[16]{};
     const BindSlot* s = slotOf(self);
     if (s != nullptr && s->fn != 0) {
@@ -342,7 +342,6 @@ bool __fastcall invokeTrue(GameCallable*)
 }
 int __fastcall invokeCollInt(GameCallable* self, const std::string* coll, const int* index)
 {
-    ++g_stats.bindCalls;
     if (self == nullptr || coll == nullptr || index == nullptr || self->spare[0] == 0) {
         return 0;
     }
@@ -356,7 +355,6 @@ void __fastcall moveCollection(GameCallable* src, GameCallable* dst)
 }
 int __fastcall invokeButton(GameCallable* self, void*)
 {
-    ++g_stats.buttonCalls;
     const BindSlot* s = slotOf(self);
     if (s != nullptr && s->fn != 0) {
         reinterpret_cast<ButtonHandler>(s->fn)(s->arg);
@@ -984,7 +982,6 @@ void onScreenConstructed(void* ctrl)
         return;
     }
     g_constructed = ctrl;
-    g_stats.registered = 0;
     if (g_listener != nullptr && g_bindReady) {
         g_listener->onScreenCreated(ctrl);
     }
@@ -1023,7 +1020,6 @@ bool bindWith(BindRegFn reg, const CallableOps& ops, const char* kind, void* ctr
         noteFault(L"binding registration");
         return false;
     }
-    ++g_stats.registered;
     return true;
 }
 }
@@ -1050,18 +1046,33 @@ struct PersistentCode {
     std::uint8_t alwaysTrue[4];
     std::uint8_t move[12];
     std::uint8_t destroy[4];
+    std::uint8_t textTramp[8];
+    std::uint8_t emptyText[32];
     alignas(8) const void* boolOps[3];
     const void* floatOps[3];
     const void* trueOps[3];
+    const void* textOps[3];
 };
 struct PersistentValues {
     std::uint8_t bools[kPersistentSlots];
     float floats[kPersistentSlots];
 };
+struct TextSlot {
+    void* fn;
+    volatile std::uint64_t length;
+    char text[kPersistentTextBytes - 16];
+};
+static_assert(sizeof(TextSlot) == kPersistentTextBytes);
+struct PersistentText {
+    TextSlot slots[kPersistentTextSlots];
+};
+static_assert(sizeof(PersistentText) <= 4096 * 3);
 
 PersistentCode* g_persistCode = nullptr;
 PersistentValues* g_persistValues = nullptr;
+PersistentText* g_persistText = nullptr;
 std::once_flag g_persistOnce;
+std::atomic<int> g_textInside{0};
 
 void makePersistent()
 {
@@ -1070,7 +1081,7 @@ void makePersistent()
     const SIZE_T page = info.dwPageSize;
     static_assert(sizeof(PersistentCode) < 4096 && sizeof(PersistentValues) < 4096);
     auto* const base = static_cast<std::uint8_t*>(
-        VirtualAlloc(nullptr, page * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        VirtualAlloc(nullptr, page * 5, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (base == nullptr) {
         log().warn(L"ContainerUi: could not allocate the persistent bindings (error {})", GetLastError());
         return;
@@ -1081,11 +1092,17 @@ void makePersistent()
     constexpr std::uint8_t kTrue[] = {0xB0, 0x01, 0xC3};
     constexpr std::uint8_t kMove[] = {0x48, 0x8B, 0x41, 0x08, 0x48, 0x89, 0x42, 0x08, 0xC3};
     constexpr std::uint8_t kRet[] = {0xC3};
+    constexpr std::uint8_t kTextTramp[] = {0x48, 0x8B, 0x42, 0x08, 0xFF, 0x20};
+    constexpr std::uint8_t kEmptyText[] = {0x31, 0xC0, 0x48, 0x89, 0x01, 0x48, 0x89, 0x41, 0x08,
+                                          0x48, 0x89, 0x41, 0x10, 0x48, 0xC7, 0x41, 0x18, 0x0F,
+                                          0x00, 0x00, 0x00, 0x48, 0x89, 0xC8, 0xC3};
     std::memcpy(code->boolRead, kBoolRead, sizeof(kBoolRead));
     std::memcpy(code->floatRead, kFloatRead, sizeof(kFloatRead));
     std::memcpy(code->alwaysTrue, kTrue, sizeof(kTrue));
     std::memcpy(code->move, kMove, sizeof(kMove));
     std::memcpy(code->destroy, kRet, sizeof(kRet));
+    std::memcpy(code->textTramp, kTextTramp, sizeof(kTextTramp));
+    std::memcpy(code->emptyText, kEmptyText, sizeof(kEmptyText));
     code->boolOps[0] = code->move;
     code->boolOps[1] = code->destroy;
     code->boolOps[2] = code->boolRead;
@@ -1095,6 +1112,9 @@ void makePersistent()
     code->trueOps[0] = code->move;
     code->trueOps[1] = code->destroy;
     code->trueOps[2] = code->alwaysTrue;
+    code->textOps[0] = code->move;
+    code->textOps[1] = code->destroy;
+    code->textOps[2] = code->textTramp;
     DWORD old = 0;
     if (!VirtualProtect(base, page, PAGE_EXECUTE_READ, &old)) {
         log().warn(L"ContainerUi: could not make the persistent bindings executable (error {})", GetLastError());
@@ -1103,6 +1123,13 @@ void makePersistent()
     }
     FlushInstructionCache(GetCurrentProcess(), base, page);
     g_persistValues = reinterpret_cast<PersistentValues*>(base + page);
+    auto* const text = reinterpret_cast<PersistentText*>(base + page * 2);
+    for (int i = 0; i < kPersistentTextSlots; ++i) {
+        text->slots[i].fn = code->emptyText;
+        text->slots[i].length = 0;
+        text->slots[i].text[0] = '\0';
+    }
+    g_persistText = text;
     g_persistCode = code;
 }
 
@@ -1127,8 +1154,59 @@ bool bindPersistent(BindRegFn reg, const void* const* ops, void* ctrl, const cha
         noteFault(L"persistent binding registration");
         return false;
     }
-    ++g_stats.registered;
     return true;
+}
+
+TextSlot* textSlot(int slot)
+{
+    if (slot < 0 || slot >= kPersistentTextSlots || !persistentReady()) {
+        return nullptr;
+    }
+    return &g_persistText->slots[slot];
+}
+
+void* __fastcall invokePersistentText(void* ret, GameCallable* self)
+{
+    g_textInside.fetch_add(1, std::memory_order_acquire);
+
+    char text[kPersistentTextBytes - 16]{};
+    std::uint64_t length = 0;
+    if (self != nullptr && self->capture != nullptr) {
+        const auto* const slot = static_cast<const TextSlot*>(self->capture);
+        length = slot->length;
+        if (length > sizeof(text) - 1) {
+            length = sizeof(text) - 1;
+        }
+        std::memcpy(text, slot->text, static_cast<std::size_t>(length));
+    }
+    text[length] = '\0';
+
+    auto* const out = static_cast<unsigned char*>(ret);
+    std::memset(out, 0, 0x20);
+    void* buf = nullptr;
+    if (length > 15) {
+        buf = hooks::callGameAllocate(static_cast<std::size_t>(length) + 1);
+        if (buf == nullptr) {
+            length = 15;
+            text[length] = '\0';
+        }
+    }
+    if (buf != nullptr) {
+        std::memcpy(buf, text, static_cast<std::size_t>(length));
+        static_cast<char*>(buf)[length] = '\0';
+        const auto ptr = reinterpret_cast<std::uintptr_t>(buf);
+        std::memcpy(out, &ptr, sizeof(ptr));
+        std::memcpy(out + 0x10, &length, sizeof(length));
+        std::memcpy(out + 0x18, &length, sizeof(length));
+    } else {
+        std::memcpy(out, text, static_cast<std::size_t>(length));
+        const std::uint64_t capacity = 15;
+        std::memcpy(out + 0x10, &length, sizeof(length));
+        std::memcpy(out + 0x18, &capacity, sizeof(capacity));
+    }
+
+    g_textInside.fetch_sub(1, std::memory_order_release);
+    return ret;
 }
 
 }
@@ -1160,6 +1238,50 @@ bool bindPersistentFloat(void* ctrl, const char* name, int slot)
     volatile float* const value = persistentFloat(slot);
     return value != nullptr && bindPersistent(g_bindFloat, g_persistCode->floatOps, ctrl, name, value);
 }
+
+bool writePersistentText(int slot, const char* text, std::size_t length)
+{
+    TextSlot* const s = textSlot(slot);
+    if (s == nullptr || text == nullptr) {
+        return false;
+    }
+    if (length > sizeof(s->text) - 1) {
+        length = sizeof(s->text) - 1;
+    }
+    s->length = 0;
+    std::memcpy(s->text, text, length);
+    s->text[length] = '\0';
+    s->length = length;
+    return true;
+}
+
+bool bindPersistentText(void* ctrl, const char* name, int slot)
+{
+    TextSlot* const s = textSlot(slot);
+    if (s == nullptr) {
+        return false;
+    }
+    InterlockedExchangePointer(&s->fn, reinterpret_cast<void*>(&invokePersistentText));
+    return bindPersistent(g_bindText, g_persistCode->textOps, ctrl, name, s);
+}
+
+void detachPersistentText()
+{
+    if (g_persistText == nullptr || g_persistCode == nullptr) {
+        return;
+    }
+    for (int i = 0; i < kPersistentTextSlots; ++i) {
+        InterlockedExchangePointer(&g_persistText->slots[i].fn, g_persistCode->emptyText);
+        g_persistText->slots[i].length = 0;
+        g_persistText->slots[i].text[0] = '\0';
+    }
+    for (int waited = 0; waited < 200 && g_textInside.load(std::memory_order_acquire) != 0; ++waited) {
+        Sleep(1);
+    }
+    if (g_textInside.load(std::memory_order_acquire) != 0) {
+        log().warn(L"ContainerUi: a persistent text getter is still running after 200 ms");
+    }
+}
 bool bindText(void* ctrl, const char* name, TextGetter fn, std::uintptr_t arg)
 {
     return bindWith(g_bindText, kTextOps, "t", ctrl, name, reinterpret_cast<std::uintptr_t>(fn),
@@ -1182,7 +1304,6 @@ bool onButtonPressed(void* ctrl, const char* buttonName, ButtonHandler fn, std::
         noteFault(L"button registration");
         return false;
     }
-    ++g_stats.registered;
     return true;
 }
 
@@ -1205,7 +1326,6 @@ bool onButtonHovered(void* ctrl, const char* buttonName, ButtonHandler fn, std::
         noteFault(L"hover registration");
         return false;
     }
-    ++g_stats.registered;
     return true;
 }
 
@@ -1236,7 +1356,6 @@ bool bindCollectionInt(void* ctrl, const char* name, CollIntGetter fn, std::uint
         noteFault(L"collection binding registration");
         return false;
     }
-    ++g_stats.registered;
     return true;
 }
 
@@ -1806,20 +1925,87 @@ const void* userDataOf(const void* stack)
     return root;
 }
 
-bool nbtItems(const void* stack, std::vector<NbtItem>& out)
+std::string enchantKey(const void* stack)
 {
-    out.clear();
-    if (g_compoundGet == nullptr || g_stackUserDataOffset < 0 || isEmpty(stack)) {
-        return false;
+    if (g_compoundGet == nullptr) {
+        return {};
     }
-    void* root = nullptr;
-    if (!readPointer(static_cast<const std::byte*>(stack) + g_stackUserDataOffset, root)) {
-        return false;
+    const void* const root = userDataOf(stack);
+    void* rootVtable = nullptr;
+    if (root == nullptr || !readPointer(root, rootVtable) || rootVtable == nullptr
+        || !memory::inGameModule(rootVtable)) {
+        return {};
     }
+    const void* const list = compoundGet(root, "ench");
+    if (list == nullptr || tagType(list) != 9) {
+        return {};
+    }
+    void* first = nullptr;
+    void* last = nullptr;
+    if (!readPointer(static_cast<const std::byte*>(list) + 0x08, first)
+        || !readPointer(static_cast<const std::byte*>(list) + 0x10, last)
+        || first == nullptr || last == nullptr) {
+        return {};
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(first);
+    const auto end = reinterpret_cast<std::uintptr_t>(last);
+    if (end < begin || (end - begin) % sizeof(void*) != 0) {
+        return {};
+    }
+    const std::size_t count = (std::min)(static_cast<std::size_t>((end - begin) / sizeof(void*)),
+                                         std::size_t{64});
+    std::vector<std::pair<int, int>> enchants;
+    enchants.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        void* elem = nullptr;
+        void* vt = nullptr;
+        if (!readPointer(static_cast<const std::byte*>(first) + i * sizeof(void*), elem)
+            || elem == nullptr || !readPointer(elem, vt) || vt != rootVtable) {
+            continue;
+        }
+        const void* const idTag = compoundGet(elem, "id");
+        const void* const levelTag = compoundGet(elem, "lvl");
+        std::uint16_t id = 0;
+        std::uint16_t level = 0;
+        if (tagType(idTag) != 2 || tagType(levelTag) != 2
+            || !readWordGuarded(static_cast<const std::byte*>(idTag) + 0x08, id)
+            || !readWordGuarded(static_cast<const std::byte*>(levelTag) + 0x08, level)) {
+            continue;
+        }
+        enchants.emplace_back(static_cast<std::int16_t>(id), static_cast<std::int16_t>(level));
+    }
+    return formatEnchantKey(std::move(enchants));
+}
+
+int nbtTagCount(const void* stack)
+{
+    const void* const root = userDataOf(stack);
+    void* rootVtable = nullptr;
     if (root == nullptr) {
-        return true;
+        return 0;
     }
-    return nbtItemsOfTag(root, out);
+    std::uint64_t size = 0;
+    if (!readPointer(root, rootVtable) || rootVtable == nullptr || !memory::inGameModule(rootVtable)
+        || !memory::copyGuarded(static_cast<const std::byte*>(root) + 0x10, &size, sizeof(size)) || size > 4096) {
+        return -1;
+    }
+    return static_cast<int>(size);
+}
+
+bool nbtInt(const void* stack, std::string_view key, std::int32_t& out)
+{
+    if (g_compoundGet == nullptr) {
+        return false;
+    }
+    const void* const root = userDataOf(stack);
+    void* rootVtable = nullptr;
+    if (root == nullptr || !readPointer(root, rootVtable) || rootVtable == nullptr
+        || !memory::inGameModule(rootVtable)) {
+        return false;
+    }
+    const void* const tag = compoundGet(root, key);
+    return tag != nullptr && tagType(tag) == 3
+        && memory::copyGuarded(static_cast<const std::byte*>(tag) + 0x08, &out, sizeof(out));
 }
 
 bool itemsListBounds(const void* root, const void*& first, const void*& last)
@@ -1963,11 +2149,6 @@ const void* screenStackAt(const std::string& coll, int index)
     const void* one = callScreenGetItemGuarded(reinterpret_cast<const void*>(g_screenGetItem), g_screen.ctrl,
                                                &name, index, faulted);
     return faulted ? nullptr : one;
-}
-
-bool synthesizing()
-{
-    return g_synthDepth.load(std::memory_order_relaxed) > 0;
 }
 
 namespace {

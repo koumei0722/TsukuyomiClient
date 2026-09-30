@@ -17,17 +17,9 @@ enum class LogLevel {
     Error,
 };
 
-struct LogEntry {
-    LogLevel level = LogLevel::Info;
-    std::wstring timestamp;
-    std::wstring text;
-};
-
 class Logger {
 public:
     static Logger& instance();
-
-    void setNotifier(std::function<void()> notifier);
 
     void write(LogLevel level, std::wstring text);
 
@@ -55,16 +47,10 @@ public:
         write(LogLevel::Error, std::format(fmt, std::forward<Args>(args)...));
     }
 
-    std::vector<LogEntry> snapshot() const;
-
 private:
     Logger() = default;
 
-    static constexpr size_t kMaxEntries = 500;
-
-    mutable std::mutex m_mutex;
-    std::vector<LogEntry> m_entries;
-    std::function<void()> m_notifier;
+    std::mutex m_mutex;
     std::ofstream m_file;
     bool m_fileTried = false;
 };

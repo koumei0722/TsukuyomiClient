@@ -39,6 +39,40 @@ bool checkAccess(const void* address, size_t size, DWORD allowedProtection)
 
 }
 
+bool copyGuarded(const void* src, void* out, std::size_t size)
+{
+    if (!plausiblePointer(reinterpret_cast<std::uintptr_t>(src) & ~std::uintptr_t{7})
+        || !plausiblePointer(reinterpret_cast<std::uintptr_t>(out) & ~std::uintptr_t{7})) {
+        return false;
+    }
+    __try {
+        std::memcpy(out, src, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                        || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+bool writeGuarded(void* dst, const void* in, std::size_t size)
+{
+    if (!plausiblePointer(reinterpret_cast<std::uintptr_t>(dst) & ~std::uintptr_t{7})
+        || !plausiblePointer(reinterpret_cast<std::uintptr_t>(in) & ~std::uintptr_t{7})) {
+        return false;
+    }
+    __try {
+        std::memcpy(dst, in, size);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                        || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
 bool isReadable(const void* address, size_t size)
 {
     constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY

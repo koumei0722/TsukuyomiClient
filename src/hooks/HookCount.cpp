@@ -38,11 +38,6 @@ bool HookCounter::counting()
     return g_counting.load(std::memory_order_relaxed);
 }
 
-bool countingHooks()
-{
-    return g_counting.load(std::memory_order_relaxed);
-}
-
 void setCountingHooks(bool on)
 {
     if (g_counting.exchange(on, std::memory_order_relaxed) == on) {

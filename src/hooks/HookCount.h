@@ -28,7 +28,6 @@ private:
 };
 
 void setCountingHooks(bool on);
-bool countingHooks();
 
 void reportHookCounts();
 

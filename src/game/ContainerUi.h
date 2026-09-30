@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tsukuyomi::containerui {
@@ -110,8 +111,6 @@ std::uintptr_t itemKey(const void* stack);
 bool click(const std::string& coll, int index, Click kind);
 bool dropCursor(bool all);
 
-bool synthesizing();
-
 int itemRarityOf(const void* item);
 int rarityOf(const void* stack);
 
@@ -127,9 +126,11 @@ struct NbtItem {
     bool enchanted = false;
     const void* elem = nullptr;
 };
-bool nbtItems(const void* stack, std::vector<NbtItem>& out);
 bool nbtItemsOfTag(const void* root, std::vector<NbtItem>& out);
 const void* userDataOf(const void* stack);
+std::string enchantKey(const void* stack);
+int nbtTagCount(const void* stack);
+bool nbtInt(const void* stack, std::string_view key, std::int32_t& out);
 bool itemsListBounds(const void* root, const void*& first, const void*& last);
 
 inline constexpr int kGlintBit = 0x8000;
@@ -155,12 +156,19 @@ bool bindingsAvailable();
 bool bindBool(void* ctrl, const char* name, BoolGetter fn, std::uintptr_t arg);
 bool bindInt(void* ctrl, const char* name, IntGetter fn, std::uintptr_t arg);
 bool bindText(void* ctrl, const char* name, TextGetter fn, std::uintptr_t arg);
-inline constexpr int kPersistentSlots = 16;
+inline constexpr int kPersistentSlots = 256;
 bool floatBindingsAvailable();
 volatile std::uint8_t* persistentBool(int slot);
 volatile float* persistentFloat(int slot);
 bool bindPersistentBool(void* ctrl, const char* name, int slot);
 bool bindPersistentFloat(void* ctrl, const char* name, int slot);
+
+inline constexpr int kPersistentTextSlots = 96;
+inline constexpr int kPersistentTextBytes = 128;
+inline constexpr int kPersistentTextMax = kPersistentTextBytes - 17;
+bool writePersistentText(int slot, const char* text, std::size_t length);
+bool bindPersistentText(void* ctrl, const char* name, int slot);
+void detachPersistentText();
 bool onButtonPressed(void* ctrl, const char* buttonName, ButtonHandler fn, std::uintptr_t arg);
 bool onButtonHovered(void* ctrl, const char* buttonName, ButtonHandler fn, std::uintptr_t arg);
 void requestRefresh();
@@ -177,9 +185,6 @@ struct Stats {
     unsigned long long hoverEvents = 0;
     unsigned long long ticks = 0;
     unsigned long long tickCalls = 0;
-    unsigned long long bindCalls = 0;
-    unsigned long long buttonCalls = 0;
-    int registered = 0;
 };
 Stats stats();
 

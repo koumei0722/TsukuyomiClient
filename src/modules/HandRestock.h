@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
+#include <set>
+#include <string>
+#include <vector>
 
 #include "game/HolderTable.h"
 #include "game/ItemStackOps.h"
@@ -20,6 +24,7 @@ public:
     bool available() const override;
 
     void onScansReady() override;
+    void loadConfig(const nlohmann::json& section) override;
     void saveConfig(nlohmann::json& section) const override;
 
     void onSetSelectedSlot(void* holder);
@@ -182,8 +187,13 @@ private:
         std::uint8_t count = 0;
 
         int total = 0;
+        std::string name;
     };
     HandState m_last[kSpotCount];
+    mutable std::mutex m_excludedMutex;
+    std::set<std::string> m_excluded;
+    std::vector<std::string> restockCommand(const std::vector<std::string>& args);
+    std::string mainHandItemName() const;
     Clock::time_point m_nextRefillAt[kSpotCount]{};
 
     Clock::time_point m_ignoreUntil[kSpotCount]{};

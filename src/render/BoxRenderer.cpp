@@ -101,6 +101,11 @@ struct Snapshot {
 };
 std::mutex g_camLock;
 Snapshot g_cam;
+constexpr std::ptrdiff_t kPerspectiveStride = 0x120;
+std::atomic<int> g_perspective{0};
+std::atomic<unsigned long long> g_perspectiveAt{0};
+constexpr unsigned long long kPerspectiveStaleMs = 1000;
+std::atomic<unsigned> g_perspectiveViewMissing{0};
 
 std::mutex g_boxLock;
 std::shared_ptr<const std::vector<blocks::DiffBox>> g_boxes;
@@ -148,10 +153,11 @@ void noteCamera(void* cameraBase)
     float proj[16];
     float view[16];
     bool ok = false;
+    std::byte savedMatrices[0x80];
     if (g_projFound.load(std::memory_order_acquire)
-        && memory::isReadable(base + at, 0x80)) {
-        std::memcpy(proj, base + at, sizeof(proj));
-        std::memcpy(view, base + at + 0x40, sizeof(view));
+        && memory::copyGuarded(base + at, savedMatrices, sizeof(savedMatrices))) {
+        std::memcpy(proj, savedMatrices, sizeof(proj));
+        std::memcpy(view, savedMatrices + 0x40, sizeof(view));
         ok = looksLikeProjection(proj) && looksLikeView(view);
     }
     if (!ok) {
@@ -196,15 +202,29 @@ void noteCamera(void* cameraBase)
     }
 
     float eye[3];
-    std::memcpy(&eye[0], base + kCameraX, sizeof(float));
-    std::memcpy(&eye[1], base + kCameraY, sizeof(float));
-    std::memcpy(&eye[2], base + kCameraZ, sizeof(float));
-    if (!finiteFloat(eye[0]) || !finiteFloat(eye[1]) || !finiteFloat(eye[2])) {
+    static_assert(kCameraY == kCameraX + sizeof(float) && kCameraZ == kCameraY + sizeof(float));
+    if (!memory::copyGuarded(base + kCameraX, eye, sizeof(eye))
+        || !finiteFloat(eye[0]) || !finiteFloat(eye[1]) || !finiteFloat(eye[2])) {
         std::lock_guard<std::mutex> guard(g_camLock);
         g_cam.valid = false;
         return;
     }
 
+    const unsigned long long perspectiveAt = g_perspectiveAt.load(std::memory_order_acquire);
+    const int perspective = g_perspective.load(std::memory_order_relaxed);
+    if (perspectiveAt != 0 && GetTickCount64() - perspectiveAt < kPerspectiveStaleMs
+        && (perspective == 1 || perspective == 2)) {
+        float other[16];
+        if (memory::copyGuarded(base + at + 0x40 + perspective * kPerspectiveStride, other, sizeof(other))
+            && looksLikeView(other)) {
+            std::memcpy(view, other, sizeof(view));
+        } else if (g_perspectiveViewMissing.fetch_add(1, std::memory_order_relaxed) == 0) {
+            log().warn(L"BoxRenderer: the view matrix for perspective {} was not found (camera {:#x}, +{:#x}); "
+                       L"using the first person one",
+                       perspective, reinterpret_cast<std::uintptr_t>(base),
+                       static_cast<std::uintptr_t>(at + 0x40 + perspective * kPerspectiveStride));
+        }
+    }
     Snapshot snap;
     snap.eye[0] = eye[0];
     snap.eye[1] = eye[1];
@@ -244,6 +264,12 @@ bool cameraSnapshot(float eye[3], float vp[16])
     std::memcpy(eye, g_cam.eye, sizeof(g_cam.eye));
     std::memcpy(vp, g_cam.vp, sizeof(g_cam.vp));
     return true;
+}
+
+void noteViewPerspective(int perspective)
+{
+    g_perspective.store(perspective, std::memory_order_relaxed);
+    g_perspectiveAt.store(GetTickCount64(), std::memory_order_release);
 }
 
 std::shared_ptr<const std::vector<blocks::DiffBox>> boxSnapshot()

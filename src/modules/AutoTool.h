@@ -151,6 +151,7 @@ private:
     static constexpr std::size_t kMaxHeld = 8;
     Held m_held[kMaxHeld];
     std::size_t m_heldCount = 0;
+    int m_attackButton = -1;
     void flushHeld(bool dropAll);
     std::atomic<unsigned long long> m_lastAttackMs{0};
     std::atomic<void*> m_attackOwner{nullptr};

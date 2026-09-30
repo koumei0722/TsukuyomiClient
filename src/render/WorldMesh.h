@@ -1,10 +1,14 @@
 #pragma once
 
+#include "render/DebugLine.h"
+
+#include <vector>
+
 namespace tsukuyomi::worldmesh {
 
-bool installHooks();
+void setDebugLines(std::vector<DebugLine> lines);
 
-int mode();
+bool installHooks();
 
 bool active(bool xray);
 

@@ -148,12 +148,6 @@ ItemScroller::Step ItemScroller::clearGridStep(bool nonMatchingOnly)
     return ok ? Step::Done : Step::Fail;
 }
 
-bool ItemScroller::outputMatchesSelected() const
-{
-    const Recipe& r = m_recipes[static_cast<size_t>(m_selectedRecipe)];
-    return !r.empty() && matchesIngredient(stackOf(outputSlot()), r.result);
-}
-
 ItemScroller::Step ItemScroller::fillGridStep(const Recipe& recipe, bool fillStacks)
 {
     if (recipe.empty() || !cursorEmpty()) {
@@ -708,9 +702,9 @@ void ItemScroller::onRecipeViewKeys()
         loadRecipes();
     }
     auto edge = [this](int slot, int vk) {
-        const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
-        const bool e = down && !m_viewKeysWas[static_cast<size_t>(slot)];
-        m_viewKeysWas[static_cast<size_t>(slot)] = down;
+        const std::uint64_t seq = keySeq(vk);
+        const bool e = seq != m_viewKeysSeq[static_cast<size_t>(slot)];
+        m_viewKeysSeq[static_cast<size_t>(slot)] = seq;
         return e;
     };
     for (int k = 0; k < 9; ++k) {
@@ -718,7 +712,7 @@ void ItemScroller::onRecipeViewKeys()
             changeRecipeSelection(k);
         }
     }
-    const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    const bool shift = keyHeld(VK_SHIFT);
     const int jump = shift ? kRecipesPerPage : kRecipesPerPage / 2;
     if (edge(9, VK_UP)) {
         changeRecipeSelection(m_selectedRecipe - 1);

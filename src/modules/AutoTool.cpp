@@ -1,4 +1,5 @@
 #include "modules/AutoTool.h"
+#include "input/GameButtons.h"
 
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
@@ -661,6 +662,7 @@ void AutoTool::saveConfig(nlohmann::json& section) const
 
 void AutoTool::onScansReady()
 {
+    m_attackButton = GameButtons::instance().watchButton(gamebuttonlogic::button::destroyOrAttack);
     if (!available() && enabled()) {
         log().warn(L"AutoTool: required functions not found, disabling");
         setEnabled(false);
@@ -1107,7 +1109,7 @@ void AutoTool::onUpdate()
         Clock::time_point(Clock::duration(m_lastSpeedQuery.load(std::memory_order_relaxed)));
 
     const bool idle = (Clock::now() - lastQuery) > std::chrono::milliseconds(kIdleRestoreMs);
-    const bool released = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0;
+    const bool released = !GameButtons::instance().buttonHeld(m_attackButton);
     const bool unfocused = !input::isInGameplay();
     const bool fighting = attackedRecently();
 

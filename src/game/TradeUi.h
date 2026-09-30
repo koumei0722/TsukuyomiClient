@@ -13,7 +13,6 @@ bool available();
 
 void onHoverInvoke(const void* bag);
 void onSecondaryInvoke(void* ctrl, const void* bag);
-void setSelectInvoke(const void* original);
 
 class Listener {
 public:

@@ -26,8 +26,6 @@ public:
 
     unsigned long long msSinceView() const;
 
-    float yaw() const;
-
     void setGameMode(void* gameMode);
     void* gameMode() const;
 
@@ -41,8 +39,8 @@ public:
     void onScansReady();
     bool knowsServerPlayer() const;
     bool isServerPlayer(const void* player) const;
-
-    bool playerFeetY(float& outY) const;
+    const void* serverPlayerVtable() const { return m_serverPlayerVtable.load(std::memory_order_acquire); }
+    const void* playerVtable() const { return m_playerVtable.load(std::memory_order_acquire); }
 
     bool playerFeet(float& outX, float& outY, float& outZ) const;
 
@@ -59,20 +57,14 @@ public:
     bool adoptPlayerFromEntity(void* entityContext);
 
     static bool rawPosOf(const void* player, float& outX, float& outY, float& outZ);
-    static bool targetPosOf(const void* player, float& outX, float& outY, float& outZ);
+    static bool previousPosOf(const void* player, float& outX, float& outY, float& outZ);
 
     static constexpr float kEyeHeight = 1.62f;
-
-    void* playerComponent(unsigned int typeId, std::size_t stride) const;
 
     bool isPlayerEntity(const void* entityContext) const;
 
     static constexpr std::ptrdiff_t kPlayerPositionOffset = 0x594;
-
-    static constexpr std::ptrdiff_t kPlayerTargetPosOffset = 0x1330;
-    static constexpr std::ptrdiff_t kPlayerTargetPosSize = 24;
-
-    static constexpr std::ptrdiff_t kPlayerTargetArgOffset = 0x1320;
+    static constexpr std::ptrdiff_t kPlayerPreviousPositionOffset = 0x588;
 
 private:
     GameData() = default;
@@ -86,6 +78,7 @@ private:
     std::atomic<void*> m_player{nullptr};
     mutable std::atomic<void*> m_playerAlt{nullptr};
     std::atomic<const void*> m_serverPlayerVtable{nullptr};
+    std::atomic<const void*> m_playerVtable{nullptr};
     std::atomic<int> m_playerAltLogs{0};
     std::atomic<unsigned long long> m_playerSerial{0};
     std::atomic<unsigned long long> m_adoptAt{0};

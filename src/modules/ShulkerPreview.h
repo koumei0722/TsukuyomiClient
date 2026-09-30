@@ -89,6 +89,8 @@ private:
         std::array<Elem, kSlots> elems{};
         std::array<bool, kSlots> live{};
         std::array<int, kSlots> counts{};
+        std::array<float, kSlots> durRatio{};
+        std::array<bool, kSlots> durShown{};
         unsigned long long usedAt = 0;
     };
     static constexpr std::size_t kContentSets = 128;

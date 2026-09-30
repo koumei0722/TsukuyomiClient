@@ -532,13 +532,6 @@ bool available()
     return g_ready;
 }
 
-void setSelectInvoke(const void* original)
-{
-    if (original != nullptr) {
-        g_selectInvoke = original;
-    }
-}
-
 void setListener(Listener* listener)
 {
     g_listener = listener;

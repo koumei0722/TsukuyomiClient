@@ -27,6 +27,15 @@ void ModuleManager::registerModule(Module* module)
 
 void ModuleManager::loadConfig()
 {
+    constexpr std::pair<std::string_view, std::string_view> renames[] = {
+        {"FastRightClick", "FastUseItem"},
+    };
+    for (const auto& [from, to] : renames) {
+        if (Config::instance().renameSection(from, to)) {
+            log().info(L"Config: renamed section {} -> {}", toUtf16(std::string(from)),
+                       toUtf16(std::string(to)));
+        }
+    }
     for (Module* module : m_modules) {
         const std::string key = toUtf8(module->name());
         module->loadConfig(Config::instance().section(key));

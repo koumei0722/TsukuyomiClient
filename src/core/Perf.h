@@ -13,8 +13,6 @@ enum class Slot : int {
     Restore,
     Dirty,
     Publish,
-    MeshLookup,
-    MeshTessellate,
     ChunkBuild,
     AskBuilds,
 

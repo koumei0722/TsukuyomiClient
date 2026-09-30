@@ -8,8 +8,6 @@ bool installOverlayHooks();
 
 void shutdownOverlay();
 
-void setGameModeSelection(bool visible, int selectedMode);
-
 struct Viewport {
     HWND window = nullptr;
     float width = 0.0f;

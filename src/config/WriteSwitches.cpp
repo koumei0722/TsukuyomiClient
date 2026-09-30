@@ -66,25 +66,9 @@ bool isKnown(const std::string& name)
     return false;
 }
 
-constexpr const char* kRetired[] = {
-    "BeDispatch", "ControlsBindingName", "ControlsRowBindings", "ControlsSectionSetup",
-    "D3D12CreateCommittedResource", "D3D12CreatePipelineState", "D3D12CreatePlacedResource",
-    "D3D12ResourceMap", "D3D12SetGraphicsRootCBV", "KeyActionName", "KeyBindingIsDefault",
-    "KeyBindingLookup", "KeyRowListBuild", "KeybindListBuild", "ModelPartDraw", "MoveApply",
-    "OptionRegister", "OreFacetBind", "OreKeyNameToIndex", "OreKeyRowsWrap",
-    "OreKeyboardInputGroup", "PackStackOperation", "RowDataCandA", "RowDataCandB",
-    "SettingsActionData", "SettingsActionQueryUpdate", "SettingsTabList", "TextureLookup",
-    "UiButtonMappings", "UiResolveVar",
-};
-
 bool isRetired(const std::string& name)
 {
-    for (const char* retired : kRetired) {
-        if (name == retired) {
-            return true;
-        }
-    }
-    return false;
+    return !isKnown(name);
 }
 
 }
@@ -107,6 +91,10 @@ void load()
             g_fileBroken = true;
             return;
         }
+        std::erase_if(g_invalid, [](const std::string& key) {
+            const std::size_t dot = key.find('.');
+            return !isKnown(dot == std::string::npos ? key : key.substr(dot + 1));
+        });
         for (const auto& [name, on] : g_readHooks) {
             if (!isRetired(name)) {
                 g_values[name] = on;
@@ -185,8 +173,6 @@ void finishStartup()
                    path.wstring());
         return;
     }
-    std::vector<std::pair<std::string, bool>> unknownHooks;
-    std::vector<std::pair<std::string, bool>> unknownPatches;
     std::vector<std::pair<std::string, bool>> known;
     bool missing = false;
     std::size_t retired = 0;
@@ -195,25 +181,19 @@ void finishStartup()
             ++retired;
             continue;
         }
-        (isKnown(name) ? known : unknownHooks).emplace_back(name, on);
+        known.emplace_back(name, on);
     }
     for (const auto& [name, on] : g_readPatches) {
         if (isRetired(name)) {
             ++retired;
             continue;
         }
-        (isKnown(name) ? known : unknownPatches).emplace_back(name, on);
+        known.emplace_back(name, on);
     }
     for (const Entry& e : table()) {
         if (g_values.find(e.name) == g_values.end()) {
             missing = true;
         }
-    }
-    for (const auto& [name, on] : unknownHooks) {
-        log().warn(L"hooks.json: unknown hook name \"{}\" (ignored)", toUtf16(name));
-    }
-    for (const auto& [name, on] : unknownPatches) {
-        log().warn(L"hooks.json: unknown patch name \"{}\" (ignored)", toUtf16(name));
     }
     if (!g_off.empty()) {
         std::wstring list;
@@ -237,7 +217,7 @@ void finishStartup()
         log().warn(L"hooks.json is not updated with the missing names until the values above are fixed");
         return;
     }
-    const std::string text = render(known, unknownHooks, unknownPatches);
+    const std::string text = render(known, {}, {});
     const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                     nullptr);
     if (file == INVALID_HANDLE_VALUE) {

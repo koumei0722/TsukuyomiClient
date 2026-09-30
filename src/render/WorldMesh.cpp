@@ -58,10 +58,12 @@ MeshDestroyFn g_meshDestroy = nullptr;
 std::atomic<bool> g_keptBroken{false};
 using StageHostFn = void*(__fastcall*)(void*, void*, void*, void*);
 constexpr std::ptrdiff_t kHostCtxAt = 0x28;
-constexpr std::ptrdiff_t kViewMainFlag = 0x81;
 StageHostFn g_hostOriginal = nullptr;
 std::atomic<unsigned long long> g_hostCalls{0};
 std::atomic<int> g_drawAt{0};
+std::mutex g_debugMutex;
+std::vector<DebugLine> g_debugLines;
+std::atomic<unsigned> g_debugNoMaterial{0};
 std::atomic<bool> g_drewThisFrame{false};
 TessBeginFn g_begin = nullptr;
 TessVertexFn g_vertex = nullptr;
@@ -110,8 +112,6 @@ struct Choice {
 constexpr Choice kChoices[] = {
     {1, "selection_overlay", 0x1090, true},
     {2, "name_tag", 0, false},
-    {3, "selection_overlay_opaque", 0x10a0, true},
-    {4, "selection_overlay_double_sided", 0x10b0, true},
     {5, "name_tag_depth_tested", 0, false},
     {6, "selection_box", 0x10f0, false},
 };
@@ -119,6 +119,8 @@ constexpr int kDefaultFlat = 1;
 constexpr int kDefaultXray = 2;
 
 constexpr int kLineMode = 6;
+constexpr int kDebugRibbonMode = 5;
+constexpr int kDebugOnTopMode = 2;
 constexpr std::uint8_t kPrimitiveQuads = 1;
 constexpr std::uint8_t kPrimitiveLines = 4;
 constexpr float kLineAlpha = 1.0F;
@@ -870,11 +872,9 @@ struct Job {
     const boxmesh::Quad* quads;
     std::size_t count;
     const boxmesh::Edge* edges;
+    const DebugLine* debugLines;
     std::size_t edgeCount;
     float rgba[4];
-    float inflate;
-    bool vertexColor;
-    bool flip;
     std::uint32_t limit;
     bool perQuadColor;
     float palette[boxmesh::kMaxColor + 1][4];
@@ -895,33 +895,17 @@ struct Job {
 
 void emitRect(const Job& job, const boxmesh::Quad& quad)
 {
-    static constexpr float kNormal[6][3] = {
-        {0.0F, -1.0F, 0.0F}, {0.0F, 1.0F, 0.0F}, {0.0F, 0.0F, -1.0F},
-        {0.0F, 0.0F, 1.0F},  {-1.0F, 0.0F, 0.0F}, {1.0F, 0.0F, 0.0F},
-    };
     std::int32_t c[4][3] = {};
     boxmesh::corners(quad, c);
-    const float e = job.inflate;
-    const float* const n = kNormal[quad.dir % 6];
     float v[4][3] = {};
     for (int i = 0; i < 4; ++i) {
         for (int k = 0; k < 3; ++k) {
-            const std::int64_t twice = static_cast<std::int64_t>(c[0][k]) + c[2][k];
-            const std::int64_t mine = 2LL * c[i][k];
-            const float spread = mine > twice ? 1.0F : (mine < twice ? -1.0F : 0.0F);
-            const double at = static_cast<double>(c[i][k]) + static_cast<double>(n[k] * e + spread * e);
-            v[i][k] = static_cast<float>(at - job.cam[k]);
+            v[i][k] = static_cast<float>(static_cast<double>(c[i][k]) - job.cam[k]);
         }
     }
     void* const tess = job.tess;
-    if (!job.flip) {
-        for (int i = 0; i < 4; ++i) {
-            g_vertex(tess, v[i][0], v[i][1], v[i][2]);
-        }
-    } else {
-        for (int i = 3; i >= 0; --i) {
-            g_vertex(tess, v[i][0], v[i][1], v[i][2]);
-        }
+    for (int i = 0; i < 4; ++i) {
+        g_vertex(tess, v[i][0], v[i][1], v[i][2]);
     }
 }
 
@@ -941,16 +925,9 @@ bool emitRibbon(const Job& job, const boxmesh::Edge& edge)
         return false;
     }
     void* const tess = job.tess;
-    if (job.flip) {
-        for (int i = 0; i < 4; ++i) {
-            g_vertex(tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]),
-                     static_cast<float>(v[i][2]));
-        }
-    } else {
-        for (int i = 3; i >= 0; --i) {
-            g_vertex(tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]),
-                     static_cast<float>(v[i][2]));
-        }
+    for (int i = 3; i >= 0; --i) {
+        g_vertex(tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]),
+                 static_cast<float>(v[i][2]));
     }
     return true;
 }
@@ -977,10 +954,7 @@ __declspec(noinline) void runJob(Job& job)
             std::memcpy(tess + kTessOffset, zero, sizeof(zero));
             std::memcpy(tess + kTessScale, one, sizeof(one));
             tess[kTessUseMatrix] = 0;
-            tess[kTessNoColor] = (job.vertexColor || job.perQuadColor) ? 0 : 1;
-            if (job.vertexColor) {
-                g_color(tess, job.rgba[0], job.rgba[1], job.rgba[2], job.rgba[3]);
-            }
+            tess[kTessNoColor] = job.perQuadColor ? 0 : 1;
             std::uint8_t current = 0xFF;
             std::uint32_t used = 0;
             for (; at < job.count; ++at) {
@@ -1048,6 +1022,16 @@ void emitEdge(const Job& job, const boxmesh::Edge& edge)
     }
 }
 
+void emitDebugEdge(const Job& job, const DebugLine& edge)
+{
+    for (const double* point : {edge.a, edge.b}) {
+        g_vertex(job.tess,
+                 static_cast<float>(point[0] - job.cam[0]),
+                 static_cast<float>(point[1] - job.cam[1]),
+                 static_cast<float>(point[2] - job.cam[2]));
+    }
+}
+
 __declspec(noinline) void runLineJob(Job& job)
 {
     __try {
@@ -1071,18 +1055,101 @@ __declspec(noinline) void runLineJob(Job& job)
             std::memcpy(tess + kTessOffset, zero, sizeof(zero));
             std::memcpy(tess + kTessScale, one, sizeof(one));
             tess[kTessUseMatrix] = 0;
-            tess[kTessNoColor] = job.vertexColor ? 0 : 1;
-            if (job.vertexColor) {
-                g_color(tess, job.rgba[0], job.rgba[1], job.rgba[2], job.rgba[3]);
-            }
+            tess[kTessNoColor] = 1;
             std::uint32_t used = 0;
             for (; at < job.edgeCount; ++at) {
                 if (used + 2U > limit && used != 0) {
                     break;
                 }
-                emitEdge(job, job.edges[at]);
+                if (job.debugLines != nullptr) {
+                    emitDebugEdge(job, job.debugLines[at]);
+                } else {
+                    emitEdge(job, job.edges[at]);
+                }
                 used += 2U;
                 ++job.faces;
+            }
+            if (color != nullptr) {
+                std::memcpy(color, job.rgba, sizeof(job.rgba));
+                reinterpret_cast<unsigned char*>(color)[0x10] = 1;
+            }
+            alignas(16) unsigned char texture[0x40] = {};
+            g_render(job.ctx, tess, job.material, texture);
+            ++job.batches;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        job.failed = true;
+        job.code = GetExceptionCode();
+    }
+}
+
+bool ribbonVisible(const Job& job, const DebugLine& line)
+{
+    double p[2][3] = {};
+    for (int k = 0; k < 3; ++k) {
+        p[0][k] = line.a[k] - job.cam[k];
+        p[1][k] = line.b[k] - job.cam[k];
+    }
+    double v[4][3] = {};
+    return boxmesh::ribbonCorners(p[0], p[1], job.haveForward ? job.forward : nullptr, job.forwardW,
+                                  job.ribbonScale * line.width, kRibbonNearW, v);
+}
+
+bool emitDebugRibbon(const Job& job, const DebugLine& line)
+{
+    double p[2][3] = {};
+    for (int k = 0; k < 3; ++k) {
+        p[0][k] = line.a[k] - job.cam[k];
+        p[1][k] = line.b[k] - job.cam[k];
+    }
+    double v[4][3] = {};
+    if (!boxmesh::ribbonCorners(p[0], p[1], job.haveForward ? job.forward : nullptr, job.forwardW,
+                                job.ribbonScale * line.width, kRibbonNearW, v)) {
+        return false;
+    }
+    for (int i = 3; i >= 0; --i) {
+        g_vertex(job.tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]), static_cast<float>(v[i][2]));
+    }
+    return true;
+}
+
+__declspec(noinline) void runDebugRibbonJob(Job& job)
+{
+    __try {
+        auto* const tess = static_cast<unsigned char*>(job.tess);
+        float* color = nullptr;
+        std::memcpy(&color, static_cast<unsigned char*>(job.ctx) + kCtxColor, sizeof(color));
+        const std::uint32_t limit = job.limit & ~3U;
+        std::size_t at = 0;
+        while (at < job.edgeCount) {
+            while (at < job.edgeCount && !ribbonVisible(job, job.debugLines[at])) ++at;
+            if (at >= job.edgeCount) {
+                break;
+            }
+            if (tess[kTessBuilding] != 0 || tess[kTessVoid] != 0) {
+                job.busy = true;
+                return;
+            }
+            g_begin(tess, nullptr, kPrimitiveQuads, 0, false);
+            if (tess[kTessBuilding] == 0) {
+                job.busy = true;
+                return;
+            }
+            const float zero[3] = {0.0F, 0.0F, 0.0F};
+            const float one[3] = {1.0F, 1.0F, 1.0F};
+            std::memcpy(tess + kTessOffset, zero, sizeof(zero));
+            std::memcpy(tess + kTessScale, one, sizeof(one));
+            tess[kTessUseMatrix] = 0;
+            tess[kTessNoColor] = 1;
+            std::uint32_t used = 0;
+            for (; at < job.edgeCount; ++at) {
+                if (used + 4U > limit && used != 0) {
+                    break;
+                }
+                if (emitDebugRibbon(job, job.debugLines[at])) {
+                    used += 4U;
+                    ++job.ribbons;
+                }
             }
             if (color != nullptr) {
                 std::memcpy(color, job.rgba, sizeof(job.rgba));
@@ -1106,6 +1173,114 @@ struct TessSaved {
     unsigned char colorDirty;
     bool haveColor;
 };
+
+bool saveState(void* ctx, void* tess, TessSaved& saved);
+void restoreState(void* ctx, void* tess, const TessSaved& saved);
+
+void drawDebugLines(void* lrp, void* ctx)
+{
+    std::vector<DebugLine> lines;
+    {
+        std::lock_guard lock(g_debugMutex);
+        lines = g_debugLines;
+    }
+    if (lines.empty() || lrp == nullptr || ctx == nullptr) return;
+    void* tess = nullptr;
+    float cam[3]{};
+    std::uint32_t limit = 0;
+    if (!memory::copyGuarded(static_cast<std::byte*>(ctx) + kCtxTess, &tess, sizeof(tess))
+        || tess == nullptr
+        || !memory::copyGuarded(static_cast<std::byte*>(lrp) + kLrpCamera, cam, sizeof(cam))
+        || !memory::copyGuarded(static_cast<std::byte*>(tess) + kTessLimit, &limit, sizeof(limit))
+        || !std::isfinite(cam[0]) || !std::isfinite(cam[1]) || !std::isfinite(cam[2])) return;
+    const void* material = materialFor(lrp, kLineMode);
+    if (material == nullptr) {
+        g_debugNoMaterial.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool anyThick = std::any_of(lines.begin(), lines.end(), [](const DebugLine& l) { return l.width > 1.0F; });
+    const void* const ribbonMaterial = anyThick ? materialFor(lrp, kDebugRibbonMode) : nullptr;
+    const bool anyOnTop = std::any_of(lines.begin(), lines.end(), [](const DebugLine& l) { return l.onTop; });
+    const void* const onTopMaterial = anyOnTop ? materialFor(lrp, kDebugOnTopMode) : nullptr;
+    TessSaved saved{};
+    if (!saveState(ctx, tess, saved)) return;
+    Job job{};
+    job.ctx = ctx;
+    job.tess = tess;
+    job.material = material;
+    job.cam[0] = cam[0];
+    job.cam[1] = cam[1];
+    job.cam[2] = cam[2];
+    job.debugLines = lines.data();
+    job.edgeCount = lines.size();
+    job.limit = (limit >= 64 && limit <= (1U << 24)) ? limit : 65532;
+    if (anyThick) {
+        double yScale = 0.0;
+        float eye[3] = {};
+        float vp[16] = {};
+        if (boxes::cameraSnapshot(eye, vp)) {
+            const double col1 = std::sqrt(static_cast<double>(vp[1]) * vp[1] + static_cast<double>(vp[5]) * vp[5]
+                                          + static_cast<double>(vp[9]) * vp[9]);
+            const double col3 = std::sqrt(static_cast<double>(vp[3]) * vp[3] + static_cast<double>(vp[7]) * vp[7]
+                                          + static_cast<double>(vp[11]) * vp[11]);
+            if (std::isfinite(col1) && col1 > 0.05 && col1 < 100.0) yScale = col1;
+            if (std::isfinite(col3) && col3 > 1e-3 && std::isfinite(vp[15])) {
+                job.forward[0] = vp[3];
+                job.forward[1] = vp[7];
+                job.forward[2] = vp[11];
+                job.forwardW = vp[15];
+                job.haveForward = true;
+            }
+        }
+        const render::Viewport view = render::overlayViewport();
+        if (yScale > 0.0 && view.valid && view.height >= 64.0F) {
+            job.ribbonScale = 2.0 / (yScale * view.height);
+        } else {
+            job.haveForward = false;
+        }
+    }
+    for (std::size_t at = 0; at < lines.size();) {
+        const float* color = lines[at].rgba;
+        const float width = lines[at].width;
+        const bool onTop = lines[at].onTop;
+        std::size_t end = at + 1;
+        while (end < lines.size() && std::equal(color, color + 4, lines[end].rgba) && lines[end].width == width
+               && lines[end].onTop == onTop) ++end;
+        job.debugLines = lines.data() + at;
+        job.edgeCount = end - at;
+        std::copy_n(color, 4, job.rgba);
+        if (onTop) {
+            if (onTopMaterial == nullptr) {
+                at = end;
+                continue;
+            }
+            job.material = onTopMaterial;
+            runLineJob(job);
+        } else if (width > 1.0F && ribbonMaterial != nullptr && job.haveForward) {
+            job.material = ribbonMaterial;
+            runDebugRibbonJob(job);
+        } else {
+            job.material = material;
+            runLineJob(job);
+        }
+        if (job.failed || job.busy) break;
+        at = end;
+    }
+    restoreState(ctx, tess, saved);
+    if (anyOnTop && onTopMaterial == nullptr) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            log().warn(L"WorldMesh: the always-on-top debug lines are not drawn (name_tag material missing)");
+        }
+    }
+    if (anyThick && (ribbonMaterial == nullptr || !job.haveForward)) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            log().warn(L"WorldMesh: thick debug lines are drawn 1 px wide (material {} / projection {})",
+                       ribbonMaterial != nullptr ? L"ok" : L"missing", job.haveForward ? L"ok" : L"missing");
+        }
+    }
+}
 
 __declspec(noinline) bool saveState(void* ctx, void* tess, TessSaved& saved)
 {
@@ -1219,8 +1394,6 @@ constexpr double kSortBase = 1.0;
 constexpr double kSortSpan = 32.0;
 constexpr unsigned kKeptStallFrames = 600;
 unsigned g_keptStall = 0;
-float g_keptInflate = 0.0F;
-bool g_keptFlip = false;
 float g_keptXrayPalette[2][boxmesh::kMaxColor + 1][4] = {};
 std::uint64_t g_keptPaletteVersion = 1;
 std::atomic<bool> g_keptReleaseAsked{false};
@@ -1228,8 +1401,6 @@ std::atomic<bool> g_keptReleased{false};
 enum class KeptWhy : std::uint8_t {
     Released,
     BoxesOff,
-    ModeOff,
-    Rebake,
     Broken,
     NotKept,
 };
@@ -1246,6 +1417,46 @@ struct MeshName {
 MeshName g_meshName{nullptr, 0};
 
 alignas(16) float g_sortMatrix[16] = {};
+bool pageChecked(const void* address, std::size_t size, bool write)
+{
+    struct Entry {
+        std::uintptr_t page = 0;
+        unsigned long long at = 0;
+        bool write = false;
+    };
+    constexpr std::size_t kEntries = 8;
+    constexpr unsigned long long kKeepMs = 1000;
+    thread_local Entry entries[kEntries];
+    thread_local std::size_t next = 0;
+    if (address == nullptr || size == 0) {
+        return false;
+    }
+    const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{0xFFF};
+    const auto last = (reinterpret_cast<std::uintptr_t>(address) + size - 1) & ~std::uintptr_t{0xFFF};
+    const unsigned long long now = GetTickCount64();
+    const auto known = [&](std::uintptr_t page) {
+        for (const Entry& e : entries) {
+            if (e.page == page && now - e.at < kKeepMs && (e.write || !write)) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (known(first) && known(last)) {
+        return true;
+    }
+    const bool ok = write ? memory::isWritable(address, size) : memory::isReadable(address, size);
+    if (ok) {
+        for (const std::uintptr_t page : {first, last}) {
+            if (!known(page)) {
+                entries[next] = Entry{page, now, write};
+                next = (next + 1) % kEntries;
+            }
+        }
+    }
+    return ok;
+}
+
 struct TopMatrix {
     float* top = nullptr;
     float* pushed = nullptr;
@@ -1298,8 +1509,8 @@ __declspec(noinline) bool findTopMatrix(void* ctx, TopMatrix& m)
                 m.pushed = nullptr;
             }
         }
-        if (m.top == nullptr || !memory::isWritable(m.top, sizeof(float) * 16)
-            || (m.pushed != nullptr && !memory::isWritable(m.pushed, sizeof(float) * 16))) {
+        if (m.top == nullptr || !pageChecked(m.top, sizeof(float) * 16, true)
+            || (m.pushed != nullptr && !pageChecked(m.pushed, sizeof(float) * 16, true))) {
             return false;
         }
         std::memcpy(m.savedTop, m.top, sizeof(m.savedTop));
@@ -1318,7 +1529,7 @@ __declspec(noinline) bool findTopMatrix(void* ctx, TopMatrix& m)
         if (size < mapSize) {
             auto* const entry =
                 reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(map) + ((first + size) & mask) * 8);
-            if (memory::isWritable(entry, sizeof(std::uint64_t))) {
+            if (pageChecked(entry, sizeof(std::uint64_t), true)) {
                 m.mapEntry = entry;
                 m.savedMapEntry = *entry;
                 std::memcpy(g_sortMatrix, m.savedTop, sizeof(g_sortMatrix));
@@ -1331,7 +1542,7 @@ __declspec(noinline) bool findTopMatrix(void* ctx, TopMatrix& m)
             m.slotIndex = size - 2;
             std::memcpy(&m.slot, reinterpret_cast<const unsigned char*>(map) + ((first + m.slotIndex) & mask) * 8,
                         sizeof(m.slot));
-            if (m.slot != nullptr && m.slot != m.top && memory::isWritable(m.slot, sizeof(float) * 16)) {
+            if (m.slot != nullptr && m.slot != m.top && pageChecked(m.slot, sizeof(float) * 16, true)) {
                 std::memcpy(m.savedSlot, m.slot + 12, sizeof(m.savedSlot));
                 m.sortControl = true;
             } else {
@@ -1406,8 +1617,6 @@ struct KeptBuild {
     void* tess;
     double origin[3];
     double eye[3];
-    float inflate;
-    bool flip;
     int kind;
     const boxmesh::Quad* quads;
     const boxmesh::Edge* edges;
@@ -1440,14 +1649,8 @@ bool emitRibbonAround(const Job& job, const boxmesh::Edge& edge, const double ey
                  static_cast<float>(v[i][1] + eye[1] - job.cam[1]),
                  static_cast<float>(v[i][2] + eye[2] - job.cam[2]));
     };
-    if (job.flip) {
-        for (int i = 0; i < 4; ++i) {
-            put(i);
-        }
-    } else {
-        for (int i = 3; i >= 0; --i) {
-            put(i);
-        }
+    for (int i = 3; i >= 0; --i) {
+        put(i);
     }
     return true;
 }
@@ -1476,8 +1679,6 @@ __declspec(noinline) bool makeKeptMesh(KeptBuild& b, void* outMesh, bool& busy)
         job.cam[0] = b.origin[0];
         job.cam[1] = b.origin[1];
         job.cam[2] = b.origin[2];
-        job.inflate = b.inflate;
-        job.flip = b.flip;
         b.made = 0;
         const std::uint32_t end = b.first + b.count;
         if (b.kind == 0) {
@@ -1721,8 +1922,6 @@ void syncKept()
 struct KeptFrame {
     bool xray = false;
     double cam[3] = {};
-    float inflate = 0.0F;
-    bool flip = false;
     std::uint32_t limit = 0;
     float palette[boxmesh::kMaxColor + 1][4] = {};
     float linePalette[boxmesh::kMaxColor + 1][4] = {};
@@ -1803,8 +2002,6 @@ KeptMade buildKeptRegionBody(const RegionOut& source, void* tess, const KeptFram
     b.origin[1] = fresh.origin[1];
     b.origin[2] = fresh.origin[2];
     std::copy(eye, eye + 3, b.eye);
-    b.inflate = frame.inflate;
-    b.flip = frame.flip;
     const auto add = [&](int kind, std::uint8_t color, std::uint32_t total, std::uint32_t per) {
         for (std::uint32_t at = 0; at < total && ok; at += per) {
             KeptMesh mesh;
@@ -2052,8 +2249,6 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
     frame.cam[0] = camF[0];
     frame.cam[1] = camF[1];
     frame.cam[2] = camF[2];
-    frame.inflate = static_cast<float>(0) / 1024.0F;
-    frame.flip = false;
     frame.limit = limit;
     const float faceAlpha = boxes::boxFaceAlpha();
     float faceRgba[boxmesh::kMaxColor + 1][4] = {};
@@ -2088,11 +2283,6 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
         || std::memcmp(g_keptXrayPalette[1], frame.linePalette, sizeof(frame.linePalette)) != 0) {
         ++g_keptPaletteVersion;
     }
-    if (!g_kept.empty() && (frame.inflate != g_keptInflate || frame.flip != g_keptFlip)) {
-        destroyKept(KeptWhy::Rebake);
-    }
-    g_keptInflate = frame.inflate;
-    g_keptFlip = frame.flip;
     std::memcpy(g_keptXrayPalette[0], frame.palette, sizeof(frame.palette));
     std::memcpy(g_keptXrayPalette[1], frame.linePalette, sizeof(frame.linePalette));
     float eye[3] = {};
@@ -2308,19 +2498,13 @@ void drawBoxes(void* lrp, void* ctx)
     const bool xray = boxes::boxXray();
     const int mode = xray ? kDefaultXray
                           : kDefaultFlat;
-    if (mode == 0) {
-        if (!g_kept.empty()) {
-            destroyKept(KeptWhy::ModeOff);
-        }
-        return;
-    }
-    if (ctx == nullptr || lrp == nullptr || !memory::isReadable(ctx, kCtxTess + 8)) {
+    if (ctx == nullptr || lrp == nullptr || !pageChecked(ctx, kCtxTess + 8, false)) {
         g_badCtx.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     void* tess = nullptr;
     std::memcpy(&tess, static_cast<unsigned char*>(ctx) + kCtxTess, sizeof(tess));
-    if (tess == nullptr || !memory::isReadable(tess, kTessReadable)) {
+    if (tess == nullptr || !pageChecked(tess, kTessReadable, false)) {
         g_badCtx.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -2338,7 +2522,7 @@ void drawBoxes(void* lrp, void* ctx)
     QueryPerformanceCounter(&t0);
 
     float cam[3] = {};
-    if (!memory::isReadable(static_cast<unsigned char*>(lrp) + kLrpCamera, sizeof(cam))) {
+    if (!pageChecked(static_cast<unsigned char*>(lrp) + kLrpCamera, sizeof(cam), false)) {
         return;
     }
     std::memcpy(cam, static_cast<unsigned char*>(lrp) + kLrpCamera, sizeof(cam));
@@ -2403,9 +2587,6 @@ void drawBoxes(void* lrp, void* ctx)
     }
 
     const float faceAlpha = boxes::boxFaceAlpha();
-    const float inflate = static_cast<float>(0) / 1024.0F;
-    const bool vertexColor = false;
-    const bool flip = false;
     std::size_t budget = static_cast<std::size_t>(
         (std::max)(1, kDefaultMaxBoxes));
     std::uint32_t batches = 0;
@@ -2503,9 +2684,6 @@ void drawBoxes(void* lrp, void* ctx)
             job.rgba[1] = 1.0F;
             job.rgba[2] = 1.0F;
             job.rgba[3] = 1.0F;
-            job.inflate = inflate;
-            job.vertexColor = false;
-            job.flip = flip;
             job.limit = limit;
             runJob(job);
             batches += job.batches;
@@ -2555,9 +2733,6 @@ void drawBoxes(void* lrp, void* ctx)
             job.rgba[1] = rgb[1];
             job.rgba[2] = rgb[2];
             job.rgba[3] = alpha;
-            job.inflate = inflate;
-            job.vertexColor = vertexColor;
-            job.flip = flip;
             job.limit = limit;
             runJob(job);
             batches += job.batches;
@@ -2592,7 +2767,6 @@ void drawBoxes(void* lrp, void* ctx)
         job.rgba[1] = baseRgb[1];
         job.rgba[2] = baseRgb[2];
         job.rgba[3] = kLineAlpha;
-        job.vertexColor = vertexColor;
         job.limit = limit;
         runLineJob(job);
         batches += job.batches;
@@ -2647,19 +2821,6 @@ void* __fastcall detourStageHost(void* lrp, void* arg2, void* view, void* arg4)
     void* const result =
         (g_hostOriginal != nullptr) ? g_hostOriginal(lrp, arg2, view, arg4) : nullptr;
     g_hostCalls.fetch_add(1, std::memory_order_relaxed);
-    {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true)) {
-            void* ctx = nullptr;
-            if (arg2 != nullptr && memory::isReadable(arg2, kHostCtxAt + sizeof(ctx))) {
-                std::memcpy(&ctx, static_cast<unsigned char*>(arg2) + kHostCtxAt, sizeof(ctx));
-            }
-            int flag = -1;
-            if (view != nullptr && memory::isReadable(view, kViewMainFlag + 1)) {
-                flag = *(static_cast<const unsigned char*>(view) + kViewMainFlag);
-            }
-        }
-    }
     if (g_drawAt.load(std::memory_order_relaxed) != 1
         || g_teardown.load(std::memory_order_acquire)) {
         return result;
@@ -2679,6 +2840,7 @@ void* __fastcall detourStageHost(void* lrp, void* arg2, void* view, void* arg4)
         return result;
     }
     drawBoxes(lrp, ctx);
+    drawDebugLines(lrp, ctx);
     g_inside.store(false, std::memory_order_release);
     return result;
 }
@@ -2695,9 +2857,21 @@ void __fastcall detourNameTagStage(void* lrp, void* ctx, void* view, void* extra
         return;
     }
     drawBoxes(lrp, ctx);
+    drawDebugLines(lrp, ctx);
     g_inside.store(false, std::memory_order_release);
 }
 
+}
+
+void setDebugLines(std::vector<DebugLine> lines)
+{
+    std::stable_sort(lines.begin(), lines.end(), [](const DebugLine& a, const DebugLine& b) {
+        if (a.onTop != b.onTop) return !a.onTop;
+        if (a.width != b.width) return a.width < b.width;
+        return std::lexicographical_compare(a.rgba, a.rgba + 4, b.rgba, b.rgba + 4);
+    });
+    std::lock_guard lock(g_debugMutex);
+    g_debugLines = std::move(lines);
 }
 
 bool installHooks()
@@ -2799,12 +2973,6 @@ bool installHooks()
     return true;
 }
 
-int mode()
-{
-    return boxes::boxXray() ? kDefaultXray
-                            : kDefaultFlat;
-}
-
 bool active(bool xray)
 {
     if (!g_installed.load(std::memory_order_acquire) || g_teardown.load(std::memory_order_acquire)) {
@@ -2812,7 +2980,7 @@ bool active(bool xray)
     }
     const int want = xray ? kDefaultXray
                           : kDefaultFlat;
-    return want != 0 && !g_modeBroken[want & 7].load(std::memory_order_relaxed);
+    return !g_modeBroken[want & 7].load(std::memory_order_relaxed);
 }
 
 void onPresent()
@@ -2822,6 +2990,12 @@ void onPresent()
 
 void report()
 {
+    static bool warnedDebugMaterial = false;
+    if (!warnedDebugMaterial && g_debugNoMaterial.load(std::memory_order_relaxed) != 0) {
+        warnedDebugMaterial = true;
+        log().warn(L"WorldMesh: debug line material unavailable ({} attempts)",
+                   g_debugNoMaterial.load(std::memory_order_relaxed));
+    }
     if (!g_installed.load(std::memory_order_acquire)) {
         return;
     }
@@ -2999,6 +3173,7 @@ void report()
 
 void shutdown()
 {
+    setDebugLines({});
     g_keptReleaseAsked.store(true, std::memory_order_seq_cst);
     const bool pending = g_installed.load(std::memory_order_acquire)
                          && (g_keptMeshCount.load(std::memory_order_seq_cst) != 0
@@ -3016,8 +3191,6 @@ void shutdown()
         log().info(L"WorldMesh: released {} kept mesh(es) on the render thread", last);
     } else if (last != 0) {
         const wchar_t* const reason = why == KeptWhy::BoxesOff  ? L"when the boxes went off"
-                                      : why == KeptWhy::ModeOff ? L"when the box mode was set to none"
-                                      : why == KeptWhy::Rebake  ? L"to rebuild them with new settings"
                                       : why == KeptWhy::Broken  ? L"after giving up on them"
                                       : why == KeptWhy::NotKept ? L"when the boxes left the kept drawing"
                                                                 : L"on request";

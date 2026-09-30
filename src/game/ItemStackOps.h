@@ -27,15 +27,11 @@ public:
 
     bool assignFrom(void* dst, const void* src);
 
-    bool setCount(void* stack, std::uint8_t count);
-
     bool stash(const void* src);
 
     bool restore(void* dst);
 
     void discard();
-
-    bool hasStash() const { return m_hasStash; }
 
 private:
     ItemStackOps() = default;
@@ -47,7 +43,6 @@ private:
                                             const void* srcField);
 
     static constexpr std::size_t kStackSize = kStackBytes;
-    static constexpr std::ptrdiff_t kCountOffset = 0x22;
     static constexpr std::ptrdiff_t kNetIdOffset = 0x80;
     static constexpr std::ptrdiff_t kNetTagOffset = 0x90;
 

@@ -21,14 +21,9 @@ public:
     void loadConfig(const nlohmann::json& section) override;
     void saveConfig(nlohmann::json& section) const override;
 
-    bool screenSwapEnabled() const { return m_screenSwap; }
-
-    bool legacyBridgeEnabled() const { return m_legacyBridge; }
     void onScansReady() override;
 
     void onPlayerViewUpdate();
-
-    bool onInventoryHotbarKey(const void* controller, int hotbarIndex);
 
     void onInventoryContent(const void* payload);
 
@@ -68,8 +63,6 @@ private:
     {
         return (slot == kHeldSlot) ? hands.selected : slot;
     }
-
-    static int slotUnderCursor();
 
     void servePending();
 
@@ -168,9 +161,6 @@ private:
     static constexpr unsigned long long kQueueWaitMs = 500;
 
     static constexpr unsigned long long kStaleRequestMs = 2000;
-
-    bool m_screenSwap = false;
-    bool m_legacyBridge = false;
 
     std::atomic<unsigned long long> m_nextWarnMs{0};
     static constexpr unsigned long long kWarnIntervalMs = 10000;

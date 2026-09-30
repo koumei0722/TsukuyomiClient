@@ -53,8 +53,6 @@ private:
 
     const wchar_t* patternName() const;
     const wchar_t* heightName() const;
-    void cyclePattern();
-    void cycleHeight();
 
     void captureHeight();
 

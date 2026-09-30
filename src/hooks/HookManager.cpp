@@ -153,18 +153,6 @@ bool HookManager::groupEnabled(HookGroup group) const
     return m_groupOn[static_cast<std::size_t>(group)];
 }
 
-std::size_t HookManager::groupSize(HookGroup group) const
-{
-    const std::lock_guard<std::recursive_mutex> guard(m_lock);
-    std::size_t count = 0;
-    for (const Entry& entry : m_entries) {
-        if (entry.group == group) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 bool HookManager::setGroupEnabled(HookGroup group, bool on)
 {
     const std::lock_guard<std::recursive_mutex> guard(m_lock);

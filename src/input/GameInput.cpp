@@ -23,9 +23,4 @@ bool sneakHeldWithin(unsigned long long ms)
     return at != 0 && GetTickCount64() - at <= ms;
 }
 
-unsigned long long lastSneakMs()
-{
-    return g_sneakSeenMs.load(std::memory_order_acquire);
-}
-
 }

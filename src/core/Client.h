@@ -27,7 +27,6 @@ private:
 
     void registerModules();
     void loadHotkeys();
-    void saveHotkeys();
 
     HMODULE m_self = nullptr;
     bool m_settingsSavePending = false;

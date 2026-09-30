@@ -46,6 +46,10 @@ void Module::update()
         onUpdate();
         return;
     }
+    if (handlesToggleKey()) {
+        onUpdate();
+        return;
+    }
     if (toggleRequested && input::isInGameplay()) {
         toggle();
         UiSound::instance().request();

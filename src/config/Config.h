@@ -18,6 +18,7 @@ public:
     nlohmann::json& section(std::string_view name);
 
     void eraseSection(std::string_view name);
+    bool renameSection(std::string_view from, std::string_view to);
 
     static int getInt(const nlohmann::json& node, std::string_view key, int fallback);
     static float getFloat(const nlohmann::json& node, std::string_view key, float fallback);

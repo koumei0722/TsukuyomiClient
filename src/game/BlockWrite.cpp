@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -23,28 +24,14 @@ namespace {
 using RegionSetBlockFn = bool(__fastcall*)(void*, const void*, const void*, unsigned int,
                                            unsigned int, void*);
 
-using SubChunkSetFn = void(__fastcall*)(void*, unsigned int, unsigned int, const void*);
-
 std::atomic<void*> g_region{nullptr};
 std::atomic<unsigned long long> g_regionSeen{0};
 std::atomic<void*> g_regionPlayer{nullptr};
 std::atomic<void*> g_regionVtable{nullptr};
 
-enum class Refusal : int {
-    None = 0,
-    NoRegion,
-    NoPlayer,
-    NotedNoPlayer,
-    PlayerChanged,
-    BadVtable,
-    VtableChanged,
-};
-std::atomic<Refusal> g_refusal{Refusal::None};
 std::atomic<unsigned int> g_mode{0};
 std::atomic<unsigned int> g_updateFlags{0};
 std::atomic<void*> g_actor{nullptr};
-
-std::atomic<bool> g_wroteGhost{false};
 
 std::atomic<void*> g_renderRegion{nullptr};
 std::atomic<unsigned long long> g_renderRegionSeen{0};
@@ -129,18 +116,6 @@ std::uint64_t regionGeneration()
     return g_regionGeneration.load(std::memory_order_acquire);
 }
 
-__declspec(noinline) bool callRegionSetBlock(RegionSetBlockFn fn, void* region,
-                                             const void* pos, const void* block,
-                                             unsigned int mode, unsigned int flags,
-                                             void* actor)
-{
-    __try {
-        return fn(region, pos, block, mode, flags, actor);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 __declspec(noinline) bool regionIsAlive(void* region)
 {
     if (region == nullptr) {
@@ -163,45 +138,10 @@ __declspec(noinline) bool regionIsAlive(void* region)
     }
 }
 
-bool placeAtRegion(void* region, const BlockPos& at, const void* block)
+bool placeAt(const BlockPos& at, const void* block)
 {
-    if (region == nullptr || block == nullptr) {
-        return false;
-    }
-    if (!regionIsAlive(region)) {
-        return false;
-    }
-    if (findSubChunk(region, at.x, at.y, at.z) == nullptr) {
-        return false;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::BlockSourceSetBlock)) {
-        return false;
-    }
-    const auto setBlock = scanner.addressAs<RegionSetBlockFn>(Target::BlockSourceSetBlock);
-    if (setBlock == nullptr) {
-        return false;
-    }
-    const int pos[3] = {at.x, at.y, at.z};
-    beginSelfWrite();
-    beginRenderWrite();
-    const bool ok = callRegionSetBlock(setBlock, region, pos, block,
-                                       g_mode.load(std::memory_order_relaxed),
-                                       g_updateFlags.load(std::memory_order_relaxed),
-                                       g_actor.load(std::memory_order_relaxed));
-    endRenderWrite();
-    endSelfWrite();
-    return ok;
-}
-
-bool placeAt(const BlockPos& at, const void* block, bool* wroteGhost)
-{
-    if (wroteGhost != nullptr) {
-        *wroteGhost = false;
-    }
     void* const target = g_region.load(std::memory_order_relaxed);
     if (target == nullptr || block == nullptr) {
-        g_refusal.store(Refusal::NoRegion, std::memory_order_relaxed);
         return false;
     }
     void* const player = GameData::instance().player();
@@ -210,10 +150,6 @@ bool placeAt(const BlockPos& at, const void* block, bool* wroteGhost)
         constexpr unsigned long long kFreshMs = 60000;
         const auto seen = g_regionSeen.load(std::memory_order_relaxed);
         if (seen == 0 || GetTickCount64() - seen > kFreshMs) {
-            g_refusal.store(player == nullptr        ? Refusal::NoPlayer
-                            : notedPlayer == nullptr ? Refusal::NotedNoPlayer
-                                                     : Refusal::PlayerChanged,
-                            std::memory_order_relaxed);
             return false;
         }
     } else {
@@ -221,16 +157,13 @@ bool placeAt(const BlockPos& at, const void* block, bool* wroteGhost)
         void* vtable = nullptr;
         if (noted == nullptr || !memory::isReadable(target, 0x40)
             || !memory::inGameModule(noted)) {
-            g_refusal.store(Refusal::BadVtable, std::memory_order_relaxed);
             return false;
         }
         std::memcpy(&vtable, target, sizeof(vtable));
         if (vtable != noted) {
-            g_refusal.store(Refusal::VtableChanged, std::memory_order_relaxed);
             return false;
         }
     }
-    g_refusal.store(Refusal::None, std::memory_order_relaxed);
     const Scanner& scanner = Scanner::instance();
     if (!scanner.found(Target::BlockSourceSetBlock)) {
         return false;
@@ -240,14 +173,9 @@ bool placeAt(const BlockPos& at, const void* block, bool* wroteGhost)
         return false;
     }
     const int pos[3] = {at.x, at.y, at.z};
-    g_wroteGhost.store(false, std::memory_order_relaxed);
-    const bool ok = setBlock(target, pos, block, g_mode.load(std::memory_order_relaxed),
-                             g_updateFlags.load(std::memory_order_relaxed),
-                             g_actor.load(std::memory_order_relaxed));
-    if (wroteGhost != nullptr) {
-        *wroteGhost = g_wroteGhost.load(std::memory_order_relaxed);
-    }
-    return ok;
+    return setBlock(target, pos, block, g_mode.load(std::memory_order_relaxed),
+                    g_updateFlags.load(std::memory_order_relaxed),
+                    g_actor.load(std::memory_order_relaxed));
 }
 
 namespace {
@@ -257,28 +185,31 @@ using StorageGetFn = const void*(__fastcall*)(void* storage, unsigned int index)
 constexpr std::ptrdiff_t kStorageBase = 0x20;
 constexpr std::size_t kGetSlot = 3;
 
-struct Placed {
-    void* subChunk;
-    unsigned int layer;
-    unsigned int index;
-    const void* before;
-};
-
-std::mutex g_placedLock;
-std::vector<Placed> g_placed;
-
-std::atomic<bool> g_placing{false};
-std::atomic<const void*> g_air{nullptr};
-std::atomic<unsigned long> g_placingThread{0};
-
+using KnownSet = std::unordered_set<const void*>;
 std::mutex g_knownLock;
-std::unordered_set<const void*> g_known;
+std::atomic<const KnownSet*> g_known{nullptr};
+struct RetiredKnown {
+    std::unique_ptr<KnownSet> set;
+    unsigned long long at = 0;
+};
+std::unique_ptr<KnownSet> g_knownOwned;
+std::vector<RetiredKnown> g_knownRetired;
+
+void publishKnownLocked(std::unique_ptr<KnownSet> next)
+{
+    const unsigned long long now = GetTickCount64();
+    g_known.store(next.get(), std::memory_order_release);
+    if (g_knownOwned) {
+        g_knownRetired.push_back({std::move(g_knownOwned), now});
+    }
+    g_knownOwned = std::move(next);
+    std::erase_if(g_knownRetired, [now](const RetiredKnown& r) { return now - r.at >= 5000; });
+}
 
 constexpr std::size_t kStorageVtableSlots = 32;
 std::atomic<const void*> g_storageVtables[kStorageVtableSlots] = {};
 std::atomic<std::size_t> g_storageVtableCount{0};
 std::mutex g_storageVtableLock;
-std::atomic<std::size_t> g_storageVtableRejected{0};
 
 bool isKnownStorageVtable(const void* vtable)
 {
@@ -356,7 +287,6 @@ const void* readBlock(void* subChunk, unsigned int layer, unsigned int index)
         return nullptr;
     }
     if (!isKnownStorageVtable(vtable)) {
-        g_storageVtableRejected.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     void* fn = nullptr;
@@ -367,8 +297,8 @@ const void* readBlock(void* subChunk, unsigned int layer, unsigned int index)
 
     const void* got = callStorageGet(fn, storage, index);
 
-    std::lock_guard<std::mutex> guard(g_knownLock);
-    if (g_known.empty() || g_known.find(got) == g_known.end()) {
+    const KnownSet* const known = g_known.load(std::memory_order_acquire);
+    if (known == nullptr || known->find(got) == known->end()) {
         return nullptr;
     }
     return got;
@@ -378,13 +308,14 @@ const void* readBlock(void* subChunk, unsigned int layer, unsigned int index)
 
 void setKnownBlocks(const void* const* blocks, std::size_t count)
 {
-    std::lock_guard<std::mutex> guard(g_knownLock);
-    g_known.clear();
+    auto next = std::make_unique<KnownSet>();
     for (std::size_t i = 0; i < count; ++i) {
         if (blocks[i] != nullptr) {
-            g_known.insert(blocks[i]);
+            next->insert(blocks[i]);
         }
     }
+    std::lock_guard<std::mutex> guard(g_knownLock);
+    publishKnownLocked(next->empty() ? nullptr : std::move(next));
 }
 
 namespace {
@@ -410,11 +341,6 @@ std::atomic<std::size_t> g_subChunkCount{0};
 
 thread_local int t_writePos[3] = {0, 0, 0};
 thread_local bool t_writePosValid = false;
-
-thread_local void* t_renderSubChunk = nullptr;
-thread_local unsigned int t_renderIndex = 0;
-
-thread_local bool t_nudgeGuard = false;
 
 constexpr std::size_t kSlotIndexSize = 8192;
 std::atomic<std::uint64_t> g_slotIndexKey[kSlotIndexSize] = {};
@@ -636,27 +562,6 @@ void forgetSubChunkAt(int baseX, int baseY, int baseZ)
     g_subChunks[at].chunkAlt.store(nullptr, std::memory_order_release);
 }
 
-void storageVtableStats(std::size_t& known, std::size_t& rejected)
-{
-    known = std::min(g_storageVtableCount.load(std::memory_order_acquire), kStorageVtableSlots);
-    rejected = g_storageVtableRejected.exchange(0, std::memory_order_relaxed);
-}
-
-void noteSubChunkAlt(int baseX, int baseY, int baseZ, void* subChunk)
-{
-    if (subChunk == nullptr) {
-        return;
-    }
-    const std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
-    if (at >= kSubChunkSlots) {
-        return;
-    }
-    if (g_subChunks[at].chunk.load(std::memory_order_acquire) == subChunk) {
-        return;
-    }
-    g_subChunks[at].chunkAlt.store(subChunk, std::memory_order_release);
-}
-
 bool worldPosOfSubChunkWrite(void* subChunk, unsigned int index, int out[3])
 {
     if (subChunk == nullptr || out == nullptr || index >= 4096) {
@@ -727,7 +632,7 @@ void noteWorldChanged(bool leftAWorld)
         blocks::dropWorldBlocks();
         {
             std::lock_guard<std::mutex> guard(g_knownLock);
-            g_known.clear();
+            publishKnownLocked(nullptr);
         }
         log().info(L"Schematica: left a world, so the blocks from there are no longer "
                    L"answered (the schematic was {})",
@@ -745,24 +650,6 @@ void noteWorldChanged(bool leftAWorld)
 
 namespace {
 std::atomic<int> g_selfWrite{0};
-std::atomic<int> g_renderWrite{0};
-}
-
-void beginRenderWrite()
-{
-    g_renderWrite.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void endRenderWrite()
-{
-    if (g_renderWrite.fetch_sub(1, std::memory_order_acq_rel) <= 0) {
-        g_renderWrite.store(0, std::memory_order_release);
-    }
-}
-
-bool renderWriting()
-{
-    return g_renderWrite.load(std::memory_order_acquire) > 0;
 }
 
 void beginSelfWrite()
@@ -782,73 +669,12 @@ bool selfWriting()
     return g_selfWrite.load(std::memory_order_acquire) > 0;
 }
 
-void beginPlacement(const void* air)
-{
-    g_air.store(air, std::memory_order_relaxed);
-    g_placingThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
-    g_placing.store(true, std::memory_order_release);
-}
-
-void endPlacement()
-{
-    g_placing.store(false, std::memory_order_release);
-}
-
-std::size_t placedCount()
-{
-    std::lock_guard<std::mutex> guard(g_placedLock);
-    std::size_t count = 0;
-    for (const Placed& one : g_placed) {
-        if (one.layer == 0) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 const void* onSubChunkWrite(void* subChunk, unsigned int layer, unsigned int index,
                             const void* block)
 {
     if (layer == 0) {
-        if (renderWriting()) {
-            if (t_renderSubChunk == nullptr) {
-                t_renderSubChunk = subChunk;
-                t_renderIndex = index;
-            }
-            if (t_nudgeGuard) {
-                const void* const air = g_air.load(std::memory_order_relaxed);
-                const void* const before = readBlock(subChunk, layer, index);
-                if (before == nullptr || before != air) {
-                    return before;
-                }
-                g_wroteGhost.store(true, std::memory_order_relaxed);
-            }
-        } else {
-            learnSubChunk(subChunk, index);
-        }
+        learnSubChunk(subChunk, index);
     }
-
-    if (!g_placing.load(std::memory_order_acquire) || subChunk == nullptr || renderWriting()) {
-        return block;
-    }
-    if (GetCurrentThreadId() != g_placingThread.load(std::memory_order_relaxed)) {
-        return block;
-    }
-    const void* const air = g_air.load(std::memory_order_relaxed);
-    const void* const before = readBlock(subChunk, layer, index);
-    if (before == nullptr) {
-        return nullptr;
-    }
-    if (before != air) {
-        return before;
-    }
-
-    {
-        std::lock_guard<std::mutex> guard(g_placedLock);
-        g_placed.push_back(Placed{subChunk, layer, index, before});
-    }
-    g_wroteGhost.store(true, std::memory_order_relaxed);
-
     return block;
 }
 
@@ -856,7 +682,6 @@ namespace {
 using GetChunkAtFn = void*(__fastcall*)(void*, const int*);
 
 std::atomic<std::size_t> g_findWhy[kFindWhyCount] = {};
-std::atomic<std::size_t> g_looseHits{0};
 
 void noteFindWhy(std::size_t which)
 {
@@ -884,11 +709,6 @@ void findSubChunkStats(std::size_t out[kFindWhyCount])
     for (std::size_t i = 0; i < kFindWhyCount; ++i) {
         out[i] = g_findWhy[i].exchange(0, std::memory_order_relaxed);
     }
-}
-
-std::size_t findSubChunkLooseHits()
-{
-    return g_looseHits.load(std::memory_order_relaxed);
 }
 
 constexpr std::ptrdiff_t kSourceLoose = 0x1c;
@@ -940,9 +760,6 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
         auto* chunk = static_cast<std::uint8_t*>(getChunkAt(bs, at));
         if (chunk == nullptr) {
             chunk = static_cast<std::uint8_t*>(getChunkLoose(getChunkAt, bs, at));
-            if (chunk != nullptr) {
-                g_looseHits.fetch_add(1, std::memory_order_relaxed);
-            }
         }
         if (chunk == nullptr) {
             noteFindWhy(4);
@@ -986,109 +803,6 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
         noteFindWhy(10);
         return nullptr;
     }
-}
-
-bool nudgeRegion(void* region, const BlockPos& at, const void* block, const void* air,
-                 void** outSubChunk, StorageSpot* hold)
-{
-    if (outSubChunk != nullptr) {
-        *outSubChunk = nullptr;
-    }
-    if (hold != nullptr) {
-        *hold = StorageSpot{};
-    }
-    if (region == nullptr || block == nullptr || air == nullptr) {
-        return false;
-    }
-    if (!regionIsAlive(region)) {
-        return false;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::BlockSourceSetBlock) || !scanner.found(Target::SubChunkSetBlock)) {
-        return false;
-    }
-    const auto setBlock = scanner.addressAs<RegionSetBlockFn>(Target::BlockSourceSetBlock);
-    const auto setStorage = scanner.addressAs<SubChunkSetFn>(Target::SubChunkSetBlock);
-    if (setBlock == nullptr || setStorage == nullptr) {
-        return false;
-    }
-
-    const int pos[3] = {at.x, at.y, at.z};
-    t_renderSubChunk = nullptr;
-    t_renderIndex = 0;
-    g_air.store(air, std::memory_order_relaxed);
-    g_wroteGhost.store(false, std::memory_order_relaxed);
-
-    beginSelfWrite();
-    beginRenderWrite();
-    t_nudgeGuard = true;
-    callRegionSetBlock(setBlock, region, pos, block, g_mode.load(std::memory_order_relaxed),
-                       g_updateFlags.load(std::memory_order_relaxed),
-                       g_actor.load(std::memory_order_relaxed));
-    t_nudgeGuard = false;
-    void* const sub = t_renderSubChunk;
-    const unsigned int index = t_renderIndex;
-    const bool wrote = g_wroteGhost.load(std::memory_order_relaxed);
-    if (sub != nullptr && index == subChunkIndex(at.x, at.y, at.z)
-        && outSubChunk != nullptr) {
-        *outSubChunk = sub;
-    }
-    if (wrote && sub != nullptr && index == subChunkIndex(at.x, at.y, at.z)) {
-        if (hold != nullptr) {
-            hold->subChunk = sub;
-            hold->index = index;
-        } else {
-            setStorage(sub, 0, index, air);
-        }
-    }
-    endRenderWrite();
-    endSelfWrite();
-    t_renderSubChunk = nullptr;
-    return wrote && sub != nullptr;
-}
-
-void clearSpot(const StorageSpot& spot, const void* air)
-{
-    if (spot.subChunk == nullptr || air == nullptr || spot.index >= 4096) {
-        return;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::SubChunkSetBlock)) {
-        return;
-    }
-    const auto setStorage = scanner.addressAs<SubChunkSetFn>(Target::SubChunkSetBlock);
-    if (setStorage == nullptr) {
-        return;
-    }
-    beginSelfWrite();
-    beginRenderWrite();
-    setStorage(spot.subChunk, 0, spot.index, air);
-    endRenderWrite();
-    endSelfWrite();
-}
-
-std::size_t restoreAll()
-{
-    std::vector<Placed> mine;
-    {
-        std::lock_guard<std::mutex> guard(g_placedLock);
-        mine.swap(g_placed);
-    }
-    if (mine.empty()) {
-        return 0;
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::SubChunkSetBlock)) {
-        return 0;
-    }
-    const auto setBlock = scanner.addressAs<SubChunkSetFn>(Target::SubChunkSetBlock);
-    if (setBlock == nullptr) {
-        return 0;
-    }
-    for (const Placed& one : mine) {
-        setBlock(one.subChunk, one.layer, one.index, one.before);
-    }
-    return mine.size();
 }
 
 }

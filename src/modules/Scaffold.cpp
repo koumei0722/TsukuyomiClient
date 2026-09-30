@@ -61,33 +61,6 @@ const wchar_t* Scaffold::heightName() const
     }
 }
 
-void Scaffold::cyclePattern()
-{
-    switch (m_pattern) {
-    case Pattern::Cross:   m_pattern = Pattern::Square3; break;
-    case Pattern::Square3: m_pattern = Pattern::Square5; break;
-    case Pattern::Square5: m_pattern = Pattern::Square7; break;
-    case Pattern::Square7:
-    default:               m_pattern = Pattern::Cross; break;
-    }
-}
-
-void Scaffold::cycleHeight()
-{
-    switch (m_height) {
-    case Height::Follow:   m_height = Height::Manual; break;
-    case Height::Manual:   m_height = Height::OnEnable; break;
-    case Height::OnEnable:
-    default:               m_height = Height::Follow; break;
-    }
-
-    if (enabled()) {
-        captureHeight();
-    } else {
-        m_hasCapturedY = false;
-    }
-}
-
 void Scaffold::captureHeight()
 {
     m_hasCapturedY = false;

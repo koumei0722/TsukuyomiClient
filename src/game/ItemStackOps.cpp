@@ -481,23 +481,6 @@ bool ItemStackOps::assignFrom(void* dst, const void* src)
     return true;
 }
 
-bool ItemStackOps::setCount(void* stack, std::uint8_t count)
-{
-    if (stack == nullptr) {
-        return false;
-    }
-    auto* const target = static_cast<std::byte*>(stack);
-    if (!memory::isWritable(target, kStackSize)) {
-        return false;
-    }
-    void* const vtable = *reinterpret_cast<void* const*>(target);
-    if (vtable == nullptr || !mainModule().contains(vtable)) {
-        return false;
-    }
-    target[kCountOffset] = static_cast<std::byte>(count);
-    return true;
-}
-
 bool ItemStackOps::stash(const void* src)
 {
     discard();

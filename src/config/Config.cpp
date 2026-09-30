@@ -92,6 +92,25 @@ void Config::eraseSection(std::string_view name)
     m_root.erase(std::string(name));
 }
 
+bool Config::renameSection(std::string_view from, std::string_view to)
+{
+    const std::string oldName(from);
+    const std::string newName(to);
+    if (oldName == newName) {
+        return false;
+    }
+    const auto old = m_root.find(oldName);
+    if (old == m_root.end() || !old->is_object()) {
+        return false;
+    }
+    const auto current = m_root.find(newName);
+    if (current == m_root.end() || !current->is_object()) {
+        m_root[newName] = std::move(*old);
+    }
+    m_root.erase(oldName);
+    return true;
+}
+
 int Config::getInt(const nlohmann::json& node, std::string_view key, int fallback)
 {
     const auto it = node.find(std::string(key));

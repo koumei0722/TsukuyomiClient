@@ -23,26 +23,25 @@ bool attackHooksInstalled();
 bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra,
                     bool simTick);
 
+bool callGameModeContinueDestroyBlock(void* gameMode, const void* pos, std::uint8_t face,
+                                      const void* playerPos, bool* out);
+bool callGameModeDestroyBlock(void* gameMode, const void* pos, std::uint8_t face);
+bool hasGameModeContinueDestroyBlock();
+bool hasGameModeDestroyBlock();
+
 int callUseItem(void* gameMode, void* itemStack, int extra);
 
 int callUseItemTransaction(void* gameMode, void* itemStack, int extra);
-
-bool callSetGameMode(void* self, int mode, int extra);
 
 void callNotifyInventoryOpen(void* client);
 
 void* callUiDefLookup(void* self, const void* space, const void* name);
 
-void* callUiBagFind(void* bag, const char* key);
-
 void* uiBagSetFunction();
 
 bool setUiBagNumber(void* holder, const char* name, unsigned long long size, float value);
 
-bool callKeyDisplayName(void* outString, int keyCode);
-
 bool callSettingsGroupRegister(void* registry, const void* idView, void* provider);
-bool callSettingsInvokeAction(void* component, void* done);
 
 void* gameClientInstance();
 
@@ -50,7 +49,6 @@ bool callOpenHowToPlayScreen();
 
 bool popTopScreen();
 
-bool offstackScreenAvailable();
 bool offstackScreenHeld();
 bool tickOffstackScreen();
 void releaseOffstackScreen(const wchar_t* why);
@@ -67,15 +65,11 @@ enum class InventoryOpenResult {
 
 InventoryOpenResult callOpenInventoryScreen(void* client);
 
-bool hasGetDestroySpeed();
-bool hasSetSelectedSlot();
-bool hasBuildBlock();
-bool hasUseItem();
-bool hasUseItemTransaction();
-bool hasSetGameMode();
 bool hasNotifyInventoryOpen();
 
-const void* readWorldBlock(void* region, const int pos[3]);
+inline constexpr std::size_t kHitResultBytes = 0x85;
+bool readHitResult(unsigned char out[kHitResultBytes]);
+bool readLiquidHitResult(unsigned char out[kHitResultBytes]);
 
 void requestGhostChunkBuild();
 
@@ -87,14 +81,6 @@ bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
                             std::uint32_t* stacked = nullptr);
 std::uint64_t nextBuildSeq();
 void clearChunkBoxTries();
-void chunkRebuildStats(std::size_t (&out)[9]);
-
-void askBuildStats(std::size_t (&out)[9]);
-
-void overlayStats(std::size_t& stacked, std::size_t& missed);
-
-void hotPathStats(std::size_t& preds, std::size_t& scans, std::size_t& getBlockGhost,
-                  std::size_t& getBlockCalls);
 
 void armStorageHooks(void* subChunk, int baseX, int baseY, int baseZ);
 

@@ -569,7 +569,7 @@ void ItemScroller::handleViewInput()
             if (changed) {
                 enqueueClearGrid();
             } else {
-                const bool shift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+                const bool shift = keyHeld(VK_SHIFT);
                 enqueueFillGrid(shift);
             }
             if (debugLog()) {
@@ -578,7 +578,7 @@ void ItemScroller::handleViewInput()
             }
         }
     }
-    const bool middle = mouseHeld(VK_MBUTTON);
+    const bool middle = keyHeld(VK_MBUTTON);
     int hovered = -1;
     if (middle && !m_viewMiddleWas && m_recipeViewOpen && viewHovered(hovered)) {
         enqueueClearGrid();

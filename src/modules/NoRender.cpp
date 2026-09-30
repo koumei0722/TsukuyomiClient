@@ -1,4 +1,5 @@
 #include "modules/NoRender.h"
+#include "memory/ForceTrue.h"
 
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
@@ -8,8 +9,10 @@
 
 #include <Windows.h>
 
+#include <cstdint>
 #include <cstring>
 #include <string>
+#include <utility>
 
 namespace tsukuyomi {
 
@@ -198,59 +201,6 @@ bool nearAssert(const std::byte* call, std::size_t size)
     return false;
 }
 
-bool makeForceTrueBytes(const std::byte* at, std::size_t& sizeOut,
-                        std::vector<std::byte>& out)
-{
-    const auto* const b = reinterpret_cast<const unsigned char*>(at);
-    unsigned char rex = 0;
-    std::size_t head = 0;
-    if (b[0] >= 0x40 && b[0] <= 0x4F) {
-        rex = b[0];
-        head = 1;
-    }
-    const bool isMovzx = (b[head] == 0x0F && b[head + 1] == 0xB6);
-    const bool isMov8 = (b[head] == 0x8A);
-    if (!isMovzx && !isMov8) {
-        return false;
-    }
-    const std::size_t modrmAt = head + (isMovzx ? 2u : 1u);
-    const unsigned char modrm = b[modrmAt];
-
-    if ((modrm & 0xC7) != 0x40 || b[modrmAt + 1] != 0x10) {
-        return false;
-    }
-    const unsigned reg = (modrm >> 3) & 7;
-    const bool regHigh = (rex & 0x04) != 0;
-    const std::size_t size = modrmAt + 2;
-
-    out.clear();
-    if (isMov8) {
-
-        if (rex != 0 || regHigh) {
-            out.push_back(static_cast<std::byte>(0x40 | (regHigh ? 0x01 : 0x00)));
-        }
-        out.push_back(static_cast<std::byte>(0xB0 + reg));
-        out.push_back(std::byte{0x01});
-    } else {
-
-        if (regHigh) {
-            return false;
-        }
-        out.push_back(std::byte{0x31});
-        out.push_back(static_cast<std::byte>(0xC0 | (reg << 3) | reg));
-        out.push_back(static_cast<std::byte>(0xB0 + reg));
-        out.push_back(std::byte{0x01});
-    }
-    if (out.size() > size) {
-        return false;
-    }
-    while (out.size() < size) {
-        out.push_back(std::byte{0x90});
-    }
-    sizeOut = size;
-    return true;
-}
-
 }
 
 NoRender& NoRender::instance()
@@ -344,7 +294,7 @@ void NoRender::resolveOptions()
         std::vector<std::byte> patched;
         for (std::byte* scan = callSite + 6; scan + 6 < callSite + kReadSpan && scan + 6 < end;
              ++scan) {
-            if (makeForceTrueBytes(scan, size, patched)) {
+            if (memory::makeForceTrueBytes(scan, size, patched)) {
                 read = scan;
                 break;
             }
@@ -378,11 +328,43 @@ void NoRender::resolveOptions()
         log().warn(L"NoRender: the name-tag stage was not found");
     }
 
-    if (Scanner::instance().address(Target::FogSettingsFetch) != nullptr) {
-        m_byOption[static_cast<std::size_t>(Stage::Fog)] = true;
-        ++m_found;
+    std::byte* const clamp = Scanner::instance().address(Target::FogDistanceClamp);
+    std::byte* const colorClamp = Scanner::instance().address(Target::FogColorDistanceClamp);
+    if (Scanner::instance().address(Target::FogSettingsFetch) != nullptr && clamp != nullptr && colorClamp != nullptr) {
+        const std::size_t at = static_cast<std::size_t>(Stage::Fog);
+        constexpr float kStart = 1.0e7F;
+        constexpr float kEnd = 2.0e7F;
+        struct Site {
+            std::byte* from;
+            std::size_t size;
+            std::byte* startDisp;
+            std::byte* endDisp;
+            std::vector<std::uint8_t> head;
+        };
+        const Site sites[] = {
+
+            {clamp + 0x0C, 0x51, clamp + 0x0C + 6, clamp + 0x34 + 6, {0x41, 0xC7, 0x84, 0x24}},
+
+            {colorClamp + 0x0A, 0x48, colorClamp + 0x12 + 4, colorClamp + 0x2A + 4, {0xC7, 0x86}},
+        };
+        for (const Site& site : sites) {
+            std::vector<std::byte> bytes(site.size, std::byte{0x90});
+            std::size_t cursor = 0;
+            for (const auto& [disp, value] : {std::pair{site.startDisp, kStart}, std::pair{site.endDisp, kEnd}}) {
+                std::memcpy(bytes.data() + cursor, site.head.data(), site.head.size());
+                std::memcpy(bytes.data() + cursor + site.head.size(), disp, sizeof(std::uint32_t));
+                std::memcpy(bytes.data() + cursor + site.head.size() + 4, &value, sizeof(value));
+                cursor += site.head.size() + 8;
+            }
+            Patch patch(site.from, std::move(bytes), patchName(at).c_str());
+            if (patch.valid()) {
+                m_patches[at].push_back(std::move(patch));
+                ++m_found;
+            }
+        }
+        m_byOption[at] = true;
     } else {
-        log().warn(L"NoRender: the fog distance getter was not found");
+        log().warn(L"NoRender: the fog distance getter or one of its two clamps was not found");
     }
 
     if (std::byte* const outline = Scanner::instance().address(Target::BlockOutlineDraw);

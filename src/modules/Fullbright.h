@@ -15,7 +15,9 @@ public:
     const wchar_t* name() const override { return L"Fullbright"; }
     bool available() const override;
 
-    void* onGetEffect(int effectId, void* original);
+    void* onGetEffect(int effectId, void* original, const void* returnAddress);
+
+    void setFogColorReturns(const void* first, const void* second);
 
     static constexpr int kNightVisionEffectId = 16;
 
@@ -32,6 +34,8 @@ private:
 
     alignas(16) std::byte m_fake[kFakeBytes]{};
     bool m_fakeReady = false;
+
+    std::atomic<const void*> m_fogReturn[2]{};
 
     void ensureFake();
 };

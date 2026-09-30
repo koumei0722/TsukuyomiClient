@@ -13,6 +13,7 @@ public:
 
     const wchar_t* name() const override { return L"FastBlockPlacement"; }
     bool available() const override;
+    void onScansReady() override;
 
     MenuItem buildMenu() override;
     void loadConfig(const nlohmann::json& section) override;
@@ -45,7 +46,6 @@ private:
     };
 
     const wchar_t* axisName() const;
-    void cycleAxis();
 
     void placeRange();
 
@@ -81,6 +81,7 @@ private:
     void* m_gameMode = nullptr;
     BlockPos m_base;
     bool m_hasBase = false;
+    int m_useButton = -1;
 
     bool m_placing = false;
 

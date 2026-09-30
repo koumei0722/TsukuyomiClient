@@ -1,13 +1,11 @@
 #include "modules/FreeCamera.h"
+#include "input/GameButtons.h"
 
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "game/GameData.h"
-#include "game/UiSound.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
-#include "input/Keys.h"
-#include "input/LowLevelHook.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -26,11 +24,6 @@ namespace tsukuyomi {
 
 namespace {
 
-bool keyDown(int virtualKey)
-{
-    return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
-}
-
 int accessViolationFilter(unsigned long code)
 {
     return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
@@ -38,28 +31,15 @@ int accessViolationFilter(unsigned long code)
                : EXCEPTION_CONTINUE_SEARCH;
 }
 
-struct MoveInputPeek {
-    std::uint32_t bits = 0;
-    std::uint32_t bits2 = 0;
-    std::uint16_t flags = 0;
-};
-
 constexpr std::uint32_t kUpDownEdge = (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);
 constexpr std::uint32_t kUpDownHeld = (1u << 26) | (1u << 21);
 
-constexpr std::uint32_t kMoveBits = (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16);
-
-bool peekMoveInputGuarded(std::byte* input, bool clearJump, MoveInputPeek* out)
+bool dropUpDownBitsGuarded(std::byte* input)
 {
     __try {
-        out->bits = *reinterpret_cast<const std::uint32_t*>(input + 0x00);
-        out->bits2 = *reinterpret_cast<const std::uint32_t*>(input + 0x10);
-        out->flags = *reinterpret_cast<const std::uint16_t*>(input + 0x60);
-        if (clearJump) {
-            constexpr std::uint32_t drop = kUpDownEdge | kUpDownHeld;
-            *reinterpret_cast<std::uint32_t*>(input + 0x00) &= ~drop;
-            *reinterpret_cast<std::uint32_t*>(input + 0x10) &= ~drop;
-        }
+        constexpr std::uint32_t drop = kUpDownEdge | kUpDownHeld;
+        *reinterpret_cast<std::uint32_t*>(input + 0x00) &= ~drop;
+        *reinterpret_cast<std::uint32_t*>(input + 0x10) &= ~drop;
         return true;
     } __except (accessViolationFilter(GetExceptionCode())) {
         return false;
@@ -82,8 +62,6 @@ bool takeMoveIntentGuarded(std::byte* out, float* took)
 
 }
 
-FreeCamera* FreeCamera::s_hookOwner = nullptr;
-
 FreeCamera& FreeCamera::instance()
 {
     static FreeCamera module;
@@ -95,74 +73,16 @@ bool FreeCamera::available() const
     return Scanner::instance().found(Target::CameraUpdate);
 }
 
-FreeCamera::MoveKey FreeCamera::moveKeyFor(DWORD virtualKey)
-{
-    switch (virtualKey) {
-    case 'W':
-        return MoveKey::Forward;
-    case 'S':
-        return MoveKey::Back;
-    case 'A':
-        return MoveKey::Left;
-    case 'D':
-        return MoveKey::Right;
-    case VK_SPACE:
-        return MoveKey::Up;
-    case VK_LSHIFT:
-    case VK_SHIFT:
-        return MoveKey::Down;
-    case VK_LCONTROL:
-    case VK_CONTROL:
-        return MoveKey::Fast;
-    default:
-        return MoveKey::Count;
-    }
-}
-
-int FreeCamera::virtualKeyFor(MoveKey key)
-{
-    switch (key) {
-    case MoveKey::Forward:
-        return 'W';
-    case MoveKey::Back:
-        return 'S';
-    case MoveKey::Left:
-        return 'A';
-    case MoveKey::Right:
-        return 'D';
-    case MoveKey::Up:
-        return VK_SPACE;
-    case MoveKey::Down:
-        return VK_LSHIFT;
-    case MoveKey::Fast:
-        return VK_LCONTROL;
-    default:
-        return 0;
-    }
-}
-
 bool FreeCamera::held(MoveKey key) const
 {
-    if (movementSuppressed()) {
-        if (key == MoveKey::Up || key == MoveKey::Down) {
-            const std::uint64_t seen =
-                m_rawSeenMs[static_cast<size_t>(key)].load(std::memory_order_relaxed);
-            return seen != 0 && (GetTickCount64() - seen) <= kRawHoldGraceMs;
-        }
-        return keyDown(virtualKeyFor(key));
+    const int index = static_cast<int>(key);
+    if (index < 0 || index >= static_cast<int>(kMoveKeyCount)) return false;
+    const bool watched = GameButtons::instance().buttonHeld(m_moveButtons[index]);
+    if (key == MoveKey::Up || key == MoveKey::Down) {
+        const std::uint64_t seen = m_rawSeenMs[static_cast<size_t>(key)].load(std::memory_order_relaxed);
+        return watched || (seen != 0 && GetTickCount64() - seen <= kRawHoldGraceMs);
     }
-
-    if (m_keyHook != nullptr) {
-        return m_held[static_cast<size_t>(key)].load(std::memory_order_relaxed);
-    }
-
-    return keyDown(virtualKeyFor(key));
-}
-
-bool FreeCamera::movementSuppressed() const
-{
-    const unsigned long long at = m_inputSeenAt.load(std::memory_order_acquire);
-    return at != 0 && (GetTickCount64() - at) <= kInputFreshMs;
+    return watched;
 }
 
 void FreeCamera::onMoveInput(void* input)
@@ -171,15 +91,10 @@ void FreeCamera::onMoveInput(void* input)
         return;
     }
 
-    const bool clearJump = enabled() && input::isInGameplay();
-
-    MoveInputPeek peek;
-    if (!peekMoveInputGuarded(static_cast<std::byte*>(input), clearJump, &peek)) {
+    if (!enabled() || !input::isInGameplay()) {
         return;
     }
-
-    m_inputSeenAt.store(GetTickCount64(), std::memory_order_release);
-
+    dropUpDownBitsGuarded(static_cast<std::byte*>(input));
 }
 
 void FreeCamera::onMoveIntent(void* out, void* input)
@@ -280,9 +195,8 @@ bool FreeCamera::intentFresh() const
     return at != 0 && (GetTickCount64() - at) <= kIntentFreshMs;
 }
 
-float FreeCamera::cameraYaw(const std::byte* cameraBase)
+float FreeCamera::cameraYaw(const float* q)
 {
-    const auto* const q = reinterpret_cast<const float*>(cameraBase + kCameraQuat);
     const float qw = q[1];
     const float qy = q[3];
     return 2.0f * std::atan2(qy, qw) * (180.0f / std::numbers::pi_v<float>);
@@ -309,6 +223,14 @@ float FreeCamera::movementOffset() const
 
 void FreeCamera::onScansReady()
 {
+    const char* names[kMoveKeyCount] = {
+        gamebuttonlogic::button::up, gamebuttonlogic::button::down,
+        gamebuttonlogic::button::left, gamebuttonlogic::button::right,
+        gamebuttonlogic::button::jump, gamebuttonlogic::button::sneak,
+        gamebuttonlogic::button::sprint};
+    for (size_t i = 0; i < kMoveKeyCount; ++i) {
+        m_moveButtons[i] = GameButtons::instance().watchButton(names[i]);
+    }
     if (std::byte* const base = Scanner::instance().address(Target::CameraUpdate);
         base != nullptr) {
         m_patchX = makeNopPatch(base + kWriteX, kWriteSize, "FreeCamera.CameraPosition");
@@ -407,138 +329,8 @@ void FreeCamera::saveConfig(nlohmann::json& section) const
     section["speed"] = m_speed;
 }
 
-void FreeCamera::clearHeldKeys()
-{
-    for (std::atomic<bool>& flag : m_held) {
-        flag.store(false, std::memory_order_relaxed);
-    }
-}
-
-bool FreeCamera::comboKeyOf(const std::vector<int>& combo, DWORD virtualKey)
-{
-    if (combo.empty()) {
-        return false;
-    }
-    const int vk = keys::normalize(static_cast<int>(virtualKey));
-    if (keys::isModifier(vk)) {
-        return false;
-    }
-    bool isMain = false;
-    for (const int key : combo) {
-        if (!keys::isModifier(key) && key == vk) {
-            isMain = true;
-            break;
-        }
-    }
-    if (!isMain) {
-        return false;
-    }
-    for (const int key : combo) {
-        if (keys::isModifier(key) && (GetAsyncKeyState(key) & 0x8000) == 0) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool FreeCamera::consumeToggle()
-{
-    return m_togglePressed.exchange(false, std::memory_order_relaxed);
-}
-
-void FreeCamera::onUpdate()
-{
-    if (m_keyHook == nullptr && available()) {
-        installKeyHook();
-    }
-    if (m_keyHook == nullptr) {
-        return;
-    }
-    if (consumeToggle() && input::isInGameplay()) {
-        toggle();
-        UiSound::instance().request();
-    }
-}
-
-void FreeCamera::installKeyHook()
-{
-    if (m_keyHook != nullptr || m_keyHookFailed.load(std::memory_order_relaxed)) {
-        return;
-    }
-
-    clearHeldKeys();
-    s_hookOwner = this;
-    const input::LowLevelHook hook =
-        input::installLowLevelHook(WH_KEYBOARD_LL, &FreeCamera::keyboardHookProc);
-    m_keyHook = hook.hook;
-    if (m_keyHook == nullptr) {
-        s_hookOwner = nullptr;
-        m_keyHookFailed.store(true, std::memory_order_relaxed);
-        if (!m_keyHookWarned) {
-            m_keyHookWarned = true;
-            log().warn(L"FreeCamera: could not hook the keyboard (error {}, {} with the module). "
-                       L"The camera still moves, but the player will move with it. "
-                       L"Retrying only when FreeCamera is switched",
-                       hook.errorWithoutModule, hook.errorWithModule);
-        }
-        return;
-    }
-    if (hook.withModule) {
-        log().info(L"FreeCamera: hooked the keyboard with the module (error {} without it)",
-                   hook.errorWithoutModule);
-    } else {
-        log().info(L"FreeCamera: hooked the keyboard");
-    }
-}
-
-void FreeCamera::removeKeyHook()
-{
-    if (m_keyHook != nullptr) {
-        UnhookWindowsHookEx(m_keyHook);
-        m_keyHook = nullptr;
-    }
-    s_hookOwner = nullptr;
-
-    clearHeldKeys();
-}
-
-LRESULT CALLBACK FreeCamera::keyboardHookProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code == HC_ACTION && s_hookOwner != nullptr) {
-        const bool down = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-        const bool up = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
-
-        const DWORD vkCode = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam)->vkCode;
-
-        if ((down || up) && input::isInGameplay()
-            && comboKeyOf(s_hookOwner->toggleKey().combo(), vkCode)) {
-            if (down) {
-                if (!s_hookOwner->m_toggleDown.exchange(true, std::memory_order_relaxed)) {
-                    s_hookOwner->m_togglePressed.store(true, std::memory_order_relaxed);
-                }
-            } else {
-                s_hookOwner->m_toggleDown.store(false, std::memory_order_relaxed);
-            }
-            return 1;
-        }
-
-        if ((down || up) && s_hookOwner->enabled() && input::isInGameplay()
-            && !s_hookOwner->movementSuppressed()) {
-            const MoveKey key = moveKeyFor(vkCode);
-            if (key != MoveKey::Count) {
-                s_hookOwner->m_held[static_cast<size_t>(key)].store(down,
-                                                                    std::memory_order_relaxed);
-                return 1;
-            }
-        }
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
-}
-
 void FreeCamera::onEnabledChanged(bool enabled)
 {
-    m_keyHookFailed.store(false, std::memory_order_relaxed);
-
     if (enabled) {
         if (!GameData::instance().hasLivePlayer()) {
             GameData::instance().findPlayerFromClient(hooks::gameClientInstance());
@@ -562,9 +354,7 @@ void FreeCamera::onEnabledChanged(bool enabled)
 
         m_patchPerspective.apply();
 
-        clearHeldKeys();
     } else {
-        clearHeldKeys();
 
         m_patchX.restore();
         m_patchY.restore();
@@ -591,18 +381,19 @@ bool FreeCamera::freezeViewVector(float* out)
         m_hasFrozenView = false;
         return false;
     }
-    if (out == nullptr || !memory::isReadable(out, sizeof(m_frozenView))) {
+    if (out == nullptr) {
         return false;
     }
     if (!m_hasFrozenView) {
-        std::memcpy(m_frozenView, out, sizeof(m_frozenView));
+        if (!memory::copyGuarded(out, m_frozenView, sizeof(m_frozenView))) {
+            return false;
+        }
         m_hasFrozenView = true;
         log().info(L"FreeCamera: froze the aim direction at ({:.3f}, {:.3f}, {:.3f})",
                    m_frozenView[0], m_frozenView[1], m_frozenView[2]);
         return false;
     }
-    std::memcpy(out, m_frozenView, sizeof(m_frozenView));
-    return true;
+    return memory::writeGuarded(out, m_frozenView, sizeof(m_frozenView));
 }
 
 bool FreeCamera::borrowForChunkReload()
@@ -638,38 +429,32 @@ bool FreeCamera::borrowing() const
 
 bool FreeCamera::applyBorrow(std::byte* cameraBase)
 {
-    if (!memory::isWritable(cameraBase + kCameraX,
-                            static_cast<size_t>(kCameraZ + sizeof(float) - kCameraX))) {
+    static_assert(kCameraY == kCameraX + sizeof(float)
+                  && kCameraZ == kCameraY + sizeof(float));
+    float position[3]{};
+    if (!memory::copyGuarded(cameraBase + kCameraX, position, sizeof(position))) {
         endBorrow(nullptr);
         return false;
     }
-    auto* const x = reinterpret_cast<float*>(cameraBase + kCameraX);
-    auto* const y = reinterpret_cast<float*>(cameraBase + kCameraY);
-    auto* const z = reinterpret_cast<float*>(cameraBase + kCameraZ);
     if (!m_borrowSynced) {
-        m_borrowX = *x;
-        m_borrowY = *y;
-        m_borrowZ = *z;
+        m_borrowX = position[0];
+        m_borrowY = position[1];
+        m_borrowZ = position[2];
         m_borrowSynced = true;
     }
     if (GetTickCount64() >= m_borrowUntil) {
         endBorrow(cameraBase);
         return false;
     }
-    *x = m_borrowX + kBorrowJump;
-    *y = m_borrowY;
-    *z = m_borrowZ + kBorrowJump;
-    return true;
+    const float moved[3] = {m_borrowX + kBorrowJump, m_borrowY, m_borrowZ + kBorrowJump};
+    return memory::writeGuarded(cameraBase + kCameraX, moved, sizeof(moved));
 }
 
 void FreeCamera::endBorrow(std::byte* cameraBase)
 {
-    if (cameraBase != nullptr && m_borrowSynced
-        && memory::isWritable(cameraBase + kCameraX,
-                              static_cast<size_t>(kCameraZ + sizeof(float) - kCameraX))) {
-        *reinterpret_cast<float*>(cameraBase + kCameraX) = m_borrowX;
-        *reinterpret_cast<float*>(cameraBase + kCameraY) = m_borrowY;
-        *reinterpret_cast<float*>(cameraBase + kCameraZ) = m_borrowZ;
+    if (cameraBase != nullptr && m_borrowSynced) {
+        const float position[3] = {m_borrowX, m_borrowY, m_borrowZ};
+        memory::writeGuarded(cameraBase + kCameraX, position, sizeof(position));
     }
     m_patchX.restore();
     m_patchY.restore();
@@ -695,24 +480,22 @@ void FreeCamera::onCameraWrite(void* cameraBase)
     }
 
     if (!input::isInGameplay()) {
-        clearHeldKeys();
         return;
     }
 
     auto* const base = static_cast<std::byte*>(cameraBase);
-    if (!memory::isWritable(base + kCameraQuat,
-                            static_cast<size_t>(kCameraZ + sizeof(float) - kCameraQuat))) {
+    static_assert(kCameraX == kCameraQuat + 4 * sizeof(float)
+                  && kCameraY == kCameraX + sizeof(float)
+                  && kCameraZ == kCameraY + sizeof(float));
+    float cameraState[7]{};
+    if (!memory::copyGuarded(base + kCameraQuat, cameraState, sizeof(cameraState))) {
         return;
     }
 
-    auto* const x = reinterpret_cast<float*>(base + kCameraX);
-    auto* const y = reinterpret_cast<float*>(base + kCameraY);
-    auto* const z = reinterpret_cast<float*>(base + kCameraZ);
-
     if (!m_synced) {
-        m_x = *x;
-        m_y = *y;
-        m_z = *z;
+        m_x = cameraState[4];
+        m_y = cameraState[5];
+        m_z = cameraState[6];
         m_synced = true;
     }
 
@@ -733,7 +516,7 @@ void FreeCamera::onCameraWrite(void* cameraBase)
         offset = movementOffset();
     }
     if (offset < kNoMovement) {
-        const float angle = (cameraYaw(base) + offset + 90.0f)
+        const float angle = (cameraYaw(cameraState) + offset + 90.0f)
                             * (std::numbers::pi_v<float> / 180.0f);
         m_x += std::cos(angle) * speed * scale;
         m_z += std::sin(angle) * speed * scale;
@@ -747,14 +530,12 @@ void FreeCamera::onCameraWrite(void* cameraBase)
         m_y -= speed;
     }
 
-    *x = m_x;
-    *y = m_y;
-    *z = m_z;
+    const float position[3] = {m_x, m_y, m_z};
+    memory::writeGuarded(base + kCameraX, position, sizeof(position));
 }
 
 void FreeCamera::shutdown()
 {
-    removeKeyHook();
 
     m_patchX.restore();
     m_patchY.restore();

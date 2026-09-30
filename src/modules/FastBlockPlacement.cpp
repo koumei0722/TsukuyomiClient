@@ -1,4 +1,5 @@
 #include "modules/FastBlockPlacement.h"
+#include "input/GameButtons.h"
 
 #include "config/Config.h"
 #include "core/Logger.h"
@@ -21,6 +22,11 @@ FastBlockPlacement& FastBlockPlacement::instance()
 {
     static FastBlockPlacement module;
     return module;
+}
+
+void FastBlockPlacement::onScansReady()
+{
+    m_useButton = GameButtons::instance().watchButton(gamebuttonlogic::button::buildOrInteract);
 }
 
 bool FastBlockPlacement::available() const
@@ -136,16 +142,6 @@ void FastBlockPlacement::rememberPlaced(const BlockPos& pos)
     m_placed.push_back(pos);
 }
 
-void FastBlockPlacement::cycleAxis()
-{
-    switch (m_axis) {
-    case Axis::X: m_axis = Axis::Y; break;
-    case Axis::Y: m_axis = Axis::Z; break;
-    case Axis::Z:
-    default:      m_axis = Axis::X; break;
-    }
-}
-
 MenuItem FastBlockPlacement::buildMenu()
 {
     std::vector<MenuItem> children;
@@ -240,7 +236,7 @@ void FastBlockPlacement::onPlayerViewUpdate()
         return;
     }
 
-    if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) {
+    if (GameButtons::instance().buttonHeld(m_useButton)) {
         m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
         placeRange();
         return;

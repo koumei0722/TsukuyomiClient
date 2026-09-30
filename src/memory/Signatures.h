@@ -9,6 +9,10 @@ enum class Target {
     PlayerView,
     PacketSend,
     BuildBlock,
+    GameModeContinueDestroyBlock,
+    GameModeDestroyBlock,
+    GameModeStopDestroyBlock,
+    GameModeStartDestroyWrapper,
     GetDestroySpeed,
     SetSelectedSlot,
     AbilitiesAccess,
@@ -33,37 +37,36 @@ enum class Target {
     InventoryContentGetId,
     HandleItemStackResponse,
     SendCommandRequest,
-    MakeCommandOrigin,
+    CommandRegistryLoadPacket,
+
+    CommandAutoComplete,
+    CommandAutoCompleteFilter,
+    ClientGetGuiDataSite,
+    GuiDataDisplayClientMessage,
     MakeComplexTransaction,
     MakeInventoryAction,
     DestroyInventoryAction,
     AddInventoryAction,
     SendComplexTransaction,
     InventoryHoveredSlot,
-    InventoryHotbarKey,
     MoveInputHandler,
     PlayerRotation,
     PlayerHeadRotation,
     PlayerHeadRotationInput,
     ViewPerspective,
     UiDefLookup,
-    UiBagFind,
     UiEventDispatch,
     UiSliderPublish,
     OreKeyRowsBuild,
     I18nAnchor,
-    KeyDisplayName,
     SettingsGroupRegister,
     SettingsProviderCall,
-    SettingsGroupInfoUpdate,
     SettingsFindComponent,
     GameAllocate,
     PlaySound,
     MakeOptionElement,
     ViewVector,
-    SenderVtableRef,
     PlayerVtableRef,
-    OwnControllerVtableRef,
     NetManagerVtableRef,
     KeyResetVisibleVtableRef,
     BlockRegistryRef,
@@ -72,9 +75,9 @@ enum class Target {
     BlockCollisionQuery,
     BlockRenderLookup,
     BlockTessellate,
-    SettingsInvokeAction,
     OpenHowToPlayScreen,
     HitResultAssign,
+    HitResultMoveAssign,
     ChunkVisibilityScan,
     BeRenderLoop,
     VisibilityGate,
@@ -91,8 +94,13 @@ enum class Target {
     BlockOutlineDraw,
 
     FogSettingsFetch,
+    FogDistanceClamp,
+
+    FogColorDistanceClamp,
 
     ItemRegistryLookupByName,
+
+    ItemRegistryItemListSite,
     TessellatorBegin,
     TessellatorVertex,
     TessellatorColor,
@@ -104,9 +112,10 @@ enum class Target {
     MeshDestroy,
     MaterialPtrCtorSite,
     GetActorEffect,
+
+    FogColorNightVisionSite,
     CameraFovStore,
     OpenInventoryScreen,
-    HotbarSelectTick,
     MoveIntentFromInput,
     InputGather,
 
@@ -151,11 +160,16 @@ enum class Target {
 
     ShulkerContentsText,
 
+    ItemHoverTextBuild,
+
     HoverRendererRender,
     HoverBoxSizeStore,
     UiDrawItem,
     ShulkerHoverAppend,
     ItemGlintSlotSite,
+
+    ItemMaxDamageSlotSite,
+    ItemStackDamageValue,
 
     ShaderColorFillSite,
     GlintTintSite,
@@ -173,8 +187,60 @@ enum class Target {
     HudScreenCtor,
 
     HudGetItemSite,
+
+    RenderCurrentFrame,
+    ServerLevelTick,
+    PacketCheckSize,
+    NetworkSend,
+    StartGameHandle,
+    RegionalDifficultyCondition,
+    RegionalDifficultyTail,
+    LevelChunkTickCall,
+
+    RenderedActorCountStore,
+
+    ClimateSampleCall,
+    OverworldGeneratorCtor,
+
+    PreliminarySurfaceLoop,
+    PreliminarySurfaceCall,
+    DensityGridEntry,
+    BlenderFactoryFlags,
+    DBChunkStorageVtable,
+    DiscardSetInsert,
+
+    GameButtonActionName,
+    GameButtonFindKeymap,
+    GameButtonBindAction,
+    InputMappingFactoryDtorSite,
+    InputMappingChordsField,
+    InputMappingFactoryPtrSite,
+    GameButtonRegisterDownSite,
+    GameButtonInputUpdate,
+    GameButtonRebuild,
+    GameButtonRegisterUpSite,
+
+    PauseMenuOnFocusLostSite,
+    SmoothLightingGetter,
+    BoolOptionSet,
+
+    GuiDataClearMessages,
+    GuiDataFieldSite,
+    GamePauseCallSite,
+    EmoteReleased,
+    EmoteWheelSelected,
+    EmoteWheelCtor,
+    EmoteWheelBindings,
+    ChatCommandRunSite,
+
+    ProfanityFilterGetter,
+
+    ActorAttachPos,
     Count,
 };
+
+inline constexpr std::string_view kEmoteIsValidBindingShape =
+    "41 57 41 56 56 57 53 48 83 EC 40 4C 89 C6 48 89 D7 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 38 4C 8B 79 08 4D 8D 70 08 4C 89 F1 E8 ? ? ? ? BB FF FF FF FF 84 C0 75 ? 4C 89 F1 E8 ? ? ? ? 84 C0 74 ? 48 8D 15 ? ? ? ? 4C 89 F1 E8 ? ? ? ? 49 89 C6 48 89 C1 E8 ? ? ? ? 84 C0 75 ? 4C 89 F1 E8 ? ? ? ? 84 C0 74 ? 4C 89 F1 31 D2 E8 ? ? ? ?";
 
 struct TargetInfo {
     Target target;
@@ -203,6 +269,28 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 01 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 D0 00 00 00 FE FF FF FF 44 89 CB 44 88 85 CE 00 00 00 49 89 D7 48 89 CE"},
 
+    {Target::GameModeContinueDestroyBlock, L"GameModeContinueDestroyBlock",
+     L"continued block breaking (FastBlockBreak)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 ? ? ? ? "
+     "0F 29 7D ? 0F 29 75 ? 48 C7 45 ? FE FF FF FF 4D 89 CF 44 88 45 ? 48 89 D7 "
+     "48 89 CE 48 8B 9D ? ? ? ? 48 8B 89 ? ? ? ? 48 8B 01 48 8B 40 ? 48 8D 55 ? "
+     "FF 15 ? ? ? ? C6 03 00 48 8B 4E ?"},
+
+    {Target::GameModeDestroyBlock, L"GameModeDestroyBlock",
+     L"block destruction (FastBlockBreak)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC ? 48 8D 6C 24 ? 48 C7 45 ? "
+     "FE FF FF FF 44 89 C3 48 89 D7 48 89 CE 48 8B 49 ? 48 8B 91 ? ? ? ? 8B 42 08"},
+
+    {Target::GameModeStopDestroyBlock, L"GameModeStopDestroyBlock",
+     L"stop block breaking (FastBlockBreak)",
+     "56 48 83 EC 20 48 89 CE 48 8B 89 ? ? ? ? F3 0F 10 56 ? 48 8B 01 48 8B 40 ? "
+     "FF 15 ? ? ? ? C7 46 ? 00 00 00 00 48 C7 86 ? ? ? ? 00 00 00 00 48 83 C4 20 5E C3"},
+
+    {Target::GameModeStartDestroyWrapper, L"GameModeStartDestroyWrapper",
+     L"start block breaking like a press (FastBlockBreak)",
+     "41 56 56 57 53 48 83 EC 28 45 89 C8 48 89 D6 48 89 CF 4C 8B 4C 24 ? 48 8B 01 48 8B 40 ? "
+     "FF 15 ? ? ? ? 4C 8B 77 ? 84 C0 74 ? 41 C6 86 ? ? ? ? 01"},
+
     {Target::GetDestroySpeed, L"GetDestroySpeed", L"destroy speed calculation (AutoTool)",
      "55 41 56 56 57 53 48 81 EC C0 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 30 "
      "48 C7 45 28 FE FF FF FF 48 8B 01 4C 8B 40 08 8B 40 10 4D 8B 50 48 49 8B 50 50"},
@@ -214,17 +302,17 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::AbilitiesAccess, L"AbilitiesAccess", L"ability lookup (CreativeNoClip)",
      "56 57 55 53 48 83 EC 28 48 83 F9 01 0F 84 ? ? ? ? 48 83 F9 02"},
 
-    {Target::UseItem, L"useItem", L"item use (FastRightClick)",
+    {Target::UseItem, L"useItem", L"item use (FastUseItem)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38 03 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 B0 02 00 00 FE FF FF FF 44 88 85 AF 02 00 00 48 89 D6 48 89 CF"},
 
     {Target::UseItemTransaction, L"useItemTransaction",
-     L"item use request sent to the server (FastRightClick)",
+     L"item use request sent to the server (FastUseItem)",
      "55 41 57 41 56 41 54 56 57 53 48 81 EC 50 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 "
      "C8 00 00 00 FE FF FF FF 44 89 C3 49 89 D6 48 89 CF"},
 
     {Target::SneakingCheck, L"sneaking check (MoveInputComponent bit 0)",
-     L"is the player sneaking (FastRightClick)",
+     L"is the player sneaking (FastUseItem)",
      "48 8B 51 08 8B 41 10 8B 4A 50 4C 8B 42 48 44 29 C1 C1 E9 03 FF C9 81 E1 87 18 8B 01 "
      "4D 8D 0C C8 48 8B 4A 68 66 66 66 2E 0F 1F 84 00 00 00 00 00 4D 8B 01 49 83 F8 FF "
      "0F 84 ? ? ? ? 49 C1 E0 05 4E 8D 0C 01 42 81 7C 01 08 87 18 8B 01 75 E0 4C 01 C1 "
@@ -234,7 +322,7 @@ inline constexpr TargetInfo kTargets[] = {
      "8B 41 50 89 D1 C1 E9 04 81 E1 F8 3F 00 00 48 8B 04 08 48 85 C0 74 ? 81 E2 FF FF 03 "
      "00 83 E2 7F 48 6B CA ? 0F B6 04 08 24 01 C3"},
 
-    {Target::SetGameMode, L"SetGameMode", L"game mode change (GameModeSwitch)",
+    {Target::SetGameMode, L"SetGameMode", L"game mode change (PlayerContext / GameModeState)",
      "41 57 41 56 56 57 53 48 83 EC 40 44 89 C3 89 D7 48 89 CE"},
 
     {Target::SwapSlots, L"swapSlots", L"inventory slot swap (HandRestock)",
@@ -323,15 +411,29 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 01 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 10 01 00 00 FE FF FF FF 48 89 4D 48 C6 41 58 01 48 8B 32"},
 
-    {Target::SendCommandRequest, L"sendCommandRequest", L"run a chat command (GameModeSwitch)",
+    {Target::SendCommandRequest, L"sendCommandRequest", L"run a chat command (ChatCommand hooks it)",
      "55 41 57 41 56 41 54 56 57 53 48 81 EC 90 01 00 00 48 8D AC 24 80 00 00 00 "
      "48 C7 85 08 01 00 00 FE FF FF FF 45 89 CE 4C 89 C7 48 89 D6 48 89 CB 48 8B 49 10 "
      "4C 89 C2 66 41 B8 40 00"},
 
-    {Target::MakeCommandOrigin, L"makeCommandOrigin",
-     L"build a command origin (GameModeSwitch)",
-     "55 41 56 56 57 53 48 81 EC 60 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 D0 00 00 00 "
-     "48 C7 85 C8 00 00 00 FE FF FF FF 89 D7 48 89 CE E8 ? ? ? ? 0F 57 F6 0F 29 75 60"},
+    {Target::CommandRegistryLoadPacket, L"CommandRegistryLoadPacket", L"load the client command registry",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 02 00 00 48 8D AC 24 80 00 00 00 "
+     "0F 29 B5 20 02 00 00 48 C7 85 18 02 00 00 FE FF FF FF 48 89 8D E0 01 00 00 "
+     "0F 57 F6 0F 29 B5 C0 00 00 00"},
+
+    {Target::CommandAutoComplete, L"CommandAutoComplete", L"build chat command completions (stage GB-5)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 08 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 80 01 00 00 "
+     "FE FF FF FF 4C 89 CB 4C 89 C6 48 89 95 70 01 00 00 44 8B AD F0 01 00 00"},
+
+    {Target::CommandAutoCompleteFilter, L"CommandAutoCompleteFilter", L"drop completions the player cannot use (stage GB-5)",
+     "55 41 56 56 57 53 48 83 EC 50 48 8D 6C 24 50 48 C7 45 F8 FE FF FF FF 44 89 CE 4C 89 C3 49 89 D0 "
+     "48 89 CF 48 8D 55 D8 E8 ? ? ? ? 40 84 F6"},
+
+    {Target::ClientGetGuiDataSite, L"ClientGetGuiDataSite", L"GuiData vtable slot in the chat caller",
+     "48 8B 4F 58 48 8B 01 48 8B 80 ? ? ? ? 48 8D 55 E0 FF 15 ? ? ? ? 48 83 7D E0 00 75 ? 48 8D 05 ? ? ? ? 48 89 44 24 20 48 8D 0D ? ? ? ? 48 8D 15 ? ? ? ? 4C 8D 0D ? ? ? ? 41 B8 2C 01 00 00 E8 ? ? ? ? 84 C0 74 ? C7 04 25 00 00 00 00 DE C0 AD DE 48 8B 45 E0 80 38 00 75 ? 48 8D 05 ? ? ? ? 48 89 44 24 20 48 8D 0D ? ? ? ? 48 8D 15 ? ? ? ? 4C 8D 0D ? ? ? ? 41 B8 30 01 00 00 E8 ? ? ? ? 84 C0 74 ? C7 04 25 00 00 00 00 DE C0 AD DE 48 8B 4D F0 48 89 F2 E8 ? ? ? ? 0F 57 C0 48 8B 75 E8 0F 11 45 E0 48 85 F6"},
+
+    {Target::GuiDataDisplayClientMessage, L"GuiDataDisplayClientMessage", L"append a local chat message",
+     "55 41 57 41 56 56 57 53 48 81 EC 88 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 00 02 00 00 FE FF FF FF 4D 89 CE 4C 89 C3 48 89 D7 48 89 CE 0F 57 C0"},
 
     {Target::MakeComplexTransaction, L"makeComplexTransaction",
      L"create an inventory transaction (LegacyTransaction)",
@@ -363,17 +465,9 @@ inline constexpr TargetInfo kTargets[] = {
      "41 56 56 57 55 53 48 83 EC 30 48 89 D6 48 89 CB 44 8B 05 ? ? ? ? "
      "48 8D 3D ? ? ? ? 48 89 FA"},
 
-    {Target::InventoryHotbarKey, L"inventoryHotbarKey",
-     L"number-key swap in the inventory screen (OffhandSwap)",
-     "55 41 57 41 56 41 54 56 57 53 48 81 EC F0 00 00 00 48 8D AC 24 80 00 00 00 "
-     "48 C7 45 68 FE FF FF FF 44 89 C7 48 89 D3 48 89 CE"},
-
     {Target::UiDefLookup, L"uiDefLookup", L"look a UI definition up by namespace and name",
      "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 38 4C 89 C6 48 89 D3 48 8B 05 "
      "? ? ? ? 48 31 E0 48 89 44 24 30 4C 8B 72 10"},
-
-    {Target::UiBagFind, L"uiBagFind", L"find a child slot in a UI value record (read-only)",
-     "48 89 5C 24 18 48 89 6C 24 20 41 56 48 83 EC 20 80 79 08 07 4C 8B F2 0F 85"},
 
     {Target::UiEventDispatch, L"uiEventDispatch", L"dispatch a UI event to the handler list",
      "41 56 56 57 55 53 48 83 EC 20 48 89 D6 48 89 CF "
@@ -392,10 +486,6 @@ inline constexpr TargetInfo kTargets[] = {
      "48 B8 67 75 69 2E 64 6F 6E 65 48 89 45 D0 48 8D 0D ? ? ? ? "
      "48 8B 05 ? ? ? ? 48 8B 80 80 00 00 00 48 8D 55 F0"},
 
-    {Target::KeyDisplayName, L"keyDisplayName", L"key code -> display name (vanilla wording)",
-     "55 41 57 41 56 41 54 56 57 53 48 81 EC F0 00 00 00 48 8D AC 24 80 00 00 00 "
-     "48 C7 45 68 FE FF FF FF 48 89 D6 45 85 C0 74 ? 45 89 C6"},
-
     {Target::SettingsGroupRegister, L"settingsGroupRegister",
      L"register an Ore UI settings group (id + provider)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 68 48 8D 6C 24 60 "
@@ -405,21 +495,6 @@ inline constexpr TargetInfo kTargets[] = {
      L"std::function::_Do_call that builds a settings group's item vector",
      "55 41 56 56 57 53 48 81 EC 90 00 00 00 48 8D AC 24 80 00 00 00 "
      "48 C7 45 08 FE FF FF FF 49 89 D1 48 8B 71 08 0F 57 C0"},
-
-    {Target::SettingsGroupInfoUpdate, L"settingsGroupInfoUpdate",
-     L"SettingsGroupInfoQuery value updater (id -> component -> name/state)",
-     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 08 01 00 00 48 8D AC 24 80 00 00 00 48 "
-     "C7 85 80 00 00 00 FE FF FF FF 48 89 CE 48 8B B9 30 01 00 00 0F 57 C0 0F 29 45 F0 0F "
-     "29 45 E0 4C 8B A1 80 01 00 00 48 83 B9 88 01 00 00 10 72 ? 48 8B 9E 70 01 00 00 EB ? "
-     "48 8D 9E 70 01 00 00 4D 85 E4 0F 88 ? ? ? ? 49 83 FC 0F 76 ? 4C 89 E2 48 83 CA 0F 48 "
-     "83 FA 17 41 BD 16 00 00 00 4C 0F 43 EA 48 8B 0D ? ? ? ? 48 8B 01 48 8B 40 08 48 81 "
-     "FA FF 0F 00 00 72 ? 4D 8D 75 28 4C 89 F2 FF 15 ? ? ? ? 49 89 C7 48 85 C0 0F 84 ? ? ? "
-     "? 4D 89 FE 49 83 C6 27 49 83 E6 E0 4D 89 7E F8 EB ? 4C 89 65 F0 48 C7 45 F8 0F 00 00 "
-     "00 0F 10 03 0F 29 45 E0 4C 8D 75 E0 EB ? 4D 8D 7D 01 4C 89 FA FF 15 ? ? ? ? 49 89 C6 "
-     "48 85 C0 0F 84 ? ? ? ? 4C 89 75 E0 4C 89 65 F0 4C 89 6D F8 4D 8D 44 24 01 4C 89 F1 "
-     "48 89 DA E8 ? ? ? ? 4C 89 75 B8 4C 89 65 C0 48 8B 07 48 8B 40 18 48 8D 55 A8 4C 8D "
-     "45 B8 48 89 F9 FF 15 ? ? ? ? 80 7D B0 01 75 ? 48 8B 7D A8 0F B6 87 C8 03 00 00 83 F8 "
-     "06 72 ? 8D 48 F9"},
 
     {Target::SettingsFindComponent, L"settingsFindComponent",
      L"Settings::IRegistry::find(component by id)",
@@ -435,10 +510,6 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 03 00 00 48 8D AC 24 80 00 00 00 "
      "0F 29 BD 90 02 00 00 0F 29 B5 80 02 00 00 48 C7 85 78 02 00 00 FE FF FF FF "
      "0F 28 F3 F3 0F 10 05 ?? ?? ?? ?? 0F 28 CB F3 0F 59 C8"},
-
-    {Target::SettingsInvokeAction, L"settingsInvokeAction", L"Ore UI: perform a settings action",
-     "55 56 57 48 83 EC 70 48 8D 6C 24 70 48 C7 45 F8 FE FF FF FF 48 89 55 F0 "
-     "48 89 CE 48 8B 01 48 8B 40 08 FF 15"},
 
     {Target::OpenHowToPlayScreen, L"openHowToPlayScreen",
      L"open the How to Play screen (borrowed to show our own page)",
@@ -460,15 +531,8 @@ inline constexpr TargetInfo kTargets[] = {
      "0F 28 F2 48 89 D6 48 8B 51 10 8B 41 18 48 8B 4A 48 4C 8B 42 50 49 29 C8 49 C1 E8 03 "
      "41 FF C8 41 81 E0 B7 36 DF 75 4E 8D 0C"},
 
-    {Target::SenderVtableRef, L"senderVtableRef", L"lea of the command sender vtable",
-     "48 8D 05 ?? ?? ?? ?? 48 89 01 48 8B 02 48 89 41 08 48 8D 41 10 48 89"},
-
     {Target::PlayerVtableRef, L"playerVtableRef", L"lea of the Player (LocalPlayer) vtable",
      "48 8D 05 ?? ?? ?? ?? 49 89 06 49 8D 8E B8 0C 00 00"},
-
-    {Target::OwnControllerVtableRef, L"ownControllerVtableRef",
-     L"lea of the inventory controller vtable",
-     "1D 00 00 48 8D 0D ?? ?? ?? ?? 48 89 0F 48"},
 
     {Target::NetManagerVtableRef, L"netManagerVtableRef", L"lea of the net manager vtable",
      "48 8D 05 ? ? ? ? 48 89 01 48 8B 49 78 48 85 C9 74 ? F0 FF 49 0C 75 ? 48 8B 01 48 8B "
@@ -504,6 +568,10 @@ inline constexpr TargetInfo kTargets[] = {
 
     {Target::HitResultAssign, L"HitResult::operator=", L"what the crosshair is on",
      "56 57 48 83 EC 28 48 89 C8 48 8B 4A 30 48 89 48 30 0F 10 02"},
+
+    {Target::HitResultMoveAssign, L"HitResult::operator=(&&)", L"what the crosshair is on (entity hits)",
+     "56 57 48 83 EC 38 0F 29 74 24 20 48 89 D7 48 89 CE 48 8B 42 30 48 89 41 30 0F 10 02 0F 10 4A 10 "
+     "0F 10 52 20"},
 
     {Target::ChunkVisibilityScan, L"chunk visibility scan",
      L"decide whether a sub chunk has anything to draw",
@@ -571,10 +639,21 @@ inline constexpr TargetInfo kTargets[] = {
      "48 89 D0 8B 49 08 48 83 F9 05 77 ? 48 8D 15 ? ? ? ? 48 63 0C 8A 48 01 D1 FF E1 "
      "B9 30 00 00 00"},
 
+    {Target::FogDistanceClamp, L"fog distance clamp",
+     L"clamp of the fog start/end handed to the shaders (NoRender fog)",
+     "41 C7 84 24 ? ? 00 00 00 00 80 3F F3 41 0F 10 8C 24 ? ? 00 00 F3 41 0F 5D 8C 24 ? ? 00 00 "
+     "F3 41 0F 11 8C 24 ? ? 00 00 F3 41 0F 10 8C 24 ? ? 00 00 F3 41 0F 10 94 24 ? ? 00 00 "
+     "0F 28 D9 F3 0F C2 DA 01 F3 0F 5F D0 0F 54 CB 0F 55 DA 0F 56 D9 F3 41 0F 11 9C 24 ? ? 00 00"},
+
     {Target::ItemRegistryLookupByName, L"ItemRegistry::lookupByName",
      L"look up an item by its name (stage CQ-9)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 01 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 A0 00 00 00 FE FF FF FF 48 89 D6 49 83 79 08 00 0F 84 ? ? ? ? 48 89 4D 28"},
+
+    {Target::ItemRegistryItemListSite, L"ItemRegistry item list site",
+     L"find the list of every registered item (stage GB-4)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 00 00 00 48 8D AC 24 80 00 00 00 "
+     "0F 29 75 00 48 C7 45 F8 FE FF FF FF 48 89 CE 48 8B 79 ? 48 8B 59 ? 48 39 DF 75 ? EB ?"},
 
     {Target::NameTagStageCaller, L"name tag stage caller",
      L"count whether the frame stage host runs (stage CQ-7)",
@@ -623,11 +702,6 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::CameraFovStore, L"camera fov store", L"the other write of the field of view (Zoom)",
      "F3 0F 10 85 08 01 00 00 4A 8D 04 ED 00 00 00 00 4C 01 E8 C1 E0 05 F3 41 0F 11 44 06 50"},
 
-    {Target::HotbarSelectTick, L"hotbar select tick",
-     L"the caller that moves the hotbar (Zoom suppresses it while zooming)",
-     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 04 00 00 48 8D AC 24 80 00 00 00 48 "
-     "C7 85 70 04 00 00 FE FF FF FF 4C 89 C6 48 89 D3 48 8D 7A 38"},
-
     {Target::InputGather, L"input gather",
      L"builds the held-input bits and move amounts (FreeCamera takes them)",
      "56 57 44 0F B7 49 02 45 89 C8 41 81 E0 80 00 00 00 44 89 C8 25 00 01 00 00 "
@@ -641,6 +715,17 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::GetActorEffect, L"Actor::getEffect", L"look up a mob effect on an actor (Fullbright)",
      "48 83 EC 28 4C 8B 41 10 8B 41 18 49 8B 48 48 4D 8B 48 50 49 29 C9 49 C1 E9 03 "
      "41 FF C9 41 81 E1 50 B5 A1 E6 4E 8D 14 C9 49 8B 48 68"},
+
+    {Target::FogColorDistanceClamp, L"fog color distance clamp",
+     L"second clamp of the fog start/end inside the fog color update (NoRender fog)",
+     "C7 86 ? ? 00 00 00 00 80 3F F3 0F 10 8E ? ? 00 00 F3 0F 10 96 ? ? 00 00 F3 0F 5D 96 ? ? 00 00 "
+     "F3 0F 11 96 ? ? 00 00 F3 0F 10 96 ? ? 00 00 0F 28 D9 F3 0F C2 DA 01 F3 0F 5F D0 0F 28 C3 0F 55 C2 "
+     "0F 54 D9 0F 56 D8 F3 0F 11 9E ? ? 00 00"},
+
+    {Target::FogColorNightVisionSite, L"fog color night vision site",
+     L"getEffect(night vision) calls inside the fog color update (Fullbright leaves the sky alone)",
+     "48 83 3D ? ? ? ? 00 0F 84 ? ? ? ? BA 10 00 00 00 E8 ? ? ? ? 48 85 C0 0F 84 ? ? ? ? "
+     "48 89 D9 BA 10 00 00 00 E8 ? ? ? ? 48 89 C7 48 89 D9 BA 1A 00 00 00 E8"},
 
     {Target::ContainerSmHandle, L"containerSmHandle", L"container screen state machine (ItemScroller)",
      "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 48 4D 89 CF 44 89 C5 89 D7 48 89 CB "
@@ -778,6 +863,10 @@ inline constexpr TargetInfo kTargets[] = {
      "0F 57 C0 0F 11 01 48 C7 41 10 00 00 00 00 48 89 8D ? ? 00 00 48 C7 41 18 0F 00 00 00 48 85 D2 0F 84 ? ? ? ? "
      "48 89 D6 48 8D 3D ? ? ? ? 48 89 7D C0 48 C7 45 C8 05 00 00 00"},
 
+    {Target::ItemHoverTextBuild, L"itemHoverTextBuild", L"build the whole item tooltip text (DebugKeys F3+H)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC A8 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 10 01 00 00 48 C7 85 08 01 00 00 "
+     "FE FF FF FF 44 88 CE 4C 89 45 38 48 89 D0 48 89 4D 60 0F 57 C0 0F 11 02 48 C7 42 10 00 00 00 00 48 C7 42 18 0F 00 00 00 C6 42 40 00"},
+
     {Target::HoverRendererRender, L"HoverRendererRender", L"draw the item tooltip box (ShulkerPreview)",
      "55 41 57 41 56 56 57 53 48 81 EC 78 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 85 E0 00 00 00 "
      "0F 29 BD D0 00 00 00 0F 29 B5 C0 00 00 00 48 C7 85 B8 00 00 00 FE FF FF FF 48 83 79 20 00 "
@@ -801,6 +890,14 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::ItemGlintSlotSite, L"ItemGlintSlotSite", L"Item::isGlint vtable slot (ShulkerPreview)",
      "B0 01 66 45 85 FF 48 8D B5 ? ? ? ? 78 ? 48 8B 85 ? ? ? ? 48 85 C0 74 ? 48 8B 08 48 85 C9 74 ? "
      "48 8B 01 48 8B 80 ? ? ? ? 48 8D 95"},
+
+    {Target::ItemMaxDamageSlotSite, L"ItemMaxDamageSlotSite", L"Item::getMaxDamage vtable slot (ShulkerPreview)",
+     "48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 98 0F 57 F6 F3 0F 2A F0 F3 0F 11 B5 ? ? ? ? 48 8B 47 10"},
+
+    {Target::ItemStackDamageValue, L"ItemStackDamageValue", L"ItemStackBase::getDamageValue (ShulkerPreview)",
+     "56 57 48 83 EC 38 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 30 48 8B 41 08 48 85 C0 74 ? "
+     "48 83 38 00 74 ? 48 8B 71 10 48 85 F6 74 ? 48 8D 3D ? ? ? ? 48 89 7C 24 20 "
+     "48 C7 44 24 28 06 00 00 00"},
 
     {Target::ShaderColorFillSite, L"ShaderColorFillSite", L"the UI shader color written by fillRectangle (ShulkerPreview)",
      "48 8B 4A 30 0F 10 00 0F 11 01 C6 41 10 01"},
@@ -841,6 +938,144 @@ inline constexpr TargetInfo kTargets[] = {
 
     {Target::HudGetItemSite, L"hudGetItemSite", L"where the HUD binding resolver reads its container manager (InventoryHUD)",
      "49 8B 8E ? ? ? ? 4C 89 FA 41 89 D8 E8 ? ? ? ? BB FF FF FF FF 80 78 23 01"},
+
+    {Target::RenderCurrentFrame, L"renderCurrentFrame", L"start of one rendered frame (DebugScreen fps)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 B8 ? 36 00 00 E8 ? ? ? ? 48 29 C4 48 8D AC 24 80 00 00 00 "
+     "44 0F 29 BD ? 35 00 00 44 0F 29 B5 ? 35 00 00 44 0F 29 AD ? 35 00 00 44 0F 29 A5 ? 35 00 00"},
+
+    {Target::ServerLevelTick, L"serverLevelTick", L"integrated server level tick (DebugScreen tps)",
+     "56 48 83 EC 30 48 8B 41 30 48 85 C0 0F 84 F1 00 00 00 80 38 01 0F 85 E8 00 00 00 48 89 CE 48 8B "
+     "49 40 48 8B 01 48 8B 80 ? ? 00 00 FF 15 ? ? ? ? 84 C0 0F 85 C9 00 00 00 48 83 7E 30 00 75 3B"},
+
+    {Target::PacketCheckSize, L"packetCheckSize", L"incoming packet size check (DebugScreen rx)",
+     "56 57 55 53 48 81 EC 88 00 00 00 44 89 CD 4C 89 C3 48 89 D6 48 89 CF 4C 89 44 24 28 48 8B 01 48 "
+     "8B 40 18 FF 15"},
+
+    {Target::RenderedActorCountStore, L"renderedActorCountStore", L"store of the rendered entity count (DebugScreen E)",
+     "44 01 E7 89 3D ?? ?? ?? ?? 48 8B 85 00 02 00 00 48 8B 40 28 48 8B 70 18 48 8D 4E 40 C6 46 78 01"},
+
+    {Target::ClimateSampleCall, L"climateSampleCall", L"call of the climate sampler in BiomeSource3d::getBiome (DebugScreen)",
+     "48 8B 0E 8B 47 08 89 45 18 48 8B 07 48 89 45 10 48 8D 55 A8 4C 8D 45 10 E8 ? ? ? ? 80 BE C0 00 00 00 01"},
+
+    {Target::OverworldGeneratorCtor, L"overworldGeneratorCtor", L"OverworldGenerator constructor (vtable and BiomeSource field)",
+     "48 8D 05 ? ? ? ? 48 89 07 48 8D 05 ? ? ? ? 48 89 47 70 48 8D 87 78 02 00 00 48 89 85 ? ? ? ? C6 87 ? ? ? ? 00 "
+     "48 8D 87 ? ? ? ? 48 89 85"},
+
+    {Target::PreliminarySurfaceLoop, L"preliminarySurfaceLoop", L"search loop of the preliminary surface level (DebugScreen PS)",
+     "BA 27 00 00 00 F3 0F 10 15 ?? ?? ?? ?? F3 44 0F 10 25 ?? ?? ?? ?? 0F 57 E4 4C 8D 05 ?? ?? ?? ?? F3 0F 10 2D ?? ?? ?? ?? "
+     "F3 0F 10 35 ?? ?? ?? ?? F3 0F 10 3D ?? ?? ?? ?? F3 44 0F 10 05 ?? ?? ?? ?? F3 44 0F 10 0D ?? ?? ?? ?? "
+     "F3 44 0F 10 15 ?? ?? ?? ?? F3 44 0F 10 1D ?? ?? ?? ?? EB"},
+
+    {Target::PreliminarySurfaceCall, L"preliminarySurfaceCall", L"column offset/factor call in the preliminary surface level (DebugScreen PS)",
+     "48 8D 8B ?? ?? 00 00 48 8D 55 D4 49 89 E8 E8 ?? ?? ?? ?? 4C 8B 8B ?? ?? 00 00 48 8B 83 ?? ?? 00 00 48 89 44 24 20 "
+     "48 8D 4D E0 4C 8D 45 D4 4C 89 F2 E8"},
+
+    {Target::DensityGridEntry, L"densityGridEntry", L"density grid of one chunk in OverworldGenerator (DebugScreen N)",
+     "55 41 57 41 56 56 57 53 48 83 EC 78 48 8D 6C 24 70 48 C7 45 00 FE FF FF FF 4C 89 C7 48 89 D6 48 89 CB 49 8B 10 "
+     "4C 8B 89 ?? ?? 00 00 48 8B 81 ?? ?? 00 00 4C 8D 81 ?? ?? 00 00 48 89 44 24 20 48 8D 4D C8 E8"},
+
+    {Target::BlenderFactoryFlags, L"blenderFactoryFlags", L"ChunkBlenderFactory construction (DebugScreen N safety flag)",
+     "48 C7 40 40 00 00 00 00 40 88 78 48 48 C7 40 50 00 00 00 00 66 44 89 70 58 40 84 FF"},
+
+    {Target::DBChunkStorageVtable, L"dbChunkStorageVtable", L"DBChunkStorage constructor (DebugScreen Chunks[S])",
+     "48 8D 05 ?? ?? ?? ?? 48 8B 4D 10 48 89 01 C7 41 70 00 00 00 00 0F 57 C0 0F 11 41 78"},
+
+    {Target::DiscardSetInsert, L"discardSetInsert", L"insert into the discarding chunk set (DebugScreen Chunks[S] unload)",
+     "48 B8 FF FF FF FF FF FF FF 07 48 39 86 ?? ?? 00 00 0F 84 ?? ?? ?? ?? 48 8D 86 ?? ?? 00 00 48 89 45 E0"},
+    {Target::NetworkSend, L"networkSend", L"outgoing packet send (DebugScreen tx)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 08 01 00 00 48 8D AC 24 80 00 00 00 48 C7 85 80 00 "
+     "00 00 FE FF FF FF 45 89 CD 4C 89 C6 48 89 D7 48 89 CB"},
+
+    {Target::StartGameHandle, L"StartGameHandle", L"StartGame packet handler (DebugScreen server version)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 ? ? 00 00 "
+     "48 C7 85 ? ? 00 00 FE FF FF FF 48 89 95 ? ? 00 00 48 89 CE 48 83 79 48 00 4C 89 85"},
+
+    {Target::RegionalDifficultyCondition, L"RegionalDifficultyCondition", L"Level regional difficulty vtable slot (DebugScreen)",
+     "56 57 48 83 EC 48 0F 29 7C 24 30 0F 29 74 24 20 4C 89 C6 48 89 CF 48 8B 02 48 8B 40 28 48 89 D1 "
+     "FF 15 ? ? ? ? 0F 28 F0 F3 0F 10 7F 10 48 8B 4E 08 8B 96 ? ? 00 00 48 8B 01 48 8B 80 ? ? 00 00"},
+
+    {Target::RegionalDifficultyTail, L"RegionalDifficultyTail", L"Level regional difficulty return tail (DebugScreen)",
+     "F3 0F 58 D3 0F 57 DB F3 0F 2A DE F3 0F 59 DA F3 0F 10 15 ? ? ? ? 0F 2E D3 77 24 "
+     "0F 2E 1D ? ? ? ? 0F 28 C1 77 18 F3 0F 58 1D ? ? ? ? F3 0F 59 1D ? ? ? ? 0F 28 C3"},
+
+    {Target::LevelChunkTickCall, L"LevelChunkTickCall", L"call of LevelChunk tick (DebugScreen)",
+     "48 8B 0F 48 89 4D 20 4C 89 75 28 4C 89 65 E0 48 89 4D E8 48 89 75 F0 48 89 5D 18 48 89 F2 "
+     "4C 8B 45 D8 49 89 D9 E8 ? ? ? ? 4D 85 F6"},
+
+    {Target::GameButtonActionName, L"gameButtonActionName", L"input action id -> name (hotkeys as game buttons)",
+     "41 57 41 56 41 54 56 57 53 48 83 EC 28 48 89 CE 48 63 C2 48 C1 E0 04 48 8D 0D"},
+
+    {Target::GameButtonFindKeymap, L"gameButtonFindKeymap", L"keymapping lookup by action name (hotkeys as game buttons)",
+     "55 41 56 56 57 53 48 83 EC 30 48 8D 6C 24 30 48 C7 45 F8 FE FF FF FF 48 8B 71 08 4C 8B 71 10 4C 39 F6 74 ? "
+     "48 89 D7 48 8B 5A 10 48 83 7A 18 10"},
+
+    {Target::GameButtonBindAction, L"gameButtonBindAction", L"bind one input action to a button (hotkeys as game buttons)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78 01 00 00 48 8D AC 24 80 00 00 00 0F 29 BD E0 00 00 00 "
+     "0F 29 B5 D0 00 00 00 48 C7 85 C8 00 00 00 FE FF FF FF 4C 89 4D 70 4C 89 45 30 48 89 95 C0 00 00 00"},
+
+    {Target::InputMappingFactoryDtorSite, L"inputMappingFactoryDtorSite", L"the two mapping tables of the input mapping factory (hotkey chords)",
+     "48 8D 4E ? 48 8B 56 ? E8 ? ? ? ? 48 8B 4E ? BA 00 03 00 00 E8 ? ? ? ? 48 8B 4E ? 48 85 C9 74 ? 48 8B 56 ? 48 29 CA "
+     "48 81 FA 00 10 00 00 72 ? 48 8B 41 F8 48 83 C1 F8 48 29 C1 48 83 F9 20 73 ? 48 83 C2 27 48 89 C1 48 8D 5E ? E8 ? ? ? ? "
+     "0F 57 C0 0F 11 03 48 C7 43 10 00 00 00 00 48 8D 4E ? 48 8B 56 ? E8 ? ? ? ? 48 8B 4E ? BA 00 03 00 00"},
+
+    {Target::InputMappingChordsField, L"inputMappingChordsField", L"chord vector field of InputMapping (hotkey chords)",
+     "48 8B 45 E0 48 8D 88 ? ? ? ? 0F 11 B0 ? ? ? ? 48 C7 80 ? ? ? ? 00 00 00 00 4D 8D 48 08 49 8B 50 08 49 2B 10 48 C1 FA 06"},
+
+    {Target::InputMappingFactoryPtrSite, L"inputMappingFactoryPtrSite", L"owner -> input mapping factory field (hotkey chords)",
+     "48 8B 08 48 39 C1 75 ? 49 8B 5D ? 48 8B 43 ? 48 85 C0 0F 84 ? ? ? ? 4C 8B 73 ? 48 8B 4B ? 48 C1 E9 03 48 39 C1"},
+
+    {Target::GameButtonRegisterDownSite, L"gameButtonRegisterDownSite", L"call of InputHandler button-down registration (hotkeys as game buttons)",
+     "48 8D 95 50 19 00 00 4C 8D 85 30 09 00 00 48 89 F9 45 31 C9 E8 ? ? ? ?"},
+
+    {Target::GameButtonInputUpdate, L"gameButtonInputUpdate", L"client input handler update (hotkeys as game buttons)",
+     "55 41 57 41 56 56 57 53 48 83 EC 38 48 8D 6C 24 30 48 C7 45 00 FE FF FF FF 4C 89 CB 4D 89 C6 48 89 D6 "
+     "48 89 CF 48 8B 0D ? ? ? ? 48 8B 01 48 8B 40 10 B2 13 FF 15"},
+
+    {Target::GameButtonRebuild, L"gameButtonRebuild", L"rebuild the input mappings (hotkeys as game buttons)",
+     "55 41 56 56 57 53 48 81 EC 80 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 F8 FE FF FF FF 48 89 CE "
+     "48 8B 49 08 48 8B 01 48 8B 80 78 09 00 00 FF 15"},
+
+    {Target::GameButtonRegisterUpSite, L"gameButtonRegisterUpSite", L"call of InputHandler button-up registration (game button states)",
+     "C7 85 B8 16 00 00 6D 6F 74 65 48 8D 95 B0 16 00 00 45 31 C9 E8 ? ? ? ?"},
+
+    {Target::PauseMenuOnFocusLostSite, L"pauseMenuOnFocusLostSite", L"read of options.pauseMenuOnFocusLost (DebugKeys F3+P)",
+     "48 8B 4D 18 48 8B 01 48 8B 80 78 05 00 00 FF 15 ? ? ? ? 48 8B 08 4C 8B 89 D8 00 00 00 48 8D 55 F0 48 89 C1 41 B8 2E 03 00 00"},
+
+    {Target::SmoothLightingGetter, L"smoothLightingGetter", L"options.smooth_lighting getter (DebugKeys F3+A)",
+     "48 83 EC 38 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 30 48 8B 01 48 8B 40 08 48 8D 54 24 28 41 B8 29 00 00 00 FF 15 ? ? ? ? 48 8B 4C 24 28"},
+
+    {Target::BoolOptionSet, L"boolOptionSet", L"BoolOption::set (DebugKeys F3+P)",
+     "56 57 53 48 83 EC 30 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 28 48 8B 41 08 48 83 B8 38 02 00 00 00 74 1F"},
+
+    {Target::GuiDataClearMessages, L"guiDataClearMessages", L"clear the vanilla chat (DebugKeys F3+D)",
+     "56 57 53 48 83 EC 20 48 89 CE 48 8B B9 50 01 00 00 48 8B 99 58 01 00 00 48 39 DF 74 ? 0F 1F 00 48 89 F9 E8 ? ? ? ? 48 81 C7 10 01 00 00"},
+
+    {Target::GuiDataFieldSite, L"guiDataFieldSite", L"ClientInstance GuiData field (DebugKeys F3+D)",
+     "48 8B B9 ? ? ? ? 48 85 FF 0F 84 ? ? ? ? 0F 57 C0 0F 11 02 48 C7 42 10 00 00 00 00 48 8B 47 38 48 85 C0"},
+
+    {Target::GamePauseCallSite, L"gamePauseCallSite", L"pause model calls (DebugKeys F3+Esc)",
+     "48 8B 89 ? ? 00 00 B2 01 E8 ? ? ? ? 48 8B 8E ? ? 00 00 B2 01 E8 ? ? ? ? 48 8B 8E ? ? 00 00 E8"},
+
+    {Target::EmoteReleased, L"emoteReleased", L"vanilla emote button release (DebugKeys F3+F4)",
+     "55 41 56 56 57 53 48 83 EC 60 48 8D 6C 24 60 48 C7 45 F8 FE FF FF FF 48 89 CF E8 ? ? ? ? 84 C0 0F 85 ? ? ? ? 48 8B 07 48 8B 80 F8 00 00 00 48 89 F9 FF 15 ? ? ? ? 48 85 C0 0F 84 ? ? ? ? 48 89 C6 48 8B 07 48 8B 80 E8 04 00 00"},
+
+    {Target::EmoteWheelSelected, L"emoteWheelSelected", L"emote wheel selection (DebugKeys F3+F4)",
+     "41 57 41 56 56 57 53 48 83 EC 50 89 D7 48 89 CE 48 8B 99 48 0D 00 00 48 83 7B 48 00 75"},
+
+    {Target::EmoteWheelCtor, L"emoteWheelCtor", L"identify own emote wheel (DebugKeys F3+F4)",
+     "55 56 57 48 81 EC D0 03 00 00 48 8D AC 24 80 00 00 00 48 C7 85 48 03 00 00 FE FF FF FF 4C 89 85 40 03 00 00 48 89 CE 0F 57 C0 0F 29 85 F0 02 00 00 48 8B 42 08 48 85 C0 74 0A F0 FF 40 08 48 8B 42 08 EB 02 31 C0 48 89 95 38 03 00 00 48 8B 0A 48 89 8D F0 02 00 00 48 89 85 F8 02 00 00 48 8D 95 F0 02 00 00 48 89 F1 E8 ? ? ? ? 48 8D 05 ? ? ? ?"},
+
+    {Target::EmoteWheelBindings, L"emoteWheelBindings", L"emote binding vtables (DebugKeys F3+F4)",
+     "48 8D 05 ? ? ? ? 48 89 85 20 02 00 00 48 89 8D 28 02 00 00 48 8D 9A 00 0B 00 00 C7 85 F4 03 00 00 8C D4 3E 3C"},
+
+    {Target::ChatCommandRunSite, L"chatCommandRunSite", L"run a chat command like the chat screen (DebugKeys F3+F4 / F3+N)",
+     "48 8B 48 48 48 89 4D F0 48 89 5D F8 48 8B 40 58 48 89 45 00 48 85 C9 0F 84 ? ? ? ? 80 39 00 0F 84 ? ? ? ? 48 8D 55 F0 48 89 F9 E8 ? ? ? ?"},
+
+    {Target::ProfanityFilterGetter, L"profanityFilterGetter", L"options.filter_profanity getter (DebugScreen F3+D)",
+     "48 83 EC 38 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 30 48 8B 01 48 8B 40 08 48 8D 54 24 28 41 B8 34 02 00 00"},
+
+    {Target::ActorAttachPos, L"actorAttachPos", L"Actor::getAttachPos (DebugScreen F3+B)",
+     "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 78 0F 29 74 24 60 44 89 C7 48 89 D6 8D 47 FF 83 F8 01 77 ? 48 8B 81 20 02 00 00 F3 0F 10 40 14"},
 };
 
 static_assert(std::size(kTargets) == static_cast<size_t>(Target::Count));

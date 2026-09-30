@@ -80,7 +80,6 @@ private:
     enum class Group { None, Player, Storage, Grid, Output, TradeIn, TradeOut, Other };
     static Group groupOf(const std::string& coll);
     std::vector<Slot> slotsOf(Group group) const;
-    Group otherGroupOf(const Slot& slot) const;
     std::vector<Slot> otherSlotsOf(const Slot& slot) const;
     bool screenHas(Group group) const;
 
@@ -114,7 +113,6 @@ private:
     enum class Amount { One, LeaveOne, Stacks, Matching };
     bool tryMoveItemsVertically(const Slot& slot, bool up, Amount amount);
     int rowOf(const Slot& s) const;
-    bool slotY(const Slot& s, int& y) const;
 
     bool tryMoveItemsByScroll(const Slot& slot, bool scrollingUp);
 
@@ -184,7 +182,6 @@ private:
     Step fillGridStep(const Recipe& recipe, bool fillStacks);
     Step throwCraftResultsStep(const Recipe& recipe);
     Step throwNonRecipeItemsStep(const Recipe& recipe);
-    bool outputMatchesSelected() const;
     void enqueueClearGrid();
     void enqueueFillGrid(bool fillStacks);
     void enqueueCraftAsManyAsPossible();
@@ -253,8 +250,8 @@ private:
         int before = 0;
     };
     std::vector<GainBase> m_autoTradeGains;
-    std::atomic<bool> m_rightDownSneak{false};
-    std::atomic<unsigned long long> m_rightDownMs{0};
+    int m_useButton = -1;
+    int m_sneakButton = -1;
     bool autoTradeBypassed() const;
     void logTradeState(void* ctrl);
     std::string m_loggedVillager;
@@ -292,9 +289,11 @@ private:
 
     bool comboHeld(const std::vector<int>& combo, bool exactModifiers) const;
     bool comboHeldAt(const std::vector<int>& combo, bool exactModifiers, int pressVk) const;
-    bool mouseHeld(int vk) const;
+    bool keyHeld(int vk) const;
+    std::uint64_t keySeq(int vk) const;
+    void watchKeys();
     int recentMouseButton() const;
-    bool comboEdge(const std::vector<int>& combo, bool& wasDown, bool exactModifiers);
+    bool comboEdge(const std::vector<int>& combo, bool& wasDown, std::uint64_t& seenSeq, bool exactModifiers);
     bool screenBlacklisted() const;
     bool slotBlacklisted(const Slot& s) const;
     void debugSlot(const Slot& s) const;
@@ -302,16 +301,14 @@ private:
     void logStats();
     void pollHotkeys();
     void consumeWheel();
+    void resyncWheelSeqs();
+    unsigned long long wheelLastMs() const;
     static constexpr int kSafeClicksPerTick = 16;
     int clickCap() const;
     bool budgetLeft() const;
     void pushJob(std::function<bool()> step);
     void runJobs();
     void pushListJob(std::function<std::vector<Slot>()> collect, std::function<bool(const Slot&)> unit);
-
-    void installMouseHook();
-    void removeMouseHook();
-    static LRESULT CALLBACK mouseHookProc(int code, WPARAM wParam, LPARAM lParam);
 
     static constexpr int kHotkeyCount = 31;
     bool readHotkeys(const nlohmann::json& section, std::array<std::vector<int>, kHotkeyCount>& out,
@@ -331,6 +328,7 @@ private:
         std::vector<int> keys;
         std::vector<int> defaults;
         bool wasDown = false;
+        std::uint64_t seenSeq = 0;
     };
     enum KeyId {
         kCraftEverything,
@@ -367,6 +365,12 @@ private:
         kKeyCount
     };
     std::array<KeySetting, kKeyCount> m_keys = makeKeys();
+    std::array<int, 256> m_keySlots = [] {
+        std::array<int, 256> slots{};
+        slots.fill(-1);
+        return slots;
+    }();
+    int m_namedButtons[6]{-1, -1, -1, -1, -1, -1};
     static std::array<KeySetting, kKeyCount> makeKeys();
 
     int m_massCraftInterval = 2;
@@ -421,30 +425,28 @@ private:
     Slot m_dragLast;
     std::set<Slot> m_dragged;
     Slot m_cursorSource;
-    std::atomic<int> m_wheel{0};
-    std::atomic<unsigned long long> m_wheelSeen{0};
+    int m_wheelLeftButton = -1;
+    int m_wheelRightButton = -1;
+    std::uint64_t m_wheelLeftSeen = 0;
+    std::uint64_t m_wheelRightSeen = 0;
     bool m_wheelPrimed = false;
     static constexpr unsigned long long kWheelCarryGapMs = 150;
-    std::atomic<unsigned long long> m_wheelLastMs{0};
     bool m_wheelCarry = false;
-    std::atomic<bool> m_mouseDown[3]{};
-    std::atomic<unsigned long long> m_mouseDownMs[3]{};
     unsigned long long m_lastStatsMs = 0;
-    HHOOK m_mouseHook = nullptr;
-    bool m_mouseHookFailed = false;
-    static ItemScroller* s_hookOwner;
     int m_clicksThisTick = 0;
     bool m_inTick = false;
     std::deque<std::function<bool()>> m_jobs;
     int m_massCraftTicker = 0;
     int m_badRecipeClicks = 0;
-    bool m_massToggleWas = false;
     std::array<Recipe, kRecipeCount> m_recipes{};
     int m_selectedRecipe = 0;
     bool m_recipesLoaded = false;
     mutable bool m_recipesDirty = false;
     bool m_recipeViewOpen = false;
-    std::array<bool, 16> m_viewKeysWas{};
+    std::array<std::uint64_t, 16> m_viewKeysSeq{};
+    bool m_toggleWasDown = false;
+    std::uint64_t m_toggleSeenSeq = 0;
+    void resyncKeySeqs();
     bool m_middleWas = false;
     RecipeView m_view{};
     int m_viewHover = -1;

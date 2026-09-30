@@ -5,6 +5,7 @@
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
 #include "core/FreezeWatch.h"
+#include "core/DiagFlags.h"
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "core/Version.h"
@@ -15,17 +16,19 @@
 #include "game/GameData.h"
 #include "hooks/HookManager.h"
 #include "input/Foreground.h"
+#include "input/GameButtons.h"
 #include "memory/Scanner.h"
+#include "modules/DebugScreen.h"
 #include "modules/AntiEffect.h"
 #include "modules/AutoTool.h"
 #include "modules/CreativeNoClip.h"
+#include "modules/FastBlockBreak.h"
 #include "modules/FastBlockPlacement.h"
 #include "modules/FastInventory.h"
-#include "modules/FastRightClick.h"
+#include "modules/FastUseItem.h"
 #include "modules/FlySpeed.h"
 #include "modules/FreeCamera.h"
 #include "modules/Fullbright.h"
-#include "modules/GameModeSwitch.h"
 #include "modules/HandRestock.h"
 #include "modules/ModuleManager.h"
 #include "modules/NoRender.h"
@@ -65,12 +68,13 @@ void Client::registerModules()
 {
     ModuleManager::instance().registerModule(&FreeCamera::instance());
     ModuleManager::instance().registerModule(&FastBlockPlacement::instance());
+    ModuleManager::instance().registerModule(&FastBlockBreak::instance());
     ModuleManager::instance().registerModule(&AntiEffect::instance());
     ModuleManager::instance().registerModule(&AutoTool::instance());
     ModuleManager::instance().registerModule(&Scaffold::instance());
     ModuleManager::instance().registerModule(&CreativeNoClip::instance());
     ModuleManager::instance().registerModule(&FlySpeed::instance());
-    ModuleManager::instance().registerModule(&FastRightClick::instance());
+    ModuleManager::instance().registerModule(&FastUseItem::instance());
     ModuleManager::instance().registerModule(&HandRestock::instance());
     ModuleManager::instance().registerModule(&OffhandSwap::instance());
     ModuleManager::instance().registerModule(&Schematica::instance());
@@ -82,6 +86,7 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&ItemScroller::instance());
     ModuleManager::instance().registerModule(&ShulkerPreview::instance());
     ModuleManager::instance().registerModule(&InventoryHUD::instance());
+    ModuleManager::instance().registerModule(&DebugScreen::instance());
 }
 
 void Client::startup()
@@ -105,6 +110,8 @@ void Client::startup()
 
     UiSound::instance().onScansReady();
 
+    GameButtons::instance().install();
+
     hooks::installAll();
 
     ModuleManager::instance().onScansReady();
@@ -116,13 +123,8 @@ void Client::startup()
 
 void Client::loadHotkeys()
 {
+    m_unloadKey.useLegacyOnly();
     m_unloadKey.set({VK_END});
-
-    Config::instance().eraseSection("console");
-}
-
-void Client::saveHotkeys()
-{
 }
 
 namespace {
@@ -143,6 +145,8 @@ void Client::mainLoop()
     m_settingsCheckAt = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     while (!unloadRequested()) {
         pumpThreadMessages();
+
+        diagflags::poll();
 
         if (!m_lateHooksDone) {
             m_lateHooksDone = hooks::installLate();
@@ -191,8 +195,6 @@ void Client::shutdown()
 
     hooks::freezeHookGroups();
 
-    log().setNotifier(nullptr);
-
     ModuleManager::instance().shutdown();
 
     blocks::waitUntilIdle();
@@ -204,9 +206,10 @@ void Client::shutdown()
 
     uiprobe::restoreKeyRows();
 
+    GameButtons::instance().shutdown();
     HookManager::instance().shutdown();
+    uiprobe::removeCrashWatch();
 
-    saveHotkeys();
     ModuleManager::instance().saveConfig();
     Config::instance().save();
 }

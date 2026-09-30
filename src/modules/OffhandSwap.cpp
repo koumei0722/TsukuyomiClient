@@ -8,7 +8,6 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
-#include "game/InventoryScreen.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
 #include "game/LegacyTransaction.h"
@@ -145,39 +144,8 @@ void OffhandSwap::onUpdate()
     }
     if (wants) {
         m_requestedAtMs.store(GetTickCount64(), std::memory_order_relaxed);
-        m_requestedSlot.store(slotUnderCursor(), std::memory_order_release);
+        m_requestedSlot.store(kHeldSlot, std::memory_order_release);
     }
-}
-
-int OffhandSwap::slotUnderCursor()
-{
-    if (!instance().screenSwapEnabled()) {
-        return kHeldSlot;
-    }
-
-    const InventoryScreen::Hovered hovered = InventoryScreen::instance().hovered();
-    switch (hovered.area) {
-    case InventoryScreen::Area::Hotbar:
-    case InventoryScreen::Area::Inventory:
-        return hovered.containerSlot;
-    default:
-        return kHeldSlot;
-    }
-}
-
-bool OffhandSwap::onInventoryHotbarKey(const void* controller, int hotbarIndex)
-{
-    if (!m_screenSwap || !enabled() || hotbarIndex < 0 || hotbarIndex >= kHotbarSlots) {
-        return false;
-    }
-
-    if (InventoryScreen::readFrom(controller).area != InventoryScreen::Area::Offhand) {
-        return false;
-    }
-
-    m_requestedAtMs.store(GetTickCount64(), std::memory_order_relaxed);
-    m_requestedSlot.store(hotbarIndex, std::memory_order_release);
-    return true;
 }
 
 void OffhandSwap::onPlayerViewUpdate()
@@ -781,9 +749,6 @@ void OffhandSwap::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
 
-    m_screenSwap = Config::getBool(section, "screenSwap", false);
-    m_legacyBridge = Config::getBool(section, "legacyBridge", false);
-
     const auto it = section.find("swapKeys");
     if (it == section.end() || !it->is_array()) {
         m_swapKey.set(defaultSwapKeys());
@@ -802,9 +767,6 @@ void OffhandSwap::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
     section["swapKeys"] = m_swapKey.combo();
-
-    section["screenSwap"] = m_screenSwap;
-    section["legacyBridge"] = m_legacyBridge;
 }
 
 }

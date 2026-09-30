@@ -34,10 +34,6 @@ public:
     bool setGroupEnabled(HookGroup group, bool on);
     bool groupEnabled(HookGroup group) const;
 
-    std::size_t groupSize(HookGroup group) const;
-
-    bool initialized() const { return m_initialized; }
-
 private:
     HookManager() = default;
 

@@ -15,7 +15,7 @@ Fullbright& Fullbright::instance()
 
 bool Fullbright::available() const
 {
-    return Scanner::instance().found(Target::GetActorEffect);
+    return Scanner::instance().found(Target::GetActorEffect) && m_fogReturn[0].load(std::memory_order_acquire) != nullptr;
 }
 
 void Fullbright::ensureFake()
@@ -34,12 +34,23 @@ void Fullbright::ensureFake()
     m_fakeReady = true;
 }
 
-void* Fullbright::onGetEffect(int effectId, void* original)
+void Fullbright::setFogColorReturns(const void* first, const void* second)
+{
+    m_fogReturn[0].store(first, std::memory_order_release);
+    m_fogReturn[1].store(second, std::memory_order_release);
+}
+
+void* Fullbright::onGetEffect(int effectId, void* original, const void* returnAddress)
 {
     if (!enabled() || effectId != kNightVisionEffectId) {
         return original;
     }
     if (original != nullptr) {
+        return original;
+    }
+    const void* const fogFirst = m_fogReturn[0].load(std::memory_order_acquire);
+    if (fogFirst == nullptr || returnAddress == fogFirst
+        || returnAddress == m_fogReturn[1].load(std::memory_order_acquire)) {
         return original;
     }
 

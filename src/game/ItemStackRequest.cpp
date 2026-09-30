@@ -281,16 +281,18 @@ void ItemStackRequest::forget()
 
 int ItemStackRequest::packetId(void* packet)
 {
-    if (packet == nullptr || !memory::isReadable(packet, sizeof(void*))) {
+    void** vtable = nullptr;
+    if (!memory::plausiblePointer(packet) || !readBytesGuarded(packet, &vtable, sizeof(vtable))
+        || !memory::inGameModule(vtable)) {
         return -1;
     }
-    auto** const vtable = *reinterpret_cast<void***>(packet);
-    if (!memory::isReadable(vtable, sizeof(void*) * (kGetIdVtableIndex + 1))) {
+    void* getIdAt = nullptr;
+    if (!readBytesGuarded(vtable + kGetIdVtableIndex, &getIdAt, sizeof(getIdAt))
+        || !memory::inGameModule(getIdAt)) {
         return -1;
     }
     using GetIdFn = int(__fastcall*)(void*);
-    const auto getId = reinterpret_cast<GetIdFn>(vtable[kGetIdVtableIndex]);
-    return getId != nullptr ? getId(packet) : -1;
+    return reinterpret_cast<GetIdFn>(getIdAt)(packet);
 }
 
 void ItemStackRequest::observePacket(void* packet)
@@ -495,22 +497,6 @@ std::byte* ItemStackRequest::findContainerOpenHandle()
 {
     return findPacketHandle(Scanner::instance().address(Target::ContainerOpenGetId),
                             L"container-open", kHandleVtableOffset);
-}
-
-std::byte* ItemStackRequest::resolvePacketHandle(Target getIdTarget, const wchar_t* what)
-{
-    return findPacketHandle(Scanner::instance().address(getIdTarget), what, kHandleVtableOffset);
-}
-
-std::byte* ItemStackRequest::resolvePacketReader(Target getIdTarget, const wchar_t* what)
-{
-    return findPacketHandle(Scanner::instance().address(getIdTarget), what, kReadVtableOffset);
-}
-
-std::byte* ItemStackRequest::findContainerOpenReader()
-{
-    return findPacketHandle(Scanner::instance().address(Target::ContainerOpenGetId),
-                            L"container-open reader", kReadVtableOffset);
 }
 
 std::byte* ItemStackRequest::findInventoryContentReader()
@@ -986,9 +972,7 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
     const void* faultPc = nullptr;
     const void* faultAddress = nullptr;
 
-    m_building.fetch_add(1, std::memory_order_acq_rel);
     const bool sent = sendGuarded(payload, &faultPc, &faultAddress);
-    m_building.fetch_sub(1, std::memory_order_acq_rel);
 
     if (m_openedByUs.load(std::memory_order_acquire)) {
         m_pendingCloseAtMs.store(GetTickCount64() + kCloseDelayMs, std::memory_order_release);

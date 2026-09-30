@@ -9,8 +9,14 @@
 #include "core/Logger.h"
 #include "core/Perf.h"
 #include "game/GameData.h"
+#include "game/BlockRegistry.h"
+#include "game/ChatCommand.h"
+#include "game/ChatCommandParse.h"
+#include "game/ContainerUi.h"
+#include "game/UiProbe.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
+#include "input/Foreground.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -141,6 +147,17 @@ bool HandRestock::available() const
 
 void HandRestock::onScansReady()
 {
+    chatcommand::registerModuleCommand({"restock", "handrestock", "hr"},
+        "/tk restock add|remove|list|clear [item]",
+        [this](const std::vector<std::string>& args) { return restockCommand(args); },
+        [this](const std::vector<std::string>& words, std::size_t argument, std::string_view suggestion) {
+            if (argument != 3 || words.size() < 3) return true;
+            const std::string& action = words[2];
+            if (action != "remove" && action != "rm" && action != "del") return true;
+            const std::string name = chatcommand::normalizeItem(suggestion);
+            std::lock_guard lock(m_excludedMutex);
+            return m_excluded.contains(name);
+        });
     m_swapSlots = Scanner::instance().addressAs<SwapSlotsFn>(Target::SwapSlots);
     if (m_swapSlots == nullptr) {
         log().warn(L"HandRestock: swapSlots was not found, "
@@ -165,14 +182,84 @@ void HandRestock::onScansReady()
                m_inventoryDisp);
 }
 
+void HandRestock::loadConfig(const nlohmann::json& section)
+{
+    Module::loadConfig(section);
+    std::set<std::string> names;
+    if (const auto it = section.find("excluded"); it != section.end() && it->is_array()) {
+        for (const auto& value : *it) {
+            if (value.is_string()) names.insert(chatcommand::normalizeItem(value.get<std::string>()));
+        }
+    }
+    std::lock_guard lock(m_excludedMutex);
+    m_excluded = std::move(names);
+}
+
 void HandRestock::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
+    {
+        std::lock_guard lock(m_excludedMutex);
+        section["excluded"] = m_excluded;
+    }
     section.erase("inventoryKey");
 
     section.erase("testKeys");
 
     section.erase("keepServerInventoryOpen");
+}
+
+std::string HandRestock::mainHandItemName() const
+{
+    Inventory inventory;
+    SlotView view;
+    if (!resolveClient(inventory) || !readSlot(inventory.slots, inventory.hand, view)
+        || view.item == nullptr || view.count == 0) return {};
+    return containerui::itemName(inventory.slots + kSlotStride * inventory.hand);
+}
+
+std::vector<std::string> HandRestock::restockCommand(const std::vector<std::string>& args)
+{
+    const std::string& action = args[0];
+    if (action == "list" || action == "ls") {
+        if (args.size() != 1) return {"Usage: /tk restock list"};
+        std::vector<std::string> names;
+        {
+            std::lock_guard lock(m_excludedMutex);
+            names.assign(m_excluded.begin(), m_excluded.end());
+        }
+        return chatcommand::listLines(names);
+    }
+    if (action == "clear") {
+        if (args.size() != 1) return {"Usage: /tk restock clear"};
+        std::size_t count;
+        {
+            std::lock_guard lock(m_excludedMutex);
+            count = m_excluded.size();
+            m_excluded.clear();
+        }
+        if (count != 0) uiprobe::markSettingsDirty();
+        return {"Cleared " + std::to_string(count) + " exclusions"};
+    }
+    if (action != "add" && action != "remove" && action != "rm" && action != "del")
+        return {"Unknown command: /tk restock " + action + " (try /tk help)"};
+    if (args.size() > 2) return {"Usage: /tk restock add|remove [item]"};
+    const std::string item = args.size() == 2 ? chatcommand::normalizeItem(args[1])
+                                                : chatcommand::normalizeItem(mainHandItemName());
+    if (item == "minecraft:") return {"Nothing in your main hand"};
+    if (blocks::itemByName(item) == nullptr) return {"Unknown item: " + item};
+    const bool adding = action == "add";
+    bool changed;
+    std::size_t count;
+    {
+        std::lock_guard lock(m_excludedMutex);
+        changed = adding ? m_excluded.insert(item).second : m_excluded.erase(item) != 0;
+        count = m_excluded.size();
+    }
+    if (changed) uiprobe::markSettingsDirty();
+    if (adding) return {changed ? "Added " + item + " to the HandRestock exclusions ("
+                                 + std::to_string(count) + " items)" : item + " is already excluded"};
+    return {changed ? "Removed " + item + " from the HandRestock exclusions" : item + " is not excluded"};
 }
 
 void HandRestock::onEnabledChanged(bool )
@@ -212,6 +299,17 @@ void HandRestock::onPlayerViewUpdate()
     const perf::Scope guard{perf::Slot::HandRestock};
 
     serveOutstanding();
+
+    if (!input::isInGameplay()) {
+        for (int spot = 0; spot < kSpotCount; ++spot) {
+            if (m_pending[spot].active) {
+                dropPending(static_cast<Spot>(spot),
+                            L"not on the game screen (a menu or another screen is open)");
+            }
+            m_last[spot] = HandState{};
+        }
+        return;
+    }
 
     servePending(kSpotHand);
     servePending(kSpotOffhand);
@@ -276,6 +374,11 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
     m_last[spot] = HandState{inventory.container, slot,     view.item,
                              view.block,          view.aux, view.count,
                              total};
+    if (view.item != nullptr && view.count > 0) {
+        m_last[spot].name = previous.item == view.item ? previous.name
+            : containerui::itemName(spot == kSpotHand ? inventory.slots + kSlotStride * slot
+                                               : inventory.offhand);
+    }
 
     const bool wentEmpty = previous.item != nullptr && previous.count > 0
                            && (view.item == nullptr || view.count == 0);
@@ -290,6 +393,14 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
                        reinterpret_cast<uintptr_t>(inventory.container), previous.slot, slot);
         }
         return;
+    }
+
+    {
+        std::lock_guard lock(m_excludedMutex);
+        if (!previous.name.empty() && m_excluded.contains(chatcommand::normalizeItem(previous.name))) {
+            dropPending(spot, L"the item is excluded");
+            return;
+        }
     }
 
     if (Clock::now() < m_ignoreUntil[spot]) {

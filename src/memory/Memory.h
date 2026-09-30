@@ -17,6 +17,9 @@ inline bool plausiblePointer(const void* value)
     return plausiblePointer(reinterpret_cast<std::uintptr_t>(value));
 }
 
+bool copyGuarded(const void* src, void* out, std::size_t size);
+bool writeGuarded(void* dst, const void* in, std::size_t size);
+
 bool isReadable(const void* address, size_t size);
 
 bool isWritable(const void* address, size_t size);

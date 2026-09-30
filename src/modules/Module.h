@@ -48,6 +48,8 @@ protected:
 
     virtual bool persistEnabled() const { return true; }
 
+    virtual bool handlesToggleKey() const { return false; }
+
     MenuItem enabledItem();
     MenuItem toggleKeyItem();
 

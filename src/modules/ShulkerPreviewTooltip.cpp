@@ -3,6 +3,8 @@
 #include "config/WriteSwitches.h"
 #include "core/Logger.h"
 #include "core/Strings.h"
+#include "game/DurabilityBar.h"
+#include "game/GameString.h"
 #include "game/TooltipReserve.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
@@ -26,8 +28,7 @@ using CtorFn = void(__fastcall*)(void* stack);
 using LoadFn = void(__fastcall*)(void* stack, const void* tag);
 using ItemStackFn = std::uintptr_t(__fastcall*)(const void* item, void* stack);
 using DtorFn = void(__fastcall*)(void* stack, int flags);
-using AllocFn = void*(__fastcall*)(void* allocator, std::size_t size);
-using DeleteFn = void(__fastcall*)(void* ptr, std::size_t size);
+using DeleteFn = gamestring::DeleteFn;
 using GetFontHandleFn = void*(__fastcall*)(void* client, void* out);
 using FontOfHandleFn = void*(__fastcall*)(void* handle);
 using FontHandleDtorFn = void(__fastcall*)(void* handle);
@@ -38,6 +39,8 @@ using DrawTextFn = void(__fastcall*)(void* ctx, void* font, const float* rect, v
                                      float alpha, int align, const void* measure, const void* caret);
 using FlushTextFn = void(__fastcall*)(void* ctx, float obfuscation, std::uint64_t alphaOverride);
 using TagHashFn = std::uint64_t(__fastcall*)(const void* tag);
+using MaxDamageFn = short(__fastcall*)(const void* item);
+using DamageValueFn = short(__fastcall*)(const void* stack);
 
 constexpr std::size_t kTagHashSlot = 0x50 / 8;
 
@@ -51,12 +54,21 @@ constexpr float kGridH = 3 * kCell;
 constexpr float kTextInset = 5.0f;
 constexpr float kBoxExtraW = 9.0f;
 constexpr float kBoxExtraH = 8.0f;
+constexpr float kDurBarX = 3.0f;
+constexpr float kDurBarY = 13.7f;
+constexpr float kDurBarWidth = 12.0f;
+constexpr float kDurBarHeight = 1.0f;
+constexpr float kDurShadowExtra = 1.0f;
 
 struct Api {
     CtorFn ctor = nullptr;
     LoadFn load = nullptr;
     int fixupSlot = -1;
     int glintSlot = -1;
+    int maxDamageSlot = -1;
+    DamageValueFn damageValue = nullptr;
+    bool durReady = false;
+    bool durBroken = false;
     const void* appendRet = nullptr;
     void** allocatorAt = nullptr;
     DeleteFn gameDelete = nullptr;
@@ -164,6 +176,29 @@ bool buildStackGuarded(void* elem, const void* tag)
     }
 }
 
+bool durabilityGuarded(const void* stack, float& ratio, bool& shown)
+{
+    __try {
+        shown = false;
+        auto* const bytes = static_cast<const std::byte*>(stack);
+        void* const weak = *reinterpret_cast<void* const*>(bytes + kStackItem);
+        void* const item = weak != nullptr ? *static_cast<void* const*>(weak) : nullptr;
+        if (item == nullptr) {
+            return true;
+        }
+        void** const vt = *static_cast<void***>(item);
+        const int max = reinterpret_cast<MaxDamageFn>(vt[g_api.maxDamageSlot / 8])(item);
+        const int damage = g_api.damageValue(stack);
+        if (max > 0 && damage > 0) {
+            shown = true;
+            ratio = std::clamp(static_cast<float>(max - damage) / static_cast<float>(max), 0.0f, 1.0f);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 bool destroyStackGuarded(void* elem)
 {
     __try {
@@ -222,84 +257,6 @@ bool writeShaderColorGuarded(void* ctx, const float* in4)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-}
-
-void* allocGameGuarded(std::size_t size)
-{
-    __try {
-        void* const allocator = *g_api.allocatorAt;
-        if (allocator == nullptr) {
-            return nullptr;
-        }
-        void** const vt = *static_cast<void***>(allocator);
-        return reinterpret_cast<AllocFn>(vt[1])(allocator, size);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-bool deleteGameGuarded(void* ptr, std::size_t size)
-{
-    __try {
-        g_api.gameDelete(ptr, size);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool assignGameString(void* str, std::string_view text)
-{
-    auto* const s = static_cast<std::byte*>(str);
-    std::uint64_t size = 0;
-    std::uint64_t cap = 0;
-    if (!readGuarded(s + 0x10, &size, 8) || !readGuarded(s + 0x18, &cap, 8) || size > cap || cap > 0x100000) {
-        return false;
-    }
-    const std::size_t n = text.size();
-    if (n <= cap) {
-        char* data = reinterpret_cast<char*>(s);
-        if (cap >= 16 && !readGuarded(s, &data, 8)) {
-            return false;
-        }
-        if (data == nullptr || !memory::isWritable(data, n + 1)) {
-            return false;
-        }
-        std::memcpy(data, text.data(), n);
-        data[n] = 0;
-        const std::uint64_t newSize = n;
-        std::memcpy(s + 0x10, &newSize, 8);
-        return true;
-    }
-    const std::uint64_t newCap = std::max<std::uint64_t>(static_cast<std::uint64_t>(n) | 0xF, 0x16);
-    if (newCap + 1 >= 0x1000) {
-        return false;
-    }
-    char* const fresh = static_cast<char*>(allocGameGuarded(newCap + 1));
-    if (fresh == nullptr) {
-        return false;
-    }
-    std::memcpy(fresh, text.data(), n);
-    fresh[n] = 0;
-    if (cap >= 16) {
-        void* old = nullptr;
-        if (readGuarded(s, &old, 8) && old != nullptr) {
-            if (cap + 1 < 0x1000) {
-                deleteGameGuarded(old, cap + 1);
-            } else {
-                void* real = nullptr;
-                if (readGuarded(static_cast<std::byte*>(old) - 8, &real, 8) && real != nullptr) {
-                    deleteGameGuarded(real, cap + 1 + 0x27);
-                }
-            }
-        }
-    }
-    void* const freshPtr = fresh;
-    const std::uint64_t newSize = n;
-    std::memcpy(s, &freshPtr, 8);
-    std::memcpy(s + 0x10, &newSize, 8);
-    std::memcpy(s + 0x18, &newCap, 8);
-    return true;
 }
 
 bool fillGuarded(void* ctx, const float* rect, const float* color, float alpha)
@@ -417,6 +374,7 @@ void ShulkerPreview::resolveTooltip()
     std::byte* const render = scanner.address(Target::HoverRendererRender);
     std::byte* const boxSize = scanner.address(Target::HoverBoxSizeStore);
     std::byte* const glintSite = scanner.address(Target::ItemGlintSlotSite);
+    std::byte* const maxDamageSite = scanner.address(Target::ItemMaxDamageSlotSite);
     api.drawItem = scanner.addressAs<UiDrawItemFn>(Target::UiDrawItem);
     if (std::byte* at = findInFunction(contents, 0xC00, "48 8D 4D ? E8 ? ? ? ? 48 8D 4D ? 48 89 F2 E8 ? ? ? ?")) {
         api.ctor = reinterpret_cast<CtorFn>(callTarget(at + 4));
@@ -428,6 +386,10 @@ void ShulkerPreview::resolveTooltip()
     if (glintSite != nullptr && memory::isReadable(glintSite + 41, 4)) {
         api.glintSlot = readDisp32(glintSite + 41);
     }
+    if (maxDamageSite != nullptr && memory::isReadable(maxDamageSite + 6, 4)) {
+        api.maxDamageSlot = readDisp32(maxDamageSite + 6);
+    }
+    api.damageValue = scanner.addressAs<DamageValueFn>(Target::ItemStackDamageValue);
     if (append != nullptr && contents != nullptr && memory::isReadable(append, 0x80)) {
         for (std::size_t i = 0; i + 5 <= 0x80; ++i) {
             if (static_cast<std::uint8_t>(append[i]) == 0xE8 && callTarget(append + i) == contents) {
@@ -476,17 +438,19 @@ void ShulkerPreview::resolveTooltip()
     api.tintReady = api.shaderColor > 0 && api.shaderColorDirty > 0 && api.screenInCtx > 0;
 
     auto slotOk = [](int slot) { return slot > 0 && slot < 0x1000 && slot % 8 == 0; };
+    api.durReady = slotOk(api.maxDamageSlot) && api.damageValue != nullptr;
     api.ready = api.ctor != nullptr && api.load != nullptr && slotOk(api.fixupSlot) && slotOk(api.glintSlot)
                 && api.appendRet != nullptr && api.allocatorAt != nullptr && api.gameDelete != nullptr
                 && api.drawItem != nullptr && api.boxW > 0x40 && api.boxH > 0x40 && slotOk(api.clientFontSlot)
                 && api.fontOfHandle != nullptr && api.fontHandleDtor != nullptr && api.textFieldsOk
                 && render != nullptr;
     g_api = api;
+    gamestring::configure(api.allocatorAt, api.gameDelete);
     const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
     auto rva = [base](const void* p) { return p != nullptr ? reinterpret_cast<std::uintptr_t>(p) - base : 0; };
     log().info(L"ShulkerPreview: tooltip parts {} (ctor {:#x} load {:#x} fixup +{:#x} glint +{:#x} ret {:#x} "
                L"alloc {:#x} delete {:#x} draw {:#x} box +{:#x}/+{:#x} font +{:#x} {:#x}/{:#x} text {} tag hash {:#x} "
-               L"glint tint {} +{:#x}/+{:#x}/+{:#x})",
+               L"glint tint {} +{:#x}/+{:#x}/+{:#x} durability {} slot +{:#x} damage {:#x})",
                api.ready ? L"ready" : L"NOT usable", rva(reinterpret_cast<const void*>(api.ctor)),
                rva(reinterpret_cast<const void*>(api.load)), api.fixupSlot, api.glintSlot, rva(api.appendRet),
                rva(api.allocatorAt), rva(reinterpret_cast<const void*>(api.gameDelete)),
@@ -494,7 +458,8 @@ void ShulkerPreview::resolveTooltip()
                rva(reinterpret_cast<const void*>(api.fontOfHandle)),
                rva(reinterpret_cast<const void*>(api.fontHandleDtor)), api.textFieldsOk,
                rva(reinterpret_cast<const void*>(api.tagHash)), api.tintReady, api.screenInCtx, api.shaderColor,
-               api.shaderColorDirty);
+               api.shaderColorDirty, api.durReady, api.maxDamageSlot,
+               rva(reinterpret_cast<const void*>(api.damageValue)));
 }
 
 bool ShulkerPreview::tooltipAvailable() const
@@ -516,6 +481,8 @@ void ShulkerPreview::freeSetLocked(ContentSet& set)
         }
         set.live[at] = false;
     }
+    set.durRatio.fill(0.0f);
+    set.durShown.fill(false);
     set.id = 0;
     set.key.clear();
     set.usedAt = 0;
@@ -590,6 +557,11 @@ ShulkerPreview::ContentSet* ShulkerPreview::acquireSetLocked(const std::string& 
         }
         victim->live[at] = true;
         victim->counts[at] = one.count;
+        if (g_api.durReady && !g_api.durBroken
+            && !durabilityGuarded(victim->elems[at].bytes, victim->durRatio[at], victim->durShown[at])) {
+            g_api.durBroken = true;
+            log().error(L"ShulkerPreview: reading item durability faulted; durability bars are turned off");
+        }
         ++built;
     }
     if (built == 0) {
@@ -645,7 +617,7 @@ void ShulkerPreview::onContentsText(void* out, const void* tag, const void* retu
         id = set->id;
     }
     const std::string text = tr::reserveText(m_reserveRows.load(), m_reserveSpaces.load(), id);
-    if (!assignGameString(out, text)) {
+    if (!gamestring::assign(out, text)) {
         static bool told = false;
         if (!told) {
             told = true;
@@ -797,6 +769,32 @@ void ShulkerPreview::onHoverRender(void* self, void* ctx, void* client, void* ow
             g_api.broken = true;
             log().error(L"ShulkerPreview: drawing a preview item faulted; the tooltip preview is turned off");
             return;
+        }
+    }
+    if (g_api.durReady && !g_api.durBroken && g_ctx.fill != nullptr) {
+        static const float kBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        for (int i = 0; i < kSlots; ++i) {
+            const auto at = static_cast<std::size_t>(i);
+            if (!set->live[at] || !set->durShown[at]) {
+                continue;
+            }
+            const float cx = gx + static_cast<float>(i % 9) * kCell;
+            const float cy = gy + static_cast<float>(i / 9) * kCell;
+            const float x0 = cx + kDurBarX;
+            const float y0 = cy + kDurBarY;
+            const float shadow[4] = {x0, x0 + kDurBarWidth + kDurShadowExtra,
+                                     y0, y0 + kDurBarHeight + kDurShadowExtra};
+            const float ground[4] = {x0, x0 + kDurBarWidth, y0, y0 + kDurBarHeight};
+            const float width = durabilityBarWidth(set->durRatio[at], kDurBarWidth);
+            const float body[4] = {x0, x0 + width, y0, y0 + kDurBarHeight};
+            const DurabilityBarColor rgb = durabilityBarColor(set->durRatio[at]);
+            const float color[4] = {rgb.r, rgb.g, rgb.b, 1.0f};
+            if (!fillGuarded(ctx, shadow, kBlack, alpha) || !fillGuarded(ctx, ground, kBlack, alpha)
+                || !fillGuarded(ctx, body, color, alpha)) {
+                g_api.durBroken = true;
+                log().error(L"ShulkerPreview: fillRectangle faulted; durability bars are no longer drawn");
+                break;
+            }
         }
     }
     if (g_ctx.drawText == nullptr || g_ctx.flushText == nullptr) {

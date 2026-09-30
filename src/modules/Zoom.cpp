@@ -4,7 +4,7 @@
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "input/Foreground.h"
-#include "input/LowLevelHook.h"
+#include "input/GameButtons.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -20,31 +20,6 @@
 
 namespace tsukuyomi {
 
-namespace {
-
-int accessViolationFilter(unsigned long code)
-{
-    return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
-               ? EXCEPTION_EXECUTE_HANDLER
-               : EXCEPTION_CONTINUE_SEARCH;
-}
-
-std::size_t copyFloatsGuarded(const std::byte* at, float* out, std::size_t count)
-{
-    std::size_t done = 0;
-    __try {
-        for (; done < count; ++done) {
-            std::memcpy(&out[done], at + done * sizeof(float), sizeof(float));
-        }
-    } __except (accessViolationFilter(GetExceptionCode())) {
-    }
-    return done;
-}
-
-}
-
-Zoom* Zoom::s_hookOwner = nullptr;
-
 Zoom& Zoom::instance()
 {
     static Zoom module;
@@ -58,6 +33,9 @@ bool Zoom::available() const
 
 void Zoom::onScansReady()
 {
+    m_wheelLeftButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryLeft);
+    m_wheelRightButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryRight);
+
     if (std::byte* const base = Scanner::instance().address(Target::CameraUpdate);
         base != nullptr) {
         const auto* const b = reinterpret_cast<const unsigned char*>(base + kWriteFov);
@@ -80,31 +58,6 @@ void Zoom::onScansReady()
             log().warn(L"Zoom: the second fov write is not a movss, so it is left alone");
         }
     }
-
-    if (const std::byte* const fn = Scanner::instance().address(Target::HotbarSelectTick);
-        fn != nullptr) {
-        std::size_t size = memory::functionSize(fn);
-        for (std::size_t at = 0x10; size == 0 && at + 3 < kHotbarFnScan; ++at) {
-            if (!memory::isReadable(fn + at, 3)) {
-                break;
-            }
-            const auto* const b = reinterpret_cast<const unsigned char*>(fn + at);
-            if (b[0] == 0xCC && b[1] == 0xCC && b[2] == 0xCC) {
-                size = at;
-                break;
-            }
-        }
-        if (size != 0) {
-            m_hotbarFn = fn;
-            m_hotbarFnSize = size;
-        } else {
-            log().warn(L"Zoom: could not find the end of the hotbar scroll function, so slot "
-                       L"changes during zoom cannot be blocked");
-        }
-    } else {
-        log().warn(L"Zoom: the hotbar scroll function was not found, so slot changes during "
-                   L"zoom cannot be blocked");
-    }
 }
 
 bool Zoom::suppressHotbar(const void* returnAddress) const
@@ -115,10 +68,6 @@ bool Zoom::suppressHotbar(const void* returnAddress) const
     if (returnAddress == nullptr) {
         return false;
     }
-    const auto* const at = static_cast<const std::byte*>(returnAddress);
-    if (m_hotbarFn != nullptr && (at < m_hotbarFn || at >= m_hotbarFn + m_hotbarFnSize)) {
-        m_hotbarOutside.fetch_add(1, std::memory_order_relaxed);
-    }
     return true;
 }
 
@@ -127,6 +76,13 @@ void Zoom::onUpdate()
     const bool down = !m_zoomKey.empty() && enabled() && available() && m_zoomKey.isDown()
                       && input::isInGameplay();
     const bool was = m_zooming.exchange(down, std::memory_order_acq_rel);
+    const auto& buttons = GameButtons::instance();
+    const std::uint64_t left = buttons.buttonPressSeq(m_wheelLeftButton);
+    const std::uint64_t right = buttons.buttonPressSeq(m_wheelRightButton);
+    const int wheel = down && was
+        ? gamebuttonlogic::wheelNotches(left, m_wheelLeftSeen, right, m_wheelRightSeen) : 0;
+    m_wheelLeftSeen = left;
+    m_wheelRightSeen = right;
     if (down != was) {
         if (down) {
             m_baseFovReady = false;
@@ -138,13 +94,6 @@ void Zoom::onUpdate()
         log().info(L"Zoom: {} (factor {:.2f})", down ? L"started" : L"stopped", m_factor);
     }
 
-    if (enabled() && available() && !m_zoomKey.empty()) {
-        installMouseHook();
-    } else {
-        removeMouseHook();
-    }
-
-    const int wheel = m_wheel.exchange(0, std::memory_order_acq_rel);
     if (wheel != 0) {
         const float before = m_factor;
         m_factor = std::clamp(m_factor + kFactorStep * static_cast<float>(wheel), kMinFactor,
@@ -159,71 +108,13 @@ void Zoom::onEnabledChanged(bool enabled)
 {
     if (!enabled) {
         m_zooming.store(false, std::memory_order_release);
-        removeMouseHook();
     }
-}
-
-void Zoom::installMouseHook()
-{
-    if (m_mouseHook != nullptr || m_mouseHookFailed.load(std::memory_order_relaxed)) {
-        return;
-    }
-    s_hookOwner = this;
-    const input::LowLevelHook hook = input::installLowLevelHook(WH_MOUSE_LL, &Zoom::mouseHookProc);
-    m_mouseHook = hook.hook;
-    if (m_mouseHook == nullptr) {
-        s_hookOwner = nullptr;
-        m_mouseHookFailed.store(true, std::memory_order_relaxed);
-        if (!m_mouseHookWarned) {
-            m_mouseHookWarned = true;
-            log().warn(L"Zoom: could not grab the mouse (error {}, {} with the module); the factor "
-                       L"cannot be changed with the wheel. Retrying only when Zoom is switched or "
-                       L"its key is cleared and set again",
-                       hook.errorWithoutModule, hook.errorWithModule);
-        }
-        return;
-    }
-    if (hook.withModule) {
-        log().info(L"Zoom: grabbed the mouse with the module (error {} without it)",
-                   hook.errorWithoutModule);
-    } else {
-        log().info(L"Zoom: grabbed the mouse");
-    }
-}
-
-void Zoom::removeMouseHook()
-{
-    if (m_mouseHook != nullptr) {
-        UnhookWindowsHookEx(m_mouseHook);
-        m_mouseHook = nullptr;
-    }
-    s_hookOwner = nullptr;
-
-    m_mouseHookFailed.store(false, std::memory_order_relaxed);
-}
-
-LRESULT CALLBACK Zoom::mouseHookProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code == HC_ACTION && s_hookOwner != nullptr && wParam == WM_MOUSEWHEEL) {
-        s_hookOwner->m_wheelAt.store(GetTickCount64(), std::memory_order_release);
-        s_hookOwner->m_wheelSeen.fetch_add(1, std::memory_order_relaxed);
-
-        if (s_hookOwner->zooming()) {
-            const auto* const info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-            const int delta = GET_WHEEL_DELTA_WPARAM(info->mouseData);
-            if (delta != 0) {
-                s_hookOwner->m_wheel.fetch_add(delta > 0 ? 1 : -1, std::memory_order_acq_rel);
-            }
-            return 1;
-        }
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 static bool looksLikeCamera(const std::byte* at, std::ptrdiff_t fovOffset)
 {
     float v[4]{};
-    if (copyFloatsGuarded(at + fovOffset - 4, v, 4) != 4) {
+    if (!memory::copyGuarded(at + fovOffset - 4, v, sizeof(v))) {
         return false;
     }
     const float aspect = v[0];
@@ -268,10 +159,9 @@ void Zoom::onCameraWrite(void* cameraBase, void* source)
             continue;
         }
         float current = 0.0f;
-        if (!memory::isReadable(target + kFovOffsets[0], sizeof(float))) {
+        if (!memory::copyGuarded(target + kFovOffsets[0], &current, sizeof(current))) {
             continue;
         }
-        std::memcpy(&current, target + kFovOffsets[0], sizeof(current));
         if (!std::isfinite(current) || current < kFovMin || current > kFovMax) {
             continue;
         }
@@ -289,10 +179,9 @@ void Zoom::onCameraWrite(void* cameraBase, void* source)
         if (!std::isfinite(shrunk) || shrunk <= 0.0f) {
             continue;
         }
-        if (!memory::isWritable(target + kFovOffsets[0], sizeof(float))) {
+        if (!memory::writeGuarded(target + kFovOffsets[0], &shrunk, sizeof(shrunk))) {
             continue;
         }
-        *reinterpret_cast<float*>(target + kFovOffsets[0]) = shrunk;
         ++wrote;
     }
     if (captured && wrote != 0) {
@@ -351,7 +240,6 @@ void Zoom::saveConfig(nlohmann::json& section) const
 
 void Zoom::shutdown()
 {
-    removeMouseHook();
     m_zooming.store(false, std::memory_order_release);
 
     m_patchFov.restore();

@@ -28,24 +28,29 @@ std::string stateNamesOf(const void* block);
 const void* stateVariant(const void* block, const std::vector<WantedState>& want,
                          std::size_t* missing = nullptr);
 
+inline constexpr std::size_t kStateTextBytes = 96;
+
+bool nameOfBlock(const void* block, char* out, std::size_t cap);
+int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates);
+
+int tagsOfBlock(const void* block, char out[][kStateTextBytes], int maxTags);
+
+bool materialFlags(const void* block, bool& blocksMotion, bool& liquid);
+
 const void* rotatedBlock(const void* block, int quarters, bool* ok = nullptr);
 
-const void* blockTable();
 std::size_t lastEntryCount();
 
 void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
                     std::int32_t sx, std::int32_t sy, std::int32_t sz, float alpha);
 void clearGhostRegion();
 bool ghostOn();
-bool ghostAt(std::int32_t x, std::int32_t y, std::int32_t z, float& alpha);
 
 float ghostAlpha();
 
 bool ghostBounds(std::int32_t* mn, std::int32_t* mx);
 
 bool lastGhostBounds(std::int32_t* mn, std::int32_t* mx);
-
-std::vector<std::array<std::int32_t, 3>> ghostBlockEntityCells();
 
 inline constexpr int kGhostLayer = 3;
 
@@ -103,8 +108,6 @@ DiffColor colorOfDiffKind(DiffKind kind);
 bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void* real,
                       const void* realExtra = nullptr, bool realExtraKnown = false);
 
-void clearDiffCells();
-
 struct DiffBox {
     std::int32_t x = 0;
     std::int32_t y = 0;
@@ -126,8 +129,6 @@ bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t 
 
 bool ghostBoxTouchesSubChunk(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ);
 
-void subChunkOccupiedStats(std::size_t& calls, std::size_t& cells);
-
 bool ghostInside(std::int32_t x, std::int32_t y, std::int32_t z);
 
 const void* ghostBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, int layer = 0);
@@ -148,6 +149,8 @@ bool calibrateItemIds();
 bool blockItemIdAux(const void* block, std::int32_t& out);
 
 const void* itemByName(const std::string& name);
+
+std::vector<std::string> registeredItemNames();
 
 bool maxStackSizeOf(const char* name, const void* block, int& out);
 
@@ -171,20 +174,5 @@ void noteMeshThread(unsigned long id);
 bool isMeshThread(unsigned long id);
 
 std::size_t meshThreadCount();
-
-enum class GhostHook : int {
-    Layer = 0,
-    Tessellate = 1,
-    Phantom = 2,
-    Alpha = 3,
-    Aim = 4,
-    Filled = 5,
-    Count = 6,
-};
-void noteGhostHit(GhostHook which);
-
-std::size_t ghostHitCount(GhostHook which);
-
-void noteGhostDraw(std::int32_t x, std::int32_t y, std::int32_t z);
 
 }

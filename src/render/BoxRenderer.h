@@ -18,6 +18,7 @@ void setStyle(bool on, float faceAlpha, bool xray);
 bool boxStyle(blocks::DiffColor color, float rgb[3], float* faceAlpha);
 
 bool cameraSnapshot(float eye[3], float vp[16]);
+void noteViewPerspective(int perspective);
 std::shared_ptr<const std::vector<blocks::DiffBox>> boxSnapshot();
 bool boxesOn();
 float boxFaceAlpha();

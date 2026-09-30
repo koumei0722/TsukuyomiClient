@@ -43,10 +43,6 @@ public:
 
     static constexpr int kResultSuccess = 0;
 
-    bool hasNetManager() const { return m_client.load(std::memory_order_acquire) != nullptr; }
-
-    bool isBuildingRequest() const { return m_building.load(std::memory_order_acquire) != 0; }
-
     void forget();
 
     void noteInventoryContent(int containerId)
@@ -68,13 +64,7 @@ public:
 
     static std::byte* findContainerOpenHandle();
 
-    static std::byte* resolvePacketHandle(Target getIdTarget, const wchar_t* what);
-
-    static std::byte* resolvePacketReader(Target getIdTarget, const wchar_t* what);
-
     static std::byte* findInventoryContentReader();
-
-    static std::byte* findContainerOpenReader();
 
     bool suppressionPending();
     bool captureOpenShell(const void* packet, std::byte* shell);
@@ -86,11 +76,6 @@ public:
     void rememberContainerOpenResult(const void* result);
 
     void onFrame();
-
-    bool hasClientInstance() const
-    {
-        return m_clientInstance.load(std::memory_order_acquire) != nullptr;
-    }
 
     bool suppressingInputReset() const;
 
@@ -203,8 +188,6 @@ private:
     bool wasAnswered(std::int32_t id) const;
 
     std::atomic<void*> m_client{nullptr};
-
-    std::atomic<int> m_building{0};
 
     std::atomic<bool> m_warnedMissing{false};
     std::atomic<bool> m_warnedOccupied{false};

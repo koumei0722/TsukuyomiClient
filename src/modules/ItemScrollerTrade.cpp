@@ -3,6 +3,7 @@
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
+#include "game/ContainerUi.h"
 #include "game/TradeUi.h"
 #include "game/UiProbe.h"
 #include "hooks/Detours.h"
@@ -39,7 +40,15 @@ std::string ItemScroller::globalTradeKeyOf(const void* offer) const
         return {};
     }
     auto kind = [](const void* st) {
-        return cui::isEmpty(st) ? std::string("-") : cui::itemName(st) + ":" + std::to_string(cui::auxOf(st));
+        if (cui::isEmpty(st)) {
+            return std::string("-");
+        }
+        std::string key = cui::itemName(st) + ":" + std::to_string(cui::auxOf(st));
+        const std::string enchants = cui::enchantKey(st);
+        if (!enchants.empty()) {
+            key += "#" + enchants;
+        }
+        return key;
     };
     return kind(tradeui::offerSell(offer)) + "<" + kind(tradeui::offerBuyA(offer)) + "+"
            + kind(tradeui::offerBuyB(offer));
@@ -396,7 +405,7 @@ void ItemScroller::tradeScreenTick(bool offstack)
         }
         return;
     }
-    const bool middle = mouseHeld(VK_MBUTTON);
+    const bool middle = keyHeld(VK_MBUTTON);
     if (middle && !m_tradeMiddleWas && m_enableVillagerTradeFeatures) {
         int tier = -1;
         int index = -1;

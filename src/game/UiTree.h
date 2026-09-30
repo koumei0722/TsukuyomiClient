@@ -58,12 +58,10 @@ public:
 
     std::size_t usedNodes() const { return m_nodeAt; }
     std::size_t usedWords() const { return m_wordAt; }
-    std::size_t usedRecords() const { return m_recordAt; }
     std::size_t usedText() const { return m_textAt; }
 
     std::size_t capacityNodes() const { return m_nodeCap; }
     std::size_t capacityWords() const { return m_wordCap; }
-    std::size_t capacityRecords() const { return m_recordCap; }
     std::size_t capacityText() const { return m_textCap; }
 
     std::uintptr_t* makeMap(KeyValue* items, std::size_t count);

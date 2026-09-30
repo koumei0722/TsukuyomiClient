@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <format>
 #include <string>
@@ -40,7 +41,6 @@ constexpr std::size_t kMinEntries = 64;
 constexpr std::size_t kMaxEntries = 100000;
 
 std::size_t g_lastEntries = 0;
-const void* g_lastTable = nullptr;
 
 __declspec(noinline) bool safeCopy(void* to, const void* from, std::size_t size) noexcept
 {
@@ -168,11 +168,6 @@ const void* rotatedBlock(const void* block, int quarters, bool* ok)
     return turned;
 }
 
-const void* blockTable()
-{
-    return g_lastTable;
-}
-
 std::size_t lastEntryCount()
 {
     return g_lastEntries;
@@ -181,7 +176,6 @@ std::size_t lastEntryCount()
 bool resolve(const std::vector<std::string>& wanted, Table& out)
 {
     g_lastEntries = 0;
-    g_lastTable = nullptr;
 
     const void* const global = tableGlobal();
     if (global == nullptr) {
@@ -201,7 +195,6 @@ bool resolve(const std::vector<std::string>& wanted, Table& out)
         log().warn(L"BlockRegistry: the block table looks wrong ({} entries)", declared);
         return false;
     }
-    g_lastTable = head;
 
     std::vector<const void*> stack;
     stack.reserve(64);
@@ -395,6 +388,128 @@ std::string stateNamesOf(const void* block)
     return out;
 }
 
+namespace {
+
+std::mutex g_blockLookupMutex;
+std::unordered_map<const void*, std::string> g_legacyNames;
+bool g_legacyNamesReady = false;
+std::unordered_map<const void*, std::vector<StateSlot>> g_legacySlots;
+
+}
+
+bool nameOfBlock(const void* block, char* out, std::size_t cap)
+{
+    if (out == nullptr || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const void* const legacy = legacyOfFast(block);
+    if (legacy == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_blockLookupMutex);
+    if (!g_legacyNamesReady) {
+        Table table;
+        if (!resolve({}, table)) {
+            return false;
+        }
+        for (const auto& [name, def] : table) {
+            const void* const key = legacyOfFast(def);
+            if (key != nullptr) {
+                g_legacyNames.emplace(key, name);
+            }
+        }
+        g_legacyNamesReady = true;
+    }
+    const auto found = g_legacyNames.find(legacy);
+    if (found == g_legacyNames.end()) {
+        return false;
+    }
+    std::snprintf(out, cap, "%s", found->second.c_str());
+    return true;
+}
+
+int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates)
+{
+    if (block == nullptr || out == nullptr || maxStates <= 0 || !memory::isReadable(block, 0x128)) {
+        return 0;
+    }
+    const void* const legacy = readPointer(block, kBlockLegacyAt);
+    if (legacy == nullptr || !memory::isReadable(legacy, 0x248)) {
+        return 0;
+    }
+    std::uint16_t index = 0;
+    if (!safeCopy(&index, static_cast<const std::uint8_t*>(block) + 0x120, sizeof(index))) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_blockLookupMutex);
+    auto slots = g_legacySlots.find(legacy);
+    if (slots == g_legacySlots.end()) {
+        slots = g_legacySlots.emplace(legacy, readStateSlots(legacy)).first;
+    }
+    int rows = 0;
+    for (const StateSlot& slot : slots->second) {
+        if (rows >= maxStates) {
+            break;
+        }
+        const std::uint32_t value = slot.mask != 0 ? ((index & slot.mask) >> slot.shift) : 0;
+        if (!slot.names.empty() && value < slot.names.size()) {
+            std::snprintf(out[rows], kStateTextBytes, "%s: %s", slot.name.c_str(),
+                          slot.names[value].c_str());
+        } else {
+            std::snprintf(out[rows], kStateTextBytes, "%s: %u", slot.name.c_str(), value);
+        }
+        ++rows;
+    }
+    return rows;
+}
+
+int tagsOfBlock(const void* block, char out[][kStateTextBytes], int maxTags)
+{
+    constexpr std::ptrdiff_t kTagsBegin = 0x1a0;
+    constexpr std::ptrdiff_t kTagsEnd = 0x1a8;
+    constexpr std::uintptr_t kTagBytes = 0x30;
+    constexpr std::ptrdiff_t kTagText = 0x08;
+    if (block == nullptr || out == nullptr || maxTags <= 0) {
+        return 0;
+    }
+    const void* const legacy = readPointer(block, kBlockLegacyAt);
+    const auto begin = reinterpret_cast<std::uintptr_t>(readPointer(legacy, kTagsBegin));
+    const auto end = reinterpret_cast<std::uintptr_t>(readPointer(legacy, kTagsEnd));
+    if (legacy == nullptr || begin == 0 || end < begin || (end - begin) % kTagBytes != 0
+        || (end - begin) / kTagBytes > 64) {
+        return 0;
+    }
+    int rows = 0;
+    for (std::uintptr_t at = begin; at < end && rows < maxTags; at += kTagBytes) {
+        std::string tag;
+        if (!readStdString(reinterpret_cast<const void*>(at + kTagText), tag)) {
+            continue;
+        }
+        std::snprintf(out[rows], kStateTextBytes, tag.find(':') == std::string::npos ? "#minecraft:%s" : "#%s",
+                      tag.c_str());
+        ++rows;
+    }
+    return rows;
+}
+
+bool materialFlags(const void* block, bool& blocksMotion, bool& liquid)
+{
+    constexpr std::ptrdiff_t kMaterialAt = 0x28;
+    constexpr std::size_t kLiquidAt = 0x02;
+    constexpr std::size_t kBlocksMotionAt = 0x03;
+    const void* const legacy = readPointer(block, kBlockLegacyAt);
+    const void* const material = readPointer(legacy, kMaterialAt);
+    std::uint8_t bytes[4]{};
+    if (material == nullptr || !safeCopy(bytes, material, sizeof(bytes))
+        || bytes[kLiquidAt] > 1 || bytes[kBlocksMotionAt] > 1) {
+        return false;
+    }
+    liquid = bytes[kLiquidAt] != 0;
+    blocksMotion = bytes[kBlocksMotionAt] != 0;
+    return true;
+}
+
 const void* stateVariant(const void* block, const std::vector<WantedState>& want,
                          std::size_t* missing)
 {
@@ -486,23 +601,6 @@ std::atomic<bool> g_layerOn{false};
 std::atomic<int> g_layerAxis{1};
 std::atomic<std::int32_t> g_layerLo{0};
 std::atomic<std::int32_t> g_layerHi{0};
-std::atomic<unsigned long long>
-    g_ghostHits[static_cast<std::size_t>(GhostHook::Count)] = {};
-
-constexpr std::size_t kDrawChunkSlots = 64;
-
-struct DrawChunkSlot {
-    std::atomic<std::int32_t> baseX{0};
-    std::atomic<std::int32_t> baseY{0};
-    std::atomic<std::int32_t> baseZ{0};
-    std::atomic<unsigned long long> hits{0};
-};
-
-DrawChunkSlot g_drawChunks[kDrawChunkSlots];
-std::atomic<std::size_t> g_drawChunkCount{0};
-std::atomic<std::uint32_t> g_drawChunkGen{0};
-
-std::atomic<bool> g_ghostMaskUsable{false};
 
 std::vector<std::uint16_t> g_drawCells;
 
@@ -532,7 +630,6 @@ std::int32_t g_lastMin[3] = {0, 0, 0};
 std::int32_t g_lastMax[3] = {0, 0, 0};
 std::atomic<unsigned long long> g_lastBoundsAt{0};
 constexpr unsigned long long kLastBoundsMs = 8000;
-std::atomic<bool> g_meshBoxes{false};
 std::atomic<unsigned long> g_simThread{0};
 
 std::atomic<unsigned long> g_meshThreads[kMeshThreadLimit] = {};
@@ -616,14 +713,6 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
     g_ghostAlpha.store(alpha, std::memory_order_relaxed);
     g_ghostMin[0] = x;  g_ghostMin[1] = y;  g_ghostMin[2] = z;
     g_ghostMax[0] = x + sx;  g_ghostMax[1] = y + sy;  g_ghostMax[2] = z + sz;
-    for (auto& one : g_ghostHits) {
-        one.store(0, std::memory_order_relaxed);
-    }
-    g_drawChunkCount.store(0, std::memory_order_release);
-    g_drawChunkGen.fetch_add(1, std::memory_order_release);
-    for (auto& one : g_drawChunks) {
-        one.hits.store(0, std::memory_order_relaxed);
-    }
 
     g_drawCellsPtr.store(nullptr, std::memory_order_release);
     g_drawCells2Ptr.store(nullptr, std::memory_order_release);
@@ -635,7 +724,6 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
     const std::uint64_t cells = static_cast<std::uint64_t>(sx) * static_cast<std::uint64_t>(sy)
                                 * static_cast<std::uint64_t>(sz);
     const bool usable = cells > 0 && cells <= kGhostCellLimit;
-    g_ghostMaskUsable.store(usable, std::memory_order_relaxed);
     if (!usable && cells > 0) {
         log().warn(L"Schematica: {} cells is over the limit of {}, so no ghost or "
                    L"color box can be drawn for this schematic (and its collision is kept)",
@@ -682,59 +770,13 @@ void clearGhostRegion()
     g_wantCells2Ptr.store(nullptr, std::memory_order_release);
     g_drawCellsCount.store(0, std::memory_order_relaxed);
     retireDrawCells();
-
-    {
-        std::wstring line;
-        const std::size_t used = std::min(g_drawChunkCount.load(std::memory_order_acquire),
-                                          kDrawChunkSlots);
-        for (std::size_t i = 0; i < used; ++i) {
-            line += std::format(L" ({},{},{})={}",
-                                g_drawChunks[i].baseX.load(std::memory_order_relaxed),
-                                g_drawChunks[i].baseY.load(std::memory_order_relaxed),
-                                g_drawChunks[i].baseZ.load(std::memory_order_relaxed),
-                                g_drawChunks[i].hits.load(std::memory_order_relaxed));
-        }
-    }
 }
 
 bool ghostOn() { return g_ghostOn.load(std::memory_order_acquire); }
 
-bool ghostAt(std::int32_t x, std::int32_t y, std::int32_t z, float& alpha)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    if (x < g_ghostMin[0] || x >= g_ghostMax[0] || y < g_ghostMin[1] || y >= g_ghostMax[1]
-        || z < g_ghostMin[2] || z >= g_ghostMax[2]) {
-        return false;
-    }
-    alpha = g_ghostAlpha.load(std::memory_order_relaxed);
-    return true;
-}
-
 float ghostAlpha()
 {
     return g_ghostAlpha.load(std::memory_order_relaxed);
-}
-
-std::vector<std::array<std::int32_t, 3>> ghostBlockEntityCells()
-{
-    std::vector<std::array<std::int32_t, 3>> out;
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return out;
-    }
-    const std::int32_t mn[3] = {g_ghostMin[0], g_ghostMin[1], g_ghostMin[2]};
-    const std::int32_t mx[3] = {g_ghostMax[0], g_ghostMax[1], g_ghostMax[2]};
-    for (std::int32_t y = mn[1]; y < mx[1]; ++y) {
-        for (std::int32_t z = mn[2]; z < mx[2]; ++z) {
-            for (std::int32_t x = mn[0]; x < mx[0]; ++x) {
-                if (hasBlockEntity(ghostBlockAt(x, y, z, 0))) {
-                    out.push_back({x, y, z});
-                }
-            }
-        }
-    }
-    return out;
 }
 
 bool lastGhostBounds(std::int32_t* mn, std::int32_t* mx)
@@ -956,6 +998,10 @@ constexpr std::ptrdiff_t kItemNameAt = 0x128;
 constexpr std::ptrdiff_t kCounterObject = 0x00;
 constexpr std::ptrdiff_t kCounterWeak = 0x0c;
 
+constexpr std::size_t kItemListBeginAt = 45;
+constexpr std::size_t kItemListEndAt = 49;
+constexpr std::size_t kMaxItems = 20000;
+
 constexpr char kTlsPattern[] =
     "8B 05 ?? ?? ?? ?? 65 48 8B 14 25 58 00 00 00 48 8B 04 C2 48 8B 80 ?? ?? ?? ?? F0 FF 41 0C";
 constexpr std::size_t kTlsDispAt = 22;
@@ -1029,6 +1075,27 @@ void* itemRegistryPtr()
     void* registry = nullptr;
     std::memcpy(&registry, static_cast<unsigned char*>(blockPtr) + at, sizeof(registry));
     return registry;
+}
+
+__declspec(noinline) bool readItemMapName(const void* at, char (&out)[128]) noexcept
+{
+    __try {
+        const auto* data = static_cast<const std::uint8_t*>(at);
+        const auto size = *reinterpret_cast<const std::size_t*>(data + 0x10);
+        const auto capacity = *reinterpret_cast<const std::size_t*>(data + 0x18);
+        if (size == 0 || size > 127 || capacity < size) return false;
+        const char* chars = capacity <= 15 ? reinterpret_cast<const char*>(data)
+                                           : *reinterpret_cast<const char* const*>(data);
+        for (std::size_t i = 0; i < size; ++i) {
+            const auto ch = static_cast<unsigned char>(chars[i]);
+            if (ch < 0x20 || ch >= 0x7f) return false;
+            out[i] = static_cast<char>(ch);
+        }
+        out[size] = '\0';
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 using ItemLookupByNameFn = void*(__fastcall*)(void*, void*, int*, const void*);
@@ -1170,6 +1237,32 @@ bool calibrateStackSizes()
     return ok;
 }
 
+}
+
+std::vector<std::string> registeredItemNames()
+{
+    std::vector<std::string> names;
+    void* const registry = itemRegistryPtr();
+    const auto* site = Scanner::instance().address(Target::ItemRegistryItemListSite);
+    if (registry == nullptr || site == nullptr || !memory::isReadable(site + kItemListBeginAt, 5))
+        return names;
+    const auto beginAt = static_cast<std::ptrdiff_t>(site[kItemListBeginAt]);
+    const auto endAt = static_cast<std::ptrdiff_t>(site[kItemListEndAt]);
+    if (endAt != beginAt + 8 || beginAt % 8 != 0) return names;
+    std::uintptr_t begin = 0, end = 0;
+    if (!safeCopy(&begin, static_cast<const std::uint8_t*>(registry) + beginAt, sizeof(begin))
+        || !safeCopy(&end, static_cast<const std::uint8_t*>(registry) + endAt, sizeof(end))
+        || begin == 0 || end < begin || (end - begin) % 8 != 0 || (end - begin) / 8 > kMaxItems) return names;
+    const std::size_t count = (end - begin) / 8;
+    names.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const void* counter = readPointer(reinterpret_cast<const void*>(begin), static_cast<std::ptrdiff_t>(i * 8));
+        const void* item = readPointer(counter, kCounterObject);
+        if (item == nullptr) continue;
+        char name[128]{};
+        if (readItemMapName(static_cast<const std::uint8_t*>(item) + kItemNameAt, name)) names.emplace_back(name);
+    }
+    return names;
 }
 
 bool maxStackSizeOf(const char* name, const void* block, int& out)
@@ -1498,17 +1591,6 @@ bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void
     return changed;
 }
 
-void clearDiffCells()
-{
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
-    std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_acquire);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    if (cells != nullptr && count != 0) {
-        std::memset(cells, 0, count);
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
-}
-
 std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
                              std::size_t* dropped, const double* eye, int* keptRadius)
 {
@@ -1739,21 +1821,11 @@ const void* legacyOfFast(const void* block)
     return answer;
 }
 
-std::atomic<std::size_t> g_occupiedCalls{0};
-std::atomic<std::size_t> g_occupiedCells{0};
-
-void subChunkOccupiedStats(std::size_t& calls, std::size_t& cells)
-{
-    calls = g_occupiedCalls.exchange(0, std::memory_order_relaxed);
-    cells = g_occupiedCells.exchange(0, std::memory_order_relaxed);
-}
-
 bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ)
 {
     if (!g_ghostOn.load(std::memory_order_acquire)) {
         return false;
     }
-    g_occupiedCalls.fetch_add(1, std::memory_order_relaxed);
     const std::int32_t x0 = std::max(baseX, g_ghostMin[0]);
     const std::int32_t y0 = std::max(baseY, g_ghostMin[1]);
     const std::int32_t z0 = std::max(baseZ, g_ghostMin[2]);
@@ -1768,10 +1840,6 @@ bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t 
     const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_acquire);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     if (cells != nullptr && count != 0) {
-        g_occupiedCells.fetch_add(static_cast<std::size_t>(x1 - x0)
-                                     * static_cast<std::size_t>(y1 - y0)
-                                     * static_cast<std::size_t>(z1 - z0),
-                                 std::memory_order_relaxed);
         for (std::int32_t x = x0; x < x1 && !found; ++x) {
             for (std::int32_t y = y0; y < y1 && !found; ++y) {
                 for (std::int32_t z = z0; z < z1; ++z) {
@@ -2009,68 +2077,6 @@ std::size_t meshThreadCount()
         }
     }
     return live;
-}
-
-void noteGhostHit(GhostHook which)
-{
-    const auto at = static_cast<std::size_t>(which);
-    if (at < std::size(g_ghostHits)) {
-        g_ghostHits[at].fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-std::size_t ghostHitCount(GhostHook which)
-{
-    const auto at = static_cast<std::size_t>(which);
-    return at < std::size(g_ghostHits) ? g_ghostHits[at].load(std::memory_order_relaxed) : 0;
-}
-
-void noteGhostDraw(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    const std::int32_t baseX = x >> 4 << 4;
-    const std::int32_t baseY = y >> 4 << 4;
-    const std::int32_t baseZ = z >> 4 << 4;
-    const std::uint32_t gen = g_drawChunkGen.load(std::memory_order_acquire);
-    thread_local std::uint32_t t_gen = 0;
-    thread_local std::size_t t_slot = kDrawChunkSlots;
-    thread_local std::int32_t t_base[3] = {0, 0, 0};
-    if (t_slot < kDrawChunkSlots && t_gen == gen && t_base[0] == baseX
-        && t_base[1] == baseY && t_base[2] == baseZ) {
-        g_drawChunks[t_slot].hits.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const std::size_t used = std::min(g_drawChunkCount.load(std::memory_order_acquire),
-                                      kDrawChunkSlots);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_drawChunks[i].baseX.load(std::memory_order_relaxed) == baseX
-            && g_drawChunks[i].baseY.load(std::memory_order_relaxed) == baseY
-            && g_drawChunks[i].baseZ.load(std::memory_order_relaxed) == baseZ) {
-            g_drawChunks[i].hits.fetch_add(1, std::memory_order_relaxed);
-            t_gen = gen;
-            t_slot = i;
-            t_base[0] = baseX;
-            t_base[1] = baseY;
-            t_base[2] = baseZ;
-            return;
-        }
-    }
-    std::size_t slot = g_drawChunkCount.load(std::memory_order_acquire);
-    if (slot >= kDrawChunkSlots) {
-        return;
-    }
-    if (!g_drawChunkCount.compare_exchange_strong(slot, slot + 1,
-                                                  std::memory_order_acq_rel)) {
-        return;
-    }
-    g_drawChunks[slot].baseX.store(baseX, std::memory_order_relaxed);
-    g_drawChunks[slot].baseY.store(baseY, std::memory_order_relaxed);
-    g_drawChunks[slot].baseZ.store(baseZ, std::memory_order_relaxed);
-    g_drawChunks[slot].hits.store(1, std::memory_order_release);
-    t_gen = gen;
-    t_slot = slot;
-    t_base[0] = baseX;
-    t_base[1] = baseY;
-    t_base[2] = baseZ;
 }
 
 }

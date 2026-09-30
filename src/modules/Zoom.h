@@ -30,17 +30,6 @@ public:
 
     bool zooming() const { return m_zooming.load(std::memory_order_acquire); }
 
-    bool wheelFresh(unsigned long long ms = 400) const
-    {
-        const unsigned long long at = m_wheelAt.load(std::memory_order_acquire);
-        return at != 0 && (GetTickCount64() - at) <= ms;
-    }
-
-    unsigned long long wheelSeen() const
-    {
-        return m_wheelSeen.load(std::memory_order_relaxed);
-    }
-
     bool suppressHotbar(const void* returnAddress) const;
 
 protected:
@@ -51,10 +40,6 @@ protected:
 
 private:
     Zoom() = default;
-
-    void installMouseHook();
-    void removeMouseHook();
-    static LRESULT CALLBACK mouseHookProc(int code, WPARAM wParam, LPARAM lParam);
 
     static constexpr std::ptrdiff_t kFovOffsets[] = {0x50, 0x170};
 
@@ -87,24 +72,10 @@ private:
 
     std::atomic<bool> m_zooming{false};
 
-    static Zoom* s_hookOwner;
-    HHOOK m_mouseHook = nullptr;
-
-    std::atomic<bool> m_mouseHookFailed{false};
-    bool m_mouseHookWarned = false;
-
-    std::atomic<int> m_wheel{0};
-
-    std::atomic<unsigned long long> m_wheelAt{0};
-    std::atomic<unsigned long long> m_wheelSeen{0};
-
-    const std::byte* m_hotbarFn = nullptr;
-    std::size_t m_hotbarFnSize = 0;
-    static constexpr std::size_t kHotbarFnScan = 0x4000;
-
-    mutable std::atomic<bool> m_hotbarLogged{false};
-    mutable std::atomic<unsigned long long> m_hotbarOutside{0};
-
+    int m_wheelLeftButton = -1;
+    int m_wheelRightButton = -1;
+    std::uint64_t m_wheelLeftSeen = 0;
+    std::uint64_t m_wheelRightSeen = 0;
 };
 
 }

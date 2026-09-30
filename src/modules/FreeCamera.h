@@ -26,16 +26,11 @@ public:
     void onScansReady() override;
     void shutdown() override;
 
-protected:
-    void onUpdate() override;
-
 public:
 
     void onCameraWrite(void* cameraBase);
 
     void onMoveInput(void* input);
-
-    bool movementSuppressed() const;
 
     void onMoveIntent(void* out, void* input);
 
@@ -99,7 +94,7 @@ private:
     static constexpr float kNoMovement = 360.0f;
     float movementOffset() const;
 
-    static float cameraYaw(const std::byte* cameraBase);
+    static float cameraYaw(const float* quat);
 
     enum class MoveKey {
         Forward,
@@ -114,41 +109,16 @@ private:
 
     static constexpr size_t kMoveKeyCount = static_cast<size_t>(MoveKey::Count);
 
-    static MoveKey moveKeyFor(DWORD virtualKey);
-    static int virtualKeyFor(MoveKey key);
-
     bool held(MoveKey key) const;
-
-    bool consumeToggle();
-    static bool comboKeyOf(const std::vector<int>& combo, DWORD virtualKey);
-
-    void installKeyHook();
-    void removeKeyHook();
-    void clearHeldKeys();
-
-    static LRESULT CALLBACK keyboardHookProc(int code, WPARAM wParam, LPARAM lParam);
-
-    static FreeCamera* s_hookOwner;
 
     static constexpr std::uint32_t kRawJumpBit = 1u << 7;
     static constexpr std::uint32_t kRawSneakBit = 1u << 0;
     static constexpr std::uint64_t kRawHoldGraceMs = 150;
 
-    static constexpr std::uint32_t kInputJumpHeld = 1u << 26;
-    static constexpr std::uint32_t kInputSneakHeld = 1u << 21;
-
     std::atomic<float> m_intentStrafe{0.0f};
     std::atomic<float> m_intentForward{0.0f};
     std::atomic<unsigned long long> m_intentAt{0};
     static constexpr unsigned long long kIntentFreshMs = 120;
-
-    static constexpr int kUpDownLogLimit = 40;
-
-    std::atomic<unsigned long long> m_inputSeenAt{0};
-
-    static constexpr unsigned long long kInputFreshMs = 500;
-
-    static constexpr int kInputLogLimit = 128;
 
     float m_speed = kDefaultSpeed;
 
@@ -185,16 +155,8 @@ private:
 
     Patch m_patchPerspective;
 
-    HHOOK m_keyHook = nullptr;
-
-    std::atomic<bool> m_keyHookFailed{false};
-    bool m_keyHookWarned = false;
-
-    std::atomic<bool> m_held[kMoveKeyCount]{};
+    int m_moveButtons[kMoveKeyCount]{-1, -1, -1, -1, -1, -1, -1};
     std::atomic<std::uint64_t> m_rawSeenMs[kMoveKeyCount]{};
-
-    std::atomic<bool> m_toggleDown{false};
-    std::atomic<bool> m_togglePressed{false};
 
     float m_frozenView[3]{};
     bool m_hasFrozenView = false;

@@ -51,7 +51,6 @@ enum Kind : std::uint16_t {
     kEndEvent,
     kIndirect,
     kViewport,
-    kOurs,
 };
 
 struct Event {
@@ -436,7 +435,6 @@ const char* kindName(std::uint16_t kind)
     case kEndEvent: return "END";
     case kIndirect: return "INDIRECT";
     case kViewport: return "VP";
-    case kOurs: return "OURS";
     default: return "?";
     }
 }
@@ -579,13 +577,18 @@ bool installHooks()
     return ok;
 }
 
-bool recording()
+std::atomic<bool> g_sawD3D12{false};
+
+bool sawD3D12()
 {
-    return g_state.load(std::memory_order_relaxed) == kRecording;
+    return g_sawD3D12.load(std::memory_order_relaxed);
 }
 
 void notePso(ID3D12PipelineState* pso, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* desc)
 {
+    if (pso != nullptr) {
+        g_sawD3D12.store(true, std::memory_order_relaxed);
+    }
     if (pso == nullptr || desc == nullptr || g_teardown.load(std::memory_order_relaxed)) {
         return;
     }
@@ -713,15 +716,6 @@ void onViewport(ID3D12GraphicsCommandList* list, float width, float height, floa
         std::memcpy(&mx, &maxDepth, sizeof(mx));
         push(make(kViewport, list, static_cast<std::uint64_t>(width),
                   static_cast<std::uint64_t>(height), mn, mx));
-    }
-}
-
-void onOurs(ID3D12GraphicsCommandList* list, const char* tag)
-{
-    if (g_state.load(std::memory_order_relaxed) == kRecording) {
-        Event e = make(kOurs, list);
-        e.text = (tag != nullptr) ? tag : "";
-        push(std::move(e));
     }
 }
 

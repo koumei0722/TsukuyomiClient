@@ -73,9 +73,6 @@ private:
     std::mutex m_importMutex;
     std::wstring m_importedStem;
 
-    std::wstring currentFileName() const;
-    void selectNextFile();
-
     struct Blueprint {
         std::wstring name;
         std::wstring fileName;
@@ -232,7 +229,6 @@ private:
     };
     void requestPrepare(unsigned purposes);
     void pollPrepare();
-    bool prepareBusy() const { return m_prepBusy; }
     void startPrepare();
     std::vector<PrepEntry> snapshotVisible(bool& needLoad);
     static std::vector<schematic::Placement> placementsOf(const std::vector<PrepEntry>& entries);
@@ -260,7 +256,6 @@ private:
     std::unique_ptr<PrepareJob> m_workDone;
     std::vector<std::unique_ptr<schematic::CellSet>> m_workTrash;
     bool m_workStop = false;
-    bool m_workStarted = false;
     std::atomic<bool> m_workCancel{false};
     void* m_workThread = nullptr;
 
@@ -273,10 +268,8 @@ private:
     mutable std::mutex m_filesMutex;
 
     std::unordered_map<std::string, std::int32_t> m_iconIds;
-    std::size_t m_iconMissing = 0;
 
     std::unordered_map<std::string, int> m_stackSizes;
-    std::size_t m_stackMissing = 0;
 
     Hotkey m_pageKey;
     std::atomic<bool> m_pageRequested{false};
@@ -328,8 +321,6 @@ private:
 
     void diffStep();
 
-    std::vector<std::string> m_paletteKeys;
-
     static constexpr std::size_t kDiffPerFrame = 256;
 
     std::size_t m_diffUpTo = 0;
@@ -377,13 +368,8 @@ private:
     std::size_t m_earlyCursor = 0;
     std::unordered_set<std::uint64_t> m_earlyOutside;
     std::uint64_t m_earlyRegionGen = 0;
+    unsigned long long m_earlySettledAt = 0;
     static constexpr std::size_t kEarlyCellBudget = 8192;
-    std::size_t m_earlyChunks = 0;
-    std::size_t m_earlyCells = 0;
-    std::size_t m_earlyCalls = 0;
-    std::size_t m_earlyLate = 0;
-    std::size_t m_relearnChunks = 0;
-    std::atomic<std::size_t> m_earlyBusy{0};
 
     struct ChunkChange {
         std::int32_t cx = 0;
@@ -396,7 +382,6 @@ private:
     };
     static constexpr std::uint32_t kHealMaxAsks = 3;
     std::unordered_map<std::uint64_t, ChunkChange> m_chunkChanges;
-    std::size_t m_healAsked = 0;
     static constexpr unsigned long long kHealRetryMs = 4000;
     void noteChunkChange(std::int32_t x, std::int32_t y, std::int32_t z);
     std::size_t healStaleChunks(unsigned long long now);
@@ -419,8 +404,6 @@ private:
 
     std::size_t m_boxSignature = 0;
     unsigned long long m_boxPublishedAt = 0;
-    std::size_t m_boxPublished = 0;
-    std::size_t m_boxSkipped = 0;
     static constexpr unsigned long long kBoxPublishMs = 500;
 
     bool m_boxLiveDirty = false;
@@ -436,37 +419,10 @@ private:
     double m_boxLastEye[3] = {};
     bool m_boxLastEyeValid = false;
 
-    std::size_t m_diffLaps = 0;
-    unsigned long long m_diffLoggedAt = 0;
-    static constexpr unsigned long long kDiffLogMs = 30000;
-
-    static constexpr std::size_t kDirtyCallers = 10;
-    std::size_t m_dirtyFrom[kDirtyCallers]{};
-    std::size_t m_learnedLate = 0;
-
-    std::size_t m_learnMissed = 0;
-    std::size_t m_learnTotal = 0;
-    std::size_t m_learnMissedNotLoaded = 0;
-    std::size_t m_learnMissedOutside = 0;
-    std::size_t m_learnMissedOther = 0;
-    std::size_t m_learnMissedByColumn = 0;
-    std::int32_t m_learnMissedAt[3] = {0, 0, 0};
-    double m_learnMissedNear = -1.0;
-    double m_learnKeptFar = -1.0;
-    unsigned long long m_learnLogAt = 0;
-    static constexpr unsigned long long kLearnLogMs = 30000;
-
-    std::vector<std::size_t> m_diffByEntry;
-    std::vector<std::size_t> m_diffByEntryDone;
-    unsigned long long m_diagLogAt = 0;
-    static constexpr unsigned long long kDiagLogMs = 30000;
-    static constexpr std::size_t kDiagTopEntries = 24;
-    void logDrawDiag(unsigned long long now);
-
     static constexpr unsigned long long kBoxModeRetryMs = 500;
     unsigned long long m_boxModeRetryAt = 0;
 
-    std::size_t dirtyChunks(int who = 0, bool askAll = true);
+    std::size_t dirtyChunks(bool askAll = true);
 
     void rebuildGhostChunkList();
 
@@ -520,8 +476,6 @@ private:
 
     std::atomic<bool> m_clearPending{false};
 
-    std::vector<blockwrite::BlockPos> m_placed;
-
     std::uint64_t m_regionGeneration = 0;
 
     unsigned long long m_worldSettleUntil = 0;
@@ -539,7 +493,6 @@ private:
     std::atomic<bool> m_ghostOverMismatch{true};
     std::atomic<int> m_boxAlpha{35};
     std::atomic<bool> m_boxModeChanged{false};
-    const void* m_ghost = nullptr;
     const void* m_poke = nullptr;
 
     std::size_t m_drawnUpTo = 0;
@@ -549,16 +502,6 @@ private:
     bool m_waitedLogged = false;
     bool m_firstLogged = false;
     bool m_anchorLogged = false;
-
-    static constexpr int kBoxReloadTries = 4;
-    static constexpr unsigned long long kBoxReloadRetryMs = 3000;
-    int m_boxReloadTries = 0;
-    unsigned long long m_boxReloadAt = 0;
-
-    static constexpr unsigned long long kBoxesPlacedWaitMs = 5000;
-    unsigned long long m_boxesPlacedAt = 0;
-    bool m_boxesPlacedLogged = false;
-    bool m_boxesGaveUpLogged = false;
 
     static constexpr unsigned long long kBoxModeReloadSlowMs = 5000;
     std::atomic<bool> m_boxReloadWanted{false};
@@ -576,12 +519,9 @@ private:
     std::vector<std::wstring> m_files;
     std::vector<std::wstring> m_fileNames;
 
-    int m_selected = -1;
-
     std::string m_pendingFile;
 
     mutable std::mutex m_mutex;
-    structure::Structure m_loaded;
 
     blocks::Table m_palette;
 

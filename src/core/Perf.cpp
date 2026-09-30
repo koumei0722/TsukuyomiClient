@@ -1,16 +1,14 @@
 #include "core/Perf.h"
 
 #include "core/Logger.h"
-#include "core/Paths.h"
+#include "core/DiagFlags.h"
 
 #include <windows.h>
 
 #include <array>
 #include <atomic>
-#include <filesystem>
 #include <format>
 #include <string>
-#include <system_error>
 
 namespace tsukuyomi::perf {
 namespace {
@@ -33,7 +31,6 @@ std::atomic<unsigned long long> g_reportedAt{0};
 const wchar_t* const kNames[] = {
     L"Schematica",  L"load",       L"cells",      L"draw",      L"clear",
     L"prune",       L"diff",       L"restore",    L"dirty",     L"publish",
-    L"lookup",      L"tessellate",
     L"chunk-build", L"ask-builds",
     L"HandRestock", L"hr-resolve", L"hr-count",   L"hr-watch",  L"hr-client",
     L"hr-own",
@@ -64,16 +61,12 @@ bool on()
 {
 
     static std::atomic<int> armed{0};
-    static std::atomic<unsigned long long> readAt{0};
-    const unsigned long long at = GetTickCount64();
-    const unsigned long long last = readAt.load(std::memory_order_acquire);
-    if (last != 0 && at - last < 500) {
-        return armed.load(std::memory_order_relaxed) == 1;
+    const bool want = diagflags::get(diagflags::Flag::Perf);
+
+    if (armed.load(std::memory_order_relaxed) == (want ? 1 : 2)) {
+        return want;
     }
-    readAt.store(at, std::memory_order_release);
-    std::error_code ec;
-    const bool want = std::filesystem::exists(paths::dataDir() / L"diag-perf.txt", ec);
-    const int was = armed.exchange(want ? 1 : 2, std::memory_order_release);
+    const int was = armed.exchange(want ? 1 : 2, std::memory_order_acq_rel);
     if (was != 0 && was != (want ? 1 : 2)) {
         log().info(L"Perf: diag-perf.txt = {}", want ? L"on" : L"off");
         if (want) {

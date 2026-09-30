@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Tsukuyomi
-    VERSION 2.2.1
+    VERSION 2.2.2
     LANGUAGES CXX)
 
 if(NOT MSVC)
@@ -59,11 +59,13 @@ target_link_libraries(Tsukuyomi PRIVATE
     minhook
     nlohmann_json::nlohmann_json
     libhat::libhat
-    d2d1
-    dwrite
     dwmapi
     comdlg32
-    ole32)
+    ole32
+
+    dxgi
+    pdh
+    psapi)
 
 target_compile_options(Tsukuyomi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8>

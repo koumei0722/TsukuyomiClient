@@ -6,9 +6,9 @@
 #include "core/Strings.h"
 #include "game/ItemStackOps.h"
 #include "input/Foreground.h"
+#include "input/GameButtons.h"
 #include "input/GameInput.h"
 #include "input/Keys.h"
-#include "input/LowLevelHook.h"
 
 #include <Windows.h>
 
@@ -22,8 +22,6 @@
 #include <sstream>
 
 namespace tsukuyomi {
-
-ItemScroller* ItemScroller::s_hookOwner = nullptr;
 
 namespace {
 
@@ -43,11 +41,6 @@ constexpr wchar_t kDefaultTopPriority[] =
     L"minecraft:netherite_axe,minecraft:netherite_shovel,minecraft:netherite_hoe";
 
 constexpr wchar_t kDefaultCategoryOrder[] = L"construction,equipment,items,nature,other";
-
-bool keyDown(int vk)
-{
-    return (GetAsyncKeyState(vk) & 0x8000) != 0;
-}
 
 std::vector<std::string> splitList(const std::wstring& text)
 {
@@ -331,6 +324,13 @@ void ItemScroller::loadConfig(const nlohmann::json& section)
         for (size_t i = 0; i < m_keys.size(); ++i) {
             m_keys[i].keys = combos[i];
         }
+        watchKeys();
+        for (KeySetting& setting : m_keys) {
+            int trigger = 0;
+            for (int vk : setting.keys) if (!keys::isModifier(vk)) trigger = vk;
+            setting.seenSeq = trigger ? keySeq(trigger) : 0;
+            setting.wasDown = true;
+        }
         std::lock_guard<std::mutex> lock(m_keysMutex);
         m_keyText = text;
     }
@@ -439,6 +439,10 @@ void ItemScroller::applyPendingKeys()
     for (size_t i = 0; i < m_keys.size(); ++i) {
         if (m_keys[i].keys != m_pendingKeys[i]) {
             m_keys[i].keys = m_pendingKeys[i];
+            watchKeys();
+            int trigger = 0;
+            for (int vk : m_keys[i].keys) if (!keys::isModifier(vk)) trigger = vk;
+            m_keys[i].seenSeq = trigger ? keySeq(trigger) : 0;
             m_keys[i].wasDown = true;
             log().info(L"ItemScroller: {} = {}", m_keys[i].name, keys::comboName(m_keys[i].keys));
         }
@@ -450,9 +454,11 @@ bool ItemScroller::autoTradeBypassed() const
     if (input::sneakHeldWithin(input::kSneakHoldGraceMs)) {
         return true;
     }
-    constexpr unsigned long long kWindowMs = 3000;
-    const unsigned long long at = m_rightDownMs.load(std::memory_order_acquire);
-    return m_rightDownSneak.load(std::memory_order_acquire) && at != 0 && GetTickCount64() - at < kWindowMs;
+    const GameButtons& buttons = GameButtons::instance();
+    const std::uint64_t at = buttons.buttonLastPressMs(m_useButton);
+    return at != 0 && GetTickCount64() - at < 3000
+        && gamebuttonlogic::sneakHeldAt(at, buttons.buttonLastPressMs(m_sneakButton),
+                                        buttons.buttonLastReleaseMs(m_sneakButton), input::kSneakHoldGraceMs);
 }
 
 void ItemScroller::saveConfig(nlohmann::json& section) const
@@ -536,6 +542,16 @@ void ItemScroller::rebuildLists()
 
 void ItemScroller::onScansReady()
 {
+    m_keySlots.fill(-1);
+    const char* names[] = {gamebuttonlogic::button::shift, gamebuttonlogic::button::control,
+        gamebuttonlogic::button::alt, gamebuttonlogic::button::pointerPressed,
+        gamebuttonlogic::button::menuSecondarySelect, gamebuttonlogic::button::menuTertiarySelect};
+    for (int i = 0; i < 6; ++i) m_namedButtons[i] = GameButtons::instance().watchButton(names[i]);
+    m_useButton = GameButtons::instance().watchButton(gamebuttonlogic::button::buildOrInteract);
+    m_sneakButton = GameButtons::instance().watchButton(gamebuttonlogic::button::sneak);
+    m_wheelLeftButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryLeft);
+    m_wheelRightButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryRight);
+    watchKeys();
     cui::onScansReady();
     ItemStackOps::instance().onScansReady();
     cui::setListener(this);
@@ -554,7 +570,6 @@ void ItemScroller::shutdown()
     cui::setListener(nullptr);
     tradeui::setListener(nullptr);
     saveFavorites();
-    removeMouseHook();
     if (m_recipesDirty) {
         saveRecipes();
     }
@@ -565,7 +580,6 @@ void ItemScroller::onEnabledChanged(bool on)
     if (!on) {
         stopDrag();
         m_jobs.clear();
-        removeMouseHook();
         tradeui::setUnlockTier(-1);
         tradeui::setFavoriteTier({}, {});
         m_unlockSent = -2;
@@ -576,76 +590,6 @@ void ItemScroller::onEnabledChanged(bool on)
 void ItemScroller::onUpdate()
 {
     watchConfigFile();
-    if (enabled() && available()) {
-        installMouseHook();
-    } else {
-        removeMouseHook();
-    }
-}
-
-void ItemScroller::installMouseHook()
-{
-    if (m_mouseHook != nullptr || m_mouseHookFailed) {
-        return;
-    }
-    s_hookOwner = this;
-    const input::LowLevelHook hook = input::installLowLevelHook(WH_MOUSE_LL, &ItemScroller::mouseHookProc);
-    m_mouseHook = hook.hook;
-    if (m_mouseHook == nullptr) {
-        s_hookOwner = nullptr;
-        m_mouseHookFailed = true;
-        log().warn(L"ItemScroller: could not grab the mouse wheel (error {}, {} with the module); "
-                   L"wheel features are off",
-                   hook.errorWithoutModule, hook.errorWithModule);
-    }
-}
-
-void ItemScroller::removeMouseHook()
-{
-    if (m_mouseHook != nullptr) {
-        UnhookWindowsHookEx(m_mouseHook);
-        m_mouseHook = nullptr;
-    }
-    s_hookOwner = nullptr;
-    m_mouseHookFailed = false;
-}
-
-LRESULT CALLBACK ItemScroller::mouseHookProc(int code, WPARAM wParam, LPARAM lParam)
-{
-    if (code == HC_ACTION && s_hookOwner != nullptr) {
-        int button = -1;
-        bool down = false;
-        switch (wParam) {
-        case WM_LBUTTONDOWN: button = 0; down = true; break;
-        case WM_LBUTTONUP: button = 0; break;
-        case WM_RBUTTONDOWN: button = 1; down = true; break;
-        case WM_RBUTTONUP: button = 1; break;
-        case WM_MBUTTONDOWN: button = 2; down = true; break;
-        case WM_MBUTTONUP: button = 2; break;
-        default: break;
-        }
-        if (button >= 0) {
-            s_hookOwner->m_mouseDown[button].store(down, std::memory_order_release);
-            if (down) {
-                s_hookOwner->m_mouseDownMs[button].store(GetTickCount64(), std::memory_order_release);
-            }
-        }
-        if (button == 1 && down) {
-            s_hookOwner->m_rightDownSneak.store(input::sneakHeldWithin(input::kSneakHoldGraceMs),
-                                                std::memory_order_release);
-            s_hookOwner->m_rightDownMs.store(GetTickCount64(), std::memory_order_release);
-        }
-    }
-    if (code == HC_ACTION && wParam == WM_MOUSEWHEEL && s_hookOwner != nullptr) {
-        const auto* info = reinterpret_cast<const MSLLHOOKSTRUCT*>(lParam);
-        const int delta = GET_WHEEL_DELTA_WPARAM(info->mouseData);
-        if (delta != 0) {
-            s_hookOwner->m_wheel.fetch_add(delta > 0 ? 1 : -1, std::memory_order_acq_rel);
-            s_hookOwner->m_wheelSeen.fetch_add(1, std::memory_order_relaxed);
-            s_hookOwner->m_wheelLastMs.store(GetTickCount64(), std::memory_order_release);
-        }
-    }
-    return CallNextHookEx(nullptr, code, wParam, lParam);
 }
 
 namespace {
@@ -655,23 +599,55 @@ int mouseIndex(int vk)
 }
 }
 
-bool ItemScroller::mouseHeld(int vk) const
+bool ItemScroller::keyHeld(int vk) const
 {
     const int i = mouseIndex(vk);
-    if (i < 0) {
-        return keyDown(vk);
-    }
-    return (m_mouseHook != nullptr) ? m_mouseDown[i].load(std::memory_order_acquire) : keyDown(vk);
+    int named = i == 0 ? 3 : i == 1 ? 4 : i == 2 ? 5
+        : vk == kShift ? 0 : vk == kCtrl ? 1 : vk == kAlt ? 2 : -1;
+    if (named >= 0) return GameButtons::instance().buttonHeld(m_namedButtons[named]);
+    return vk >= 0 && vk < static_cast<int>(m_keySlots.size())
+        && GameButtons::instance().keyHeld(m_keySlots[vk]);
+}
+
+std::uint64_t ItemScroller::keySeq(int vk) const
+{
+    const int i = mouseIndex(vk);
+    const int named = i == 0 ? 3 : i == 1 ? 4 : i == 2 ? 5
+        : vk == kShift ? 0 : vk == kCtrl ? 1 : vk == kAlt ? 2 : -1;
+    if (named >= 0) return GameButtons::instance().buttonPressSeq(m_namedButtons[named]);
+    return vk >= 0 && vk < static_cast<int>(m_keySlots.size())
+        ? GameButtons::instance().keyPressSeq(m_keySlots[vk]) : 0;
+}
+
+void ItemScroller::resyncKeySeqs()
+{
+    auto sync = [this](const std::vector<int>& combo, bool& wasDown, std::uint64_t& seen) {
+        int trigger = 0;
+        for (int vk : combo) if (!keys::isModifier(vk)) trigger = vk;
+        seen = trigger ? keySeq(trigger) : 0;
+        wasDown = comboHeld(combo, true);
+    };
+    for (KeySetting& setting : m_keys) sync(setting.keys, setting.wasDown, setting.seenSeq);
+    if (!toggleKey().empty()) sync(toggleKey().combo(), m_toggleWasDown, m_toggleSeenSeq);
+}
+
+void ItemScroller::watchKeys()
+{
+    auto watch = [this](int vk) {
+        if (vk >= 0 && vk < static_cast<int>(m_keySlots.size()) && mouseIndex(vk) < 0
+            && vk != kShift && vk != kCtrl && vk != kAlt) {
+            m_keySlots[vk] = GameButtons::instance().watchKey(vk);
+        }
+    };
+    for (const KeySetting& setting : m_keys) for (int vk : setting.keys) watch(vk);
+    for (int vk : {'Q', 'W', 'S'}) watch(vk);
+    for (int vk = VK_NUMPAD1; vk <= VK_NUMPAD9; ++vk) watch(vk);
+    for (int vk : {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT}) watch(vk);
 }
 
 int ItemScroller::recentMouseButton() const
 {
-    const unsigned long long l = m_mouseDownMs[0].load(std::memory_order_acquire);
-    const unsigned long long r = m_mouseDownMs[1].load(std::memory_order_acquire);
-    if (m_mouseHook == nullptr) {
-        return (keyDown(kRmb) && !keyDown(kLmb)) ? kRmb : kLmb;
-    }
-    return (r > l) ? kRmb : kLmb;
+    return keyHeld(kLmb) ? kLmb : kRmb;
 }
 
 bool ItemScroller::comboHeld(const std::vector<int>& combo, bool exactModifiers) const
@@ -688,10 +664,10 @@ bool ItemScroller::comboHeldAt(const std::vector<int>& combo, bool exactModifier
         if (vk == pressVk) {
             return true;
         }
-        if (pressVk != 0 && mouseIndex(vk) >= 0) {
+        if (pressVk != 0 && mouseIndex(pressVk) >= 0 && mouseIndex(vk) >= 0) {
             return false;
         }
-        return mouseHeld(vk);
+        return keyHeld(vk);
     };
     for (int vk : combo) {
         if (!down(vk)) {
@@ -710,29 +686,20 @@ bool ItemScroller::comboHeldAt(const std::vector<int>& combo, bool exactModifier
     return true;
 }
 
-bool ItemScroller::comboEdge(const std::vector<int>& combo, bool& wasDown, bool exactModifiers)
+bool ItemScroller::comboEdge(const std::vector<int>& combo, bool& wasDown,
+                             std::uint64_t& seenSeq, bool exactModifiers)
 {
-    const bool down = comboHeld(combo, exactModifiers);
-    const bool edge = down && !wasDown;
-    if (down) {
-        wasDown = true;
+    int trigger = 0;
+    for (int vk : combo) if (!keys::isModifier(vk)) trigger = vk;
+    if (trigger != 0) {
+        const std::uint64_t now = keySeq(trigger);
+        const bool edge = now != seenSeq && comboHeldAt(combo, exactModifiers, trigger);
+        seenSeq = now;
         return edge;
     }
-    bool anyTrigger = false;
-    bool triggerUp = false;
-    for (int vk : combo) {
-        if (keys::isModifier(vk)) {
-            continue;
-        }
-        anyTrigger = true;
-        if (!mouseHeld(vk)) {
-            triggerUp = true;
-        }
-    }
-    if (anyTrigger ? triggerUp
-                   : !std::any_of(combo.begin(), combo.end(), [](int vk) { return keyDown(vk); })) {
-        wasDown = false;
-    }
+    const bool down = comboHeld(combo, exactModifiers);
+    const bool edge = down && !wasDown;
+    wasDown = down;
     return edge;
 }
 
@@ -870,15 +837,6 @@ int invId(const std::string& coll, bool splitPlayer)
     return 7;
 }
 
-}
-
-ItemScroller::Group ItemScroller::otherGroupOf(const Slot& slot) const
-{
-    const Group g = groupOf(slot.coll);
-    if (g == Group::Player) {
-        return screenHas(Group::Storage) ? Group::Storage : Group::Player;
-    }
-    return Group::Player;
 }
 
 std::vector<ItemScroller::Slot> ItemScroller::otherSlotsOf(const Slot& slot) const
@@ -1283,12 +1241,6 @@ void ItemScroller::dropLeaveOne(const Slot& slot)
     dropCursorAll();
 }
 
-bool ItemScroller::slotY(const Slot& s, int& y) const
-{
-    int x = 0;
-    return cui::slotScreenPos(s.coll, s.index, x, y);
-}
-
 int ItemScroller::rowOf(const Slot& s) const
 {
     const int storage = cui::collectionSize("container_items");
@@ -1659,10 +1611,10 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
     m_inTick = true;
     if (id != cui::button::kHover && debugLog()) {
         log().info(L"ItemScroller: button {:#x} state {} on \"{}\"[{}] keys{}{}{}{}{}{}{}{}",
-                   id, state, toUtf16(coll), index, keyDown(kShift) ? L" Shift" : L"",
-                   keyDown(kCtrl) ? L" Ctrl" : L"", keyDown(kAlt) ? L" Alt" : L"",
-                   mouseHeld(kLmb) ? L" L" : L"", mouseHeld(kRmb) ? L" R" : L"",
-                   keyDown('Q') ? L" Q" : L"", keyDown('W') ? L" W" : L"", keyDown('S') ? L" S" : L"");
+                   id, state, toUtf16(coll), index, keyHeld(kShift) ? L" Shift" : L"",
+                   keyHeld(kCtrl) ? L" Ctrl" : L"", keyHeld(kAlt) ? L" Alt" : L"",
+                   keyHeld(kLmb) ? L" L" : L"", keyHeld(kRmb) ? L" R" : L"",
+                   keyHeld('Q') ? L" Q" : L"", keyHeld('W') ? L" W" : L"", keyHeld('S') ? L" S" : L"");
     }
 
     if (id == cui::button::kHover) {
@@ -1690,7 +1642,7 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
                             || id == cui::button::kDropAll;
 
     if (id == cui::button::kCursorDropAll || id == cui::button::kCursorDropOne) {
-        if (keyDown(kShift) && !cursorEmpty()) {
+        if (keyHeld(kShift) && !cursorEmpty()) {
             swallow = m_enableShiftDropItems ? shiftDropItems() : true;
         }
     } else if (slotButton && slot.valid() && !slotBlacklisted(slot)) {
@@ -1762,7 +1714,7 @@ void ItemScroller::onScreenLost()
     tradeui::forgetHover();
     saveFavorites();
     m_cursorSource = Slot{};
-    m_wheel.store(0);
+    resyncWheelSeqs();
     if (m_recipesDirty) {
         saveRecipes();
     }
@@ -1770,7 +1722,12 @@ void ItemScroller::onScreenLost()
 
 void ItemScroller::consumeWheel()
 {
-    int notches = m_wheel.exchange(0, std::memory_order_acq_rel);
+    const auto& buttons = GameButtons::instance();
+    const std::uint64_t left = buttons.buttonPressSeq(m_wheelLeftButton);
+    const std::uint64_t right = buttons.buttonPressSeq(m_wheelRightButton);
+    const int notches = gamebuttonlogic::wheelNotches(left, m_wheelLeftSeen, right, m_wheelRightSeen);
+    m_wheelLeftSeen = left;
+    m_wheelRightSeen = right;
     if (notches == 0) {
         return;
     }
@@ -1792,6 +1749,20 @@ void ItemScroller::consumeWheel()
         log().info(L"ItemScroller: wheel {} on \"{}\"[{}]", notches, toUtf16(coll), index);
         dumpScreen(L"after wheel");
     }
+}
+
+void ItemScroller::resyncWheelSeqs()
+{
+    const auto& buttons = GameButtons::instance();
+    m_wheelLeftSeen = buttons.buttonPressSeq(m_wheelLeftButton);
+    m_wheelRightSeen = buttons.buttonPressSeq(m_wheelRightButton);
+}
+
+unsigned long long ItemScroller::wheelLastMs() const
+{
+    const auto& buttons = GameButtons::instance();
+    return std::max(buttons.buttonLastPressMs(m_wheelLeftButton),
+                    buttons.buttonLastPressMs(m_wheelRightButton));
 }
 
 void ItemScroller::debugSlot(const Slot& s) const
@@ -1847,14 +1818,21 @@ void ItemScroller::pollHotkeys()
     const Slot hovered{coll, index};
 
     if (!toggleKey().empty()) {
-        static bool was = false;
-        if (comboEdge(toggleKey().combo(), was, true)) {
+        for (int vk : toggleKey().combo()) {
+            if (vk >= 0 && vk < static_cast<int>(m_keySlots.size()) && m_keySlots[vk] < 0 && mouseIndex(vk) < 0
+                && vk != kShift && vk != kCtrl && vk != kAlt) {
+                m_keySlots[vk] = GameButtons::instance().watchKey(vk);
+                m_toggleSeenSeq = keySeq(vk);
+            }
+        }
+        if (comboEdge(toggleKey().combo(), m_toggleWasDown, m_toggleSeenSeq, true)) {
             toggle();
             log().info(L"ItemScroller: toggled {}", enabled() ? L"ON" : L"OFF");
             return;
         }
     }
-    auto edge = [this](KeyId id) { return comboEdge(m_keys[id].keys, m_keys[id].wasDown, true); };
+    auto edge = [this](KeyId id) { return comboEdge(m_keys[id].keys, m_keys[id].wasDown,
+                                                   m_keys[id].seenSeq, true); };
 
     if (edge(kSlotDebug)) {
         dumpScreen(L"slot debug");
@@ -1901,10 +1879,11 @@ void ItemScroller::logStats()
             std::string coll;
             int index = -1;
             const bool over = cui::hovered(coll, index);
-            log().info(L"ItemScroller: stats sm {} hover {} ticks {} ({} calls) wheel {} hook {} "
+            log().info(L"ItemScroller: stats sm {} hover {} ticks {} ({} calls) wheel left {} right {} "
                        L"hovered {} \"{}\"[{}] pitch {}",
                        st.smEvents, st.hoverEvents, st.ticks, st.tickCalls,
-                       m_wheelSeen.load(), m_mouseHook != nullptr, over, toUtf16(coll), index,
+                       GameButtons::instance().buttonPressSeq(m_wheelLeftButton),
+                       GameButtons::instance().buttonPressSeq(m_wheelRightButton), over, toUtf16(coll), index,
                        cui::slotPitchPixels());
         }
     }
@@ -1914,21 +1893,26 @@ void ItemScroller::onScreenTick()
 {
     logStats();
     if (!m_wheelPrimed) {
-        const int dropped = m_wheel.exchange(0, std::memory_order_acq_rel);
+        resyncKeySeqs();
+        const auto& buttons = GameButtons::instance();
+        const int dropped = gamebuttonlogic::wheelNotches(
+            buttons.buttonPressSeq(m_wheelLeftButton), m_wheelLeftSeen,
+            buttons.buttonPressSeq(m_wheelRightButton), m_wheelRightSeen);
+        resyncWheelSeqs();
         m_wheelPrimed = true;
-        m_wheelCarry = GetTickCount64() - m_wheelLastMs.load(std::memory_order_acquire) < kWheelCarryGapMs;
+        m_wheelCarry = GetTickCount64() - wheelLastMs() < kWheelCarryGapMs;
         if ((dropped != 0 || m_wheelCarry) && debugLog()) {
             log().info(L"ItemScroller: dropped {} wheel notch(es) from before the screen opened{}", dropped,
                        m_wheelCarry ? L" (still turning; muted until it stops)" : L"");
         }
     } else if (m_wheelCarry) {
-        m_wheel.store(0, std::memory_order_release);
-        if (GetTickCount64() - m_wheelLastMs.load(std::memory_order_acquire) >= kWheelCarryGapMs) {
+        resyncWheelSeqs();
+        if (GetTickCount64() - wheelLastMs() >= kWheelCarryGapMs) {
             m_wheelCarry = false;
         }
     }
     if (m_autoTradeOffstack) {
-        m_wheel.store(0);
+        resyncWheelSeqs();
         if (!enabled()) {
             return;
         }
@@ -1941,7 +1925,7 @@ void ItemScroller::onScreenTick()
         return;
     }
     if (!enabled() || !input::isGameForeground() || screenBlacklisted()) {
-        m_wheel.store(0);
+        resyncWheelSeqs();
         m_recipeViewOpen = false;
         updateRecipeView();
         return;
@@ -1949,13 +1933,19 @@ void ItemScroller::onScreenTick()
     m_inTick = true;
     m_clicksThisTick = 0;
     applyPendingKeys();
-    if (m_drag != DragAction::None && (!mouseHeld(m_dragMouseVk) || !dragActionHeld(m_drag))) {
+    if (m_drag != DragAction::None && (!keyHeld(m_dragMouseVk) || !dragActionHeld(m_drag))) {
         stopDrag();
     }
     runJobs();
+    const bool viewWasOpen = m_recipeViewOpen;
     m_recipeViewOpen = m_enableCraftingFeatures && isCraftingScreen()
                        && comboHeld(m_keys[kRecipeView].keys, false);
     if (m_recipeViewOpen) {
+        if (!viewWasOpen) {
+            for (int k = 0; k < 9; ++k) m_viewKeysSeq[k] = keySeq(VK_NUMPAD1 + k);
+            const int arrows[] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT};
+            for (int k = 0; k < 4; ++k) m_viewKeysSeq[k + 9] = keySeq(arrows[k]);
+        }
         onRecipeViewKeys();
     }
     handleViewInput();
