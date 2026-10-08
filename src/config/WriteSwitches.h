@@ -13,8 +13,6 @@ bool allowed(const wchar_t* name);
 
 bool blocked(std::string_view feature);
 
-std::vector<std::string> disabledNames();
-
 void noteUnknown(std::string_view name);
 
 void finishStartup();
@@ -29,9 +27,7 @@ struct Entry {
 };
 const std::vector<Entry>& table();
 
-std::string render(const std::vector<std::pair<std::string, bool>>& values,
-                   const std::vector<std::pair<std::string, bool>>& unknownHooks,
-                   const std::vector<std::pair<std::string, bool>>& unknownPatches);
+std::string render(const std::vector<std::pair<std::string, bool>>& values);
 
 bool parse(std::string_view text, std::vector<std::pair<std::string, bool>>& hooks,
            std::vector<std::pair<std::string, bool>>& patches, std::vector<std::string>* invalid = nullptr);

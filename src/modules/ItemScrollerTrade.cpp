@@ -1,11 +1,11 @@
 #include "modules/ItemScroller.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
 #include "game/ContainerUi.h"
 #include "game/TradeUi.h"
-#include "game/UiProbe.h"
 #include "hooks/Detours.h"
 
 #include <Windows.h>
@@ -87,10 +87,7 @@ void ItemScroller::refreshVillagerKey()
         std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(id));
         m_villagerKey = std::string("id:") + buf;
     }
-    if (debugLog()) {
-        log().info(L"ItemScroller: villager {} ({}; {} chars of offers)", toUtf16(m_villagerKey),
-                   byId ? L"entity id" : L"offers", all.size());
-    }
+
 }
 
 bool ItemScroller::villagerHasOwnFavorites()
@@ -128,7 +125,7 @@ bool ItemScroller::isFavorite(int tier, int index)
     if (villagerHasOwnFavorites()) {
         return isVillagerFavorite(o);
     }
-    return m_villagerTradeUseGlobalFavorites && isGlobalFavorite(o);
+    return isGlobalFavorite(o);
 }
 
 namespace {
@@ -142,7 +139,7 @@ const void* rowOffer(int tier, int index)
 bool ItemScroller::rowFavVillager(int tier, int index)
 {
     ItemScroller& self = instance();
-    if (!self.enabled() || !self.m_enableVillagerTradeFeatures) {
+    if (!self.enabled()) {
         return false;
     }
     self.refreshVillagerKey();
@@ -152,22 +149,22 @@ bool ItemScroller::rowFavVillager(int tier, int index)
 bool ItemScroller::rowFavGlobal(int tier, int index)
 {
     ItemScroller& self = instance();
-    if (!self.enabled() || !self.m_enableVillagerTradeFeatures) {
+    if (!self.enabled()) {
         return false;
     }
     self.refreshVillagerKey();
-    const bool used = self.m_villagerTradeUseGlobalFavorites && !self.villagerHasOwnFavorites();
+    const bool used = !self.villagerHasOwnFavorites();
     return used && self.isGlobalFavorite(rowOffer(tier, index));
 }
 
 bool ItemScroller::rowFavGlobalIdle(int tier, int index)
 {
     ItemScroller& self = instance();
-    if (!self.enabled() || !self.m_enableVillagerTradeFeatures) {
+    if (!self.enabled()) {
         return false;
     }
     self.refreshVillagerKey();
-    const bool used = self.m_villagerTradeUseGlobalFavorites && !self.villagerHasOwnFavorites();
+    const bool used = !self.villagerHasOwnFavorites();
     const void* const o = rowOffer(tier, index);
     return !used && self.isGlobalFavorite(o) && !self.isVillagerFavorite(o);
 }
@@ -208,34 +205,16 @@ void ItemScroller::loadFavorites()
 {
     m_favoritesLoaded = true;
     std::ifstream in{std::filesystem::path(favoritesFilePath())};
-    if (!in) {
-        return;
-    }
+    if (!in) return;
     nlohmann::json root;
     try {
         in >> root;
-    } catch (...) {
+    } catch (const nlohmann::json::exception&) {
         log().warn(L"ItemScroller: the villager favorites file could not be read");
         return;
     }
-    if (root.contains("global") && root["global"].is_array()) {
-        for (const auto& k : root["global"]) {
-            if (k.is_string()) {
-                m_globalFavorites.insert(k.get<std::string>());
-            }
-        }
-    }
-    if (root.contains("villagers") && root["villagers"].is_object()) {
-        for (auto it = root["villagers"].begin(); it != root["villagers"].end(); ++it) {
-            if (!it.value().is_array()) {
-                continue;
-            }
-            for (const auto& k : it.value()) {
-                if (k.is_string()) {
-                    m_villagerFavorites[it.key()].insert(k.get<std::string>());
-                }
-            }
-        }
+    if (!itemscrollerlogic::readFavorites(root, m_globalFavorites, m_villagerFavorites)) {
+        log().warn(L"ItemScroller: the villager favorites file has invalid field types");
     }
 }
 
@@ -269,14 +248,13 @@ void ItemScroller::saveFavorites() const
 
 void ItemScroller::onTradeSecondary(int tier, int index)
 {
-    if (!enabled() || !m_enableVillagerTradeFeatures) {
+    applyDisable();
+    if (!enabled()) {
         return;
     }
     m_tradeJobs.clear();
     m_tradeJobs.push_back(TradeJob{tier, index, 0, 0});
-    if (debugLog()) {
-        log().info(L"ItemScroller: trade everything with tier {} #{}", tier, index);
-    }
+
 }
 
 int ItemScroller::tradeTierLimit(void* ctrl) const
@@ -288,7 +266,7 @@ int ItemScroller::tradeTierLimit(void* ctrl) const
     return current >= 0 ? current : kMaxTiers;
 }
 
-int ItemScroller::tradeFavorites(bool skipImpossible)
+int ItemScroller::tradeFavorites()
 {
     void* const ctrl = cui::screenController();
     if (ctrl == nullptr) {
@@ -306,7 +284,7 @@ int ItemScroller::tradeFavorites(bool skipImpossible)
             if (!isFavorite(tier, i)) {
                 continue;
             }
-            if (skipImpossible && (tradeui::offerSoldOut(o) || !tradeui::tradePossible(ctrl, o))) {
+            if (tradeui::offerSoldOut(o) || !tradeui::tradePossible(ctrl, o)) {
                 ++skipped;
                 continue;
             }
@@ -356,7 +334,6 @@ void ItemScroller::tradeTick()
     const void* shown = stackOf(result);
     const bool ready = !cui::isEmpty(shown) && cui::itemName(shown) == cui::itemName(sell);
     if (job.phase == 0) {
-        job.lastPay = countItemInPlayer(tradeui::offerBuyA(o));
         tradeui::selectTrade(ctrl, job.tier, job.index);
         job.phase = 1;
         job.wait = 0;
@@ -367,20 +344,14 @@ void ItemScroller::tradeTick()
         if (++job.wait < kWaitTicks) {
             return;
         }
-        if (debugLog()) {
-            log().info(L"ItemScroller: trade tier {} #{} gave no result (short of the price or sold out)", job.tier,
-                       job.index);
-        }
+
         m_tradeJobs.erase(m_tradeJobs.begin());
         return;
     }
     const int payBefore = countItemInPlayer(tradeui::offerBuyA(o));
     shiftClick(result);
     const int payAfter = countItemInPlayer(tradeui::offerBuyA(o));
-    if (debugLog()) {
-        log().info(L"ItemScroller: traded tier {} #{} ({} -> {} of the price)", job.tier, job.index,
-                   payBefore, payAfter);
-    }
+
     if (payAfter >= payBefore) {
         m_tradeJobs.erase(m_tradeJobs.begin());
         return;
@@ -396,17 +367,15 @@ void ItemScroller::tradeScreenTick(bool offstack)
     refreshVillagerKey();
     updateTradeOrder(cui::screenController());
     autoTradeTick(cui::screenController());
-    if (m_debugMessages) {
-        logTradeState(cui::screenController());
-    }
+
     if (offstack) {
-        if (m_enableVillagerTradeFeatures) {
-            tradeTick();
-        }
+
+        tradeTick();
+
         return;
     }
     const bool middle = keyHeld(VK_MBUTTON);
-    if (middle && !m_tradeMiddleWas && m_enableVillagerTradeFeatures) {
+    if (middle && !m_tradeMiddleWas) {
         int tier = -1;
         int index = -1;
         if (tradeui::hovered(tier, index, 1500)) {
@@ -417,15 +386,15 @@ void ItemScroller::tradeScreenTick(bool offstack)
     void* const ctrl = cui::screenController();
     handleFavInput(ctrl);
     updateFavView(ctrl);
-    if (m_enableVillagerTradeFeatures) {
-        tradeTick();
-    }
+
+    tradeTick();
+
 }
 
 void ItemScroller::updateFavView(void* ctrl)
 {
     FavView next{};
-    if (ctrl != nullptr && enabled() && m_enableVillagerTradeFeatures && isTradeScreen()) {
+    if (ctrl != nullptr && enabled() && isTradeScreen()) {
         auto iconOf = [](const void* stack) {
             if (cui::isEmpty(stack)) {
                 return 0;
@@ -471,7 +440,7 @@ void ItemScroller::handleFavInput(void* ctrl)
     const int pressed = m_favPress;
     const bool right = m_favPressRight;
     m_favPress = -1;
-    if (pressed < 0 || pressed >= m_favView.n || ctrl == nullptr || !m_enableVillagerTradeFeatures) {
+    if (pressed < 0 || pressed >= m_favView.n || ctrl == nullptr) {
         return;
     }
     const int tier = m_favView.tier[pressed];
@@ -482,9 +451,7 @@ void ItemScroller::handleFavInput(void* ctrl)
     } else {
         tradeui::selectTrade(ctrl, tier, index);
     }
-    if (debugLog()) {
-        log().info(L"ItemScroller: favorite list {} tier {} #{}", right ? L"trade all" : L"select", tier, index);
-    }
+
 }
 
 void ItemScroller::clearTradeInputs()
@@ -558,8 +525,8 @@ void ItemScroller::updateTradeOrder(void* ctrl)
         return;
     }
     const std::string sig = std::format("{}|{}|{}{}{}{}{}", m_villagerKey, m_favVersion, enabled(),
-                                        m_enableVillagerTradeFeatures, m_villagerTradeUnlockAllTiers,
-                                        m_villagerTradeSortFavoritesFirst, m_villagerTradeUseGlobalFavorites);
+                                        true, m_villagerTradeUnlockAllTiers,
+                                        true, true);
     if (sig == m_orderSig && m_favTierSet && ++m_orderTicks < 30) {
         return;
     }
@@ -569,7 +536,7 @@ void ItemScroller::updateTradeOrder(void* ctrl)
     std::vector<int> counts;
     for (int tier = 0; tier < kMaxTiers; ++tier) {
         int n = 0;
-        while (n < kMaxOffersPerTier && tradeui::offerRaw(ctrl, tier, n) != nullptr) {
+        while (n < kMaxOffersPerTier && tradeui::offer(ctrl, tier, n) != nullptr) {
             ++n;
         }
         if (n == 0) {
@@ -578,20 +545,17 @@ void ItemScroller::updateTradeOrder(void* ctrl)
         counts.push_back(n);
         tiers = tier + 1;
     }
-    const int unlock = (enabled() && m_enableVillagerTradeFeatures && m_villagerTradeUnlockAllTiers && tiers > 0)
+    const int unlock = (enabled() && m_villagerTradeUnlockAllTiers && tiers > 0)
                            ? tiers - 1
                            : -1;
     if (unlock != m_unlockSent) {
         tradeui::setUnlockTier(unlock);
         m_unlockSent = unlock;
         cui::requestRefresh();
-        if (debugLog()) {
-            log().info(L"ItemScroller: unlock all tiers {}", unlock >= 0 ? std::format(L"up to {}", unlock) : L"off");
-        }
+
     }
     std::vector<std::pair<int, int>> fav;
-    if (enabled() && m_enableVillagerTradeFeatures && m_villagerTradeSortFavoritesFirst
-        && tradeui::favoriteTierAvailable()) {
+    if (enabled() && tradeui::favoriteTierAvailable()) {
         if (!m_favoritesLoaded) {
             loadFavorites();
         }
@@ -599,8 +563,8 @@ void ItemScroller::updateTradeOrder(void* ctrl)
         const int limit = tradeTierLimit(ctrl);
         for (int tier = 0; tier < tiers && tier <= limit; ++tier) {
             for (int i = 0; i < counts[static_cast<size_t>(tier)]; ++i) {
-                const void* o = tradeui::offerRaw(ctrl, tier, i);
-                const bool f = own ? isVillagerFavorite(o) : (m_villagerTradeUseGlobalFavorites && isGlobalFavorite(o));
+                const void* o = tradeui::offer(ctrl, tier, i);
+                const bool f = own ? isVillagerFavorite(o) : (isGlobalFavorite(o));
                 if (f) {
                     fav.emplace_back(tier, i);
                 }
@@ -613,13 +577,7 @@ void ItemScroller::updateTradeOrder(void* ctrl)
         m_favTierSet = true;
         tradeui::setFavoriteTier(fav, counts);
         cui::requestRefresh();
-        if (debugLog()) {
-            std::wstring text;
-            for (const auto& [tier, i] : fav) {
-                text += std::format(L" {}#{}", tier, i);
-            }
-            log().info(L"ItemScroller: favorite tier{}", text.empty() ? L" (none)" : text);
-        }
+
     }
 }
 
@@ -630,11 +588,19 @@ void ItemScroller::autoTradeTick(void* ctrl)
     if (!m_autoTradeWanted || ctrl == nullptr || ctrl != m_autoTradeCtrl || m_autoTradePhase >= 3) {
         return;
     }
-    if (!enabled() || !m_enableVillagerTradeFeatures) {
+    if (!enabled()) {
         if (m_autoTradeOffstack) {
             closeAutoTradeScreen(L"was switched off");
         }
         m_autoTradeWanted = false;
+        return;
+    }
+    if (!m_autoTradeOffstack) {
+        m_autoTradeWanted = false;
+        notice::failOnce("ItemScroller.autoTradeOffstack",
+                         L"ItemScroller: the trade screen could not be kept off the screen stack, so the auto trade "
+                         L"is off (the screen opens normally)",
+                         "Auto trade is off: the trade screen could not be opened in the background");
         return;
     }
     if (++m_autoTradeTicks >= kGiveUpTicks) {
@@ -646,7 +612,7 @@ void ItemScroller::autoTradeTick(void* ctrl)
         if (m_autoTradeTicks < kDelayTicks) {
             return;
         }
-        const int queued = tradeFavorites(true);
+        const int queued = tradeFavorites();
         m_autoTradeGains.clear();
         if (m_villagerTradeOnOpenThrowResults) {
             for (const TradeJob& j : m_tradeJobs) {
@@ -712,7 +678,7 @@ void ItemScroller::startThrowResults(void* ctrl)
             wants->push_back(Want{name, aux, gained});
         }
     }
-    if (debugLog() || !wants->empty()) {
+    if (!wants->empty()) {
         std::wstring text;
         for (const Want& w : *wants) {
             text += std::format(L" {} x{}", toUtf16(w.name), w.count);
@@ -756,18 +722,20 @@ void ItemScroller::closeAutoTradeScreen(const wchar_t* why)
 {
     m_autoTradePhase = 3;
     m_tradeJobs.clear();
-    if (m_autoTradeOffstack) {
-        log().info(L"ItemScroller: auto trade {} after {} tick(s) — releasing the trade screen that was never opened",
-                   why, m_autoTradeTicks);
-        return;
-    }
-    const bool ok = hooks::popTopScreen();
-    log().info(L"ItemScroller: auto trade {} after {} tick(s) — {}", why, m_autoTradeTicks,
-               ok ? L"closed the trade screen" : L"could NOT close the trade screen, leaving it open");
+    log().info(L"ItemScroller: auto trade {} after {} tick(s) — releasing the trade screen that was never opened",
+               why, m_autoTradeTicks);
 }
 
 void ItemScroller::onPlayerViewUpdate()
 {
+    if (m_unloadRelease.load(std::memory_order_acquire) == 1) {
+        if (hooks::offstackScreenHeld()) {
+            hooks::releaseOffstackScreen(L"unloading");
+        }
+        m_unloadRelease.store(2, std::memory_order_release);
+        return;
+    }
+    applyDisable();
     if (!m_autoTradeOffstack || !hooks::offstackScreenHeld()) {
         return;
     }
@@ -810,47 +778,6 @@ void ItemScroller::onOffstackTradeReleased()
     m_autoTradeOffstack = false;
     m_autoTradeWanted = false;
     m_offstackTickMs = 0;
-}
-
-void ItemScroller::logTradeState(void* ctrl)
-{
-    if (ctrl == nullptr) {
-        return;
-    }
-    if (m_loggedVillager != m_villagerKey && debugLog()) {
-        m_loggedVillager = m_villagerKey;
-        std::wstring text;
-        for (int tier = 0; tier < kMaxTiers; ++tier) {
-            const void* first = tradeui::offerRaw(ctrl, tier, 0);
-            if (first == nullptr) {
-                break;
-            }
-            text += std::format(L" | [{}]", tier);
-            for (int i = 0; i < kMaxOffersPerTier; ++i) {
-                const void* o = tradeui::offerRaw(ctrl, tier, i);
-                if (o == nullptr) {
-                    break;
-                }
-                text += std::format(L" #{} {}", i, toUtf16(globalTradeKeyOf(o)));
-            }
-        }
-        log().info(L"ItemScroller: villager {} current tier {}{}", toUtf16(m_villagerKey), tradeui::currentTier(ctrl),
-                   text);
-    }
-    if (++m_logTicks < 10) {
-        return;
-    }
-    m_logTicks = 0;
-    int tier = -1;
-    int index = -1;
-    tradeui::selectedOffer(ctrl, tier, index);
-    if ((tier != m_loggedSelTier || index != m_loggedSelIndex) && debugLog()) {
-        m_loggedSelTier = tier;
-        m_loggedSelIndex = index;
-        const void* o = (tier >= 0) ? tradeui::offerRaw(ctrl, tier, index) : nullptr;
-        log().info(L"ItemScroller: selected trade tier {} #{} {}", tier, index,
-                   o != nullptr ? toUtf16(globalTradeKeyOf(o)) : std::wstring(L"(none)"));
-    }
 }
 
 std::string ItemScroller::favoriteStarJson()

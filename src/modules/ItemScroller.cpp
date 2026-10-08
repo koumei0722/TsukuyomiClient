@@ -5,18 +5,19 @@
 #include "core/Paths.h"
 #include "core/Strings.h"
 #include "game/ItemStackOps.h"
+#include "game/SettingsCommand.h"
+#include "hooks/Detours.h"
 #include "input/Foreground.h"
 #include "input/GameButtons.h"
 #include "input/GameInput.h"
 #include "input/Keys.h"
+#include "modules/ShulkerPreview.h"
 
 #include <Windows.h>
 
 #include <algorithm>
 #include <cstdlib>
-#include <cwctype>
 #include <filesystem>
-#include <format>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -33,14 +34,6 @@ constexpr int kAlt = VK_MENU;
 constexpr int kLmb = VK_LBUTTON;
 constexpr int kRmb = VK_RBUTTON;
 constexpr int kMmb = VK_MBUTTON;
-
-constexpr wchar_t kDefaultTopPriority[] =
-    L"minecraft:diamond_sword,minecraft:diamond_spear,minecraft:diamond_pickaxe,"
-    L"minecraft:diamond_axe,minecraft:diamond_shovel,minecraft:diamond_hoe,"
-    L"minecraft:netherite_sword,minecraft:netherite_spear,minecraft:netherite_pickaxe,"
-    L"minecraft:netherite_axe,minecraft:netherite_shovel,minecraft:netherite_hoe";
-
-constexpr wchar_t kDefaultCategoryOrder[] = L"construction,equipment,items,nature,other";
 
 std::vector<std::string> splitList(const std::wstring& text)
 {
@@ -113,6 +106,59 @@ private:
     bool m_has = false;
 };
 
+std::wstring readSortList(const nlohmann::json& section, const char* key, const std::wstring& current)
+{
+    const auto it = section.find(key);
+    if (it == section.end()) {
+        return current;
+    }
+    std::wstring raw;
+    if (it->is_string()) {
+        raw = toUtf16(it->get<std::string>());
+    } else if (it->is_array()) {
+        for (const auto& v : *it) {
+            if (v.is_string()) {
+                raw += toUtf16(v.get<std::string>());
+                raw += L',';
+            }
+        }
+    } else {
+        return current;
+    }
+    std::wstring out;
+    for (const std::string& s : splitList(raw)) {
+        if (!out.empty()) {
+            out += L',';
+        }
+        out += toUtf16(s);
+    }
+    return out;
+}
+
+nlohmann::json sortListJson(const std::wstring& text)
+{
+    nlohmann::json out = nlohmann::json::array();
+    for (const std::string& s : splitList(text)) {
+        out.push_back(s);
+    }
+    return out;
+}
+
+bool nameContains(const std::string& name, const char* part)
+{
+    return name.find(part) != std::string::npos;
+}
+
+bool isShulkerName(const std::string& name)
+{
+    return nameContains(name, "shulker_box");
+}
+
+bool isBundleName(const std::string& name)
+{
+    return nameContains(name, "bundle");
+}
+
 }
 
 struct ItemScroller::StackRef {
@@ -143,10 +189,8 @@ std::array<ItemScroller::KeySetting, ItemScroller::kKeyCount> ItemScroller::make
     set(kCraftEverything, L"craftEverything", {kCtrl, 'C'});
     set(kDropAllMatching, L"dropAllMatching", {kCtrl, kShift, 'Q'});
     set(kMassCraft, L"massCraft", {kCtrl, kAlt, 'C'});
-    set(kMassCraftToggle, L"massCraftToggle", {});
     set(kMoveCraftResults, L"moveCraftResults", {kCtrl, 'M'});
     set(kRecipeView, L"recipeView", {'A'});
-    set(kSlotDebug, L"slotDebug", {kCtrl, kAlt, kShift, 'I'});
     set(kStoreRecipe, L"storeRecipe", {kMmb});
     set(kThrowCraftResults, L"throwCraftResults", {kCtrl, 'T'});
     set(kVillagerTradeFavorites, L"villagerTradeFavorites", {});
@@ -178,80 +222,16 @@ std::array<ItemScroller::KeySetting, ItemScroller::kKeyCount> ItemScroller::make
 MenuItem ItemScroller::buildMenu()
 {
     std::vector<MenuItem> c;
-    c.push_back(menu::back());
     c.push_back(enabledItem());
-    c.push_back(toggleKeyItem());
 
     auto tgl = [&c](const wchar_t* title, bool* value) {
         c.push_back(menu::toggle(title, [value] { return *value; }, [value] { *value = !*value; }));
     };
-    auto num = [&c](const wchar_t* title, int* value, int lo, int hi) {
-        c.push_back(menu::number(
-            title, [value] { return static_cast<float>(*value); },
-            [value, lo, hi](float v) { *value = std::clamp(static_cast<int>(v + 0.5f), lo, hi); },
-            true, static_cast<float>(lo), static_cast<float>(hi)));
-    };
-    auto txt = [this, &c](const wchar_t* title, std::wstring* value) {
-        c.push_back(menu::text(
-            title, [value] { return *value; },
-            [this, value](std::wstring v) {
-                *value = std::move(v);
-                rebuildLists();
-            }));
-    };
 
-    tgl(L"enableScrollingSingle", &m_enableScrollingSingle);
-    tgl(L"enableScrollingStacks", &m_enableScrollingStacks);
-    tgl(L"enableScrollingMatchingStacks", &m_enableScrollingMatchingStacks);
-    tgl(L"enableScrollingEverything", &m_enableScrollingEverything);
-    tgl(L"enableScrollingVillager", &m_enableScrollingVillager);
-    tgl(L"enableShiftPlaceItems", &m_enableShiftPlaceItems);
-    tgl(L"enableShiftDropItems", &m_enableShiftDropItems);
-    tgl(L"enableDropkeyDropMatching", &m_enableDropkeyDropMatching);
-    tgl(L"enableItemMovingFallback", &m_enableItemMovingFallback);
-    tgl(L"enableCraftingFeatures", &m_enableCraftingFeatures);
-    tgl(L"enableRightClickCraftingOneStack", &m_enableRightClickCraftingOneStack);
-    tgl(L"enableVillagerTradeFeatures", &m_enableVillagerTradeFeatures);
-
-    tgl(L"reverseScrollDirectionSingle", &m_reverseScrollDirectionSingle);
-    tgl(L"reverseScrollDirectionStacks", &m_reverseScrollDirectionStacks);
-    tgl(L"useSlotPositionAwareScrollDirection", &m_useSlotPositionAwareScrollDirection);
-    tgl(L"craftingRenderRecipeItems", &m_craftingRenderRecipeItems);
-    tgl(L"craftingRecipesSaveToFile", &m_craftingRecipesSaveToFile);
-    num(L"massCraftInterval", &m_massCraftInterval, 1, 60);
-    num(L"massCraftIterations", &m_massCraftIterations, 1, 256);
-    tgl(L"massCraftUseRecipeBook", &m_massCraftUseRecipeBook);
-    tgl(L"massCraftHold", &m_massCraftHold);
-    num(L"recipeBookFailureLimit", &m_recipeBookFailureLimit, 0, 512);
-    tgl(L"rateLimitClickPackets", &m_rateLimitClickPackets);
-    num(L"packetRateLimit", &m_packetRateLimit, 1, 1024);
-    tgl(L"villagerTradeUseGlobalFavorites", &m_villagerTradeUseGlobalFavorites);
-    tgl(L"villagerTradeSortFavoritesFirst", &m_villagerTradeSortFavoritesFirst);
     tgl(L"villagerTradeUnlockAllTiers", &m_villagerTradeUnlockAllTiers);
     tgl(L"villagerTradeFavoritesOnOpen", &m_villagerTradeFavoritesOnOpen);
     tgl(L"villagerTradeOnOpenThrowResults", &m_villagerTradeOnOpenThrowResults);
-    tgl(L"sortInventoryToggle", &m_sortInventoryToggle);
-    c.push_back(menu::choice(
-        L"sortMethodDefault",
-        {L"Category Name", L"Category Count", L"Category Rarity", L"Category RawID", L"Item Name",
-         L"Item Count", L"Item Rarity", L"Item Raw ID"},
-        [this] { return m_sortMethod; },
-        [this](int v) { m_sortMethod = std::clamp(v, 0, static_cast<int>(SortMethod::Count) - 1); }));
-    txt(L"sortCategoryOrder", &m_sortCategoryOrder);
-    txt(L"sortTopPriorityInventory", &m_sortTopPriority);
-    txt(L"sortBottomPriorityInventory", &m_sortBottomPriority);
-    tgl(L"sortShulkerBoxesAtEnd", &m_sortShulkerBoxesAtEnd);
-    tgl(L"sortShulkerBoxesInverted", &m_sortShulkerBoxesInverted);
-    tgl(L"sortBundlesAtEnd", &m_sortBundlesAtEnd);
-    tgl(L"sortBundlesInverted", &m_sortBundlesInverted);
-    txt(L"guiBlacklist", &m_guiBlacklist);
-    txt(L"slotBlacklist", &m_slotBlacklist);
-    c.push_back(menu::toggle(L"debugMessages", [this] { return m_debugMessages; }, [this] {
-        m_debugMessages = !m_debugMessages;
-        if (m_debugMessages) {
-            m_logs.store(0);
-        }
-    }));
+    c.push_back(toggleKeyItem());
 
     MenuItem item = menu::submenu(name(), std::move(c));
     item.available = [this] { return available(); };
@@ -263,64 +243,13 @@ void ItemScroller::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
     auto b = [&section](const char* key, bool& v) { v = Config::getBool(section, key, v); };
-    auto n = [&section](const char* key, int& v, int lo, int hi) {
-        v = std::clamp(Config::getInt(section, key, v), lo, hi);
-    };
-    auto s = [&section](const char* key, std::wstring& v, const wchar_t* def) {
-        v = def;
-        if (const auto it = section.find(key); it != section.end() && it->is_string()) {
-            v = toUtf16(it->get<std::string>());
-        }
-    };
-    b("enableCraftingFeatures", m_enableCraftingFeatures);
-    b("enableDropkeyDropMatching", m_enableDropkeyDropMatching);
-    b("enableItemMovingFallback", m_enableItemMovingFallback);
-    b("enableRightClickCraftingOneStack", m_enableRightClickCraftingOneStack);
-    b("enableScrollingEverything", m_enableScrollingEverything);
-    b("enableScrollingMatchingStacks", m_enableScrollingMatchingStacks);
-    b("enableScrollingSingle", m_enableScrollingSingle);
-    b("enableScrollingStacks", m_enableScrollingStacks);
-    b("enableScrollingVillager", m_enableScrollingVillager);
-    b("enableShiftDropItems", m_enableShiftDropItems);
-    b("enableShiftPlaceItems", m_enableShiftPlaceItems);
-    b("enableVillagerTradeFeatures", m_enableVillagerTradeFeatures);
-    n("massCraftInterval", m_massCraftInterval, 1, 60);
-    n("massCraftIterations", m_massCraftIterations, 1, 256);
-    b("massCraftSwapsOnly", m_massCraftSwapsOnly);
-    b("massCraftUseRecipeBook", m_massCraftUseRecipeBook);
-    b("massCraftHold", m_massCraftHold);
-    n("packetRateLimit", m_packetRateLimit, 1, 1024);
-    b("rateLimitClickPackets", m_rateLimitClickPackets);
-    n("recipeBookFailureLimit", m_recipeBookFailureLimit, 0, 512);
-    b("craftingRecipesSaveToFile", m_craftingRecipesSaveToFile);
-    b("craftingRecipesSaveFileIsGlobal", m_craftingRecipesSaveFileIsGlobal);
-    b("craftingRenderRecipeItems", m_craftingRenderRecipeItems);
-    b("debugMessages", m_debugMessages);
-    b("reverseScrollDirectionSingle", m_reverseScrollDirectionSingle);
-    b("reverseScrollDirectionStacks", m_reverseScrollDirectionStacks);
-    b("useSlotPositionAwareScrollDirection", m_useSlotPositionAwareScrollDirection);
-    b("villagerTradeUseGlobalFavorites", m_villagerTradeUseGlobalFavorites);
-    b("villagerTradeListRememberScrollPosition", m_villagerTradeListRememberScrollPosition);
-    b("villagerTradeSortFavoritesFirst", m_villagerTradeSortFavoritesFirst);
     b("villagerTradeUnlockAllTiers", m_villagerTradeUnlockAllTiers);
     b("villagerTradeFavoritesOnOpen", m_villagerTradeFavoritesOnOpen);
     b("villagerTradeOnOpenThrowResults", m_villagerTradeOnOpenThrowResults);
-    b("sortInventoryToggle", m_sortInventoryToggle);
-    b("sortAssumeEmptyBoxStacks", m_sortAssumeEmptyBoxStacks);
-    b("sortShulkerBoxesAtEnd", m_sortShulkerBoxesAtEnd);
-    b("sortShulkerBoxesInverted", m_sortShulkerBoxesInverted);
-    b("sortBundlesAtEnd", m_sortBundlesAtEnd);
-    b("sortBundlesInverted", m_sortBundlesInverted);
-    n("sortMethodDefault", m_sortMethod, 0, static_cast<int>(SortMethod::Count) - 1);
-    s("sortTopPriorityInventory", m_sortTopPriority, kDefaultTopPriority);
-    s("sortBottomPriorityInventory", m_sortBottomPriority, L"");
-    s("sortCategoryOrder", m_sortCategoryOrder, kDefaultCategoryOrder);
-    s("guiBlacklist", m_guiBlacklist, L"");
-    s("slotBlacklist", m_slotBlacklist, L"");
     {
         std::array<std::vector<int>, kHotkeyCount> combos;
         std::array<std::string, kHotkeyCount> text;
-        readHotkeys(section, combos, text, true);
+        readHotkeys(section, combos, text);
         for (size_t i = 0; i < m_keys.size(); ++i) {
             m_keys[i].keys = combos[i];
         }
@@ -333,12 +262,14 @@ void ItemScroller::loadConfig(const nlohmann::json& section)
         }
         std::lock_guard<std::mutex> lock(m_keysMutex);
         m_keyText = text;
+        m_sortTopPriority = readSortList(section, "sortTopPriorityInventory", m_sortTopPriority);
+        m_sortCategoryOrder = readSortList(section, "sortCategoryOrder", m_sortCategoryOrder);
     }
     rebuildLists();
 }
 
 bool ItemScroller::readHotkeys(const nlohmann::json& section, std::array<std::vector<int>, kHotkeyCount>& out,
-                               std::array<std::string, kHotkeyCount>& text, bool warn) const
+                               std::array<std::string, kHotkeyCount>& text) const
 {
     bool changed = false;
     const auto hk = section.find("hotkeys");
@@ -350,16 +281,9 @@ bool ItemScroller::readHotkeys(const nlohmann::json& section, std::array<std::ve
                     std::vector<int> parsed;
                     if (keys::parseCombo(toUtf16(k->get<std::string>()), parsed)) {
                         combo = std::move(parsed);
-                    } else if (warn) {
+                    } else {
                         log().warn(L"ItemScroller: hotkeys.{}: cannot read \"{}\" (using {})", m_keys[i].name,
                                    toUtf16(k->get<std::string>()), keys::comboName(combo));
-                    }
-                } else if (k->is_array()) {
-                    combo.clear();
-                    for (const auto& v : *k) {
-                        if (v.is_number_integer()) {
-                            combo.push_back(v.get<int>());
-                        }
                     }
                 }
             }
@@ -409,6 +333,17 @@ void ItemScroller::watchConfigFile()
     if (sec == root.end() || !sec->is_object()) {
         return;
     }
+    {
+        std::lock_guard<std::mutex> lock(m_keysMutex);
+        const std::wstring top = readSortList(*sec, "sortTopPriorityInventory", m_sortTopPriority);
+        const std::wstring cat = readSortList(*sec, "sortCategoryOrder", m_sortCategoryOrder);
+        if (top != m_sortTopPriority || cat != m_sortCategoryOrder) {
+            m_sortTopPriority = top;
+            m_sortCategoryOrder = cat;
+            m_listsPending.store(true, std::memory_order_release);
+            log().info(L"ItemScroller: reloaded the sort lists from the config file");
+        }
+    }
     std::array<std::vector<int>, kHotkeyCount> combos;
     std::array<std::string, kHotkeyCount> text;
     {
@@ -420,7 +355,7 @@ void ItemScroller::watchConfigFile()
             }
         }
     }
-    if (!readHotkeys(*sec, combos, text, true)) {
+    if (!readHotkeys(*sec, combos, text)) {
         return;
     }
     std::lock_guard<std::mutex> lock(m_keysMutex);
@@ -432,6 +367,9 @@ void ItemScroller::watchConfigFile()
 
 void ItemScroller::applyPendingKeys()
 {
+    if (m_listsPending.exchange(false, std::memory_order_acq_rel)) {
+        rebuildLists();
+    }
     if (!m_keysPending.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
@@ -464,76 +402,38 @@ bool ItemScroller::autoTradeBypassed() const
 void ItemScroller::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
-    section["enableCraftingFeatures"] = m_enableCraftingFeatures;
-    section["enableDropkeyDropMatching"] = m_enableDropkeyDropMatching;
-    section["enableItemMovingFallback"] = m_enableItemMovingFallback;
-    section["enableRightClickCraftingOneStack"] = m_enableRightClickCraftingOneStack;
-    section["enableScrollingEverything"] = m_enableScrollingEverything;
-    section["enableScrollingMatchingStacks"] = m_enableScrollingMatchingStacks;
-    section["enableScrollingSingle"] = m_enableScrollingSingle;
-    section["enableScrollingStacks"] = m_enableScrollingStacks;
-    section["enableScrollingVillager"] = m_enableScrollingVillager;
-    section["enableShiftDropItems"] = m_enableShiftDropItems;
-    section["enableShiftPlaceItems"] = m_enableShiftPlaceItems;
-    section["enableVillagerTradeFeatures"] = m_enableVillagerTradeFeatures;
-    section["massCraftInterval"] = m_massCraftInterval;
-    section["massCraftIterations"] = m_massCraftIterations;
-    section["massCraftSwapsOnly"] = m_massCraftSwapsOnly;
-    section["massCraftUseRecipeBook"] = m_massCraftUseRecipeBook;
-    section["massCraftHold"] = m_massCraftHold;
-    section["packetRateLimit"] = m_packetRateLimit;
-    section["rateLimitClickPackets"] = m_rateLimitClickPackets;
-    section["recipeBookFailureLimit"] = m_recipeBookFailureLimit;
-    section["craftingRecipesSaveToFile"] = m_craftingRecipesSaveToFile;
-    section["craftingRecipesSaveFileIsGlobal"] = m_craftingRecipesSaveFileIsGlobal;
-    section["craftingRenderRecipeItems"] = m_craftingRenderRecipeItems;
-    section["debugMessages"] = m_debugMessages;
-    section["reverseScrollDirectionSingle"] = m_reverseScrollDirectionSingle;
-    section["reverseScrollDirectionStacks"] = m_reverseScrollDirectionStacks;
-    section["useSlotPositionAwareScrollDirection"] = m_useSlotPositionAwareScrollDirection;
-    section["villagerTradeUseGlobalFavorites"] = m_villagerTradeUseGlobalFavorites;
-    section["villagerTradeListRememberScrollPosition"] = m_villagerTradeListRememberScrollPosition;
-    section["villagerTradeSortFavoritesFirst"] = m_villagerTradeSortFavoritesFirst;
     section["villagerTradeUnlockAllTiers"] = m_villagerTradeUnlockAllTiers;
     section["villagerTradeFavoritesOnOpen"] = m_villagerTradeFavoritesOnOpen;
     section["villagerTradeOnOpenThrowResults"] = m_villagerTradeOnOpenThrowResults;
-    section["sortInventoryToggle"] = m_sortInventoryToggle;
-    section["sortAssumeEmptyBoxStacks"] = m_sortAssumeEmptyBoxStacks;
-    section["sortShulkerBoxesAtEnd"] = m_sortShulkerBoxesAtEnd;
-    section["sortShulkerBoxesInverted"] = m_sortShulkerBoxesInverted;
-    section["sortBundlesAtEnd"] = m_sortBundlesAtEnd;
-    section["sortBundlesInverted"] = m_sortBundlesInverted;
-    section["sortMethodDefault"] = m_sortMethod;
-    section["sortTopPriorityInventory"] = toUtf8(m_sortTopPriority);
-    section["sortBottomPriorityInventory"] = toUtf8(m_sortBottomPriority);
-    section["sortCategoryOrder"] = toUtf8(m_sortCategoryOrder);
-    section["guiBlacklist"] = toUtf8(m_guiBlacklist);
-    section["slotBlacklist"] = toUtf8(m_slotBlacklist);
     nlohmann::json hk = nlohmann::json::object();
     {
         std::lock_guard<std::mutex> lock(m_keysMutex);
         for (size_t i = 0; i < m_keys.size(); ++i) {
             hk[toUtf8(m_keys[i].name)] = m_keyText[i];
         }
+        section["sortTopPriorityInventory"] = sortListJson(m_sortTopPriority);
+        section["sortCategoryOrder"] = sortListJson(m_sortCategoryOrder);
     }
     section["hotkeys"] = std::move(hk);
-    if (m_recipesDirty) {
-        saveRecipes();
-    }
+    saveRecipes();
 }
 
 void ItemScroller::rebuildLists()
 {
+    std::wstring topText;
+    std::wstring catText;
+    {
+        std::lock_guard<std::mutex> lock(m_keysMutex);
+        topText = m_sortTopPriority;
+        catText = m_sortCategoryOrder;
+    }
     m_topPriority.clear();
-    m_bottomPriority.clear();
     m_categoryOrder.clear();
-    for (const std::string& s : splitList(m_sortTopPriority)) {
+    for (const std::string& s : splitList(topText)) {
         m_topPriority.push_back(normalizeItemName(s));
     }
-    for (const std::string& s : splitList(m_sortBottomPriority)) {
-        m_bottomPriority.push_back(normalizeItemName(s));
-    }
-    for (std::string s : splitList(m_sortCategoryOrder)) {
+
+    for (std::string s : splitList(catText)) {
         std::transform(s.begin(), s.end(), s.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
         m_categoryOrder.push_back(s);
@@ -560,6 +460,17 @@ void ItemScroller::onScansReady()
     }
     tradeui::onScansReady();
     tradeui::setListener(this);
+    settingscommand::addExtra(name(), [this] {
+        std::vector<MenuItem> items;
+        items.push_back(menu::toggle(L"massCraftHold",
+            [this] { return m_massCraftHold.load(std::memory_order_relaxed); },
+            [this] {
+                const bool on = !m_massCraftHold.load(std::memory_order_relaxed);
+                m_massCraftHold.store(on, std::memory_order_relaxed);
+                log().info(L"ItemScroller: massCraftHold {}", on ? L"ON" : L"OFF");
+            }));
+        return items;
+    });
     if (!available() && enabled()) {
         log().warn(L"ItemScroller: the container screen could not be located; the module cannot work");
     }
@@ -567,17 +478,31 @@ void ItemScroller::onScansReady()
 
 void ItemScroller::shutdown()
 {
+    if (hooks::offstackScreenHeld()) {
+        m_unloadRelease.store(1, std::memory_order_release);
+        for (int waited = 0; waited < 1000 && m_unloadRelease.load(std::memory_order_acquire) != 2; ++waited) {
+            Sleep(1);
+        }
+        if (m_unloadRelease.load(std::memory_order_acquire) != 2 && hooks::offstackScreenHeld()) {
+            hooks::releaseOffstackScreen(L"unloading (the game thread did not come)");
+        }
+    }
     cui::setListener(nullptr);
     tradeui::setListener(nullptr);
     saveFavorites();
-    if (m_recipesDirty) {
-        saveRecipes();
-    }
+    saveRecipes();
 }
 
 void ItemScroller::onEnabledChanged(bool on)
 {
     if (!on) {
+        m_disableRequested.store(true, std::memory_order_release);
+    }
+}
+
+void ItemScroller::applyDisable()
+{
+    if (m_disableRequested.exchange(false, std::memory_order_acq_rel)) {
         stopDrag();
         m_jobs.clear();
         tradeui::setUnlockTier(-1);
@@ -687,40 +612,20 @@ bool ItemScroller::comboHeldAt(const std::vector<int>& combo, bool exactModifier
 }
 
 bool ItemScroller::comboEdge(const std::vector<int>& combo, bool& wasDown,
-                             std::uint64_t& seenSeq, bool exactModifiers)
+                             std::uint64_t& seenSeq)
 {
     int trigger = 0;
     for (int vk : combo) if (!keys::isModifier(vk)) trigger = vk;
     if (trigger != 0) {
         const std::uint64_t now = keySeq(trigger);
-        const bool edge = now != seenSeq && comboHeldAt(combo, exactModifiers, trigger);
+        const bool edge = now != seenSeq && comboHeldAt(combo, true, trigger);
         seenSeq = now;
         return edge;
     }
-    const bool down = comboHeld(combo, exactModifiers);
+    const bool down = comboHeld(combo, true);
     const bool edge = down && !wasDown;
     wasDown = down;
     return edge;
-}
-
-bool ItemScroller::screenBlacklisted() const
-{
-    for (const std::string& name : splitList(m_guiBlacklist)) {
-        if (cui::collectionSize(name) > 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool ItemScroller::slotBlacklisted(const Slot& s) const
-{
-    for (const std::string& name : splitList(m_slotBlacklist)) {
-        if (name == s.coll) {
-            return true;
-        }
-    }
-    return false;
 }
 
 ItemScroller::Group ItemScroller::groupOf(const std::string& coll)
@@ -750,25 +655,9 @@ ItemScroller::Group ItemScroller::groupOf(const std::string& coll)
     return Group::Other;
 }
 
-bool ItemScroller::screenHas(Group group) const
+bool ItemScroller::screenHasStorage() const
 {
-    switch (group) {
-    case Group::Player:
-        return cui::collectionSize("inventory_items") > 0 || cui::collectionSize("hotbar_items") > 0
-               || cui::collectionSize("combined_hotbar_and_inventory_items") > 0;
-    case Group::Storage:
-        return cui::collectionSize("container_items") > 0;
-    case Group::Grid:
-        return cui::collectionSize("crafting_input_items") > 0;
-    case Group::Output:
-        return cui::collectionSize("crafting_output_items") > 0;
-    case Group::TradeIn:
-        return cui::collectionSize("trade2_ingredient1_item") > 0;
-    case Group::TradeOut:
-        return cui::collectionSize("trade2_result_item") > 0;
-    default:
-        return false;
-    }
+    return cui::collectionSize("container_items") > 0;
 }
 
 std::vector<ItemScroller::Slot> ItemScroller::slotsOf(Group group) const
@@ -795,15 +684,9 @@ std::vector<ItemScroller::Slot> ItemScroller::slotsOf(Group group) const
     case Group::Grid:
         add("crafting_input_items");
         break;
-    case Group::Output:
-        add("crafting_output_items");
-        break;
     case Group::TradeIn:
         add("trade2_ingredient1_item");
         add("trade2_ingredient2_item");
-        break;
-    case Group::TradeOut:
-        add("trade2_result_item");
         break;
     default:
         break;
@@ -841,12 +724,12 @@ int invId(const std::string& coll, bool splitPlayer)
 
 std::vector<ItemScroller::Slot> ItemScroller::otherSlotsOf(const Slot& slot) const
 {
-    const bool split = !screenHas(Group::Storage);
+    const bool split = !screenHasStorage();
     const int mine = invId(slot.coll, split);
     std::vector<Slot> all;
     for (Group g : {Group::Storage, Group::Player}) {
         for (const Slot& s : slotsOf(g)) {
-            if (invId(s.coll, split) != mine && !slotBlacklisted(s)) {
+            if (invId(s.coll, split) != mine) {
                 all.push_back(s);
             }
         }
@@ -859,14 +742,9 @@ std::vector<ItemScroller::Slot> ItemScroller::otherSlotsOf(const Slot& slot) con
     return all;
 }
 
-int ItemScroller::clickCap() const
-{
-    return m_rateLimitClickPackets ? std::max(1, m_packetRateLimit) : kSafeClicksPerTick;
-}
-
 bool ItemScroller::budgetLeft() const
 {
-    return m_clicksThisTick < clickCap();
+    return m_clicksThisTick < kSafeClicksPerTick;
 }
 
 namespace {
@@ -941,15 +819,7 @@ bool ItemScroller::clickOne(const Slot& s, int kind)
     ++m_clicksThisTick;
     const bool ok = (kind < 0) ? cui::dropCursor(true)
                                : cui::click(s.coll, s.index, static_cast<cui::Click>(kind));
-    if (debugLog()) {
-        static const wchar_t* kNames[] = {L"L", L"R", L"Shift", L"Q", L"CtrlQ", L"Double"};
-        const void* st = stackOf(s);
-        const void* cur = cursor();
-        log().info(L"ItemScroller: click {} \"{}\"[{}] {} -> slot {}x{} / cursor {}x{}",
-                   kind < 0 ? L"drop-cursor" : kNames[kind], toUtf16(s.coll), s.index,
-                   ok ? L"ok" : L"FAILED", toUtf16(cui::itemName(st)), cui::countOf(st),
-                   toUtf16(cui::itemName(cur)), cui::countOf(cur));
-    }
+
     return ok;
 }
 bool ItemScroller::leftClick(const Slot& s)
@@ -1005,27 +875,6 @@ bool ItemScroller::shiftClickWithCheck(const Slot& s)
     return isEmptySlot(s) || countIn(s) != before;
 }
 
-void ItemScroller::clickSlotsToMoveItemsFromSlot(const Slot& from, bool toOther)
-{
-    if (!cursorEmpty() || isEmptySlot(from)) {
-        return;
-    }
-    std::vector<Slot> targets;
-    if (toOther) {
-        targets = otherSlotsOf(from);
-    } else {
-        const bool split = !screenHas(Group::Storage);
-        for (Group g : {Group::Storage, Group::Player}) {
-            for (const Slot& s : slotsOf(g)) {
-                if (invId(s.coll, split) == invId(from.coll, split) && !(s == from)) {
-                    targets.push_back(s);
-                }
-            }
-        }
-    }
-    moveItemsToTargets(from, targets, false);
-}
-
 void ItemScroller::moveItemsToTargets(const Slot& source, const std::vector<Slot>& targets, bool one)
 {
     if (!cursorEmpty() || isEmptySlot(source)) {
@@ -1076,7 +925,7 @@ void ItemScroller::enqueueMoveStacks(std::shared_ptr<StackRef> ref, const Slot& 
                                      bool toOther, bool firstOnly)
 {
     auto collect = [this, slot, toOther]() {
-        const bool split = !screenHas(Group::Storage);
+        const bool split = !screenHasStorage();
         const int mine = invId(slot.coll, split);
         std::vector<Slot> all;
         for (Group g : {Group::Storage, Group::Player}) {
@@ -1087,7 +936,7 @@ void ItemScroller::enqueueMoveStacks(std::shared_ptr<StackRef> ref, const Slot& 
         std::vector<Slot> out;
         for (auto it = all.rbegin(); it != all.rend(); ++it) {
             const Slot& s = *it;
-            if (s == slot || slotBlacklisted(s) || (invId(s.coll, split) == mine) != toOther) {
+            if (s == slot || (invId(s.coll, split) == mine) != toOther) {
                 continue;
             }
             out.push_back(s);
@@ -1097,7 +946,7 @@ void ItemScroller::enqueueMoveStacks(std::shared_ptr<StackRef> ref, const Slot& 
         }
         return out;
     };
-    auto unit = [this, ref, slot, matchingOnly, toOther, firstOnly](const Slot& s) {
+    auto unit = [this, ref, slot, matchingOnly, firstOnly](const Slot& s) {
         if (!cursorEmpty()) {
             return false;
         }
@@ -1108,9 +957,8 @@ void ItemScroller::enqueueMoveStacks(std::shared_ptr<StackRef> ref, const Slot& 
         if (!(s == slot) && matchingOnly && (ref == nullptr || ref->get() == nullptr || !cui::sameItem(st, ref->get()))) {
             return true;
         }
-        if (!shiftClickWithCheck(s) && m_enableItemMovingFallback) {
-            clickSlotsToMoveItemsFromSlot(s, toOther);
-        }
+
+        (void)shiftClickWithCheck(s);
         return !firstOnly || s == slot;
     };
     pushListJob(collect, unit);
@@ -1183,18 +1031,18 @@ bool ItemScroller::tryMoveSingleItemToThisInventory(const Slot& slot)
     return false;
 }
 
-void ItemScroller::enqueueDropStacks(std::shared_ptr<StackRef> ref, const Slot& refSlot, bool sameInventory)
+void ItemScroller::enqueueDropStacks(std::shared_ptr<StackRef> ref, const Slot& refSlot)
 {
     if (ref == nullptr || ref->get() == nullptr) {
         return;
     }
-    auto collect = [this, refSlot, sameInventory]() {
+    auto collect = [this, refSlot]() {
         const bool split = false;
         const int mine = invId(refSlot.coll, split);
         std::vector<Slot> out;
         for (Group g : {Group::Storage, Group::Player, Group::Grid, Group::TradeIn}) {
             for (const Slot& s : slotsOf(g)) {
-                if ((invId(s.coll, split) == mine) == sameInventory && !slotBlacklisted(s)) {
+                if (invId(s.coll, split) == mine) {
                     out.push_back(s);
                 }
             }
@@ -1227,7 +1075,7 @@ bool ItemScroller::shiftDropItems()
     }
     auto ref = std::make_shared<StackRef>(cursor());
     dropCursorAll();
-    enqueueDropStacks(ref, m_cursorSource, true);
+    enqueueDropStacks(ref, m_cursorSource);
     return true;
 }
 
@@ -1273,7 +1121,7 @@ bool ItemScroller::tryMoveItemsVertically(const Slot& slot, bool up, Amount amou
     std::vector<Cand> cands;
     for (Group g : {Group::Storage, Group::Player}) {
         for (const Slot& s : slotsOf(g)) {
-            if (s == slot || slotBlacklisted(s)) {
+            if (s == slot) {
                 continue;
             }
             const int r = rowOf(s);
@@ -1289,10 +1137,7 @@ bool ItemScroller::tryMoveItemsVertically(const Slot& slot, bool up, Amount amou
             }
         }
     }
-    if (debugLog()) {
-        log().info(L"ItemScroller: vertical {} from \"{}\"[{}] row {} -> {} candidates",
-                   up ? L"up" : L"down", toUtf16(slot.coll), slot.index, myRow, cands.size());
-    }
+
     if (cands.empty()) {
         return false;
     }
@@ -1361,7 +1206,7 @@ bool ItemScroller::tryMoveItemsVertically(const Slot& slot, bool up, Amount amou
             for (Group g : {Group::Storage, Group::Player}) {
                 for (const Slot& s : slotsOf(g)) {
                     const int r = rowOf(s);
-                    if (s == src || slotBlacklisted(s) || r == srcRow || (r < srcRow) != up) {
+                    if (s == src || r == srcRow || (r < srcRow) != up) {
                         continue;
                     }
                     const void* st = stackOf(s);
@@ -1392,46 +1237,28 @@ bool ItemScroller::tryMoveItemsVertically(const Slot& slot, bool up, Amount amou
 
 bool ItemScroller::tryMoveItemsByScroll(const Slot& slot, bool scrollingUp)
 {
-    if (!cursorEmpty() || slotBlacklisted(slot)) {
+    if (!cursorEmpty()) {
         return false;
     }
     const bool everything = comboHeld(m_keys[kModifierMoveEverything].keys, true);
     const bool matching = comboHeld(m_keys[kModifierMoveMatching].keys, true);
     const bool stacks = comboHeld(m_keys[kModifierMoveStack].keys, true);
-    const bool nonSingle = everything || matching || stacks;
     bool toOther = scrollingUp;
-    if (m_useSlotPositionAwareScrollDirection) {
-        bool above = false;
-        const int myRow = rowOf(slot);
-        const bool split = !screenHas(Group::Storage);
-        for (Group g : {Group::Storage, Group::Player}) {
-            for (const Slot& s : slotsOf(g)) {
-                if (invId(s.coll, split) != invId(slot.coll, split) && rowOf(s) < myRow) {
-                    above = true;
-                    break;
-                }
-            }
-        }
-        toOther = (above == scrollingUp);
-    }
-    if ((m_reverseScrollDirectionSingle && !nonSingle) || (m_reverseScrollDirectionStacks && nonSingle)) {
-        toOther = !toOther;
-    }
+
     const Group g = groupOf(slot.coll);
-    if (m_enableCraftingFeatures && g == Group::Output && isCraftingScreen()) {
+    if (g == Group::Output && isCraftingScreen()) {
         return tryMoveItemsCrafting(slot, toOther, stacks, everything);
     }
-    if (m_enableScrollingVillager && g == Group::TradeOut) {
+    if (g == Group::TradeOut) {
         return tryMoveItemsVillager(slot, toOther, stacks);
     }
     if (isEmptySlot(slot)) {
         return false;
     }
-    if ((!m_enableScrollingSingle && !nonSingle) || (!m_enableScrollingStacks && stacks)
-        || (!m_enableScrollingMatchingStacks && matching)
-        || (!m_enableScrollingEverything && everything)) {
+    if (isBundleName(cui::itemName(stackOf(slot)))) {
         return false;
     }
+
     if (everything) {
         enqueueMoveStacksFrom(slot, false, toOther, false);
     } else if (matching) {
@@ -1506,10 +1333,7 @@ bool ItemScroller::dragActionHeld(DragAction action) const
 
 void ItemScroller::dragApply(const Slot& slot, DragAction action)
 {
-    if (debugLog()) {
-        log().info(L"ItemScroller: drag action {} on \"{}\"[{}]", static_cast<int>(action),
-                   toUtf16(slot.coll), slot.index);
-    }
+
     switch (action) {
     case DragAction::MoveMatching:
         enqueueMoveStacksFrom(slot, true, true, false);
@@ -1548,7 +1372,7 @@ void ItemScroller::dragApply(const Slot& slot, DragAction action)
 
 void ItemScroller::dragOver(const Slot& slot, bool isStart)
 {
-    if (m_drag == DragAction::None || !slot.valid() || slotBlacklisted(slot)) {
+    if (m_drag == DragAction::None || !slot.valid()) {
         return;
     }
     std::vector<Slot> path;
@@ -1587,7 +1411,6 @@ void ItemScroller::dragOver(const Slot& slot, bool isStart)
 void ItemScroller::stopDrag()
 {
     if (m_drag != DragAction::None) {
-        dumpScreen(L"after drag");
     }
     m_drag = DragAction::None;
     m_dragMouseVk = 0;
@@ -1597,8 +1420,8 @@ void ItemScroller::stopDrag()
 
 bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& coll, int index)
 {
-    logStats();
-    if (!enabled() || screenBlacklisted()) {
+    applyDisable();
+    if (!enabled()) {
         return false;
     }
     if (m_swallowId != 0 && id == m_swallowId && state != cui::kStatePressed) {
@@ -1608,14 +1431,6 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
         return true;
     }
     const Slot slot{coll, index};
-    m_inTick = true;
-    if (id != cui::button::kHover && debugLog()) {
-        log().info(L"ItemScroller: button {:#x} state {} on \"{}\"[{}] keys{}{}{}{}{}{}{}{}",
-                   id, state, toUtf16(coll), index, keyHeld(kShift) ? L" Shift" : L"",
-                   keyHeld(kCtrl) ? L" Ctrl" : L"", keyHeld(kAlt) ? L" Alt" : L"",
-                   keyHeld(kLmb) ? L" L" : L"", keyHeld(kRmb) ? L" R" : L"",
-                   keyHeld('Q') ? L" Q" : L"", keyHeld('W') ? L" W" : L"", keyHeld('S') ? L" S" : L"");
-    }
 
     if (id == cui::button::kHover) {
         if (m_drag != DragAction::None) {
@@ -1625,11 +1440,9 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
                 stopDrag();
             }
         }
-        m_inTick = false;
         return false;
     }
     if (state != cui::kStatePressed) {
-        m_inTick = false;
         return false;
     }
 
@@ -1643,15 +1456,15 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
 
     if (id == cui::button::kCursorDropAll || id == cui::button::kCursorDropOne) {
         if (keyHeld(kShift) && !cursorEmpty()) {
-            swallow = m_enableShiftDropItems ? shiftDropItems() : true;
+            swallow = shiftDropItems();
         }
-    } else if (slotButton && slot.valid() && !slotBlacklisted(slot)) {
+    } else if (slotButton && slot.valid()) {
         const int mouseVk = isRight ? kRmb : recentMouseButton();
         if (cursorEmpty() && (id == cui::button::kTakeAllPlaceAll || isRight)
             && !isOutputSlot(slot)) {
             m_cursorSource = slot;
         }
-        if (isRight && m_enableRightClickCraftingOneStack && isOutputSlot(slot) && isCraftingScreen()) {
+        if (isRight && isOutputSlot(slot) && isCraftingScreen()) {
             rightClickCraftOneStack(slot);
             swallow = true;
         } else if (isLeftish && comboHeldAt(m_keys[kKeyMoveEverything].keys, true, mouseVk)) {
@@ -1659,7 +1472,7 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
                 enqueueMoveStacksFrom(slot, false, true, false);
             }
             swallow = true;
-        } else if (isAutoPlace && m_enableShiftPlaceItems && !cursorEmpty()
+        } else if (isAutoPlace && !cursorEmpty()
                    && isEmptySlot(slot) && groupOf(slot.coll) != Group::Output) {
             shiftPlaceItems(slot);
             swallow = true;
@@ -1677,14 +1490,13 @@ bool ItemScroller::onSlotButton(std::uint32_t id, int state, const std::string& 
     }
     if (swallow) {
         m_swallowId = id;
-        dumpScreen(L"after click");
     }
-    m_inTick = false;
     return swallow;
 }
 
 void ItemScroller::onScreenLost()
 {
+    applyDisable();
     m_wheelPrimed = false;
     stopDrag();
     m_swallowId = 0;
@@ -1701,9 +1513,6 @@ void ItemScroller::onScreenLost()
     m_autoTradeTicks = 0;
     m_autoTradeGains.clear();
     m_unlockSent = -2;
-    m_loggedVillager.clear();
-    m_loggedSelTier = -2;
-    m_loggedSelIndex = -2;
     m_orderSig.clear();
     m_orderTicks = 0;
     m_recipeViewOpen = false;
@@ -1715,9 +1524,7 @@ void ItemScroller::onScreenLost()
     saveFavorites();
     m_cursorSource = Slot{};
     resyncWheelSeqs();
-    if (m_recipesDirty) {
-        saveRecipes();
-    }
+    saveRecipes();
 }
 
 void ItemScroller::consumeWheel()
@@ -1735,6 +1542,9 @@ void ItemScroller::consumeWheel()
         changeRecipeSelection(m_selectedRecipe + (notches < 0 ? 1 : -1) * std::abs(notches));
         return;
     }
+    if (ShulkerPreview::instance().ownsWheel()) {
+        return;
+    }
     std::string coll;
     int index = -1;
     if (!cui::hovered(coll, index)) {
@@ -1745,10 +1555,7 @@ void ItemScroller::consumeWheel()
     for (int n = 0; n < std::abs(notches); ++n) {
         tryMoveItemsByScroll(slot, step > 0);
     }
-    if (debugLog()) {
-        log().info(L"ItemScroller: wheel {} on \"{}\"[{}]", notches, toUtf16(coll), index);
-        dumpScreen(L"after wheel");
-    }
+
 }
 
 void ItemScroller::resyncWheelSeqs()
@@ -1763,51 +1570,6 @@ unsigned long long ItemScroller::wheelLastMs() const
     const auto& buttons = GameButtons::instance();
     return std::max(buttons.buttonLastPressMs(m_wheelLeftButton),
                     buttons.buttonLastPressMs(m_wheelRightButton));
-}
-
-void ItemScroller::debugSlot(const Slot& s) const
-{
-    const void* st = stackOf(s);
-    log().info(L"ItemScroller: slot \"{}\"[{}] item {} x{} (max {}) aux {} / screen vtable {:#x} / "
-               L"collections: hotbar {} inventory {} container {} grid {} output {} trade {}",
-               toUtf16(s.coll), s.index, toUtf16(cui::itemName(st)), cui::countOf(st),
-               cui::maxStackOf(st), cui::auxOf(st),
-               cui::screenKind() - reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)),
-               cui::collectionSize("hotbar_items"), cui::collectionSize("inventory_items"),
-               cui::collectionSize("container_items"), cui::collectionSize("crafting_input_items"),
-               cui::collectionSize("crafting_output_items"),
-               cui::collectionSize("trade2_result_item"));
-}
-
-void ItemScroller::dumpScreen(const wchar_t* why) const
-{
-    if (!debugLog()) {
-        return;
-    }
-    auto shortName = [](std::string n) {
-        const size_t c = n.find(':');
-        return c == std::string::npos ? n : n.substr(c + 1);
-    };
-    std::wstring text = std::format(L"ItemScroller [{}]", why);
-    for (const char* coll : {"container_items", "inventory_items", "hotbar_items",
-                             "crafting_input_items", "crafting_output_items", "cursor_items",
-                             "trade2_ingredient1_item", "trade2_ingredient2_item",
-                             "trade2_result_item"}) {
-        const int n = cui::collectionSize(coll);
-        if (n <= 0) {
-            continue;
-        }
-        text += std::format(L" | {}:", toUtf16(coll));
-        for (int i = 0; i < n; ++i) {
-            const void* st = cui::stackAt(coll, i);
-            if (cui::isEmpty(st)) {
-                text += L" .";
-            } else {
-                text += std::format(L" {}x{}", toUtf16(shortName(cui::itemName(st))), cui::countOf(st));
-            }
-        }
-    }
-    log().info(L"{}", text);
 }
 
 void ItemScroller::pollHotkeys()
@@ -1825,31 +1587,22 @@ void ItemScroller::pollHotkeys()
                 m_toggleSeenSeq = keySeq(vk);
             }
         }
-        if (comboEdge(toggleKey().combo(), m_toggleWasDown, m_toggleSeenSeq, true)) {
-            toggle();
+        if (comboEdge(toggleKey().combo(), m_toggleWasDown, m_toggleSeenSeq)) {
+            toggleByKey();
             log().info(L"ItemScroller: toggled {}", enabled() ? L"ON" : L"OFF");
             return;
         }
     }
     auto edge = [this](KeyId id) { return comboEdge(m_keys[id].keys, m_keys[id].wasDown,
-                                                   m_keys[id].seenSeq, true); };
+                                                   m_keys[id].seenSeq); };
 
-    if (edge(kSlotDebug)) {
-        dumpScreen(L"slot debug");
-        if (over) {
-            debugSlot(hovered);
-        } else {
-            log().info(L"ItemScroller: no slot under the cursor (screen vtable {:#x})",
-                       cui::screenKind() - reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr)));
-        }
+    if (edge(kDropAllMatching) && over && !isEmptySlot(hovered)) {
+        enqueueDropStacks(std::make_shared<StackRef>(stackOf(hovered)), hovered);
     }
-    if (edge(kDropAllMatching) && m_enableDropkeyDropMatching && over && !isEmptySlot(hovered)) {
-        enqueueDropStacks(std::make_shared<StackRef>(stackOf(hovered)), hovered, true);
-    }
-    if (edge(kSortInventory) && m_sortInventoryToggle && over) {
+    if (edge(kSortInventory) && over) {
         sortInventory(hovered);
     }
-    if (m_enableCraftingFeatures && isCraftingScreen()) {
+    if (isCraftingScreen()) {
         if (edge(kCraftEverything)) {
             craftEverything();
         }
@@ -1860,51 +1613,20 @@ void ItemScroller::pollHotkeys()
             enqueueMoveCraftResults();
         }
     }
-    if (edge(kMassCraftToggle)) {
-        m_massCraftHold = !m_massCraftHold;
-        log().info(L"ItemScroller: massCraftHold {}", m_massCraftHold ? L"ON" : L"OFF");
-    }
-    if (edge(kVillagerTradeFavorites) && m_enableVillagerTradeFeatures && isTradeScreen()) {
-        tradeFavorites(true);
-    }
-}
-
-void ItemScroller::logStats()
-{
-    if (m_debugMessages) {
-        const unsigned long long now = GetTickCount64();
-        if (now - m_lastStatsMs >= 3000 && debugLog()) {
-            m_lastStatsMs = now;
-            const cui::Stats st = cui::stats();
-            std::string coll;
-            int index = -1;
-            const bool over = cui::hovered(coll, index);
-            log().info(L"ItemScroller: stats sm {} hover {} ticks {} ({} calls) wheel left {} right {} "
-                       L"hovered {} \"{}\"[{}] pitch {}",
-                       st.smEvents, st.hoverEvents, st.ticks, st.tickCalls,
-                       GameButtons::instance().buttonPressSeq(m_wheelLeftButton),
-                       GameButtons::instance().buttonPressSeq(m_wheelRightButton), over, toUtf16(coll), index,
-                       cui::slotPitchPixels());
-        }
+    if (edge(kVillagerTradeFavorites) && isTradeScreen()) {
+        tradeFavorites();
     }
 }
 
 void ItemScroller::onScreenTick()
 {
-    logStats();
+    applyDisable();
     if (!m_wheelPrimed) {
         resyncKeySeqs();
-        const auto& buttons = GameButtons::instance();
-        const int dropped = gamebuttonlogic::wheelNotches(
-            buttons.buttonPressSeq(m_wheelLeftButton), m_wheelLeftSeen,
-            buttons.buttonPressSeq(m_wheelRightButton), m_wheelRightSeen);
         resyncWheelSeqs();
         m_wheelPrimed = true;
         m_wheelCarry = GetTickCount64() - wheelLastMs() < kWheelCarryGapMs;
-        if ((dropped != 0 || m_wheelCarry) && debugLog()) {
-            log().info(L"ItemScroller: dropped {} wheel notch(es) from before the screen opened{}", dropped,
-                       m_wheelCarry ? L" (still turning; muted until it stops)" : L"");
-        }
+
     } else if (m_wheelCarry) {
         resyncWheelSeqs();
         if (GetTickCount64() - wheelLastMs() >= kWheelCarryGapMs) {
@@ -1916,21 +1638,18 @@ void ItemScroller::onScreenTick()
         if (!enabled()) {
             return;
         }
-        m_inTick = true;
         m_clicksThisTick = 0;
         runJobs();
         tradeScreenTick(true);
         runJobs();
-        m_inTick = false;
         return;
     }
-    if (!enabled() || !input::isGameForeground() || screenBlacklisted()) {
+    if (!enabled() || !input::isGameForeground()) {
         resyncWheelSeqs();
         m_recipeViewOpen = false;
         updateRecipeView();
         return;
     }
-    m_inTick = true;
     m_clicksThisTick = 0;
     applyPendingKeys();
     if (m_drag != DragAction::None && (!keyHeld(m_dragMouseVk) || !dragActionHeld(m_drag))) {
@@ -1938,7 +1657,7 @@ void ItemScroller::onScreenTick()
     }
     runJobs();
     const bool viewWasOpen = m_recipeViewOpen;
-    m_recipeViewOpen = m_enableCraftingFeatures && isCraftingScreen()
+    m_recipeViewOpen = isCraftingScreen()
                        && comboHeld(m_keys[kRecipeView].keys, false);
     if (m_recipeViewOpen) {
         if (!viewWasOpen) {
@@ -1951,32 +1670,18 @@ void ItemScroller::onScreenTick()
     handleViewInput();
     consumeWheel();
     pollHotkeys();
-    if (m_enableCraftingFeatures && isCraftingScreen() && m_jobs.empty()) {
+    applyDisable();
+    if (!enabled()) {
+        m_recipeViewOpen = false;
+        updateRecipeView();
+        return;
+    }
+    if (isCraftingScreen() && m_jobs.empty()) {
         massCraftTick();
     }
     tradeScreenTick(false);
     updateRecipeView();
     runJobs();
-    m_inTick = false;
-}
-
-namespace {
-
-bool nameContains(const std::string& name, const char* part)
-{
-    return name.find(part) != std::string::npos;
-}
-
-bool isShulkerName(const std::string& name)
-{
-    return nameContains(name, "shulker_box");
-}
-
-bool isBundleName(const std::string& name)
-{
-    return nameContains(name, "bundle");
-}
-
 }
 
 int ItemScroller::customPriority(const void* stack) const
@@ -1997,10 +1702,7 @@ int ItemScroller::customPriority(const void* stack) const
     if (top >= 0) {
         return -static_cast<int>(m_topPriority.size()) + top - 2;
     }
-    const int bottom = find(m_bottomPriority);
-    if (bottom >= 0) {
-        return static_cast<int>(m_bottomPriority.size()) + bottom;
-    }
+
     return -1;
 }
 
@@ -2037,10 +1739,7 @@ ItemScroller::SortExtra ItemScroller::sortExtraOf(const void* stack) const
         return x;
     }
     const std::string name = cui::itemName(stack);
-    const auto method = static_cast<SortMethod>(m_sortMethod);
-    if (method == SortMethod::CategoryRarity || method == SortMethod::ItemRarity) {
-        x.rarity = cui::rarityOf(stack);
-    }
+
     if (isShulkerName(name)) {
         int used = 0;
         int total = 0;
@@ -2059,76 +1758,21 @@ ItemScroller::SortExtra ItemScroller::sortExtraOf(const void* stack) const
 
 int ItemScroller::compareStacks(const void* a, const void* b, const SortExtra& xa, const SortExtra& xb) const
 {
-    const bool ea = cui::isEmpty(a);
-    const bool eb = cui::isEmpty(b);
-    const std::string na = ea ? std::string() : cui::itemName(a);
-    const std::string nb = eb ? std::string() : cui::itemName(b);
-    const bool boxA = isShulkerName(na);
-    const bool boxB = isShulkerName(nb);
-    if (m_sortShulkerBoxesAtEnd && boxA != boxB) {
-        return boxA ? 1 : -1;
-    }
-    const bool bunA = isBundleName(na);
-    const bool bunB = isBundleName(nb);
-    if (m_sortBundlesAtEnd && bunA != bunB) {
-        return bunA ? 1 : -1;
-    }
-    const int pa = customPriority(a);
-    const int pb = customPriority(b);
-    if (pa != -1 || pb != -1) {
-        return (pa < pb) ? -1 : (pa > pb ? 1 : 0);
-    }
-    if (ea != eb) {
-        return ea ? 1 : -1;
-    }
-    if (ea) {
-        return 0;
-    }
-    if (boxA && boxB) {
-        const int f = m_sortShulkerBoxesInverted ? -1 : 1;
-        return f * ((xa.boxSlots < xb.boxSlots) ? -1 : (xa.boxSlots > xb.boxSlots ? 1 : 0));
-    }
-    if (bunA && bunB) {
-        const int f = m_sortBundlesInverted ? -1 : 1;
-        return f * ((xa.bundleFill < xb.bundleFill) ? -1 : (xa.bundleFill > xb.bundleFill ? 1 : 0));
-    }
-    const auto method = static_cast<SortMethod>(m_sortMethod);
-    const bool byCategory = method == SortMethod::CategoryName || method == SortMethod::CategoryCount
-                            || method == SortMethod::CategoryRarity
-                            || method == SortMethod::CategoryRawId;
-    if (byCategory) {
-        const int ca = categoryIndex(a);
-        const int cb = categoryIndex(b);
-        if (ca != cb) {
-            return ca < cb ? -1 : 1;
-        }
-    }
-    if (na != nb) {
-        switch (method) {
-        case SortMethod::CategoryCount:
-        case SortMethod::ItemCount: {
-            const int c1 = cui::countOf(a), c2 = cui::countOf(b);
-            if (c1 != c2) {
-                return c1 > c2 ? -1 : 1;
-            }
-            return na < nb ? -1 : 1;
-        }
-        case SortMethod::CategoryRarity:
-        case SortMethod::ItemRarity:
-            if (xa.rarity >= 0 && xb.rarity >= 0 && xa.rarity != xb.rarity) {
-                return xa.rarity < xb.rarity ? -1 : 1;
-            }
-            return na < nb ? -1 : 1;
-        default:
-            return na < nb ? -1 : 1;
-        }
-    }
-    const int ax = cui::auxOf(a), bx = cui::auxOf(b);
-    if (ax != bx) {
-        return ax < bx ? -1 : 1;
-    }
-    const int c1 = cui::countOf(a), c2 = cui::countOf(b);
-    return (c1 > c2) ? -1 : (c1 < c2 ? 1 : 0);
+    auto keyOf = [this](const void* stack, const SortExtra& extra) {
+        itemscrollerlogic::SortKey key;
+        key.empty = cui::isEmpty(stack);
+        if (key.empty) return key;
+        key.name = cui::itemName(stack);
+        key.box = isShulkerName(key.name);
+        key.bundle = isBundleName(key.name);
+        key.priority = customPriority(stack);
+        key.category = categoryIndex(stack);
+        key.count = cui::countOf(stack);
+        key.aux = cui::auxOf(stack);
+        key.fill = key.box ? extra.boxSlots : extra.bundleFill;
+        return key;
+    };
+    return itemscrollerlogic::compare(keyOf(a, xa), keyOf(b, xb));
 }
 
 void ItemScroller::sortInventory(const Slot& focused)
@@ -2157,6 +1801,7 @@ void ItemScroller::sortInventory(const Slot& focused)
     if (st->region.size() < 2) {
         return;
     }
+
     pushJob([this, st]() {
         Sort& s = *st;
         const size_t count = s.region.size();
@@ -2176,7 +1821,7 @@ void ItemScroller::sortInventory(const Slot& focused)
             s.i = 0;
             s.j = count;
         }
-        if (s.phase == 1) {
+        auto mergeStacks = [this, &s, count]() {
             for (; s.i < count; ++s.i, s.j = count) {
                 const void* si = stackOf(s.region[s.i]);
                 if (cui::isEmpty(si) || cui::countOf(si) >= cui::maxStackOf(si)) {
@@ -2201,35 +1846,40 @@ void ItemScroller::sortInventory(const Slot& focused)
                     }
                 }
             }
+            return true;
+        };
+        if (s.phase == 1) {
+            if (!mergeStacks()) {
+                return false;
+            }
             s.phase = 2;
         }
         if (s.phase == 2) {
-            std::vector<StackCopy> snap(count);
+            std::vector<const void*> live(count);
             std::vector<SortExtra> extra(count);
             std::vector<int> order(count);
             for (size_t i = 0; i < count; ++i) {
-                const void* live = stackOf(s.region[i]);
-                snap[i].copyFrom(live);
-                extra[i] = sortExtraOf(live);
+                live[i] = stackOf(s.region[i]);
+                extra[i] = sortExtraOf(live[i]);
                 order[i] = static_cast<int>(i);
             }
-            std::stable_sort(order.begin(), order.end(), [this, &snap, &extra](int x, int y) {
+            std::stable_sort(order.begin(), order.end(), [this, &live, &extra](int x, int y) {
                 const auto ux = static_cast<size_t>(x);
                 const auto uy = static_cast<size_t>(y);
-                return compareStacks(snap[ux].get(), snap[uy].get(), extra[ux], extra[uy]) < 0;
+                return compareStacks(live[ux], live[uy], extra[ux], extra[uy]) < 0;
             });
             s.cls.assign(count, 0);
             s.clsIsBundle.assign(1, false);
             std::vector<int> reps;
             for (size_t i = 0; i < count; ++i) {
-                const void* item = snap[i].get();
+                const void* item = live[i];
                 if (cui::isEmpty(item)) {
                     continue;
                 }
                 int found = 0;
                 if (cui::maxStackOf(item) > 1) {
                     for (size_t r = 0; r < reps.size(); ++r) {
-                        const void* rep = snap[static_cast<size_t>(reps[r])].get();
+                        const void* rep = live[static_cast<size_t>(reps[r])];
                         if (cui::maxStackOf(rep) > 1 && cui::sameItem(item, rep)) {
                             found = static_cast<int>(r) + 1;
                             break;
@@ -2257,7 +1907,18 @@ void ItemScroller::sortInventory(const Slot& focused)
             return there == 0
                    || (!s.clsIsBundle[static_cast<size_t>(carry)] && !s.clsIsBundle[static_cast<size_t>(there)]);
         };
-        for (; s.pass < 4 && s.safety > 0; ++s.pass, s.i = 0, s.moved = false) {
+        auto putDownCursor = [this, &s]() {
+            if (cursorEmpty()) {
+                return;
+            }
+            for (const Slot& r : s.region) {
+                if (isEmptySlot(r)) {
+                    leftClick(r);
+                    break;
+                }
+            }
+        };
+        for (; s.phase == 3 && s.pass < 4 && s.safety > 0; ++s.pass, s.i = 0, s.moved = false) {
             for (; s.i < count && s.safety > 0; ++s.i) {
                 if (s.cls[s.i] == s.target[s.i] || s.cls[s.i] == 0) {
                     continue;
@@ -2266,6 +1927,7 @@ void ItemScroller::sortInventory(const Slot& focused)
                     return false;
                 }
                 if (!cursorEmpty() || isEmptySlot(s.region[s.i])) {
+                    putDownCursor();
                     return true;
                 }
                 leftClick(s.region[s.i]);
@@ -2321,18 +1983,17 @@ void ItemScroller::sortInventory(const Slot& focused)
                 break;
             }
         }
-        if (!cursorEmpty()) {
-            for (const Slot& r : s.region) {
-                if (isEmptySlot(r)) {
-                    leftClick(r);
-                    break;
-                }
-            }
+        if (s.phase == 3) {
+            putDownCursor();
+            s.phase = 4;
+            s.i = 0;
+            s.j = count;
         }
-        if (debugLog()) {
-            log().info(L"ItemScroller: sorted {} slots of \"{}\"", count, toUtf16(s.region.front().coll));
-            dumpScreen(L"after sort");
+        if (s.phase == 4 && cursorEmpty() && !mergeStacks()) {
+            return false;
         }
+        putDownCursor();
+
         return true;
     });
 }

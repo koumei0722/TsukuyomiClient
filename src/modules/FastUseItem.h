@@ -24,7 +24,6 @@ public:
     int onUseItemTransaction(void* gameMode, void* itemStack, int extra);
 
 protected:
-    bool persistEnabled() const override { return true; }
 
 private:
     FastUseItem() = default;

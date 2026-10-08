@@ -66,11 +66,6 @@ bool FastBlockBreak::available() const
         && hooks::hasGameModeContinueDestroyBlock() && hooks::hasGameModeDestroyBlock();
 }
 
-MenuItem FastBlockBreak::buildMenu()
-{
-    return Module::buildMenu();
-}
-
 void FastBlockBreak::onScansReady()
 {
     const Scanner& scanner = Scanner::instance();

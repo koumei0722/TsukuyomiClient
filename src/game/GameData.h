@@ -4,6 +4,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 
 namespace tsukuyomi {
@@ -19,6 +20,7 @@ struct PlayerView {
 class GameData {
 public:
     static GameData& instance();
+    static bool copyComponent(const void* actor, std::uint32_t typeId, std::size_t stride, void* out);
 
     void setPlayerView(const PlayerView& view);
     PlayerView playerView() const;
@@ -41,6 +43,9 @@ public:
     bool isServerPlayer(const void* player) const;
     const void* serverPlayerVtable() const { return m_serverPlayerVtable.load(std::memory_order_acquire); }
     const void* playerVtable() const { return m_playerVtable.load(std::memory_order_acquire); }
+
+    bool onLevelTick(const void* level, unsigned long thread, unsigned long clientThread);
+    bool integratedServer() const;
 
     bool playerFeet(float& outX, float& outY, float& outZ) const;
 
@@ -83,6 +88,9 @@ private:
     std::atomic<unsigned long long> m_playerSerial{0};
     std::atomic<unsigned long long> m_adoptAt{0};
     std::atomic<unsigned long long> m_viewAt{0};
+    std::atomic<const void*> m_tickLevels[2]{};
+    std::atomic<unsigned long long> m_tickLevelAt[2]{};
+    std::atomic<int> m_tickLevelLogs{0};
 };
 
 }

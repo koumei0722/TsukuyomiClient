@@ -1,7 +1,6 @@
 #include "game/GameOptions.h"
 
 #include <charconv>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -90,28 +89,6 @@ bool Options::getInt(const char* key, int& out) const
     const auto result = std::from_chars(s.data(), s.data() + s.size(), parsed);
     if (result.ec != std::errc{} || result.ptr != s.data() + s.size()) return false;
     out = parsed;
-    return true;
-}
-
-bool Options::getFloat(const char* key, float& out) const
-{
-    const auto* value = find(key);
-    if (!value) return false;
-    const auto s = trimmed(*value);
-    if (s.empty()) return false;
-    float parsed = 0.0f;
-    const auto result = std::from_chars(s.data(), s.data() + s.size(), parsed);
-    if (result.ec != std::errc{} || result.ptr != s.data() + s.size()) return false;
-    out = parsed;
-    return true;
-}
-
-bool Options::getString(const char* key, char* out, std::size_t cap) const
-{
-    const auto* value = find(key);
-    if (!value || !out || cap <= value->size()) return false;
-    std::memcpy(out, value->data(), value->size());
-    out[value->size()] = '\0';
     return true;
 }
 

@@ -60,6 +60,7 @@ private:
     int m_perspective = 0;
     bool m_perspectiveKnown = false;
     int m_perspectiveUnknownFrames = 0;
+    std::atomic<bool> m_scansReady{false};
     std::uint64_t m_lastViewAt = 0;
     std::int32_t m_guiDataField = 0;
     void* m_clearMessages = nullptr;

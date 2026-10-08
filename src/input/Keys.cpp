@@ -17,6 +17,20 @@ bool isDown(int virtualKey)
 
 }
 
+std::vector<std::string> commandNames()
+{
+    std::vector<std::string> result;
+    for (char c = 'a'; c <= 'z'; ++c) result.emplace_back(1, c);
+    for (char c = '0'; c <= '9'; ++c) result.emplace_back(1, c);
+    for (int i = 1; i <= 24; ++i) result.push_back("f" + std::to_string(i));
+    for (int i = 0; i <= 9; ++i) result.push_back("num" + std::to_string(i));
+    for (const char* value : {"ctrl", "shift", "alt", "space", "enter", "esc", "tab", "backspace",
+         "capslock", "up", "down", "left", "right", "insert", "delete", "home", "end", "pageup",
+         "pagedown", "mouse1", "mouse2", "mouse3", "mouse4", "mouse5", "pause", "printscreen",
+         "scrolllock", "numlock", "menu", "win", "minus", "plus"}) result.emplace_back(value);
+    return result;
+}
+
 int normalize(int virtualKey)
 {
     switch (virtualKey) {

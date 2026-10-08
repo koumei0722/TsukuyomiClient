@@ -133,4 +133,54 @@ bool assign(void* str, std::string_view text)
     return true;
 }
 
+bool release(void* str)
+{
+    if (str == nullptr || !available()) return false;
+    auto* const s = static_cast<std::byte*>(str);
+    std::uint64_t size = 0;
+    std::uint64_t cap = 0;
+    if (!readGuarded(s + 0x10, &size, 8) || !readGuarded(s + 0x18, &cap, 8) || size > cap || cap > 0x100000) {
+        return false;
+    }
+    if (cap >= 16) {
+        void* ptr = nullptr;
+        if (!readGuarded(s, &ptr, 8) || ptr == nullptr) return false;
+        if (cap + 1 < 0x1000) {
+            if (!deleteGameGuarded(ptr, cap + 1)) return false;
+        } else {
+            void* real = nullptr;
+            if (!readGuarded(static_cast<std::byte*>(ptr) - 8, &real, 8) || real == nullptr) return false;
+            if (!deleteGameGuarded(real, cap + 1 + 0x27)) return false;
+        }
+    }
+    std::memset(s, 0, 0x20);
+    const std::uint64_t shortCap = 15;
+    std::memcpy(s + 0x18, &shortCap, 8);
+    return true;
+}
+
+bool releaseVector(void* vec)
+{
+    if (vec == nullptr || !available()) return false;
+    auto* const v = static_cast<std::byte*>(vec);
+    std::byte* range[3]{};
+    if (!readGuarded(v, range, sizeof(range))) return false;
+    std::byte* const begin = range[0];
+    std::byte* const end = range[1];
+    std::byte* const cap = range[2];
+    if (begin == nullptr) return end == nullptr && cap == nullptr;
+    if (end < begin || cap < end || (end - begin) % 0x20 != 0 || (cap - begin) % 0x20 != 0) return false;
+    bool ok = true;
+    for (std::byte* s = begin; s < end; s += 0x20) ok = release(s) && ok;
+    const std::size_t bytes = static_cast<std::size_t>(cap - begin);
+    if (bytes < 0x1000) {
+        ok = deleteGameGuarded(begin, bytes) && ok;
+    } else {
+        void* real = nullptr;
+        ok = readGuarded(begin - 8, &real, 8) && real != nullptr && deleteGameGuarded(real, bytes + 0x27) && ok;
+    }
+    std::memset(v, 0, sizeof(range));
+    return ok;
+}
+
 }

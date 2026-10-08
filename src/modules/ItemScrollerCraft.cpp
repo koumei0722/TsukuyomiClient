@@ -1,14 +1,16 @@
 #include "modules/ItemScroller.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
+#include "game/ItemStackRequest.h"
 
 #include <Windows.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <fstream>
 #include <memory>
 
@@ -18,7 +20,6 @@ namespace {
 namespace cui = containerui;
 constexpr char kGrid[] = "crafting_input_items";
 constexpr char kOutput[] = "crafting_output_items";
-constexpr char kRecipeBook[] = "recipe_search";
 }
 
 bool ItemScroller::isCraftingScreen() const
@@ -52,6 +53,13 @@ ItemScroller::Ingredient ItemScroller::ingredientOf(const void* stack) const
     if (!cui::isEmpty(stack)) {
         ing.name = cui::itemName(stack);
         ing.aux = cui::auxOf(stack);
+        ing.tagKnown = cui::tagHashOf(stack, ing.tag);
+        if (!ing.tagKnown) {
+            notice::failOnce("ItemScroller.tagHash",
+                             L"ItemScroller: the NBT of " + toUtf16(ing.name)
+                                 + L" could not be hashed (CompoundTag::hash); the recipe will not compare NBT",
+                             "ItemScroller: recipes cannot tell items apart by NBT");
+        }
     }
     return ing;
 }
@@ -61,7 +69,21 @@ bool ItemScroller::matchesIngredient(const void* stack, const Ingredient& ing) c
     if (ing.empty() || cui::isEmpty(stack)) {
         return false;
     }
-    return cui::itemName(stack) == ing.name && cui::auxOf(stack) == ing.aux;
+    if (cui::itemName(stack) != ing.name || cui::auxOf(stack) != ing.aux) {
+        return false;
+    }
+    if (!ing.tagKnown) {
+        return true;
+    }
+    std::uint64_t tag = 0;
+    if (!cui::tagHashOf(stack, tag)) {
+        notice::failOnce("ItemScroller.tagHash",
+                         L"ItemScroller: the NBT of " + toUtf16(ing.name)
+                             + L" could not be hashed (CompoundTag::hash); items with NBT never match a recipe",
+                         "ItemScroller: recipes cannot tell items apart by NBT");
+        return false;
+    }
+    return tag == ing.tag;
 }
 
 namespace {
@@ -80,14 +102,50 @@ int mapCell(int index, int fromSize, int toSize)
 
 }
 
+bool ItemScroller::wantedCells(const Recipe& recipe, int gridSize, std::vector<Ingredient>& want)
+{
+    const int fromSize = recipe.gridSize == 0 ? 9 : recipe.gridSize;
+    want.assign(static_cast<size_t>(gridSize), Ingredient{});
+    for (size_t j = 0; j < recipe.items.size() && static_cast<int>(j) < fromSize; ++j) {
+        if (recipe.items[j].empty()) {
+            continue;
+        }
+        const int cell = mapCell(static_cast<int>(j), fromSize, gridSize);
+        if (cell < 0) {
+            return false;
+        }
+        want[static_cast<size_t>(cell)] = recipe.items[j];
+    }
+    return true;
+}
+
+bool ItemScroller::gridMatchesRecipe(const Recipe& recipe) const
+{
+    const std::vector<Slot> grid = gridSlots();
+    std::vector<Ingredient> want;
+    if (recipe.empty() || !wantedCells(recipe, static_cast<int>(grid.size()), want)) {
+        return false;
+    }
+    for (size_t i = 0; i < grid.size(); ++i) {
+        const void* st = stackOf(grid[i]);
+        if (want[i].empty() ? !cui::isEmpty(st) : !matchesIngredient(st, want[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void ItemScroller::storeRecipeFromGrid(bool clearIfEmpty)
 {
     const void* out = stackOf(outputSlot());
-    Recipe& r = selectedRecipe();
+    selectedRecipe();
     if (cui::isEmpty(out)) {
         if (clearIfEmpty) {
-            r = Recipe{};
-            m_recipesDirty = true;
+            {
+                const std::lock_guard lock(m_recipesMutex);
+                m_recipes[static_cast<size_t>(m_selectedRecipe)] = Recipe{};
+                m_recipesDirty = true;
+            }
             log().info(L"ItemScroller: cleared recipe {}", m_selectedRecipe + 1);
         }
         return;
@@ -100,37 +158,26 @@ void ItemScroller::storeRecipeFromGrid(bool clearIfEmpty)
     }
     rec.result = ingredientOf(out);
     rec.resultCount = cui::countOf(out);
-    r = rec;
-    m_recipesDirty = true;
-    log().info(L"ItemScroller: stored recipe {} = {} x{}", m_selectedRecipe + 1,
-               toUtf16(rec.result.name), rec.resultCount);
+    {
+        const std::lock_guard lock(m_recipesMutex);
+        m_recipes[static_cast<size_t>(m_selectedRecipe)] = rec;
+        m_recipesDirty = true;
+    }
+    log().info(L"ItemScroller: stored recipe {} = {} x{} (nbt {:016x}{})", m_selectedRecipe + 1,
+               toUtf16(rec.result.name), rec.resultCount, rec.result.tag, rec.result.tagKnown ? L"" : L" unknown");
     enqueueClearGrid();
 }
 
-ItemScroller::Step ItemScroller::clearGridStep(bool nonMatchingOnly)
+ItemScroller::Step ItemScroller::clearGridStep()
 {
     const std::vector<Slot> grid = gridSlots();
-    const Recipe& r = selectedRecipe();
     bool ok = true;
     for (size_t i = 0; i < grid.size(); ++i) {
         const void* st = stackOf(grid[i]);
         if (cui::isEmpty(st)) {
             continue;
         }
-        if (nonMatchingOnly && !r.empty()) {
-            bool wanted = false;
-            for (size_t j = 0; j < r.items.size(); ++j) {
-                const int cell = mapCell(static_cast<int>(j), r.gridSize == 0 ? 9 : r.gridSize,
-                                         static_cast<int>(grid.size()));
-                if (cell == static_cast<int>(i) && matchesIngredient(st, r.items[j])) {
-                    wanted = true;
-                    break;
-                }
-            }
-            if (wanted) {
-                continue;
-            }
-        }
+
         if (!cursorEmpty()) {
             return Step::Fail;
         }
@@ -155,17 +202,9 @@ ItemScroller::Step ItemScroller::fillGridStep(const Recipe& recipe, bool fillSta
     }
     const std::vector<Slot> grid = gridSlots();
     const int gridSize = static_cast<int>(grid.size());
-    const int fromSize = recipe.gridSize == 0 ? 9 : recipe.gridSize;
-    std::vector<Ingredient> want(static_cast<size_t>(gridSize));
-    for (size_t j = 0; j < recipe.items.size() && static_cast<int>(j) < fromSize; ++j) {
-        if (recipe.items[j].empty()) {
-            continue;
-        }
-        const int cell = mapCell(static_cast<int>(j), fromSize, gridSize);
-        if (cell < 0) {
-            return Step::Fail;
-        }
-        want[static_cast<size_t>(cell)] = recipe.items[j];
+    std::vector<Ingredient> want;
+    if (!wantedCells(recipe, gridSize, want)) {
+        return Step::Fail;
     }
     for (int i = 0; i < gridSize; ++i) {
         const Slot& cell = grid[static_cast<size_t>(i)];
@@ -192,7 +231,7 @@ ItemScroller::Step ItemScroller::fillGridStep(const Recipe& recipe, bool fillSta
         std::vector<Slot> cells;
         for (int k = i; k < gridSize; ++k) {
             const Ingredient& other = want[static_cast<size_t>(k)];
-            if (!other.empty() && other.name == ing.name && other.aux == ing.aux) {
+            if (!other.empty() && other.same(ing)) {
                 cells.push_back(grid[static_cast<size_t>(k)]);
                 done[static_cast<size_t>(k)] = true;
             }
@@ -277,7 +316,7 @@ ItemScroller::Step ItemScroller::fillGridStep(const Recipe& recipe, bool fillSta
 
 void ItemScroller::enqueueClearGrid()
 {
-    pushJob([this]() { return clearGridStep(false) != Step::Yield; });
+    pushJob([this]() { return clearGridStep() != Step::Yield; });
 }
 
 void ItemScroller::enqueueFillGrid(bool fillStacks)
@@ -308,15 +347,19 @@ void ItemScroller::enqueueCraftAsManyAsPossible()
             if (!budgetLeft()) {
                 return false;
             }
+            if (!craftPendingSettled()) {
+                return false;
+            }
             if (!cursorEmpty()) {
                 return true;
             }
-            if (!matchesIngredient(stackOf(out), recipe.result)) {
+            if (!matchesIngredient(stackOf(out), recipe.result) || !gridMatchesRecipe(recipe)) {
                 const Step s = fillGridStep(recipe, true);
                 if (s == Step::Yield) {
                     return false;
                 }
-                if (s == Step::Fail || !matchesIngredient(stackOf(out), recipe.result)) {
+                if (s == Step::Fail || !matchesIngredient(stackOf(out), recipe.result)
+                    || !gridMatchesRecipe(recipe)) {
                     return true;
                 }
                 continue;
@@ -339,18 +382,17 @@ void ItemScroller::craftEverything()
     }
     auto failed = std::make_shared<bool>(false);
     pushJob([this, failed]() {
-        const Step s = clearGridStep(false);
+        const Step s = clearGridStep();
         if (s == Step::Yield) {
             return false;
         }
         *failed = (s == Step::Fail);
         return true;
     });
-    pushJob([this, failed, recipe]() {
+    pushJob([this, failed]() {
         if (*failed) {
             return true;
         }
-        (void)recipe;
         enqueueCraftAsManyAsPossible();
         return true;
     });
@@ -531,112 +573,115 @@ bool ItemScroller::tryMoveItemsCrafting(const Slot& slot, bool toOther, bool mov
     return false;
 }
 
-int ItemScroller::recipeBookIndexOf(const Ingredient& result)
+bool ItemScroller::pendingStacks() const
 {
-    if (m_bookIndex >= 0 && matchesIngredient(cui::screenStackAt(kRecipeBook, m_bookIndex), result)) {
-        return m_bookIndex;
+    if (cui::netTagOf(cursor()) > 0) {
+        return true;
     }
-    m_bookIndex = -1;
-    const int n = cui::screenCollectionSize(kRecipeBook);
-    for (int i = 0; i < n; ++i) {
-        if (matchesIngredient(cui::screenStackAt(kRecipeBook, i), result)) {
-            m_bookIndex = i;
-            break;
-        }
-    }
-    return m_bookIndex;
-}
-
-int ItemScroller::countIngredientInPlayer(const Ingredient& ing) const
-{
-    int n = 0;
-    for (const Slot& s : slotsOf(Group::Player)) {
-        const void* st = stackOf(s);
-        if (matchesIngredient(st, ing)) {
-            n += cui::countOf(st);
-        }
-    }
-    return n;
-}
-
-int ItemScroller::countIngredientAvailable(const Ingredient& ing) const
-{
-    int n = countIngredientInPlayer(ing);
-    for (const Slot& s : gridSlots()) {
-        const void* st = stackOf(s);
-        if (matchesIngredient(st, ing)) {
-            n += cui::countOf(st);
-        }
-    }
-    return n;
-}
-
-bool ItemScroller::ingredientsAvailable(const Recipe& recipe) const
-{
-    for (size_t i = 0; i < recipe.items.size(); ++i) {
-        const Ingredient& ing = recipe.items[i];
-        if (ing.empty()) {
-            continue;
-        }
-        int need = 0;
-        for (const Ingredient& other : recipe.items) {
-            if (!other.empty() && other.name == ing.name && other.aux == ing.aux) {
-                ++need;
+    for (Group g : {Group::Player, Group::Grid}) {
+        for (const Slot& s : slotsOf(g)) {
+            if (cui::netTagOf(stackOf(s)) > 0) {
+                return true;
             }
         }
-        if (countIngredientAvailable(ing) < need) {
-            return false;
+    }
+    return false;
+}
+
+bool ItemScroller::gridOrCursorPending() const
+{
+    if (cui::netTagOf(cursor()) > 0) {
+        return true;
+    }
+    for (const Slot& s : slotsOf(Group::Grid)) {
+        if (cui::netTagOf(stackOf(s)) > 0) {
+            return true;
         }
     }
+    return false;
+}
+
+bool ItemScroller::craftPendingSettled()
+{
+    if (!pendingStacks()) {
+        m_craftPendingSince = 0;
+        return true;
+    }
+    const unsigned long long now = GetTickCount64();
+    if (m_craftPendingSince == 0) {
+        m_craftPendingSince = now;
+    }
+    if (now - m_craftPendingSince < 5000) {
+        return false;
+    }
+    m_craftPendingSince = 0;
     return true;
 }
 
-bool ItemScroller::massCraftWithRecipeBook(const Recipe& recipe)
+void ItemScroller::putBackCursor(const Recipe& recipe)
 {
-    if (std::none_of(recipe.items.begin(), recipe.items.end(), [](const Ingredient& i) { return !i.empty(); })) {
-        return false;
+    if (cursorEmpty()) {
+        return;
     }
-    const int index = recipeBookIndexOf(recipe.result);
-    if (index < 0) {
-        if (!m_bookMissWarned) {
-            m_bookMissWarned = true;
-            log().info(L"ItemScroller: the recipe book does not list {}; mass crafting places the items by hand",
-                       toUtf16(recipe.result.name));
+    const bool ingredient = std::any_of(recipe.items.begin(), recipe.items.end(),
+                                        [&](const Ingredient& i) { return matchesIngredient(cursor(), i); });
+    if (ingredient) {
+        for (const Slot& s : slotsOf(Group::Player)) {
+            if (cursorEmpty()) {
+                return;
+            }
+            const void* st = stackOf(s);
+            if (!cui::isEmpty(st) && !(cui::sameItem(st, cursor()) && cui::countOf(st) < cui::maxStackOf(st))) {
+                continue;
+            }
+            if (!budgetLeft()) {
+                return;
+            }
+            leftClick(s);
         }
-        return false;
+        if (cursorEmpty() || !budgetLeft()) {
+            return;
+        }
     }
-    for (int i = 0; i < m_massCraftIterations && budgetLeft(); ++i) {
-        if (!cursorEmpty()) {
+    dropCursorAll();
+}
+
+ItemScroller::Step ItemScroller::dropCraftFromOutput(const Recipe& recipe)
+{
+    const Slot out = outputSlot();
+    if (!itemscrollerlogic::canTakeCraftOutput(m_clicksThisTick, kSafeClicksPerTick)) {
+        return Step::Yield;
+    }
+    int taken = 0;
+    while (itemscrollerlogic::canTakeCraftOutput(m_clicksThisTick, kSafeClicksPerTick)
+           && matchesIngredient(stackOf(out), recipe.result)) {
+        const int perSet = cui::countOf(stackOf(out));
+        const void* held = cursor();
+        const int before = cui::countOf(held);
+        if (before > 0 && before + perSet > cui::maxStackOf(held)) {
+            break;
+        }
+        leftClick(out);
+        if (cui::countOf(cursor()) <= before) {
+            break;
+        }
+        ++taken;
+    }
+    if (!cursorEmpty()) {
+        const void* held = cursor();
+        const bool more = matchesIngredient(stackOf(out), recipe.result)
+                          && cui::countOf(held) + cui::countOf(stackOf(out)) <= cui::maxStackOf(held);
+        if (!more || m_clicksThisTick + 1 < kSafeClicksPerTick) {
             dropCursorAll();
         }
-        if (throwCraftResultsStep(recipe) == Step::Yield || throwNonRecipeItemsStep(recipe) == Step::Yield) {
-            break;
-        }
-        const int at = recipeBookIndexOf(recipe.result);
-        if (at < 0) {
-            break;
-        }
-        if (!ingredientsAvailable(recipe)) {
-            ++m_badRecipeClicks;
-            break;
-        }
-        const Ingredient& first = *std::find_if(recipe.items.begin(), recipe.items.end(),
-                                                [](const Ingredient& i) { return !i.empty(); });
-        const int before = countIngredientAvailable(first);
-        ++m_clicksThisTick;
-        const bool ok = cui::press(cui::button::kRecipeTertiary, kRecipeBook, at);
-        const int after = countIngredientAvailable(first);
-        if (debugLog()) {
-            log().info(L"ItemScroller: recipe book craft {} [{}] {} {} -> {} {}", toUtf16(recipe.result.name), at,
-                       toUtf16(first.name), before, after, ok ? L"" : L"(press failed)");
-        }
-        if (!ok || after >= before) {
-            ++m_badRecipeClicks;
-            break;
-        }
-        m_badRecipeClicks = std::max(0, m_badRecipeClicks - 1);
     }
-    return true;
+    return taken > 0 ? Step::Done : Step::Fail;
+}
+
+void ItemScroller::endMassCraftSession()
+{
+    m_harvestReady = false;
+
 }
 
 void ItemScroller::massCraftTick()
@@ -644,26 +689,46 @@ void ItemScroller::massCraftTick()
     const bool active = (comboHeld(m_keys[kMassCraft].keys, true) || m_massCraftHold)
                         && !selectedRecipe().empty();
     if (!active) {
-        m_badRecipeClicks = 0;
-        m_massCraftTicker = 0;
+        if (m_mcActiveWas) {
+            m_mcActiveWas = false;
+            if (matchesIngredient(cursor(), selectedRecipe().result) && budgetLeft()) {
+                dropCursorAll();
+            }
+            endMassCraftSession();
+        }
         return;
     }
-    if (++m_massCraftTicker < m_massCraftInterval) {
-        return;
+    if (!m_mcActiveWas) {
+        m_mcActiveWas = true;
     }
-    m_massCraftTicker = 0;
-    if (m_recipeBookFailureLimit > 0 && m_badRecipeClicks > m_recipeBookFailureLimit) {
-        m_badRecipeClicks -= std::max(m_recipeBookFailureLimit / 16, 1);
-        return;
-    }
+
+    massCraftStep();
+}
+
+void ItemScroller::massCraftStep()
+{
     const Recipe recipe = selectedRecipe();
-    if (m_massCraftUseRecipeBook && massCraftWithRecipeBook(recipe)) {
-        return;
-    }
+
     const Slot out = outputSlot();
-    for (int i = 0; i < m_massCraftIterations && budgetLeft(); ++i) {
+    for (int i = 0; i < 36 && budgetLeft(); ++i) {
+        if (m_harvestReady && matchesIngredient(stackOf(out), recipe.result) && gridMatchesRecipe(recipe)) {
+            const Step s = dropCraftFromOutput(recipe);
+            if (s == Step::Yield) {
+                break;
+            }
+            if (s == Step::Fail) {
+                m_harvestReady = false;
+                break;
+            }
+            continue;
+        }
+        m_harvestReady = false;
+        if (!craftPendingSettled()) {
+            break;
+        }
+        putBackCursor(recipe);
         if (!cursorEmpty()) {
-            dropCursorAll();
+            break;
         }
         if (throwCraftResultsStep(recipe) == Step::Yield || throwNonRecipeItemsStep(recipe) == Step::Yield) {
             break;
@@ -672,24 +737,20 @@ void ItemScroller::massCraftTick()
         if (fill == Step::Yield) {
             break;
         }
-        if (!matchesIngredient(stackOf(out), recipe.result)) {
-            ++m_badRecipeClicks;
+        if (!matchesIngredient(stackOf(out), recipe.result) || !gridMatchesRecipe(recipe)) {
             break;
         }
-        const int before = cui::countOf(stackOf(gridSlots().empty() ? out : gridSlots().front()));
-        shiftClick(out);
-        if (matchesIngredient(stackOf(out), recipe.result)
-            && cui::countOf(stackOf(gridSlots().empty() ? out : gridSlots().front())) == before) {
-            ++m_badRecipeClicks;
+        if (gridOrCursorPending()) {
             break;
         }
-        m_badRecipeClicks = std::max(0, m_badRecipeClicks - 1);
+        m_harvestReady = true;
     }
 }
 
 void ItemScroller::changeRecipeSelection(int index)
 {
     index = std::clamp(index, 0, kRecipeCount - 1);
+    const std::lock_guard lock(m_recipesMutex);
     if (index != m_selectedRecipe) {
         m_selectedRecipe = index;
         m_recipesDirty = true;
@@ -748,84 +809,80 @@ std::wstring ItemScroller::recipeFilePath() const
 
 void ItemScroller::loadRecipes()
 {
-    m_recipesLoaded = true;
-    if (!m_craftingRecipesSaveToFile) {
-        return;
+    const std::lock_guard saveLock(m_recipeSaveMutex);
+    itemscrollerlogic::Recipes recipes;
+    int selected;
+    {
+        const std::lock_guard lock(m_recipesMutex);
+        m_recipesLoaded = true;
+        recipes = m_recipes;
+        selected = m_selectedRecipe;
     }
     std::ifstream in{std::filesystem::path(recipeFilePath())};
-    if (!in) {
-        return;
-    }
+    if (!in) return;
     nlohmann::json root;
     try {
         in >> root;
-    } catch (...) {
+    } catch (const nlohmann::json::exception&) {
         log().warn(L"ItemScroller: the recipe file could not be read");
         return;
     }
-    auto readIng = [](const nlohmann::json& j) {
-        Ingredient ing;
-        if (j.is_object()) {
-            ing.name = j.value("name", std::string());
-            ing.aux = j.value("aux", 0);
-        }
-        return ing;
-    };
-    if (root.contains("recipes") && root["recipes"].is_array()) {
-        for (const auto& r : root["recipes"]) {
-            const int index = r.value("index", -1);
-            if (index < 0 || index >= kRecipeCount) {
-                continue;
-            }
-            Recipe rec;
-            rec.result = readIng(r.value("result", nlohmann::json()));
-            rec.resultCount = r.value("count", 1);
-            rec.gridSize = r.value("grid", 9);
-            if (r.contains("items") && r["items"].is_array()) {
-                size_t i = 0;
-                for (const auto& it : r["items"]) {
-                    if (i >= rec.items.size()) {
-                        break;
-                    }
-                    rec.items[i++] = readIng(it);
-                }
-            }
-            m_recipes[static_cast<size_t>(index)] = rec;
-        }
+    if (!itemscrollerlogic::readRecipes(root, recipes, selected)) {
+        log().warn(L"ItemScroller: the recipe file has invalid field types");
+        return;
     }
-    m_selectedRecipe = std::clamp(root.value("selected", 0), 0, kRecipeCount - 1);
+    const std::lock_guard lock(m_recipesMutex);
+    m_recipes = std::move(recipes);
+    m_selectedRecipe = selected;
 }
 
 void ItemScroller::saveRecipes() const
 {
-    m_recipesDirty = false;
-    if (!m_craftingRecipesSaveToFile || !m_recipesLoaded) {
-        return;
+    const std::lock_guard saveLock(m_recipeSaveMutex);
+    itemscrollerlogic::Recipes recipes;
+    int selected;
+    {
+        const std::lock_guard lock(m_recipesMutex);
+        if (!m_recipesLoaded || !m_recipesDirty) return;
+        recipes = m_recipes;
+        selected = m_selectedRecipe;
+        m_recipesDirty = false;
     }
-    nlohmann::json root;
-    root["selected"] = m_selectedRecipe;
-    nlohmann::json list = nlohmann::json::array();
-    for (int i = 0; i < kRecipeCount; ++i) {
-        const Recipe& r = m_recipes[static_cast<size_t>(i)];
-        if (r.empty()) {
-            continue;
+    bool saved = false;
+    try {
+        nlohmann::json root;
+        root["selected"] = selected;
+        nlohmann::json list = nlohmann::json::array();
+        for (int i = 0; i < kRecipeCount; ++i) {
+            const Recipe& r = recipes[static_cast<size_t>(i)];
+            if (r.empty()) continue;
+            auto writeIng = [](const Ingredient& ing) {
+                nlohmann::json o = {{"name", ing.name}, {"aux", ing.aux}};
+                if (ing.tagKnown) o["tag"] = std::format("{:016x}", ing.tag);
+                return o;
+            };
+            nlohmann::json j;
+            j["index"] = i;
+            j["result"] = writeIng(r.result);
+            j["count"] = r.resultCount;
+            j["grid"] = r.gridSize;
+            nlohmann::json items = nlohmann::json::array();
+            for (const Ingredient& ing : r.items) items.push_back(writeIng(ing));
+            j["items"] = std::move(items);
+            list.push_back(std::move(j));
         }
-        nlohmann::json j;
-        j["index"] = i;
-        j["result"] = {{"name", r.result.name}, {"aux", r.result.aux}};
-        j["count"] = r.resultCount;
-        j["grid"] = r.gridSize;
-        nlohmann::json items = nlohmann::json::array();
-        for (const Ingredient& ing : r.items) {
-            items.push_back({{"name", ing.name}, {"aux", ing.aux}});
+        root["recipes"] = std::move(list);
+        std::ofstream out(std::filesystem::path(recipeFilePath()), std::ios::binary | std::ios::trunc);
+        if (out) {
+            out << root.dump(2);
+            out.flush();
+            saved = static_cast<bool>(out);
         }
-        j["items"] = std::move(items);
-        list.push_back(std::move(j));
+    } catch (const std::exception&) {
     }
-    root["recipes"] = std::move(list);
-    std::ofstream out(std::filesystem::path(recipeFilePath()), std::ios::binary | std::ios::trunc);
-    if (out) {
-        out << root.dump(2);
+    if (!saved) {
+        const std::lock_guard lock(m_recipesMutex);
+        m_recipesDirty = true;
     }
 }
 

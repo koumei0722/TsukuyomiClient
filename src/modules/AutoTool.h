@@ -65,17 +65,13 @@ private:
     std::byte* contextPlayer(void* context, int* side = nullptr) const;
     static bool readServerNetIds(const std::byte* slots, std::int32_t* out);
 
-    bool findOwner(void* item, Owner& out, const void* queryPlayer);
+    bool findOwner(void* item, Owner& out);
 
     void* findTwin(const Owner& owner);
 
     static bool sameHotbar(const std::byte* a, const std::byte* b);
 
-    static bool looksLikeSlotArray(const std::byte* slotZero, ptrdiff_t stride, int slotCount,
-                                   bool* faulted = nullptr);
-
-    static constexpr int kSlotCount = 9;
-    static constexpr ptrdiff_t kSelectedSlotOffset = 0x10;
+    static bool looksLikeSlotArray(const std::byte* slotZero, bool* faulted = nullptr);
 
     static constexpr ptrdiff_t kContainerOffset = 0xB8;
     static constexpr ptrdiff_t kSlotsOffset = 0x198;
@@ -89,7 +85,6 @@ private:
     static constexpr ptrdiff_t kContextPlayerOffset = 0x08;
 
     static constexpr ptrdiff_t kItemPointerOffset = 0x10;
-    static constexpr ptrdiff_t kSlotStride = 0x98;
 
     static constexpr int kIdleRestoreMs = 250;
 
@@ -107,11 +102,14 @@ private:
     std::atomic<void*> m_owner{nullptr};
     std::atomic<void*> m_ownClient{nullptr};
     std::atomic<int> m_ownerLogs{0};
-    std::atomic<bool> m_fallbackLogged{false};
+    static constexpr int kUnresolvedNotice = 600;
+    std::atomic<int> m_unresolvedStreak{0};
 
     std::atomic<Clock::rep> m_lastSpeedQuery{0};
 
     std::atomic<bool> m_restoreWanted{false};
+
+    std::atomic<int> m_unloadStage{0};
 
     struct Switch {
         void* owner = nullptr;

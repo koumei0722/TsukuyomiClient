@@ -31,6 +31,8 @@ struct Sample {
     Value<double> noiseN, noisePS;
     Value<int> renderedEntities, totalEntities, simulationDistance;
     Value<int> fps, fpsLimit;
+    Value<int> foodHunger;
+    Value<float> foodSaturation, foodExhaustion;
     Value<double> refreshRate;
     TextValue gameVersion, launchedVersion, modName;
     Value<int> gpuPercent;
@@ -83,6 +85,7 @@ int formatChunkSourceStats(const Sample&, char out[][kLineBytes], int maxRows);
 int formatDayCount(const Sample&, char out[][kLineBytes], int maxRows);
 int formatEntityRenderStats(const Sample&, char out[][kLineBytes], int maxRows);
 int formatFps(const Sample&, char out[][kLineBytes], int maxRows);
+int formatFoodStats(const Sample&, char out[][kLineBytes], int maxRows);
 int formatGameVersion(const Sample&, char out[][kLineBytes], int maxRows);
 int formatGpuUtilization(const Sample&, char out[][kLineBytes], int maxRows);
 int formatLightLevels(const Sample&, char out[][kLineBytes], int maxRows);

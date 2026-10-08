@@ -12,7 +12,7 @@ namespace {
 
 constexpr const char* kPlayerViewNeeds =
     "AntiEffect,AutoTool,CreativeNoClip,FastBlockPlacement,FlySpeed,FreeCamera,Fullbright,HandRestock,"
-    "OffhandSwap,Scaffold,Schematica,NoRender:fog,DebugScreen,ChatCommands";
+    "OffhandSwap,Scaffold,Schematica,NoRender:fog,DebugScreen,ChatCommands,AppleSkin,ArmorHUD";
 
 const std::vector<Entry> kTable = {
     {"AbilitiesAccess", Kind::Hook, "CreativeNoClip,FlySpeed", "", ""},
@@ -30,11 +30,11 @@ const std::vector<Entry> kTable = {
     {"CommandAutoComplete", Kind::Hook, "", "ChatCommand:complete", ""},
     {"CommandAutoCompleteFilter", Kind::Hook, "", "ChatCommand:complete", ""},
     {"CommandRegistryLoadPacket", Kind::Hook, "", "ChatCommand:complete", ""},
-    {"ContainerGetItem", Kind::Hook, "InventoryHUD:offhand", "", ""},
+    {"ContainerGetItem", Kind::Hook, "ArmorHUD,OffhandSlot,ShulkerPreview:tooltip", "", ""},
     {"ContainerOpenHandle", Kind::Hook, "HandRestock,OffhandSwap", "", ""},
-    {"ContainerScreenCtor", Kind::Hook, "InventoryHUD,ItemScroller,ShulkerPreview", "", ""},
-    {"ContainerScreenDtor", Kind::Hook, "ItemScroller,ShulkerPreview", "", ""},
-    {"ContainerScreenTick", Kind::Hook, "ItemScroller,ShulkerPreview", "", ""},
+    {"ContainerScreenCtor", Kind::Hook, "ArmorHUD,EffectTimer,InventoryEffects,InventoryHUD,ItemScroller,ShulkerPreview", "", ""},
+    {"ContainerScreenDtor", Kind::Hook, "InventoryEffects,ItemScroller,ShulkerPreview", "", ""},
+    {"ContainerScreenTick", Kind::Hook, "InventoryEffects,ItemScroller,ShulkerPreview", "", ""},
     {"ContainerSm", Kind::Hook, "ItemScroller", "", ""},
     {"FogSettingsFetch", Kind::Hook, "NoRender:fog", "", ""},
     {"EmoteWheelCtor", Kind::Hook, "DebugScreen:gameModeWheel", "", ""},
@@ -49,27 +49,40 @@ const std::vector<Entry> kTable = {
     {"GameButtonBindAction", Kind::Hook, "Hotkeys", "", ""},
     {"GameButtonFindKeymap", Kind::Hook, "Hotkeys", "", ""},
     {"GameButtonInputUpdate", Kind::Hook, "Hotkeys", "", ""},
+    {"GameButtonPadBind", Kind::Hook, "Hotkeys", "", ""},
     {"GameModeContinueDestroyBlock", Kind::Hook, "FastBlockBreak", "", ""},
     {"GameModeDestroyBlock", Kind::Hook, "FastBlockBreak", "", ""},
     {"GetActorEffect", Kind::Hook, "AntiEffect,Fullbright", "", ""},
     {"GetDestroySpeed", Kind::Hook, "AutoTool", "", ""},
     {"HandleItemStackResponse", Kind::Hook, "HandRestock,OffhandSwap", "", ""},
+    {"HeartRendererUpdate", Kind::Hook, "AppleSkin", "", ""},
     {"HitResultAssign", Kind::Hook, "", "DebugScreen,Schematica", ""},
     {"HitResultMoveAssign", Kind::Hook, "", "DebugScreen", ""},
-    {"HoverRendererRender", Kind::Hook, "ShulkerPreview:tooltip", "", ""},
-    {"HudScreenCtor", Kind::Hook, "InventoryHUD", "", ""},
-    {"I18nGet", Kind::Hook, "", "Menu:settings", ""},
-    {"InputGather", Kind::Hook, "FreeCamera", "ItemScroller", ""},
+    {"HoverRendererRender", Kind::Hook, "AppleSkin", "", ""},
+    {"HudCollectionResolve", Kind::Hook, "", "ShulkerPreview:icons", ""},
+    {"HudScreenCtor", Kind::Hook, "ArmorHUD,EffectTimer,InventoryEffects,InventoryHUD,OffhandSlot", "", ""},
+    {"HungerRendererUpdate", Kind::Hook, "AppleSkin", "", ""},
+    {"I18nGet", Kind::Hook, "", "EffectTimer,InventoryEffects,Menu:settings", ""},
+    {"InputGather", Kind::Hook, "FreeCamera,ToggleSneakSprint", "ItemScroller", ""},
     {"InventoryContentRead", Kind::Hook, "OffhandSwap", "HandRestock", ""},
     {"InventoryHoveredSlot", Kind::Hook, "FastInventory", "OffhandSwap", ""},
-    {"ItemHoverTextBuild", Kind::Hook, "", "DebugScreen", ""},
+    {"ItemHoverTextBuild", Kind::Hook, "AppleSkin", "DebugScreen", ""},
+    {"KeyBindingUnassignConflicts", Kind::Hook, "AllowDuplicateKeys", "", ""},
+    {"KeyBindingUnassignOthers", Kind::Hook, "AllowDuplicateKeys", "", ""},
+    {"EnchantCommandExecute", Kind::Hook, "ExtendedEnchantLevel", "", ""},
+    {"EnchantLevelRangeCheck", Kind::Hook, "ExtendedEnchantLevel", "", ""},
+    {"EnchantCanEnchant", Kind::Hook, "ExtendedEnchantLevel", "", ""},
     {"LegacyParticleInsert", Kind::Hook, "", "NoRender:particle", ""},
     {"LevelBuildDispatch", Kind::Hook, "Schematica", "DebugScreen", ""},
+    {"MobSwing", Kind::Hook, "", "FastBlockPlacement,Scaffold", ""},
+    {"MobEffectsRendererRender", Kind::Hook, "EffectTimer", "", ""},
+    {"MobEffectsLayout", Kind::Hook, "", "EffectTimer", ""},
     {"MoveInputHandler", Kind::Hook, "Schematica:page", "FreeCamera,HandRestock,ItemScroller", ""},
     {"MoveIntentFromInput", Kind::Hook, "FreeCamera", "", ""},
     {"NotifyInventoryOpen", Kind::Hook, "FastInventory,HandRestock,OffhandSwap", "", ""},
     {"OreKeyRowsBuild", Kind::Hook, "", "Menu:keys", ""},
     {"PacketSend", Kind::Hook, "FreeCamera,HandRestock,OffhandSwap", "", ""},
+    {"PoseDecision", Kind::Hook, "", "CreativeNoClip:pose", ""},
     {"PlayerView", Kind::Hook, kPlayerViewNeeds, "NoRender:particle,ItemScroller", ""},
     {"NetworkSend", Kind::Hook, "", "DebugScreen", ""},
     {"PacketCheckSize", Kind::Hook, "", "DebugScreen", ""},
@@ -82,12 +95,11 @@ const std::vector<Entry> kTable = {
     {"SceneStackPush", Kind::Hook, "", "ItemScroller", ""},
     {"SendCommandRequest", Kind::Hook, "ChatCommands", "", ""},
     {"SendComplexTransaction", Kind::Hook, "AutoTool:attack", "", ""},
-    {"SetGameMode", Kind::Hook, "InventoryHUD:offhand,Schematica", "Scaffold", ""},
+    {"SetGameMode", Kind::Hook, "ArmorHUD,EffectTimer,InventoryEffects,OffhandSlot,Schematica", "Scaffold", ""},
     {"SetSelectedSlot", Kind::Hook, "AutoTool,HandRestock,OffhandSwap", "Zoom", ""},
     {"SettingsFindComponent", Kind::Hook, "", "Menu:settings", ""},
     {"SettingsGroupRegister", Kind::Hook, "", "Menu:settings", ""},
     {"SettingsProviderCall", Kind::Hook, "", "Menu:settings", ""},
-    {"ShulkerContentsText", Kind::Hook, "ShulkerPreview:tooltip", "", ""},
     {"SubChunkSetBlock", Kind::Hook, "Schematica", "", ""},
     {"SubChunkStoragePredicate", Kind::Hook, "Schematica", "", ""},
     {"TradeCurrentTier", Kind::Hook, "", "ItemScroller", ""},
@@ -99,7 +111,7 @@ const std::vector<Entry> kTable = {
     {"TradeTierTotal", Kind::Hook, "", "ItemScroller", ""},
     {"TradeTierUnlocked", Kind::Hook, "", "ItemScroller", ""},
     {"TradeTierVisible", Kind::Hook, "", "ItemScroller", ""},
-    {"UiDefLookup", Kind::Hook, "InventoryHUD,Schematica:page,ShulkerPreview:icons", "ItemScroller", ""},
+    {"UiDefLookup", Kind::Hook, "ArmorHUD,EffectTimer,InventoryEffects,InventoryHUD,OffhandSlot,Schematica:page,ShulkerPreview:icons,ShulkerPreview:tooltip", "ItemScroller", ""},
     {"UiEventDispatch", Kind::Hook, "Schematica:page", "", ""},
     {"UiSliderPublish", Kind::Hook, "", "Schematica:page", ""},
     {"ViewVector", Kind::Hook, "", "FreeCamera,Scaffold", ""},
@@ -110,26 +122,7 @@ const std::vector<Entry> kTable = {
     {"PeekMessageW", Kind::Hook, "", "Menu:settings", ""},
     {"PlaySound", Kind::Hook, "", "Menu:sound", ""},
     {"Present", Kind::Hook, "", "Schematica", ""},
-    {"Present1", Kind::Hook, "", "", ""},
-    {"ExecuteCommandLists", Kind::Hook, "", "", ""},
     {"NameTagStage", Kind::Hook, "Schematica:boxes", "", ""},
-    {"NameTagStageCaller", Kind::Hook, "Schematica:boxes", "", ""},
-    {"D3D12ResourceBarrier", Kind::Hook, "", "", ""},
-    {"D3D12DrawIndexedInstanced", Kind::Hook, "", "", ""},
-    {"D3D12DrawInstanced", Kind::Hook, "", "", ""},
-    {"D3D12SetPipelineState", Kind::Hook, "", "", ""},
-    {"D3D12CreateGraphicsPipelineState", Kind::Hook, "", "", ""},
-    {"D3D12CommandListReset", Kind::Hook, "", "", ""},
-    {"D3D12ResolveSubresource", Kind::Hook, "", "", ""},
-    {"D3D12ClearRenderTargetView", Kind::Hook, "", "", ""},
-    {"D3D12SetMarker", Kind::Hook, "", "", ""},
-    {"D3D12BeginEvent", Kind::Hook, "", "", ""},
-    {"D3D12EndEvent", Kind::Hook, "", "", ""},
-    {"D3D12ExecuteIndirect", Kind::Hook, "", "", ""},
-    {"D3D12OMSetRenderTargets", Kind::Hook, "", "", ""},
-    {"D3D12CommandListClose", Kind::Hook, "", "", ""},
-    {"D3D12RSSetViewports", Kind::Hook, "", "", ""},
-    {"D3D12ClearDepthStencilView", Kind::Hook, "", "", ""},
     {"NtCreateFile", Kind::Hook, "", "Menu:keys,Menu:titleVersion", ""},
     {"NtOpenFile", Kind::Hook, "", "Menu:keys,Menu:titleVersion", ""},
     {"FreeCamera.CameraPosition", Kind::Patch, "FreeCamera", "Schematica", ""},
@@ -140,6 +133,7 @@ const std::vector<Entry> kTable = {
     {"NoRender.block", Kind::Patch, "NoRender:block", "", ""},
     {"NoRender.blockEntity", Kind::Patch, "NoRender:blockEntity", "", ""},
     {"NoRender.entity", Kind::Patch, "NoRender:entity", "", ""},
+    {"NoRender.item", Kind::Patch, "NoRender:item", "", ""},
     {"NoRender.fog", Kind::Patch, "NoRender:fog", "", ""},
     {"NoRender.sky", Kind::Patch, "NoRender:sky", "", ""},
     {"NoRender.particle", Kind::Patch, "NoRender:particle", "", ""},
@@ -147,6 +141,10 @@ const std::vector<Entry> kTable = {
     {"NoRender.nameTag", Kind::Patch, "NoRender:nameTag", "", ""},
     {"NoRender.shadow", Kind::Patch, "NoRender:shadow", "", ""},
     {"NoRender.cursor", Kind::Patch, "NoRender:cursor", "", ""},
+    {"NoBlockAnimation.Render", Kind::Patch, "NoBlockAnimation", "", ""},
+    {"ExtendedFov.RenderClamp", Kind::Patch, "ExtendedFov", "", ""},
+    {"ExtendedStructureSize.Screen", Kind::Patch, "ExtendedStructureSize", "", ""},
+    {"ExtendedStructureSize.Server", Kind::Patch, "ExtendedStructureSize", "", ""},
 };
 
 bool listHas(std::string_view list, std::string_view feature)
@@ -167,8 +165,7 @@ bool listHas(std::string_view list, std::string_view feature)
 }
 
 void appendSection(std::string& out, const char* title, Kind kind,
-                   const std::map<std::string, bool>& values,
-                   const std::vector<std::pair<std::string, bool>>& unknown)
+                   const std::map<std::string, bool>& values)
 {
     out += "  \"";
     out += title;
@@ -182,7 +179,7 @@ void appendSection(std::string& out, const char* title, Kind kind,
     std::sort(rows.begin(), rows.end(), [](const Entry* a, const Entry* b) {
         return std::string_view(a->name) < std::string_view(b->name);
     });
-    const std::size_t total = rows.size() + unknown.size();
+    const std::size_t total = rows.size();
     std::size_t written = 0;
     for (const Entry* e : rows) {
         const auto it = values.find(e->name);
@@ -220,16 +217,7 @@ void appendSection(std::string& out, const char* title, Kind kind,
         out += note;
         out += "\n";
     }
-    for (const auto& [name, on] : unknown) {
-        out += "    ";
-        out += nlohmann::json(name).dump();
-        out += ": ";
-        out += on ? "true" : "false";
-        if (++written < total) {
-            out += ",";
-        }
-        out += "   // unknown name (typo?) - has no effect\n";
-    }
+
     out += "  }";
 }
 
@@ -262,9 +250,7 @@ bool blockedBy(std::string_view feature, const std::vector<std::string>& off)
     return anyOfSeen && !anyOfAlive;
 }
 
-std::string render(const std::vector<std::pair<std::string, bool>>& values,
-                   const std::vector<std::pair<std::string, bool>>& unknownHooks,
-                   const std::vector<std::pair<std::string, bool>>& unknownPatches)
+std::string render(const std::vector<std::pair<std::string, bool>>& values)
 {
     const std::map<std::string, bool> map(values.begin(), values.end());
     std::string out;
@@ -277,9 +263,9 @@ std::string render(const std::vector<std::pair<std::string, bool>>& values,
     out += "//   Names missing here are treated as on (true). Names added by a game update are written as true.\n";
     out += "//   Everything defaults to true.\n";
     out += "{\n";
-    appendSection(out, "hooks", Kind::Hook, map, unknownHooks);
+    appendSection(out, "hooks", Kind::Hook, map);
     out += ",\n";
-    appendSection(out, "patches", Kind::Patch, map, unknownPatches);
+    appendSection(out, "patches", Kind::Patch, map);
     out += "\n}\n";
     return out;
 }
@@ -297,16 +283,22 @@ bool parse(std::string_view text, std::vector<std::pair<std::string, bool>>& hoo
     if (root.is_discarded() || !root.is_object()) {
         return false;
     }
+    for (const char* key : {"hooks", "patches"}) {
+        if (const auto it = root.find(key); it != root.end() && !it->is_object()) {
+            return false;
+        }
+    }
     const auto read = [&root, invalid](const char* key, std::vector<std::pair<std::string, bool>>& out) {
         const auto it = root.find(key);
-        if (it == root.end() || !it->is_object()) {
+        if (it == root.end()) {
             return;
         }
         for (const auto& [name, value] : it->items()) {
             if (value.is_boolean()) {
                 out.emplace_back(name, value.get<bool>());
-            } else if (invalid != nullptr) {
-                invalid->push_back(std::string(key) + "." + name);
+            } else {
+                out.emplace_back(name, true);
+                if (invalid != nullptr) invalid->push_back(std::string(key) + "." + name);
             }
         }
     };

@@ -63,7 +63,6 @@ int g_hoverIndex = -1;
 unsigned long long g_hoverMs = 0;
 
 std::atomic<void*> g_clientCtrl{nullptr};
-std::atomic<void*> g_clientModel{nullptr};
 std::atomic<void*> g_clientOwner{nullptr};
 std::atomic<int> g_unlockTier{-1};
 SRWLOCK g_viewLock = SRWLOCK_INIT;
@@ -86,7 +85,6 @@ std::uintptr_t g_nameLabelBegin = 0;
 std::uintptr_t g_nameLabelEnd = 0;
 using CurrentTierFn = int(__fastcall*)(void* owner);
 CurrentTierFn g_currentTierOriginal = nullptr;
-std::ptrdiff_t g_selectedIndexOffset = -1;
 constexpr std::ptrdiff_t kOfferBytes = 0x1b0;
 
 std::atomic<int> g_faults{0};
@@ -423,19 +421,7 @@ void onScansReady()
             g_traderIdOffset = disp;
         }
     }
-    if (const std::byte* sel = scanner.address(Target::TradeSelectModel); sel != nullptr && memory::isReadable(sel, 0x200)) {
-        for (std::size_t k = 0; k + 8 <= 0x200; ++k) {
-            if (static_cast<std::uint8_t>(sel[k]) == 0x41 && static_cast<std::uint8_t>(sel[k + 1]) == 0x89
-                && static_cast<std::uint8_t>(sel[k + 2]) == 0x94 && static_cast<std::uint8_t>(sel[k + 3]) == 0x24) {
-                std::int32_t disp = 0;
-                std::memcpy(&disp, sel + k + 4, 4);
-                if (disp > 0 && disp < 0x1000) {
-                    g_selectedIndexOffset = disp;
-                }
-                break;
-            }
-        }
-    }
+
     const bool jsonOk = resolveJson(static_cast<const std::byte*>(hooks::uiBagSetFunction()));
     g_ready = g_parse != nullptr && g_selTier != nullptr && g_selIndex != nullptr
               && g_getOffer != nullptr && g_selectInvoke != nullptr && g_modelOffset > 0 && jsonOk;
@@ -760,16 +746,10 @@ void setClientScreen(void* ctrl)
     }
     void* const owner = ownerOfModel(model);
     g_clientCtrl.store(model != nullptr ? ctrl : nullptr, std::memory_order_release);
-    g_clientModel.store(model, std::memory_order_release);
     g_clientOwner.store(owner, std::memory_order_release);
     if (model == nullptr && g_viewActive.load(std::memory_order_relaxed)) {
         setFavoriteTier({}, {});
     }
-}
-
-const void* offerRaw(void* ctrl, int tier, int rawIndex)
-{
-    return offer(ctrl, tier, rawIndex);
 }
 
 void setUnlockTier(int maxTier)
@@ -787,16 +767,6 @@ bool callCurrentTierGuarded(void* owner, int& out)
 {
     __try {
         out = g_currentTierOriginal(owner);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-bool readIntGuarded(const void* at, int& out)
-{
-    __try {
-        out = *static_cast<const volatile int*>(at);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -821,48 +791,6 @@ int currentTier(void* ctrl)
         return -1;
     }
     return value;
-}
-
-bool selectedOffer(void* ctrl, int& tier, int& rawIndex)
-{
-    tier = -1;
-    rawIndex = -1;
-    void* const owner = ownerOfCtrl(ctrl);
-    int sel = -1;
-    if (owner == nullptr || g_selectedIndexOffset <= 0
-        || !readIntGuarded(static_cast<const std::byte*>(owner) + g_selectedIndexOffset, sel) || sel < 0) {
-        return false;
-    }
-    const std::byte* begin = nullptr;
-    for (int t = 0; t < 8; ++t) {
-        for (int i = 0; i < 64; ++i) {
-            const auto* o = static_cast<const std::byte*>(offerRaw(ctrl, t, i));
-            if (o == nullptr) {
-                break;
-            }
-            if (begin == nullptr || o < begin) {
-                begin = o;
-            }
-        }
-    }
-    if (begin == nullptr) {
-        return false;
-    }
-    const std::byte* want = begin + static_cast<std::ptrdiff_t>(sel) * kOfferBytes;
-    for (int t = 0; t < 8; ++t) {
-        for (int i = 0; i < 64; ++i) {
-            const void* o = offerRaw(ctrl, t, i);
-            if (o == nullptr) {
-                break;
-            }
-            if (o == want) {
-                tier = t;
-                rawIndex = i;
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 namespace {

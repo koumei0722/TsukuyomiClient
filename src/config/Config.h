@@ -4,6 +4,8 @@
 
 #include <string>
 #include <string_view>
+#include <initializer_list>
+#include <set>
 
 namespace tsukuyomi {
 
@@ -17,8 +19,9 @@ public:
 
     nlohmann::json& section(std::string_view name);
 
-    void eraseSection(std::string_view name);
-    bool renameSection(std::string_view from, std::string_view to);
+    void pruneUnclaimed();
+    static bool ensureBool(nlohmann::json& node, std::string_view key, bool fallback);
+    static void keepOnly(nlohmann::json& node, std::initializer_list<std::string_view> keys);
 
     static int getInt(const nlohmann::json& node, std::string_view key, int fallback);
     static float getFloat(const nlohmann::json& node, std::string_view key, float fallback);
@@ -28,7 +31,10 @@ private:
     Config() = default;
 
     nlohmann::json m_root = nlohmann::json::object();
+    std::set<std::string, std::less<>> m_claimed;
+    std::set<std::string, std::less<>> m_dropped;
     std::string m_written;
+    bool m_unreadable = false;
 };
 
 }

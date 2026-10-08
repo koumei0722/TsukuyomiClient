@@ -1,8 +1,11 @@
 #include "modules/CreativeNoClip.h"
 
+#include "config/Config.h"
 #include "core/Logger.h"
 #include "game/Abilities.h"
 #include "memory/Scanner.h"
+#include "modules/DebugScreen.h"
+#include "ui/Menu.h"
 
 #include <Windows.h>
 
@@ -11,6 +14,27 @@
 namespace tsukuyomi {
 
 namespace {
+
+constexpr std::size_t kRoomStanding = 0xc;
+
+int accessFilter(unsigned long code)
+{
+    return code == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool swapByte(void* at, std::uint8_t from, std::uint8_t to)
+{
+    __try {
+        auto* const byte = static_cast<volatile std::uint8_t*>(at);
+        if (*byte != from) {
+            return false;
+        }
+        *byte = to;
+        return true;
+    } __except (accessFilter(GetExceptionCode())) {
+        return false;
+    }
+}
 
 long long nowMs()
 {
@@ -57,9 +81,35 @@ bool CreativeNoClip::available() const
     return Scanner::instance().found(Target::AbilitiesAccess);
 }
 
-bool CreativeNoClip::mayFly(std::byte* layered)
+MenuItem CreativeNoClip::buildMenu()
 {
-    std::byte* const slot = abilities::slotOf(layered, abilities::kMayFly);
+    std::vector<MenuItem> children;
+    children.push_back(enabledItem());
+    children.push_back(toggleKeyItem());
+    children.push_back(menu::toggle(
+        L"Only while flying", [this] { return m_onlyWhileFlying.load(std::memory_order_relaxed); },
+        [this] { m_onlyWhileFlying.store(!m_onlyWhileFlying.load(std::memory_order_relaxed), std::memory_order_relaxed); }));
+    MenuItem item = menu::submenu(name(), std::move(children));
+    item.available = [this] { return available(); };
+    item.isOn = [this] { return enabled(); };
+    return item;
+}
+
+void CreativeNoClip::loadConfig(const nlohmann::json& section)
+{
+    Module::loadConfig(section);
+    m_onlyWhileFlying.store(Config::getBool(section, "onlyWhileFlying", true), std::memory_order_relaxed);
+}
+
+void CreativeNoClip::saveConfig(nlohmann::json& section) const
+{
+    Module::saveConfig(section);
+    section["onlyWhileFlying"] = m_onlyWhileFlying.load(std::memory_order_relaxed);
+}
+
+bool CreativeNoClip::readBoolAbility(std::byte* layered, int index)
+{
+    std::byte* const slot = abilities::slotOf(layered, index);
     if (slot == nullptr) {
         return false;
     }
@@ -82,10 +132,17 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
     if (!abilities::looksValid(layered)) {
         return;
     }
+    m_ledger.observeWorld(DebugScreen::worldEntry());
 
-    const bool allowed = active && mayFly(layered);
+    const bool canFly = active && readBoolAbility(layered, abilities::kMayFly);
+    const bool forceFlying = canFly && !m_onlyWhileFlying.load(std::memory_order_relaxed);
+    const bool allowed = canFly && (forceFlying || readBoolAbility(layered, abilities::kFlying));
+    const bool wasClipping = m_clipping.exchange(allowed, std::memory_order_relaxed);
+    if (allowed && !wasClipping) {
+        m_noClipFromMs.store(nowMs() + kFlyingLeadMs, std::memory_order_relaxed);
+    }
 
-    if (allowed) {
+    if (forceFlying) {
         setBoolAbility(layered, abilities::kFlying, 1);
     }
 
@@ -94,6 +151,9 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
         const bool noClipReady =
             allowed && nowMs() >= m_noClipFromMs.load(std::memory_order_relaxed);
         setBoolAbility(layered, abilities::kNoClip, noClipReady ? 1 : 0);
+        if (!m_active.load(std::memory_order_seq_cst)) {
+            m_ledger.markDirty(layered);
+        }
         return;
     }
 
@@ -107,9 +167,32 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
     }
 }
 
+bool CreativeNoClip::beforePoseDecision(void* room)
+{
+    if (!m_clipping.load(std::memory_order_relaxed) || room == nullptr) {
+        return false;
+    }
+    if (!swapByte(static_cast<std::byte*>(room) + kRoomStanding, 0, 1)) {
+        return false;
+    }
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        log().info(L"CreativeNoClip: told the pose decision there is standing room (no auto sneak / crawl)");
+    }
+    return true;
+}
+
+void CreativeNoClip::afterPoseDecision(void* room)
+{
+    swapByte(static_cast<std::byte*>(room) + kRoomStanding, 1, 0);
+}
+
 void CreativeNoClip::onEnabledChanged(bool enabled)
 {
-    m_active.store(enabled, std::memory_order_relaxed);
+    m_active.store(enabled, std::memory_order_seq_cst);
+    if (!enabled) {
+        m_clipping.store(false, std::memory_order_relaxed);
+    }
 
     if (enabled) {
         m_restorePending.store(false, std::memory_order_relaxed);
@@ -135,7 +218,7 @@ void CreativeNoClip::shutdown()
         return;
     }
 
-    m_active.store(false, std::memory_order_relaxed);
+    m_active.store(false, std::memory_order_seq_cst);
     m_ledger.markAllDirty();
     m_restorePending.store(true, std::memory_order_relaxed);
 

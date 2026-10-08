@@ -30,6 +30,17 @@ struct Box {
     std::int32_t x1 = 0, y1 = 0, z1 = 0;
 };
 
+struct CellPos {
+    std::int32_t x = 0, y = 0, z = 0;
+    bool operator==(const CellPos&) const = default;
+};
+struct CellPosHash {
+    std::size_t operator()(const CellPos& pos) const noexcept;
+};
+
+std::vector<CellPos> regionChunks(const std::vector<Box>& boxes, std::size_t limit,
+                                  bool& truncated);
+
 std::uint64_t packCell(std::int32_t x, std::int32_t y, std::int32_t z);
 
 class CellIndex {
@@ -52,7 +63,7 @@ private:
     std::uint64_t m_sz = 0;
     bool m_dense = false;
     std::vector<std::uint32_t> m_slots;
-    std::unordered_map<std::uint64_t, std::uint32_t> m_sparse;
+    std::unordered_map<CellPos, std::uint32_t, CellPosHash> m_sparse;
     std::size_t m_count = 0;
 };
 
@@ -67,7 +78,6 @@ struct Loaded {
     bool ok() const { return data != nullptr; }
 };
 Loaded loadBlueprint(const std::filesystem::path& path);
-Loaded loadBlueprintBytes(const char* bytes, std::size_t size);
 
 struct Placement {
     std::shared_ptr<const structure::Structure> data;
@@ -76,6 +86,7 @@ struct Placement {
     std::int32_t y = 0;
     std::int32_t z = 0;
     int rotation = 0;
+    std::wstring name;
 };
 
 std::size_t assignPaletteBases(std::vector<Placement>& placements);

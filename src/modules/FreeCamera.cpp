@@ -3,6 +3,7 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "game/GameData.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
@@ -29,6 +30,78 @@ int accessViolationFilter(unsigned long code)
     return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR)
                ? EXCEPTION_EXECUTE_HANDLER
                : EXCEPTION_CONTINUE_SEARCH;
+}
+
+constexpr std::uint32_t kDirectLookTypeId = 0xCEB578F1u;
+constexpr std::size_t kDirectLookStride = 0x14;
+constexpr std::uint32_t kOrbitTypeId = 0x2F0FC33Fu;
+constexpr std::size_t kOrbitStride = 0x4c;
+constexpr std::size_t kOrbitAngles = 0x24;
+
+bool readCameraContext(const void* frame, int offset, std::uintptr_t& registry, std::uint32_t& id)
+{
+    __try {
+        const auto* const ctx = static_cast<const char*>(frame) + offset;
+        if (*reinterpret_cast<const std::uint8_t*>(ctx + 0x18) != 1) {
+            return false;
+        }
+        registry = *reinterpret_cast<const std::uintptr_t*>(ctx + 0x08);
+        id = *reinterpret_cast<const std::uint32_t*>(ctx + 0x10);
+        return registry != 0;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
+bool cameraComponentAt(std::uintptr_t registry, std::uint32_t id, std::uint32_t typeId, std::size_t stride,
+                       std::uintptr_t& at)
+{
+    __try {
+        const std::uintptr_t first = *reinterpret_cast<const std::uintptr_t*>(registry + 0x68);
+        const std::uintptr_t last = *reinterpret_cast<const std::uintptr_t*>(registry + 0x70);
+        if (first == 0 || last <= first || (last - first) % 0x20 != 0) {
+            return false;
+        }
+        const std::uintptr_t entries = (last - first) / 0x20;
+        std::uintptr_t store = 0;
+        for (std::uintptr_t i = 0; i < entries && i < 4096; ++i) {
+            const std::uintptr_t entry = first + i * 0x20;
+            if (*reinterpret_cast<const std::uint32_t*>(entry + 0x08) == typeId) {
+                store = *reinterpret_cast<const std::uintptr_t*>(entry + 0x10);
+                break;
+            }
+        }
+        if (store == 0) {
+            return false;
+        }
+        const std::uint32_t low = id & 0x3ffffu;
+        const std::uint32_t page = low >> 11;
+        const std::uintptr_t pagesBegin = *reinterpret_cast<const std::uintptr_t*>(store + 0x08);
+        const std::uintptr_t pagesEnd = *reinterpret_cast<const std::uintptr_t*>(store + 0x10);
+        if (pagesBegin == 0 || pagesEnd <= pagesBegin || page >= (pagesEnd - pagesBegin) / 8) {
+            return false;
+        }
+        const std::uintptr_t sparse = *reinterpret_cast<const std::uintptr_t*>(pagesBegin + page * 8);
+        if (sparse == 0) {
+            return false;
+        }
+        const std::uint32_t packed = *reinterpret_cast<const std::uint32_t*>(sparse + (low & 0x7ffu) * 4);
+        if (((id & 0xfffc0000u) ^ packed) > 0x3fffeu) {
+            return false;
+        }
+        const std::uintptr_t table = *reinterpret_cast<const std::uintptr_t*>(store + 0x50);
+        if (table == 0) {
+            return false;
+        }
+        const std::uintptr_t dense = *reinterpret_cast<const std::uintptr_t*>(table + ((packed >> 4) & 0x3ff8u));
+        if (dense == 0) {
+            return false;
+        }
+        at = dense + (packed & 0x7fu) * stride;
+        return true;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
 }
 
 constexpr std::uint32_t kUpDownEdge = (1u << 22) | (1u << 23) | (1u << 24) | (1u << 25);
@@ -91,7 +164,7 @@ void FreeCamera::onMoveInput(void* input)
         return;
     }
 
-    if (!enabled() || !input::isInGameplay()) {
+    if (!active() || !input::isInGameplay()) {
         return;
     }
     dropUpDownBitsGuarded(static_cast<std::byte*>(input));
@@ -99,7 +172,7 @@ void FreeCamera::onMoveInput(void* input)
 
 void FreeCamera::onMoveIntent(void* out, void* input)
 {
-    if (out == nullptr || !enabled() || !input::isInGameplay()) {
+    if (out == nullptr || !active() || !input::isInGameplay()) {
         return;
     }
     float took[2]{};
@@ -116,13 +189,11 @@ void FreeCamera::onMoveIntent(void* out, void* input)
 
 }
 
-bool takeRawUpDownGuarded(std::byte* out, std::uint32_t* bits, float* move)
+bool takeRawUpDownGuarded(std::byte* out, std::uint32_t* bits)
 {
     __try {
         const std::uint32_t raw = *reinterpret_cast<const std::uint32_t*>(out + 0x00);
         *bits = raw;
-        move[0] = *reinterpret_cast<const float*>(out + 0x04);
-        move[1] = *reinterpret_cast<const float*>(out + 0x08);
         constexpr std::uint32_t drop = (1u << 7) | (1u << 0);
         if ((raw & drop) != 0) {
             *reinterpret_cast<std::uint32_t*>(out + 0x00) = raw & ~drop;
@@ -153,12 +224,11 @@ bool takeInputGatherGuarded(std::byte* out, std::uint32_t* bits, float* move)
 
 void FreeCamera::onInputGatherBefore(void* out)
 {
-    if (out == nullptr || !enabled() || !input::isInGameplay()) {
+    if (out == nullptr || !active() || !input::isInGameplay()) {
         return;
     }
     std::uint32_t bits = 0;
-    float move[2]{};
-    if (!takeRawUpDownGuarded(static_cast<std::byte*>(out), &bits, move)) {
+    if (!takeRawUpDownGuarded(static_cast<std::byte*>(out), &bits)) {
         return;
     }
     const std::uint64_t now = GetTickCount64();
@@ -172,7 +242,7 @@ void FreeCamera::onInputGatherBefore(void* out)
 
 void FreeCamera::onInputGather(void* out, void* src)
 {
-    if (out == nullptr || !enabled() || !input::isInGameplay()) {
+    if (out == nullptr || !active() || !input::isInGameplay()) {
         return;
     }
     (void)src;
@@ -202,23 +272,9 @@ float FreeCamera::cameraYaw(const float* q)
     return 2.0f * std::atan2(qy, qw) * (180.0f / std::numbers::pi_v<float>);
 }
 
-float FreeCamera::movementOffset() const
+bool FreeCamera::directionHeld() const
 {
-    const bool forward = held(MoveKey::Forward);
-    const bool back = held(MoveKey::Back);
-    const bool left = held(MoveKey::Left);
-    const bool right = held(MoveKey::Right);
-
-    if (forward && left)  return -45.0f;
-    if (forward && right) return 45.0f;
-    if (back && left)     return -135.0f;
-    if (back && right)    return 135.0f;
-    if (forward)          return 0.0f;
-    if (back)             return 180.0f;
-    if (left)             return -90.0f;
-    if (right)            return 90.0f;
-
-    return kNoMovement;
+    return held(MoveKey::Forward) || held(MoveKey::Back) || held(MoveKey::Left) || held(MoveKey::Right);
 }
 
 void FreeCamera::onScansReady()
@@ -231,37 +287,63 @@ void FreeCamera::onScansReady()
     for (size_t i = 0; i < kMoveKeyCount; ++i) {
         m_moveButtons[i] = GameButtons::instance().watchButton(names[i]);
     }
+    const auto skipIfMovss = [](std::byte* at, size_t size, const char* name, const wchar_t* what) {
+        if (at == nullptr || movssStoreLength(at) != size) {
+            log().warn(L"FreeCamera: {} is not a {}-byte movss; leaving it alone", what, size);
+            return Patch{};
+        }
+        return makeSkipPatch(at, size, name);
+    };
+
     if (std::byte* const base = Scanner::instance().address(Target::CameraUpdate);
         base != nullptr) {
-        m_patchX = makeNopPatch(base + kWriteX, kWriteSize, "FreeCamera.CameraPosition");
-        m_patchY = makeNopPatch(base + kWriteY, kWriteSize, "FreeCamera.CameraPosition");
-        m_patchZ = makeNopPatch(base + kWriteZ, kWriteSize, "FreeCamera.CameraPosition");
+        const auto positionPatch = [&](std::byte* store, const wchar_t* what) -> Patch {
+            if ((reinterpret_cast<std::uintptr_t>(store) & 63) != 63) {
+                return skipIfMovss(store, kWriteSize, "FreeCamera.CameraPosition", what);
+            }
+            const auto* const s = reinterpret_cast<const unsigned char*>(store);
+            const auto* const l = s - kWriteSize;
+            const bool shaped = memory::isReadable(l, 2 * kWriteSize) && movssStoreLength(store) == kWriteSize
+                                && l[0] == 0xF3 && l[1] == 0x0F && l[2] == 0x10 && (l[3] >> 6) == 1 && (s[3] >> 6) == 1
+                                && ((l[3] >> 3) & 7) == ((s[3] >> 3) & 7) && l[4] == s[4] && (l[3] & 7) != 4
+                                && (s[3] & 7) != 4;
+            if (!shaped) {
+                log().warn(L"FreeCamera: {} is not a movss load/store pair; leaving it alone", what);
+                return Patch{};
+            }
+            const auto modrm = static_cast<std::byte>((l[3] & 0xF8) | (s[3] & 7));
+            return makeAtomicPatch(store - kWriteSize + 3, {modrm}, "FreeCamera.CameraPosition");
+        };
+        m_patchX = positionPatch(base + kWriteX, L"the camera x write");
+        m_patchY = positionPatch(base + kWriteY, L"the camera y write");
+        m_patchZ = positionPatch(base + kWriteZ, L"the camera z write");
+
+        const std::byte* const ctx = Scanner::instance().address(Target::CameraUpdateContext);
+        if (ctx != nullptr && ctx < base && base - ctx < 0x400) {
+            const int offset = static_cast<int>(std::to_integer<unsigned>(ctx[0x11]));
+            const int flag = static_cast<int>(std::to_integer<unsigned>(ctx[0x1A]));
+            if (flag == offset + 0x18) {
+                m_ctxOffset = offset;
+            }
+        }
+        if (m_ctxOffset < 0) {
+            log().warn(L"FreeCamera: the camera context was not found; FreeLook is unavailable");
+        }
     }
 
     if (std::byte* const rot = Scanner::instance().address(Target::PlayerRotation);
         rot != nullptr) {
-        m_patchYaw = makeNopPatch(rot + kWriteYaw, kWriteYawSize, "FreeCamera.BodyRotation");
-        m_patchPitch = makeNopPatch(rot + kWritePitch, kWritePitchSize, "FreeCamera.BodyRotation");
-        m_patchYawFollow = makeNopPatch(rot + kWriteYawFollow, kWriteYawFollowSize, "FreeCamera.BodyRotation");
+        m_patchYaw = skipIfMovss(rot + kWriteYaw, kWriteYawSize, "FreeCamera.BodyRotation", L"the body yaw write");
+        m_patchPitch = skipIfMovss(rot + kWritePitch, kWritePitchSize, "FreeCamera.BodyRotation", L"the body pitch write");
+        m_patchYawFollow = skipIfMovss(rot + kWriteYawFollow, kWriteYawFollowSize, "FreeCamera.BodyRotation",
+                                       L"the body yaw-follow write");
     } else {
         log().warn(L"FreeCamera: the player rotation site was not found; "
                    L"the body will turn with the camera");
     }
 
-    const auto looksMovss = [](const std::byte* at) {
-        if (at == nullptr || !memory::isReadable(at, 4)) {
-            return false;
-        }
-        const auto* const b = reinterpret_cast<const unsigned char*>(at);
-        return (b[0] == 0xF3 && b[1] == 0x0F && b[2] == 0x11)
-               || (b[0] == 0xF3 && b[1] == 0x44 && b[2] == 0x0F && b[3] == 0x11);
-    };
     const auto nopIfMovss = [&](std::byte* at, size_t size, const wchar_t* what) {
-        if (!looksMovss(at)) {
-            log().warn(L"FreeCamera: {} does not look like a movss; leaving it alone", what);
-            return Patch{};
-        }
-        return makeNopPatch(at, size, "FreeCamera.HeadRotation");
+        return skipIfMovss(at, size, "FreeCamera.HeadRotation", what);
     };
 
     if (std::byte* const head = Scanner::instance().address(Target::PlayerHeadRotation);
@@ -289,10 +371,13 @@ void FreeCamera::onScansReady()
 
     if (std::byte* const view = Scanner::instance().address(Target::ViewPerspective);
         view != nullptr) {
-        m_patchPerspective = Patch(view,
-                                   {std::byte{0xB8}, kThirdPersonBack, std::byte{0x00}, std::byte{0x00},
-                                    std::byte{0x00}, std::byte{0xC3}},
-                                   "FreeCamera.ThirdPerson");
+        static constexpr std::byte kStub[] = {std::byte{0xB8}, kThirdPersonBack, std::byte{0x00}, std::byte{0x00},
+                                              std::byte{0x00}, std::byte{0xC3}};
+        m_patchPerspective = makeStubPatch(view, kStub, "FreeCamera.ThirdPerson");
+        if (!m_patchPerspective.valid()) {
+            log().warn(L"FreeCamera: the third-person stub was not placed (no room after the view perspective getter, "
+                       L"or turned off in hooks.json); the view will stay in first person");
+        }
     } else {
         log().warn(L"FreeCamera: the view perspective getter was not found; "
                    L"the view will stay in first person");
@@ -302,9 +387,24 @@ void FreeCamera::onScansReady()
 MenuItem FreeCamera::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
+    children.push_back(menu::keybind(
+        L"FreeCamera key", [this] { return m_cameraKey.combo(); },
+        [this](std::vector<int> combo) {
+            m_cameraKey.set(std::move(combo));
+            log().info(L"FreeCamera: camera key set to {}", m_cameraKey.name());
+        },
+        {}));
+    bindPad(children.back(), m_cameraKey);
+    children.push_back(menu::keybind(
+        L"FreeLook key", [this] { return m_lookKey.combo(); },
+        [this](std::vector<int> combo) {
+            m_lookKey.set(std::move(combo));
+            log().info(L"FreeCamera: FreeLook key set to {}", m_lookKey.name());
+        },
+        {}));
+    bindPad(children.back(), m_lookKey);
     children.push_back(menu::number(
         L"Speed", [this] { return m_speed; },
         [this](float value) { m_speed = std::clamp(value, kMinSpeed, kMaxSpeed); }, false,
@@ -320,64 +420,209 @@ void FreeCamera::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
 
+    std::vector<int> combo;
+    if (const auto it = section.find("cameraKeys"); it != section.end() && it->is_array()) {
+        for (const auto& value : *it) {
+            if (value.is_number_integer()) {
+                combo.push_back(value.get<int>());
+            }
+        }
+    }
+    m_cameraKey.set(std::move(combo));
+
+    std::vector<int> lookCombo;
+    if (const auto it = section.find("lookKeys"); it != section.end() && it->is_array()) {
+        for (const auto& value : *it) {
+            if (value.is_number_integer()) {
+                lookCombo.push_back(value.get<int>());
+            }
+        }
+    }
+    m_lookKey.set(std::move(lookCombo));
+
     m_speed = std::clamp(Config::getFloat(section, "speed", kDefaultSpeed), kMinSpeed, kMaxSpeed);
 }
 
 void FreeCamera::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
+    section["cameraKeys"] = m_cameraKey.combo();
+    section["lookKeys"] = m_lookKey.combo();
     section["speed"] = m_speed;
 }
 
 void FreeCamera::onEnabledChanged(bool enabled)
 {
-    if (enabled) {
+    if (!enabled) {
+        setActive(false);
+    }
+}
+
+void FreeCamera::onUpdate()
+{
+    const bool pressed = m_cameraKey.triggered();
+    if (pressed && enabled() && input::isInGameplay() && m_look.load(std::memory_order_acquire) == kLookIdle) {
+        setActive(!active());
+    }
+    updateLook();
+}
+
+void FreeCamera::freezeBody(bool on)
+{
+    Patch* const patches[] = {&m_patchYaw,        &m_patchPitch,     &m_patchYawFollow,
+                              &m_patchHead,       &m_patchHeadPair,  &m_patchHeadAlt,
+                              &m_patchHeadAltPair, &m_patchHeadInput, &m_patchHeadInputPair};
+    Patch::setAll(patches, on);
+}
+
+void FreeCamera::updateLook()
+{
+    const bool want = enabled() && !active() && m_ctxOffset >= 0 && !m_lookKey.empty() && m_lookKey.isDown()
+                      && input::isInGameplay();
+    switch (m_look.load(std::memory_order_acquire)) {
+    case kLookIdle:
+        if (want) {
+            if (!GameData::instance().hasLivePlayer()) {
+                GameData::instance().findPlayerFromClient(hooks::gameClientInstance());
+            }
+            m_hasFrozenView = false;
+            m_lookRestored.store(false, std::memory_order_release);
+            m_lookSnapped.store(false, std::memory_order_release);
+            m_lookSnapWanted.store(true, std::memory_order_release);
+            m_look.store(kLookHolding, std::memory_order_release);
+            freezeBody(true);
+        }
+        break;
+    case kLookHolding:
+        if (!want) {
+            if (m_lookPerspective) {
+                m_patchPerspective.restore();
+                m_lookPerspective = false;
+            }
+            m_lookReleasedAt = GetTickCount64();
+            m_look.store(kLookReleasing, std::memory_order_release);
+        } else if (!m_lookPerspective && m_lookSnapped.load(std::memory_order_acquire)) {
+            m_patchPerspective.apply();
+            m_lookPerspective = true;
+        }
+        break;
+    case kLookReleasing: {
+        const bool restored = m_lookRestored.load(std::memory_order_acquire);
+        if (restored || GetTickCount64() - m_lookReleasedAt >= kLookRestoreTimeoutMs) {
+            if (!restored) {
+                static std::atomic<int> warned{0};
+                if (warned.fetch_add(1, std::memory_order_relaxed) < 3) {
+                    log().warn(L"FreeLook: the original camera did not come back in time; released without "
+                               L"turning the camera back");
+                }
+            }
+            if (!active()) {
+                freezeBody(false);
+            }
+            m_look.store(kLookIdle, std::memory_order_release);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void FreeCamera::takeLookSnapshot(void* frame)
+{
+    m_lookSnapValid = false;
+    LookSnapshot snap{};
+    if (readCameraContext(frame, m_ctxOffset, snap.registry, snap.id)) {
+        std::uintptr_t at = 0;
+        if (cameraComponentAt(snap.registry, snap.id, kDirectLookTypeId, kDirectLookStride, at)) {
+            snap.hasDirect = memory::copyGuarded(reinterpret_cast<const void*>(at), snap.direct, sizeof(snap.direct));
+        }
+        if (cameraComponentAt(snap.registry, snap.id, kOrbitTypeId, kOrbitStride, at)) {
+            snap.hasOrbit = memory::copyGuarded(reinterpret_cast<const void*>(at + kOrbitAngles), snap.orbit,
+                                                sizeof(snap.orbit));
+        }
+        m_lookSnap = snap;
+        m_lookSnapValid = snap.hasDirect || snap.hasOrbit;
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+            log().info(L"FreeLook: held the camera direction (camera {:#x}:{:#x}, direct look {}, orbit {})",
+                       snap.registry, snap.id, snap.hasDirect ? L"yes" : L"no", snap.hasOrbit ? L"yes" : L"no");
+        }
+    }
+    m_lookSnapped.store(true, std::memory_order_release);
+}
+
+bool FreeCamera::restoreLookSnapshot(void* frame)
+{
+    if (!m_lookSnapValid) {
+        return true;
+    }
+    std::uintptr_t registry = 0;
+    std::uint32_t id = 0;
+    if (!readCameraContext(frame, m_ctxOffset, registry, id) || registry != m_lookSnap.registry
+        || id != m_lookSnap.id) {
+        return false;
+    }
+    m_lookSnapValid = false;
+    bool wroteDirect = false;
+    bool wroteOrbit = false;
+    std::uintptr_t at = 0;
+    if (m_lookSnap.hasDirect && cameraComponentAt(registry, id, kDirectLookTypeId, kDirectLookStride, at)) {
+        wroteDirect = memory::writeGuarded(reinterpret_cast<void*>(at), m_lookSnap.direct, sizeof(m_lookSnap.direct));
+    }
+    if (m_lookSnap.hasOrbit && cameraComponentAt(registry, id, kOrbitTypeId, kOrbitStride, at)) {
+        wroteOrbit = memory::writeGuarded(reinterpret_cast<void*>(at + kOrbitAngles), m_lookSnap.orbit,
+                                          sizeof(m_lookSnap.orbit));
+    }
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+        log().info(L"FreeLook: turned the camera back (camera {:#x}:{:#x}; direct look {}, orbit {})", registry, id,
+                   wroteDirect ? L"yes" : L"no", wroteOrbit ? L"yes" : L"no");
+    }
+    return true;
+}
+
+void FreeCamera::setActive(bool value)
+{
+    if (active() == value) {
+        return;
+    }
+    if (value && !enabled()) {
+        return;
+    }
+    if (value) {
         if (!GameData::instance().hasLivePlayer()) {
             GameData::instance().findPlayerFromClient(hooks::gameClientInstance());
         }
         m_synced = false;
         m_hasFrozenView = false;
-        m_patchX.apply();
-        m_patchY.apply();
-        m_patchZ.apply();
+        m_active.store(true, std::memory_order_release);
+        log().info(L"FreeCamera: camera detached");
 
-        m_patchYaw.apply();
-        m_patchPitch.apply();
-        m_patchYawFollow.apply();
-
-        m_patchHead.apply();
-        m_patchHeadPair.apply();
-        m_patchHeadAlt.apply();
-        m_patchHeadAltPair.apply();
-        m_patchHeadInput.apply();
-        m_patchHeadInputPair.apply();
-
-        m_patchPerspective.apply();
+        Patch* const patches[] = {&m_patchX,          &m_patchY,           &m_patchZ,
+                                  &m_patchYaw,        &m_patchPitch,       &m_patchYawFollow,
+                                  &m_patchHead,       &m_patchHeadPair,    &m_patchHeadAlt,
+                                  &m_patchHeadAltPair, &m_patchHeadInput,  &m_patchHeadInputPair,
+                                  &m_patchPerspective};
+        Patch::setAll(patches, true);
 
     } else {
+        m_active.store(false, std::memory_order_release);
+        log().info(L"FreeCamera: camera returned");
 
-        m_patchX.restore();
-        m_patchY.restore();
-        m_patchZ.restore();
-
-        m_patchYaw.restore();
-        m_patchPitch.restore();
-        m_patchYawFollow.restore();
-        m_patchHead.restore();
-        m_patchHeadPair.restore();
-        m_patchHeadAlt.restore();
-        m_patchHeadAltPair.restore();
-        m_patchHeadInput.restore();
-        m_patchHeadInputPair.restore();
-
-        m_patchPerspective.restore();
+        Patch* const patches[] = {&m_patchX,          &m_patchY,           &m_patchZ,
+                                  &m_patchYaw,        &m_patchPitch,       &m_patchYawFollow,
+                                  &m_patchHead,       &m_patchHeadPair,    &m_patchHeadAlt,
+                                  &m_patchHeadAltPair, &m_patchHeadInput,  &m_patchHeadInputPair,
+                                  &m_patchPerspective};
+        Patch::setAll(patches, false);
 
     }
 }
 
 bool FreeCamera::freezeViewVector(float* out)
 {
-    if (!enabled()) {
+    if (!freezesAim()) {
         m_hasFrozenView = false;
         return false;
     }
@@ -398,7 +643,7 @@ bool FreeCamera::freezeViewVector(float* out)
 
 bool FreeCamera::borrowForChunkReload()
 {
-    if (enabled()) {
+    if (active()) {
         return false;
     }
     if (!m_patchX.valid() || !m_patchY.valid() || !m_patchZ.valid()) {
@@ -412,9 +657,8 @@ bool FreeCamera::borrowForChunkReload()
     if (m_borrowUntil != 0) {
         return false;
     }
-    m_patchX.apply();
-    m_patchY.apply();
-    m_patchZ.apply();
+    Patch* const patches[] = {&m_patchX, &m_patchY, &m_patchZ};
+    Patch::setAll(patches, true);
     m_borrowSynced = false;
     m_borrowUntil = GetTickCount64() + kBorrowMs;
     m_borrowActive.store(true, std::memory_order_release);
@@ -456,26 +700,34 @@ void FreeCamera::endBorrow(std::byte* cameraBase)
         const float position[3] = {m_borrowX, m_borrowY, m_borrowZ};
         memory::writeGuarded(cameraBase + kCameraX, position, sizeof(position));
     }
-    m_patchX.restore();
-    m_patchY.restore();
-    m_patchZ.restore();
+    Patch* const patches[] = {&m_patchX, &m_patchY, &m_patchZ};
+    Patch::setAll(patches, false);
     m_borrowUntil = 0;
     m_borrowSynced = false;
     m_borrowQuietUntil.store(GetTickCount64() + kBorrowQuietMs, std::memory_order_relaxed);
     m_borrowActive.store(false, std::memory_order_release);
 }
 
-void FreeCamera::onCameraWrite(void* cameraBase)
+void FreeCamera::onCameraWrite(void* cameraBase, void* frame)
 {
     if (cameraBase == nullptr) {
         return;
+    }
+    if (frame != nullptr && m_ctxOffset >= 0) {
+        const int look = m_look.load(std::memory_order_acquire);
+        if (look == kLookHolding && m_lookSnapWanted.exchange(false, std::memory_order_acq_rel)) {
+            takeLookSnapshot(frame);
+        } else if (look == kLookReleasing && !m_lookRestored.load(std::memory_order_acquire)
+                   && restoreLookSnapshot(frame)) {
+            m_lookRestored.store(true, std::memory_order_release);
+        }
     }
     if (m_borrowUntil != 0) {
         if (applyBorrow(static_cast<std::byte*>(cameraBase))) {
             return;
         }
     }
-    if (!enabled()) {
+    if (!active()) {
         return;
     }
 
@@ -512,8 +764,16 @@ void FreeCamera::onCameraWrite(void* cameraBase)
             offset = std::atan2(-s, f) * (180.0f / std::numbers::pi_v<float>);
             scale = (len < 1.0f) ? len : 1.0f;
         }
+        m_staleIntentFrames = 0;
+    } else if (directionHeld()) {
+        if (++m_staleIntentFrames == kStaleIntentNotice) {
+            notice::failOnce("FreeCamera.intent",
+                             L"FreeCamera: the movement intent did not arrive while a direction was held for "
+                                 + std::to_wstring(kStaleIntentNotice) + L" frames; the camera does not move sideways",
+                             "FreeCamera cannot move: the game's movement input did not reach it");
+        }
     } else {
-        offset = movementOffset();
+        m_staleIntentFrames = 0;
     }
     if (offset < kNoMovement) {
         const float angle = (cameraYaw(cameraState) + offset + 90.0f)
@@ -537,6 +797,11 @@ void FreeCamera::onCameraWrite(void* cameraBase)
 void FreeCamera::shutdown()
 {
 
+    setActive(false);
+    if (m_look.exchange(kLookIdle, std::memory_order_acq_rel) != kLookIdle) {
+        freezeBody(false);
+    }
+    m_lookPerspective = false;
     m_patchX.restore();
     m_patchY.restore();
     m_patchZ.restore();

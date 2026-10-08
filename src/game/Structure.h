@@ -33,10 +33,6 @@ struct Structure {
     std::int32_t sizeY = 0;
     std::int32_t sizeZ = 0;
 
-    std::int32_t originX = 0;
-    std::int32_t originY = 0;
-    std::int32_t originZ = 0;
-
     std::vector<PaletteEntry> palette;
 
     std::vector<std::int32_t> blocks;
@@ -55,7 +51,6 @@ struct Structure {
 
     const std::string& nameAt(std::int32_t x, std::int32_t y, std::int32_t z) const;
 
-    std::int32_t entryAt(std::int32_t x, std::int32_t y, std::int32_t z, int layer) const;
 };
 
 struct LoadResult {

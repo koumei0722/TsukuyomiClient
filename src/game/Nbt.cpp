@@ -249,7 +249,7 @@ Result read(const char* bytes, std::size_t size)
         return result;
     }
 
-    result.rootName = reader.text();
+    reader.text();
     result.root = readPayload(reader, tag, 0);
     if (!result.root) {
         result.why = reader.why() != nullptr ? reader.why() : "malformed";

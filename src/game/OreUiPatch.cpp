@@ -2,6 +2,7 @@
 #include "config/WriteSwitches.h"
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include <cstdint>
 #include <cstring>
@@ -44,14 +45,12 @@ using NtOpenFileFn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, OBJECT_ATTRIBUTES*, IO_S
 NtCreateFileFn g_realCreate = nullptr;
 NtOpenFileFn g_realOpen = nullptr;
 
-constexpr wchar_t kNeedle[] = L"\\gui\\dist\\hbui\\index-";
-constexpr wchar_t kSuffix[] = L".js";
-
 constexpr wchar_t kUiArchiveTail[] = L"\\resource_packs\\vanilla\\__brarchive\\ui.brarchive";
 
 std::wstring g_patchedNtPath;
 std::wstring g_startScreenNtPath;
 bool g_ready = false;
+const wchar_t* g_failure = nullptr;
 volatile bool g_done = false;
 
 constexpr const char* kOwnIds[] = {
@@ -207,11 +206,21 @@ LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
     return call();
 }
 
+volatile LONG g_inside = 0;
+
+struct InsideScope {
+    InsideScope() { InterlockedIncrement(&g_inside); }
+    ~InsideScope() { InterlockedDecrement(&g_inside); }
+    InsideScope(const InsideScope&) = delete;
+    InsideScope& operator=(const InsideScope&) = delete;
+};
+
 LONG NTAPI detourNtCreateFile(PHANDLE handle, ACCESS_MASK access, OBJECT_ATTRIBUTES* attrs,
                               IO_STATUS_BLOCK* io, LARGE_INTEGER* size, ULONG fileAttrs,
                               ULONG share, ULONG disposition, ULONG options, PVOID ea,
                               ULONG eaLength)
 {
+    const InsideScope inside;
     return withSwap(attrs, [&] {
         return g_realCreate(handle, access, attrs, io, size, fileAttrs, share, disposition,
                             options, ea, eaLength);
@@ -221,6 +230,7 @@ LONG NTAPI detourNtCreateFile(PHANDLE handle, ACCESS_MASK access, OBJECT_ATTRIBU
 LONG NTAPI detourNtOpenFile(PHANDLE handle, ACCESS_MASK access, OBJECT_ATTRIBUTES* attrs,
                             IO_STATUS_BLOCK* io, ULONG share, ULONG options)
 {
+    const InsideScope inside;
     return withSwap(attrs, [&] { return g_realOpen(handle, access, attrs, io, share, options); });
 }
 
@@ -255,6 +265,73 @@ void* makeTrampoline(unsigned char* target, size_t stolen)
     return pad;
 }
 
+struct IpMove {
+    std::uintptr_t from = 0;
+    std::uintptr_t to = 0;
+    std::size_t length = 0;
+};
+
+constexpr std::size_t kMaxFrozen = 2048;
+HANDLE g_frozen[kMaxFrozen]{};
+
+bool writeWithThreadsFrozen(unsigned char* target, const unsigned char* bytes, std::size_t size,
+                            const IpMove* moves, std::size_t moveCount)
+{
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    std::size_t frozen = 0;
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        for (BOOL ok = Thread32First(snap, &te); ok && frozen < kMaxFrozen; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) {
+                continue;
+            }
+            const HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT
+                                                 | THREAD_QUERY_INFORMATION,
+                                             FALSE, te.th32ThreadID);
+            if (thread == nullptr) {
+                continue;
+            }
+            if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+                CloseHandle(thread);
+                continue;
+            }
+            g_frozen[frozen++] = thread;
+        }
+        CloseHandle(snap);
+    }
+    for (std::size_t i = 0; i < frozen; ++i) {
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(g_frozen[i], &ctx) == 0) {
+            continue;
+        }
+        for (std::size_t m = 0; m < moveCount; ++m) {
+            if (ctx.Rip >= moves[m].from && ctx.Rip < moves[m].from + moves[m].length) {
+                ctx.Rip = moves[m].to + (ctx.Rip - moves[m].from);
+                SetThreadContext(g_frozen[i], &ctx);
+                break;
+            }
+        }
+    }
+    bool written = false;
+    DWORD old = 0;
+    if (VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &old) != 0) {
+        std::memcpy(target, bytes, size);
+        VirtualProtect(target, size, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), target, size);
+        written = true;
+    }
+    for (std::size_t i = 0; i < frozen; ++i) {
+        ResumeThread(g_frozen[i]);
+        CloseHandle(g_frozen[i]);
+        g_frozen[i] = nullptr;
+    }
+    return written;
+}
+
 bool hookOne(const char* name, void* detour, void** original,
              unsigned char (&saved)[kStolenMax], size_t& stolenOut)
 {
@@ -278,21 +355,18 @@ bool hookOne(const char* name, void* detour, void** original,
     }
     *original = pad;
 
-    DWORD old = 0;
-    if (VirtualProtect(target, 16, PAGE_EXECUTE_READWRITE, &old) == 0) {
-        return false;
-    }
-    target[0] = 0xFF;
-    target[1] = 0x25;
-    target[2] = 0x00;
-    target[3] = 0x00;
-    target[4] = 0x00;
-    target[5] = 0x00;
+    unsigned char jump[kStolenMax]{};
+    std::memcpy(jump, target, stolen);
+    jump[0] = 0xFF;
+    jump[1] = 0x25;
+    jump[2] = 0x00;
+    jump[3] = 0x00;
+    jump[4] = 0x00;
+    jump[5] = 0x00;
     const auto to = reinterpret_cast<std::uintptr_t>(detour);
-    std::memcpy(target + 6, &to, sizeof(to));
-    VirtualProtect(target, 16, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, 16);
-    return true;
+    std::memcpy(jump + 6, &to, sizeof(to));
+    const IpMove move{reinterpret_cast<std::uintptr_t>(target), reinterpret_cast<std::uintptr_t>(pad), stolen};
+    return writeWithThreadsFrozen(target, jump, stolen, &move, 1);
 }
 
 unsigned char g_savedCreate[kStolenMax]{};
@@ -301,7 +375,7 @@ size_t g_stolenCreate = 0;
 size_t g_stolenOpen = 0;
 bool g_hooked = false;
 
-void unhookOne(const char* name, const unsigned char* saved, size_t stolen)
+void unhookOne(const char* name, const unsigned char* saved, size_t stolen, void* pad)
 {
     HMODULE const ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll == nullptr || stolen == 0) {
@@ -311,13 +385,10 @@ void unhookOne(const char* name, const unsigned char* saved, size_t stolen)
     if (target == nullptr) {
         return;
     }
-    DWORD old = 0;
-    if (VirtualProtect(target, stolen, PAGE_EXECUTE_READWRITE, &old) == 0) {
-        return;
-    }
-    std::memcpy(target, saved, stolen);
-    VirtualProtect(target, stolen, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), target, stolen);
+    const auto p = reinterpret_cast<std::uintptr_t>(pad);
+    const auto t = reinterpret_cast<std::uintptr_t>(target);
+    const IpMove moves[2] = {{p, t, stolen}, {p + stolen, t + stolen, 1}};
+    writeWithThreadsFrozen(target, saved, stolen, pad != nullptr ? moves : nullptr, pad != nullptr ? 2 : 0);
 }
 
 std::wstring versionDir()
@@ -360,6 +431,8 @@ bool sameAsExistingCopy(const std::wstring& path, const std::vector<char>& made)
 
 bool patchReady() { return g_ready && g_hooked; }
 
+const wchar_t* patchFailure() { return g_failure; }
+
 const char* ownGroupId(int index)
 {
     return (index >= 0 && index < kOwnIdCount) ? kOwnIds[index] : nullptr;
@@ -376,8 +449,7 @@ bool installEarlyFileHook()
     const bool allowOpen = writes::allowed(std::string_view("NtOpenFile"));
     if (!allowCreate || !allowOpen) {
         note(L"[oreui] the file-open hook is turned off in hooks.json");
-    }
-    if (!allowCreate || !allowOpen) {
+        g_failure = L"the file-open hook is turned off in hooks.json";
         return false;
     }
     note(L"[oreui] installing the file-open hook");
@@ -387,6 +459,9 @@ bool installEarlyFileHook()
     const bool b = hookOne("NtOpenFile", reinterpret_cast<void*>(&detourNtOpenFile),
                            reinterpret_cast<void**>(&g_realOpen), g_savedOpen, g_stolenOpen);
     g_hooked = a && b;
+    if (!g_hooked) {
+        g_failure = L"the file-open hook could not be installed";
+    }
     return g_hooked;
 }
 
@@ -396,8 +471,16 @@ void removeEarlyFileHook()
         return;
     }
     g_ready = false;
-    unhookOne("NtCreateFile", g_savedCreate, g_stolenCreate);
-    unhookOne("NtOpenFile", g_savedOpen, g_stolenOpen);
+    unhookOne("NtCreateFile", g_savedCreate, g_stolenCreate, reinterpret_cast<void*>(g_realCreate));
+    unhookOne("NtOpenFile", g_savedOpen, g_stolenOpen, reinterpret_cast<void*>(g_realOpen));
+    Sleep(20);
+    if (InterlockedCompareExchange(&g_inside, 0, 0) != 0) {
+        note(L"[oreui] waiting for a file open that is still inside the hook");
+        while (InterlockedCompareExchange(&g_inside, 0, 0) != 0) {
+            Sleep(5);
+        }
+    }
+    Sleep(5);
     g_stolenCreate = 0;
     g_stolenOpen = 0;
     g_hooked = false;
@@ -618,6 +701,7 @@ bool buildPatchedBundle()
 {
     const std::wstring root = versionDir();
     if (root.empty()) {
+        g_failure = L"the game folder was not found";
         return false;
     }
     const std::wstring dir = root + L"\\data\\gui\\dist\\hbui";
@@ -627,6 +711,7 @@ bool buildPatchedBundle()
     HANDLE const search = FindFirstFileW(pattern.c_str(), &found);
     if (search == INVALID_HANDLE_VALUE) {
         note(L"[oreui] the bundle was not found");
+        g_failure = L"the bundle was not found";
         return false;
     }
     const std::wstring name = found.cFileName;
@@ -637,6 +722,7 @@ bool buildPatchedBundle()
                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (in == INVALID_HANDLE_VALUE) {
         note(L"[oreui] cannot open the bundle");
+        g_failure = L"cannot open the bundle";
         return false;
     }
     LARGE_INTEGER size{};
@@ -647,6 +733,7 @@ bool buildPatchedBundle()
     CloseHandle(in);
     if (read == 0 || got != blob.size()) {
         note(L"[oreui] cannot read the bundle");
+        g_failure = L"cannot read the bundle";
         return false;
     }
 
@@ -654,12 +741,14 @@ bool buildPatchedBundle()
     const size_t at = haystack.find(kAnchorHead);
     if (at == std::string_view::npos) {
         note(L"[oreui] could not find where to insert (different game version?)");
+        g_failure = L"could not find where to insert (different game version?)";
         return false;
     }
     const size_t valueAt = at + sizeof(kAnchorHead) - 1;
     const size_t comma = haystack.find(',', valueAt);
     if (comma == std::string_view::npos || comma <= valueAt || comma - valueAt > 24) {
         note(L"[oreui] the key group entry has an unexpected shape");
+        g_failure = L"the key group entry has an unexpected shape";
         return false;
     }
     const std::string groupName(haystack.substr(valueAt, comma - valueAt));
@@ -692,6 +781,7 @@ bool buildPatchedBundle()
                                    FILE_ATTRIBUTE_NORMAL, nullptr);
     if (out == INVALID_HANDLE_VALUE) {
         note(L"[oreui] cannot create the copy");
+        g_failure = L"cannot create the copy";
         return false;
     }
     DWORD put = 0;
@@ -699,6 +789,7 @@ bool buildPatchedBundle()
     CloseHandle(out);
     if (wrote == 0 || put != blob.size()) {
         note(L"[oreui] cannot write the copy");
+        g_failure = L"cannot write the copy";
         return false;
     }
 

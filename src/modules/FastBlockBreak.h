@@ -15,7 +15,6 @@ public:
 
     const wchar_t* name() const override { return L"FastBlockBreak"; }
     bool available() const override;
-    MenuItem buildMenu() override;
     void onScansReady() override;
 
     bool onContinueDestroyBlock(void* gameMode, const void* pos, std::uint8_t face,
@@ -24,7 +23,6 @@ public:
 
 protected:
     void onEnabledChanged(bool enabled) override;
-    bool persistEnabled() const override { return true; }
 
 private:
     FastBlockBreak() = default;

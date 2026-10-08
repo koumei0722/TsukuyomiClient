@@ -56,8 +56,6 @@ protected:
 
     void onUpdate() override;
 
-    bool persistEnabled() const override { return true; }
-
 private:
 
     void runImport(void* ownerWindow);
@@ -72,6 +70,9 @@ private:
     std::atomic<bool> m_importDone{false};
     std::mutex m_importMutex;
     std::wstring m_importedStem;
+    void* m_importThread = nullptr;
+    bool m_importStop = false;
+    void stopImport();
 
     struct Blueprint {
         std::wstring name;
@@ -85,6 +86,7 @@ private:
 
         std::shared_ptr<const structure::Structure> loaded;
         bool ready = false;
+        std::uint64_t generation = 0;
 
         std::atomic<int> sizeX{0};
         std::atomic<int> sizeY{0};
@@ -196,15 +198,13 @@ private:
     std::int32_t m_regionSizeY = 0;
     std::int32_t m_regionSizeZ = 0;
 
-    std::atomic<bool> m_cellsDirty{true};
-
     enum PreparePurpose : unsigned {
         kPrepReload = 1u,
         kPrepRedraw = 2u,
-        kPrepCells = 4u,
     };
     struct PrepEntry {
         std::wstring name;
+        std::uint64_t generation = 0;
         std::filesystem::path path;
         std::shared_ptr<const structure::Structure> data;
         int x = 0;
@@ -272,6 +272,7 @@ private:
     std::unordered_map<std::string, int> m_stackSizes;
 
     Hotkey m_pageKey;
+    mutable std::mutex m_keysMutex;
     std::atomic<bool> m_pageRequested{false};
 
     static constexpr int kLayerUpDefaultKey = 0x21;
@@ -284,7 +285,6 @@ private:
     std::atomic<int> m_layerValue{64};
     std::atomic<int> m_layerMin{0};
     std::atomic<int> m_layerMax{0};
-    std::atomic<unsigned> m_layerVersion{1};
     static constexpr unsigned long long kLayerTypeSettleMs = 400;
     std::atomic<unsigned long long> m_layerTypedAt{0};
     bool m_layerAppliedOn = false;
@@ -321,7 +321,7 @@ private:
 
     void diffStep();
 
-    static constexpr std::size_t kDiffPerFrame = 256;
+    static constexpr std::size_t kDiffPerFrame = 1536;
 
     std::size_t m_diffUpTo = 0;
 
@@ -333,8 +333,8 @@ private:
     std::vector<std::string> m_paletteNames;
     std::vector<const void*> m_paletteLegacy;
     std::vector<std::size_t> m_missingByEntry;
-    std::vector<std::size_t> m_missingByEntryDone;
-    std::vector<std::string> m_missingNamesDone;
+    std::map<std::wstring, std::map<std::string, std::size_t>> m_missingByOwnerDone;
+    std::uint64_t m_nextFileGeneration = 0;
     std::map<std::string, std::size_t> m_availableByName;
     bool m_availableKnown = false;
     std::atomic<bool> m_materialRefreshWanted{false};
@@ -342,11 +342,6 @@ private:
     std::atomic<int> m_materialListType{kMaterialAll};
     std::set<std::string> m_ignoredMaterials;
     void refreshAvailableCounts();
-
-    std::size_t m_diffWater = 0;
-    std::size_t m_diffWaterUnknown = 0;
-    std::size_t m_diffWorldWater = 0;
-    std::size_t m_diffWantWater = 0;
 
     std::size_t m_diffDropped = 0;
 
@@ -369,7 +364,7 @@ private:
     std::unordered_set<std::uint64_t> m_earlyOutside;
     std::uint64_t m_earlyRegionGen = 0;
     unsigned long long m_earlySettledAt = 0;
-    static constexpr std::size_t kEarlyCellBudget = 8192;
+    static constexpr std::size_t kEarlyCellBudget = 49152;
 
     struct ChunkChange {
         std::int32_t cx = 0;
@@ -384,7 +379,7 @@ private:
     std::unordered_map<std::uint64_t, ChunkChange> m_chunkChanges;
     static constexpr unsigned long long kHealRetryMs = 4000;
     void noteChunkChange(std::int32_t x, std::int32_t y, std::int32_t z);
-    std::size_t healStaleChunks(unsigned long long now);
+    void healStaleChunks(unsigned long long now);
 
 public:
     void earlyLearnFrame();
@@ -397,11 +392,6 @@ private:
 
     void publishBoxesLive();
 
-    static constexpr std::size_t kBoxLimit = static_cast<std::size_t>(-1);
-
-    unsigned long long m_boxDropLoggedAt = 0;
-    static constexpr unsigned long long kBoxDropLogMs = 30000;
-
     std::size_t m_boxSignature = 0;
     unsigned long long m_boxPublishedAt = 0;
     static constexpr unsigned long long kBoxPublishMs = 500;
@@ -410,25 +400,16 @@ private:
     unsigned long long m_boxLiveAt = 0;
     static constexpr unsigned long long kBoxLiveMs = 100;
 
-    bool m_boxListCut = false;
-    double m_boxListEye[3] = {};
-    bool m_boxListEyeValid = false;
-    static constexpr double kBoxRecenterBlocks = 16.0;
-    static constexpr double kBoxRecenterShare = 0.25;
-    bool boxEye(double out[3]);
-    double m_boxLastEye[3] = {};
-    bool m_boxLastEyeValid = false;
-
     static constexpr unsigned long long kBoxModeRetryMs = 500;
     unsigned long long m_boxModeRetryAt = 0;
 
-    std::size_t dirtyChunks(bool askAll = true);
+    std::size_t dirtyChunks();
 
     void rebuildGhostChunkList();
 
     std::vector<blockwrite::BlockPos> regionChunkList() const;
 
-    std::size_t learnRegionSubChunks(bool judgeNew);
+    void learnRegionSubChunks(bool judgeNew);
 
     void restoreFreedCells();
 
@@ -462,7 +443,6 @@ private:
 
     static constexpr int kMinAlpha = 10;
     static constexpr int kMaxAlpha = 100;
-    static constexpr const char* kGhostBlock = "minecraft:light_blue_stained_glass";
 
     static constexpr const char* kPokeBlock = "minecraft:structure_void";
 
@@ -481,8 +461,6 @@ private:
     unsigned long long m_worldSettleUntil = 0;
 
     static constexpr unsigned long long kWorldSettleMs = 4000;
-
-    std::size_t m_clearedUpTo = 0;
 
     const void* m_air = nullptr;
 
@@ -519,17 +497,11 @@ private:
     std::vector<std::wstring> m_files;
     std::vector<std::wstring> m_fileNames;
 
-    std::string m_pendingFile;
-
     mutable std::mutex m_mutex;
 
     blocks::Table m_palette;
 
     std::vector<const void*> m_paletteBlocks;
-
-    std::atomic<int> m_posX{0};
-    std::atomic<int> m_posY{0};
-    std::atomic<int> m_posZ{0};
 
     std::atomic<unsigned long long> m_posChangedAt{0};
     static constexpr unsigned long long kPosSettleMs = 800;

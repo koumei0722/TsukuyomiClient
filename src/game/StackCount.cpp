@@ -82,9 +82,4 @@ std::string formatStacks(std::size_t count, int stackSize)
     return out;
 }
 
-std::string formatStacksOf(std::size_t count, std::string_view name)
-{
-    return formatStacks(count, maxStackSize(name));
-}
-
 }

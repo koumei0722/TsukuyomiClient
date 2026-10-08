@@ -17,10 +17,11 @@
 #include "game/UiSound.h"
 #include "input/Foreground.h"
 #include "modules/DebugKeys.h"
+#include "modules/AppleSkin.h"
 #include "game/GameModeState.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
-#include "render/FrameTrace.h"
+#include "render/Overlay.h"
 
 #include <windows.h>
 
@@ -165,8 +166,6 @@ std::atomic<bool> DebugScreen::s_chunkTickHookReady{false};
 std::atomic<std::uint64_t> DebugScreen::s_startGameEntry{0};
 std::atomic<std::uint64_t> DebugScreen::s_versionEntry{0};
 std::atomic<char> DebugScreen::s_serverVersion[32]{};
-std::atomic<void*> DebugScreen::s_serverLevel{nullptr};
-std::atomic<std::uint64_t> DebugScreen::s_lastServerTick{0};
 std::atomic<bool> DebugScreen::s_wantSounds{false};
 std::atomic<bool> DebugScreen::s_wantParticles{false};
 std::atomic<std::uint64_t> DebugScreen::s_soundSampleTick{0};
@@ -200,17 +199,13 @@ void DebugScreen::onFrameRendered()
     s_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
-void DebugScreen::onServerTick(void* level, long long qpcTicks)
+void DebugScreen::onServerTick(long long qpcTicks)
 {
 
     if (qpcTicks > 0) {
         s_serverTicks.fetch_add(1, std::memory_order_relaxed);
         s_serverTickQpc.fetch_add(static_cast<std::uint64_t>(qpcTicks), std::memory_order_relaxed);
     }
-    if (level != nullptr) {
-        s_serverLevel.store(level, std::memory_order_relaxed);
-    }
-    s_lastServerTick.store(GetTickCount64(), std::memory_order_relaxed);
 }
 
 void DebugScreen::onPacketSent()
@@ -440,6 +435,7 @@ void DebugScreen::shutdown()
     DebugKeys::instance().shutdown();
     m_shuttingDown.store(true, std::memory_order_relaxed);
     serverfind::shutdown();
+    sysinfo::closeGpuUtilization();
     s_wantSounds.store(false, std::memory_order_relaxed);
     s_wantParticles.store(false, std::memory_order_relaxed);
     hideAllRows();
@@ -586,18 +582,30 @@ void DebugScreen::fillVersionInfo(dbgtext::Sample& out) const
     }
 }
 
+bool DebugScreen::localServerRunning()
+{
+
+    return GameData::instance().integratedServer();
+}
+
 void DebugScreen::fillSample(dbgtext::Sample& out)
 {
     {
 
-        const std::uint64_t lastTick = s_lastServerTick.load(std::memory_order_relaxed);
-        out.localServer = {true, lastTick != 0 && GetTickCount64() - lastTick < 3000};
+        out.localServer = {true, localServerRunning()};
     }
 
     fillVersionInfo(out);
 
     GameData& data = GameData::instance();
     const bool inWorld = data.msSinceView() < 500;
+    int hunger = 0;
+    float saturation = 0, exhaustion = 0;
+    if (inWorld && AppleSkin::instance().foodStats(hunger, saturation, exhaustion)) {
+        out.foodHunger = {true, hunger};
+        out.foodSaturation = {true, saturation};
+        out.foodExhaustion = {true, exhaustion};
+    }
     if (!inWorld) {
         out.serverBrand.available = false;
     }
@@ -698,7 +706,8 @@ void DebugScreen::fillSample(dbgtext::Sample& out)
     if (s_displayTick == 0 || now - s_displayTick >= 1000) {
         s_displayTick = now;
         s_display = sysinfo::Display{};
-        s_haveDisplay = sysinfo::displayInfo(window, s_display);
+
+        s_haveDisplay = window != nullptr && sysinfo::displayInfo(window, s_display);
     }
     if (s_haveDisplay) {
         const sysinfo::Display& display = s_display;
@@ -718,7 +727,7 @@ void DebugScreen::fillSample(dbgtext::Sample& out)
         setText(out.window, text);
 
         const char* api = nullptr;
-        if (frametrace::sawD3D12()) {
+        if (render::sawD3D12()) {
             api = "Direct3D 12";
         } else if (GetModuleHandleW(L"d3d12.dll") == nullptr && GetModuleHandleW(L"d3d11.dll") != nullptr) {
             api = "Direct3D 11";
@@ -747,8 +756,7 @@ void DebugScreen::fillSample(dbgtext::Sample& out)
     }
 
     sampleNetwork();
-    const std::uint64_t lastServerTick = s_lastServerTick.load(std::memory_order_relaxed);
-    if (lastServerTick != 0 && now - lastServerTick < 3000) {
+    if (out.localServer.value) {
 
         setText(out.serverBrand, "Integrated");
         if (m_tickMs >= 0.0) {
@@ -994,6 +1002,8 @@ void DebugScreen::publish()
         return;
     }
 
+    const std::lock_guard<std::mutex> publishGuard(m_publishMutex);
+
     publishHudOptions();
     if (m_shuttingDown.load(std::memory_order_relaxed) || !enabled()) {
         s_wantSounds.store(false, std::memory_order_relaxed);
@@ -1125,8 +1135,7 @@ void DebugScreen::onPlayerViewUpdate()
     wanted.localDifficulty = elementShown(kLocalDifficultyElement);
     wanted.forcedChunks = elementShown(kPlayerPositionElement);
     wanted.climate = elementShown(kChunkGenerationStatsElement);
-    const std::uint64_t lastTick = s_lastServerTick.load(std::memory_order_relaxed);
-    wanted.localServer = lastTick != 0 && GetTickCount64() - lastTick < 3000;
+    wanted.localServer = localServerRunning();
 
     if (wanted.localServer
         && (wanted.serverChunks || wanted.localDifficulty || wanted.forcedChunks || wanted.entityTags
@@ -1210,7 +1219,6 @@ void DebugScreen::onHudCreated(void* ctrl)
 MenuItem DebugScreen::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
 
@@ -1269,15 +1277,7 @@ void DebugScreen::loadConfig(const nlohmann::json& section)
     m_hideDays.store(readFlag("hideDaysPlayed"), std::memory_order_relaxed);
     m_chatBottom.store(readFlag("chatBottomLeft"), std::memory_order_relaxed);
 
-    nlohmann::json keys = section;
-    if (nlohmann::json& legacy = Config::instance().section("DebugKeys"); legacy.is_object()) {
-        for (auto it = legacy.begin(); it != legacy.end(); ++it) {
-            const std::string& key = it.key();
-            if (key.size() > 4 && key.ends_with("Keys") && !keys.contains(key)) keys[key] = it.value();
-        }
-    }
-    Config::instance().eraseSection("DebugKeys");
-    DebugKeys::instance().loadKeys(keys);
+    DebugKeys::instance().loadKeys(section);
 
     applyProfile(false);
     if (const auto it = section.find("text"); it != section.end() && it->is_object()) {

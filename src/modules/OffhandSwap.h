@@ -55,7 +55,7 @@ private:
 
     bool readStack(const std::byte* stack, StackView& out) const;
 
-    bool apply(int slot);
+    bool apply();
 
     static int swapWithOffhand(const Hands* hands, int count, int slot);
 
@@ -80,7 +80,6 @@ private:
         void* offhandItem = nullptr;
         void* holder = nullptr;
 
-        unsigned int serial = 0;
         unsigned long long giveUpAtMs = 0;
     };
     NetIdFix m_netIdFix;
@@ -119,8 +118,6 @@ private:
         bool active = false;
         std::int32_t requestId = 0;
         std::byte* hand[2] = {};
-        std::byte* offhand[2] = {};
-        int count = 0;
         int selected = -1;
         unsigned long long giveUpAtMs = 0;
         bool haveHand = false;

@@ -5,6 +5,7 @@
 #include "game/Abilities.h"
 #include "input/Foreground.h"
 #include "memory/Scanner.h"
+#include "modules/DebugScreen.h"
 
 #include <Windows.h>
 
@@ -73,12 +74,16 @@ void FlySpeed::onAbilitiesAccess(void* context)
     if (!abilities::looksValid(layered)) {
         return;
     }
+    m_ledger.observeWorld(DebugScreen::worldEntry());
 
     if (active) {
         m_ledger.note(layered);
         applyOne(layered, abilities::kFlySpeed, m_horizontal.load(std::memory_order_relaxed));
         applyOne(layered, abilities::kVerticalFlySpeed,
                  m_vertical.load(std::memory_order_relaxed));
+        if (!m_active.load(std::memory_order_seq_cst)) {
+            m_ledger.markDirty(layered);
+        }
         return;
     }
 
@@ -97,9 +102,16 @@ void FlySpeed::onAbilitiesAccess(void* context)
     }
 }
 
+void FlySpeed::onScansReady()
+{
+    if (enabled()) {
+        onEnabledChanged(true);
+    }
+}
+
 void FlySpeed::onEnabledChanged(bool enabled)
 {
-    m_active.store(enabled, std::memory_order_relaxed);
+    m_active.store(enabled, std::memory_order_seq_cst);
 
     if (enabled) {
         m_restorePending.store(false, std::memory_order_relaxed);
@@ -125,7 +137,7 @@ void FlySpeed::shutdown()
         return;
     }
 
-    m_active.store(false, std::memory_order_relaxed);
+    m_active.store(false, std::memory_order_seq_cst);
     m_ledger.markAllDirty();
     m_restorePending.store(true, std::memory_order_relaxed);
 
@@ -142,7 +154,6 @@ void FlySpeed::shutdown()
 MenuItem FlySpeed::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::number(

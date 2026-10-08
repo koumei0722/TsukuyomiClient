@@ -8,7 +8,6 @@ namespace tsukuyomi {
 
 enum class MenuItemKind {
     Submenu,
-    Back,
     Toggle,
     Cycle,
     Keybind,
@@ -28,6 +27,8 @@ struct MenuItem {
 
     std::function<std::vector<int>()> getKeys;
     std::function<void(std::vector<int>)> setKeys;
+    std::function<std::vector<int>()> getPadKeys;
+    std::function<void(std::vector<int>)> setPadKeys;
 
     std::vector<int> defaultKeys;
 
@@ -54,6 +55,8 @@ struct MenuItem {
 
     bool hidden = false;
 
+    std::string commandName;
+
     std::vector<MenuItem> children;
 
     std::wstring labelText() const { return label ? label() : std::wstring{}; }
@@ -65,7 +68,6 @@ struct MenuItem {
 namespace menu {
 
 MenuItem submenu(std::wstring title, std::vector<MenuItem> children);
-MenuItem back();
 MenuItem toggle(std::wstring title, std::function<bool()> isOn, std::function<void()> flip);
 MenuItem action(std::wstring title, std::function<void()> run);
 MenuItem cycle(std::wstring title, std::function<std::wstring()> valueText,

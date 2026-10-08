@@ -1,12 +1,7 @@
 #include "render/Overlay.h"
 
-#include "render/BoxRenderer.h"
-#include "render/FrameTrace.h"
-#include "render/WorldMesh.h"
-
 #include "core/FreezeWatch.h"
 #include "core/Logger.h"
-#include "hooks/HookCount.h"
 #include "hooks/HookManager.h"
 
 #include <Windows.h>
@@ -21,18 +16,10 @@ namespace tsukuyomi::render {
 namespace {
 using Microsoft::WRL::ComPtr;
 constexpr size_t kPresentIndex = 8;
-constexpr size_t kPresent1Index = 22;
-constexpr size_t kExecuteCommandListsIndex = 10;
 
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
-using Present1Fn = HRESULT(__stdcall*)(IDXGISwapChain1*, UINT, UINT,
-                                       const DXGI_PRESENT_PARAMETERS*);
-using ExecuteCommandListsFn = void(__stdcall*)(ID3D12CommandQueue*, UINT,
-                                               ID3D12CommandList* const*);
 
 PresentFn g_present = nullptr;
-Present1Fn g_present1 = nullptr;
-ExecuteCommandListsFn g_executeCommandLists = nullptr;
 
 std::atomic<bool> g_active{true};
 std::atomic<int> g_drawing{0};
@@ -42,8 +29,7 @@ std::atomic<float> g_viewWidth{0.0f};
 std::atomic<float> g_viewHeight{0.0f};
 
 std::atomic<bool> g_loggedPresent{false};
-std::atomic<bool> g_loggedPresent1{false};
-std::atomic<bool> g_loggedQueue{false};
+std::atomic<bool> g_sawD3D12{false};
 void* vtableEntry(void* object, size_t index)
 {
     if (object == nullptr) {
@@ -74,9 +60,6 @@ bool isGameSwapChain(IDXGISwapChain* swapChain, DXGI_SWAP_CHAIN_DESC& descOut)
 
 void notePresent(IDXGISwapChain* swapChain)
 {
-    frametrace::onPresent();
-    worldmesh::onPresent();
-
     g_drawing.fetch_add(1, std::memory_order_acq_rel);
     if (g_active.load(std::memory_order_acquire)) {
         DXGI_SWAP_CHAIN_DESC desc{};
@@ -89,6 +72,13 @@ void notePresent(IDXGISwapChain* swapChain)
             } else {
                 DXGI_SWAP_CHAIN_DESC checked{};
                 isGame = isGameSwapChain(swapChain, checked);
+                if (isGame) {
+                    ID3D12Device* device = nullptr;
+                    if (SUCCEEDED(swapChain->GetDevice(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))) {
+                        device->Release();
+                        g_sawD3D12.store(true, std::memory_order_relaxed);
+                    }
+                }
                 s_checkedIsGame.store(isGame, std::memory_order_release);
                 s_checkedWindow.store(desc.OutputWindow, std::memory_order_release);
             }
@@ -101,31 +91,28 @@ void notePresent(IDXGISwapChain* swapChain)
     }
     g_drawing.fetch_sub(1, std::memory_order_acq_rel);
 }
-void logSwapChain(IDXGISwapChain* swapChain, bool viaPresent1)
+void logSwapChain(IDXGISwapChain* swapChain)
 {
-    std::atomic<bool>& flag = viaPresent1 ? g_loggedPresent1 : g_loggedPresent;
-    if (flag.exchange(true, std::memory_order_relaxed)) {
+    if (g_loggedPresent.exchange(true, std::memory_order_relaxed)) {
         return;
     }
 
     DXGI_SWAP_CHAIN_DESC desc{};
     if (swapChain == nullptr || FAILED(swapChain->GetDesc(&desc))) {
-        log().warn(L"Overlay: {} reached but the description could not be read",
-                   viaPresent1 ? L"Present1" : L"Present");
+        log().warn(L"Overlay: Present reached but the description could not be read");
         return;
     }
 
-    log().success(L"Overlay: {} reached ({}x{}, hwnd {:#x}, format {}, buffers {})",
-                  viaPresent1 ? L"Present1" : L"Present", desc.BufferDesc.Width,
+    log().success(L"Overlay: Present reached ({}x{}, hwnd {:#x}, format {}, buffers {})",
+                  desc.BufferDesc.Width,
                   desc.BufferDesc.Height, reinterpret_cast<uintptr_t>(desc.OutputWindow),
                   static_cast<int>(desc.BufferDesc.Format), desc.BufferCount);
 }
 
 HRESULT __stdcall detourPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
-    TSUKUYOMI_HOOK_COUNT("Present");
     freezewatch::notePresent();
-    logSwapChain(swapChain, false);
+    logSwapChain(swapChain);
 
     if ((flags & DXGI_PRESENT_TEST) == 0) {
         notePresent(swapChain);
@@ -135,32 +122,6 @@ HRESULT __stdcall detourPresent(IDXGISwapChain* swapChain, UINT syncInterval, UI
     return g_present(swapChain, syncInterval, flags);
 }
 
-HRESULT __stdcall detourPresent1(IDXGISwapChain1* swapChain, UINT syncInterval, UINT flags,
-                                 const DXGI_PRESENT_PARAMETERS* parameters)
-{
-    TSUKUYOMI_HOOK_COUNT("Present1");
-    logSwapChain(swapChain, true);
-
-    if (g_present1 == nullptr) return DXGI_ERROR_INVALID_CALL;
-    return g_present1(swapChain, syncInterval, flags, parameters);
-}
-
-void __stdcall detourExecuteCommandLists(ID3D12CommandQueue* queue, UINT count,
-                                         ID3D12CommandList* const* lists)
-{
-    TSUKUYOMI_HOOK_COUNT("ExecuteCommandLists");
-    if (queue != nullptr && !g_loggedQueue.load(std::memory_order_relaxed)
-        && queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT
-        && !g_loggedQueue.exchange(true, std::memory_order_relaxed)) {
-        log().success(L"Overlay: direct command queue reached ({:#x})",
-                      reinterpret_cast<uintptr_t>(queue));
-    }
-
-    frametrace::onExecute(queue, count, lists);
-    if (g_executeCommandLists != nullptr) {
-        g_executeCommandLists(queue, count, lists);
-    }
-}
 class ProbeWindow {
 public:
     ProbeWindow() = default;
@@ -208,18 +169,7 @@ private:
     HWND m_window = nullptr;
 };
 
-struct Targets {
-    void* present = nullptr;
-    void* present1 = nullptr;
-    void* executeCommandLists = nullptr;
-
-    bool complete() const
-    {
-        return present != nullptr && present1 != nullptr && executeCommandLists != nullptr;
-    }
-};
-
-bool captureTargets(Targets& out)
+bool captureTargets(void*& present)
 {
     const HMODULE d3d12Module = GetModuleHandleW(L"d3d12.dll");
     const HMODULE dxgiModule = GetModuleHandleW(L"dxgi.dll");
@@ -280,34 +230,29 @@ bool captureTargets(Targets& out)
         return false;
     }
 
-    out.present = vtableEntry(swapChain.Get(), kPresentIndex);
-    out.present1 = vtableEntry(swapChain.Get(), kPresent1Index);
-    out.executeCommandLists = vtableEntry(queue.Get(), kExecuteCommandListsIndex);
+    present = vtableEntry(swapChain.Get(), kPresentIndex);
 
-    return out.complete();
+    return present != nullptr;
 }
 
 }
 
 bool installOverlayHooks()
 {
-    Targets targets;
-    if (!captureTargets(targets)) {
+    void* present = nullptr;
+    if (!captureTargets(present)) {
         log().warn(L"Overlay: the Present hooks are unavailable");
         return false;
     }
 
     HookManager& hooks = HookManager::instance();
 
-    const bool ok =
-        hooks.create(targets.present, &detourPresent, reinterpret_cast<void**>(&g_present),
-                     L"Present")
-        && hooks.create(targets.present1, &detourPresent1, reinterpret_cast<void**>(&g_present1),
-                        L"Present1")
-        && hooks.create(targets.executeCommandLists, &detourExecuteCommandLists,
-                        reinterpret_cast<void**>(&g_executeCommandLists), L"ExecuteCommandLists");
+    return hooks.create(present, &detourPresent, reinterpret_cast<void**>(&g_present), L"Present");
+}
 
-    return ok;
+bool sawD3D12()
+{
+    return g_sawD3D12.load(std::memory_order_relaxed);
 }
 
 Viewport overlayViewport()
@@ -316,8 +261,6 @@ Viewport overlayViewport()
     view.window = g_outputWindow.load(std::memory_order_relaxed);
     view.width = g_viewWidth.load(std::memory_order_relaxed);
     view.height = g_viewHeight.load(std::memory_order_relaxed);
-    const float scaled = view.height / 1080.0f;
-    view.scale = view.height > 0.0f ? (scaled > 0.80f ? scaled : 0.80f) : 1.0f;
     view.valid = view.window != nullptr && view.width > 0.0f && view.height > 0.0f;
     return view;
 }

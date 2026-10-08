@@ -395,7 +395,7 @@ DWORD WINAPI watchLoop(void*)
                 continue;
             }
             const unsigned long long since = slot.since.load(std::memory_order_acquire);
-            if (since == 0 || now - since < kScopeStallMs
+            if (since == 0 || since > now || now - since < kScopeStallMs
                 || slot.reported.exchange(true, std::memory_order_acq_rel)) {
                 continue;
             }
@@ -410,7 +410,7 @@ DWORD WINAPI watchLoop(void*)
         if (last == 0) {
             continue;
         }
-        if (now - last < kPresentStallMs) {
+        if (last > now || now - last < kPresentStallMs) {
             g_presentReported.store(false, std::memory_order_relaxed);
             if (HWND const fg = GetForegroundWindow(); ourWindowInFront(fg)) {
                 g_gameWindow.store(fg, std::memory_order_release);
@@ -457,7 +457,10 @@ void stop()
         return;
     }
     g_stop.store(true, std::memory_order_release);
-    WaitForSingleObject(g_thread, 3000);
+    if (WaitForSingleObject(g_thread, 5000) != WAIT_OBJECT_0) {
+        log().warn(L"FreezeWatch: still waiting for the watcher thread to stop");
+        WaitForSingleObject(g_thread, INFINITE);
+    }
     CloseHandle(g_thread);
     g_thread = nullptr;
 }

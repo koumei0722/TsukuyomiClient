@@ -67,7 +67,6 @@ void noteRegion(void* region, unsigned int mode, unsigned int updateFlags, void*
     if (onCurrentStack(region)) {
         return;
     }
-    static std::atomic<bool> announced{false};
     g_region.store(region, std::memory_order_relaxed);
     g_regionSeen.store(GetTickCount64(), std::memory_order_relaxed);
     g_regionPlayer.store(GameData::instance().player(), std::memory_order_relaxed);
@@ -93,7 +92,6 @@ void noteRenderRegion(void* region)
     if (region == nullptr || onCurrentStack(region)) {
         return;
     }
-    static std::atomic<void*> announced{nullptr};
     if (void* const previous = g_renderRegion.exchange(region, std::memory_order_relaxed);
         previous != region && previous != nullptr) {
         g_regionGeneration.fetch_add(1, std::memory_order_release);
@@ -188,22 +186,18 @@ constexpr std::size_t kGetSlot = 3;
 using KnownSet = std::unordered_set<const void*>;
 std::mutex g_knownLock;
 std::atomic<const KnownSet*> g_known{nullptr};
-struct RetiredKnown {
-    std::unique_ptr<KnownSet> set;
-    unsigned long long at = 0;
-};
+std::atomic<unsigned> g_knownReaders{0};
 std::unique_ptr<KnownSet> g_knownOwned;
-std::vector<RetiredKnown> g_knownRetired;
+std::vector<std::unique_ptr<KnownSet>> g_knownRetired;
 
 void publishKnownLocked(std::unique_ptr<KnownSet> next)
 {
-    const unsigned long long now = GetTickCount64();
-    g_known.store(next.get(), std::memory_order_release);
+    g_known.store(next.get(), std::memory_order_seq_cst);
     if (g_knownOwned) {
-        g_knownRetired.push_back({std::move(g_knownOwned), now});
+        g_knownRetired.push_back(std::move(g_knownOwned));
     }
     g_knownOwned = std::move(next);
-    std::erase_if(g_knownRetired, [now](const RetiredKnown& r) { return now - r.at >= 5000; });
+    if (g_knownReaders.load(std::memory_order_seq_cst) == 0) g_knownRetired.clear();
 }
 
 constexpr std::size_t kStorageVtableSlots = 32;
@@ -297,11 +291,11 @@ const void* readBlock(void* subChunk, unsigned int layer, unsigned int index)
 
     const void* got = callStorageGet(fn, storage, index);
 
-    const KnownSet* const known = g_known.load(std::memory_order_acquire);
-    if (known == nullptr || known->find(got) == known->end()) {
-        return nullptr;
-    }
-    return got;
+    g_knownReaders.fetch_add(1, std::memory_order_seq_cst);
+    const KnownSet* const known = g_known.load(std::memory_order_seq_cst);
+    const bool valid = known != nullptr && known->find(got) != known->end();
+    g_knownReaders.fetch_sub(1, std::memory_order_seq_cst);
+    return valid ? got : nullptr;
 }
 
 }
@@ -588,15 +582,6 @@ bool worldPosOfSubChunkWrite(void* subChunk, unsigned int index, int out[3])
     return false;
 }
 
-void* subChunkAt(int baseX, int baseY, int baseZ)
-{
-    const std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
-    if (at >= kSubChunkSlots) {
-        return nullptr;
-    }
-    return g_subChunks[at].chunk.load(std::memory_order_acquire);
-}
-
 std::size_t knownSubChunkCount()
 {
     std::size_t live = 0;
@@ -681,15 +666,6 @@ const void* onSubChunkWrite(void* subChunk, unsigned int layer, unsigned int ind
 namespace {
 using GetChunkAtFn = void*(__fastcall*)(void*, const int*);
 
-std::atomic<std::size_t> g_findWhy[kFindWhyCount] = {};
-
-void noteFindWhy(std::size_t which)
-{
-    if (which < kFindWhyCount) {
-        g_findWhy[which].fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
 thread_local bool t_lastWasMissingChunk = false;
 thread_local bool t_lastWasOutsideWorld = false;
 }
@@ -702,13 +678,6 @@ bool lastFindWasMissingChunk()
 bool lastFindWasOutsideWorld()
 {
     return t_lastWasOutsideWorld;
-}
-
-void findSubChunkStats(std::size_t out[kFindWhyCount])
-{
-    for (std::size_t i = 0; i < kFindWhyCount; ++i) {
-        out[i] = g_findWhy[i].exchange(0, std::memory_order_relaxed);
-    }
 }
 
 constexpr std::ptrdiff_t kSourceLoose = 0x1c;
@@ -735,24 +704,20 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
     t_lastWasMissingChunk = false;
     t_lastWasOutsideWorld = false;
     if (region == nullptr) {
-        noteFindWhy(0);
         return nullptr;
     }
     if (!regionIsAlive(region)) {
-        noteFindWhy(1);
         return nullptr;
     }
     __try {
         auto* const bs = static_cast<std::uint8_t*>(region);
         void** const vtable = *reinterpret_cast<void***>(bs);
         if (vtable == nullptr) {
-            noteFindWhy(2);
             return nullptr;
         }
         const auto getChunkAt = reinterpret_cast<GetChunkAtFn>(vtable[0x140 / 8]);
         if (getChunkAt == nullptr
             || !memory::inGameModule(reinterpret_cast<const void*>(getChunkAt))) {
-            noteFindWhy(3);
             return nullptr;
         }
         const int base = y >> 4 << 4;
@@ -762,13 +727,11 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
             chunk = static_cast<std::uint8_t*>(getChunkLoose(getChunkAt, bs, at));
         }
         if (chunk == nullptr) {
-            noteFindWhy(4);
             t_lastWasMissingChunk = true;
             return nullptr;
         }
         auto* const meta = *reinterpret_cast<std::uint8_t**>(chunk + 0x58);
         if (meta == nullptr) {
-            noteFindWhy(5);
             return nullptr;
         }
         std::int16_t low = 0;
@@ -776,31 +739,25 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
         std::memcpy(&low, meta + 0xc8, sizeof(low));
         std::memcpy(&high, meta + 0xca, sizeof(high));
         if (base < low || base >= high) {
-            noteFindWhy(6);
             t_lastWasOutsideWorld = true;
             return nullptr;
         }
         auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x140);
         if (table == nullptr) {
-            noteFindWhy(7);
             return nullptr;
         }
         const int index = (base >> 4) - (static_cast<int>(low) >> 4);
         if (index < 0) {
-            noteFindWhy(8);
             return nullptr;
         }
         std::uint8_t* const sub = table + static_cast<std::size_t>(index) * 0x68;
         std::int8_t tag = 0;
         std::memcpy(&tag, sub + 0x61, sizeof(tag));
         if (tag != static_cast<std::int8_t>(base >> 4)) {
-            noteFindWhy(9);
             return nullptr;
         }
-        noteFindWhy(11);
         return sub;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        noteFindWhy(10);
         return nullptr;
     }
 }

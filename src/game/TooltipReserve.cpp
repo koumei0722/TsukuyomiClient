@@ -56,9 +56,14 @@ bool readId(std::string_view text, std::size_t at, std::uint32_t& id, std::size_
 
 std::string reserveText(int rows, int spaces, std::uint32_t id)
 {
+    return reserveText(kMarker, rows, spaces, id);
+}
+
+std::string reserveText(std::string_view marker, int rows, int spaces, std::uint32_t id)
+{
     rows = std::max(rows, 1);
     spaces = std::max(spaces, 0);
-    std::string out(kMarker);
+    std::string out(marker);
     static constexpr char kHex[] = "0123456789abcdef";
     for (int digit = kIdDigits - 1; digit >= 0; --digit) {
         out += kSection;
@@ -71,15 +76,17 @@ std::string reserveText(int rows, int spaces, std::uint32_t id)
     return out;
 }
 
-bool findMarker(std::string_view text, int& line, int& lines, int& reserved, int& spaces, std::uint32_t& id)
+bool findMarker(std::string_view text, std::string_view marker, int& line, int& lines, int& reserved,
+                int& spaces, std::uint32_t& id)
 {
+    if (marker.empty()) return false;
     std::size_t at = std::string_view::npos;
     std::size_t end = 0;
-    for (std::size_t from = text.find(kMarker); from != std::string_view::npos;
-         from = text.find(kMarker, from + 1)) {
+    for (std::size_t from = text.find(marker); from != std::string_view::npos;
+         from = text.find(marker, from + 1)) {
         std::size_t after = 0;
         std::uint32_t value = 0;
-        if (readId(text, from + kMarker.size(), value, after)) {
+        if (readId(text, from + marker.size(), value, after)) {
             at = from;
             end = after;
             id = value;

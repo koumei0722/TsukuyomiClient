@@ -17,19 +17,48 @@ bool isTsukuyomiCommand(std::string_view text)
            && (text.size() == 3 || space(text[3]));
 }
 
-std::vector<std::string> words(std::string_view text)
+RestockAction restockAction(const std::vector<std::string>& args)
+{
+    if (args.empty()) return RestockAction::Invalid;
+    if (args.size() == 1 && args[0] == "list") return RestockAction::List;
+    if (args.size() == 1 && args[0] == "clear") return RestockAction::Clear;
+    if (args.size() <= 2 && args[0] == "add") return RestockAction::Add;
+    if (args.size() <= 2 && args[0] == "remove") return RestockAction::Remove;
+    return RestockAction::Invalid;
+}
+
+std::vector<std::string> rawWords(std::string_view text)
 {
     std::vector<std::string> result;
     for (std::size_t at = 0; at < text.size();) {
         while (at < text.size() && space(text[at])) ++at;
         const std::size_t first = at;
-        while (at < text.size() && !space(text[at])) ++at;
+        bool quoted = false, escaped = false;
+        int depth = 0;
+        while (at < text.size()) {
+            const char c = text[at];
+            if (!quoted && depth == 0 && space(c)) break;
+            if (quoted) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') quoted = false;
+            } else if (c == '"') quoted = true;
+            else if (c == '{' || c == '[') ++depth;
+            else if ((c == '}' || c == ']') && depth > 0) --depth;
+            ++at;
+        }
         if (first != at) {
             std::string word(text.substr(first, at - first));
-            std::transform(word.begin(), word.end(), word.begin(), lower);
             result.push_back(std::move(word));
         }
     }
+    return result;
+}
+
+std::vector<std::string> words(std::string_view text)
+{
+    auto result = rawWords(text);
+    for (auto& word : result) std::transform(word.begin(), word.end(), word.begin(), lower);
     return result;
 }
 

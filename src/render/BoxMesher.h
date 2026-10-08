@@ -50,39 +50,19 @@ struct Edge {
 };
 
 enum class EdgeStyle : std::uint8_t {
-    Shape,
     BlockSurface,
     BlockAll,
 };
 
-std::vector<Edge> buildEdges(const std::vector<Cell>& cells, EdgeStyle style = EdgeStyle::Shape);
+std::vector<Edge> buildEdges(const std::vector<Cell>& cells, EdgeStyle style);
 
 void edgeEnds(const Edge& edge, std::int32_t out[2][3]);
 
-std::vector<Edge> edgesFromQuads(const std::vector<Quad>& quads);
-
 void corners(const Quad& quad, std::int32_t out[4][3]);
 
-double distanceSq(const Quad& quad, const double eye[3]);
-double distanceSq(const Edge& edge, const double eye[3]);
-
-float keepNearest(std::vector<Quad>& quads, const double eye[3], std::size_t budget);
-float keepNearest(std::vector<Edge>& edges, const double eye[3], std::size_t budget);
-
-float copyNearest(const std::vector<Quad>& from, const double eye[3], std::size_t budget,
-                  std::vector<Quad>& to);
-float copyNearest(const std::vector<Edge>& from, const double eye[3], std::size_t budget,
-                  std::vector<Edge>& to);
-
-struct RadiusCut {
-    std::size_t full = 0;
-    std::size_t partial = 0;
-};
-RadiusCut radiusCut(const std::vector<std::size_t>& histogram, std::size_t limit);
-
 inline constexpr std::uint32_t kEdgeItem = 0x80000000U;
-float paintOrder(std::vector<Quad>& quads, std::vector<Edge>& edges, const double eye[3],
-                 std::size_t budget, double edgeReach, std::vector<std::uint32_t>& order);
+void paintOrder(const std::vector<Quad>& quads, const std::vector<Edge>& edges, const double eye[3],
+                std::vector<std::uint32_t>& order);
 
 bool ribbonCorners(const double p0[3], const double p1[3], const double* forward, double forwardW,
                    double scale, double nearW, double out[4][3]);

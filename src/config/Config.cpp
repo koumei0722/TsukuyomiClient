@@ -1,12 +1,45 @@
 #include "config/Config.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
 
 #include <fstream>
+#include <algorithm>
+#include <mutex>
+#include <set>
 
 namespace tsukuyomi {
+
+namespace {
+
+void noteWrongType(std::string_view key)
+{
+    static std::mutex mutex;
+    static std::set<std::string> told;
+    {
+        const std::lock_guard lock(mutex);
+        if (!told.insert(std::string(key)).second) {
+            return;
+        }
+    }
+    log().error(L"Config: \"{}\" has the wrong type in Tsukuyomi.json; it is reset to its default", toUtf16(key));
+    notice::failOnce("Config.wrongType",
+                     L"Config: some values in Tsukuyomi.json have the wrong type (the first one is \""
+                         + toUtf16(key) + L"\"); they are reset to their defaults",
+                     "Some settings in Tsukuyomi.json have the wrong type and are reset to their defaults");
+}
+
+void noteUnreadable(const std::wstring& why)
+{
+    notice::failOnce("Config.unreadable",
+                     L"Could not read the config file (" + why + L"). Running with the defaults and NOT saving, so "
+                         L"the file is kept as it is (fix or delete it, then inject again)",
+                     "Tsukuyomi.json could not be read: running with default settings, and changes are not saved");
+}
+
+}
 
 Config& Config::instance()
 {
@@ -17,6 +50,9 @@ Config& Config::instance()
 void Config::load()
 {
     m_root = nlohmann::json::object();
+    m_claimed.clear();
+    m_dropped.clear();
+    m_unreadable = false;
 
     const auto path = paths::configFile();
     if (path.empty()) {
@@ -33,22 +69,23 @@ void Config::load()
     try {
         nlohmann::json parsed = nlohmann::json::parse(file);
         if (!parsed.is_object()) {
-            log().warn(L"Config file is not an object. Using defaults");
+            m_unreadable = true;
+            noteUnreadable(L"not a JSON object");
             return;
         }
         m_root = std::move(parsed);
         m_written = m_root.dump(4);
         log().info(L"Config loaded");
     } catch (const nlohmann::json::exception& error) {
-        log().warn(L"Could not read the config file ({}). Using defaults",
-                   toUtf16(error.what()));
+        m_unreadable = true;
+        noteUnreadable(toUtf16(error.what()));
     }
 }
 
 bool Config::save()
 {
     const auto path = paths::configFile();
-    if (path.empty()) {
+    if (path.empty() || m_unreadable) {
         return false;
     }
 
@@ -79,6 +116,7 @@ bool Config::saveIfChanged()
 nlohmann::json& Config::section(std::string_view name)
 {
     const std::string key(name);
+    m_claimed.insert(key);
 
     const auto it = m_root.find(key);
     if (it == m_root.end() || !it->is_object()) {
@@ -87,34 +125,46 @@ nlohmann::json& Config::section(std::string_view name)
     return m_root[key];
 }
 
-void Config::eraseSection(std::string_view name)
+void Config::pruneUnclaimed()
 {
-    m_root.erase(std::string(name));
+    for (auto it = m_root.begin(); it != m_root.end();) {
+        if (m_claimed.contains(it.key())) {
+            ++it;
+        } else {
+            if (m_dropped.insert(it.key()).second) {
+                log().info(L"Config: dropped the unknown section \"{}\"", toUtf16(it.key()));
+            }
+            it = m_root.erase(it);
+        }
+    }
 }
 
-bool Config::renameSection(std::string_view from, std::string_view to)
+bool Config::ensureBool(nlohmann::json& node, std::string_view key, bool fallback)
 {
-    const std::string oldName(from);
-    const std::string newName(to);
-    if (oldName == newName) {
-        return false;
+    const bool value = getBool(node, key, fallback);
+    node[std::string(key)] = value;
+    return value;
+}
+
+void Config::keepOnly(nlohmann::json& node, std::initializer_list<std::string_view> keys)
+{
+    for (auto it = node.begin(); it != node.end();) {
+        if (std::find(keys.begin(), keys.end(), std::string_view(it.key())) != keys.end()) {
+            ++it;
+        } else {
+            it = node.erase(it);
+        }
     }
-    const auto old = m_root.find(oldName);
-    if (old == m_root.end() || !old->is_object()) {
-        return false;
-    }
-    const auto current = m_root.find(newName);
-    if (current == m_root.end() || !current->is_object()) {
-        m_root[newName] = std::move(*old);
-    }
-    m_root.erase(oldName);
-    return true;
 }
 
 int Config::getInt(const nlohmann::json& node, std::string_view key, int fallback)
 {
     const auto it = node.find(std::string(key));
-    if (it == node.end() || !it->is_number_integer()) {
+    if (it == node.end()) {
+        return fallback;
+    }
+    if (!it->is_number_integer()) {
+        noteWrongType(key);
         return fallback;
     }
     return it->get<int>();
@@ -123,7 +173,11 @@ int Config::getInt(const nlohmann::json& node, std::string_view key, int fallbac
 float Config::getFloat(const nlohmann::json& node, std::string_view key, float fallback)
 {
     const auto it = node.find(std::string(key));
-    if (it == node.end() || !it->is_number()) {
+    if (it == node.end()) {
+        return fallback;
+    }
+    if (!it->is_number()) {
+        noteWrongType(key);
         return fallback;
     }
     return it->get<float>();
@@ -132,7 +186,11 @@ float Config::getFloat(const nlohmann::json& node, std::string_view key, float f
 bool Config::getBool(const nlohmann::json& node, std::string_view key, bool fallback)
 {
     const auto it = node.find(std::string(key));
-    if (it == node.end() || !it->is_boolean()) {
+    if (it == node.end()) {
+        return fallback;
+    }
+    if (!it->is_boolean()) {
+        noteWrongType(key);
         return fallback;
     }
     return it->get<bool>();

@@ -13,9 +13,7 @@ public:
 
     void record(void* holder);
     void forget(void* holder);
-    void clear();
     std::size_t snapshot(void** out, std::size_t capacity) const;
-    std::size_t size() const;
 
 private:
     struct Entry {

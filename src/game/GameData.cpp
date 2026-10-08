@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -50,6 +51,45 @@ bool GameData::hasPlayerView() const
 {
     std::lock_guard lock(m_mutex);
     return m_valid;
+}
+
+bool GameData::onLevelTick(const void* level, unsigned long thread, unsigned long clientThread)
+{
+    if (level == nullptr) {
+        return false;
+    }
+    const bool onClientThread = clientThread == 0 || thread == clientThread;
+    const unsigned long long now = GetTickCount64();
+    bool known = false;
+    for (int i = 0; i < 2 && !known; ++i) {
+        if (m_tickLevels[i].load(std::memory_order_relaxed) == level) {
+            m_tickLevelAt[i].store(now, std::memory_order_relaxed);
+            known = true;
+        }
+    }
+    if (!known) {
+        const int slot = m_tickLevelAt[0].load(std::memory_order_relaxed) <= m_tickLevelAt[1].load(std::memory_order_relaxed)
+            ? 0 : 1;
+        m_tickLevels[slot].store(level, std::memory_order_relaxed);
+        m_tickLevelAt[slot].store(now, std::memory_order_relaxed);
+        if (m_tickLevelLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            log().info(L"GameData: a level ticks at {:#x} on thread {} (client thread {})",
+                       reinterpret_cast<std::uintptr_t>(level), thread, clientThread);
+        }
+    }
+    return !onClientThread && integratedServer();
+}
+
+bool GameData::integratedServer() const
+{
+    const unsigned long long now = GetTickCount64();
+    for (int i = 0; i < 2; ++i) {
+        const unsigned long long at = m_tickLevelAt[i].load(std::memory_order_relaxed);
+        if (at == 0 || (now > at && now - at > 2000) || m_tickLevels[i].load(std::memory_order_relaxed) == nullptr) {
+            return false;
+        }
+    }
+    return m_tickLevels[0].load(std::memory_order_relaxed) != m_tickLevels[1].load(std::memory_order_relaxed);
 }
 
 void GameData::setGameMode(void* gameMode)
@@ -228,6 +268,11 @@ bool gdCopyComponent(const void* self, std::uint32_t typeId, std::size_t stride,
     }
 }
 
+}
+
+bool GameData::copyComponent(const void* actor, std::uint32_t typeId, std::size_t stride, void* out)
+{
+    return gdCopyComponent(actor, typeId, stride, out);
 }
 
 bool GameData::playerBoxFeet(float& outX, float& outY, float& outZ) const
@@ -429,6 +474,24 @@ bool GameData::setPlayerAlt(void* player)
     if (!rawPosOf(player, x, y, z)) {
         return false;
     }
+    constexpr double kAltMaxDistance = 8.0;
+    float px = 0.0f;
+    float py = 0.0f;
+    float pz = 0.0f;
+    if (rawPlayerPos(px, py, pz)) {
+        const double distance = std::hypot(x - px, y - py, z - pz);
+        if (distance > kAltMaxDistance) {
+            return false;
+        }
+        void* const current = m_playerAlt.load(std::memory_order_acquire);
+        float cx = 0.0f;
+        float cy = 0.0f;
+        float cz = 0.0f;
+        if (current != nullptr && current != player && isServerPlayer(current) && rawPosOf(current, cx, cy, cz)
+            && std::hypot(cx - px, cy - py, cz - pz) < distance) {
+            return false;
+        }
+    }
     if (m_playerAlt.exchange(player, std::memory_order_acq_rel) != player
         && m_playerAltLogs.fetch_add(1, std::memory_order_relaxed) < 6) {
         log().info(L"GameData: the server-side player of this local world is at {:#x}",
@@ -467,14 +530,18 @@ void GameData::onScansReady()
     }
     m_playerVtable.store(playerVt, std::memory_order_release);
     if (playerVt == nullptr) {
-        log().warn(L"GameData: the Player vtable was not found; the local player is only picked up through /gamemode");
+        notice::failOnce("GameData.playerVtable",
+                         L"GameData: the Player vtable was not found; the local player is only picked up through /gamemode",
+                         "Most features stay idle until you run /gamemode once: the player type could not be found");
     }
     if (vtable != nullptr) {
         log().info(L"GameData: telling the server-side player apart by the ServerPlayer type (vtable rva {:#x})",
                    static_cast<std::uintptr_t>(static_cast<const std::byte*>(vtable) - exe));
     } else {
-        log().warn(L"GameData: the ServerPlayer vtable was not found; the server-side player of a local world is not "
-                   L"remembered (HandRestock picks it by the net ids instead)");
+        notice::failOnce("GameData.serverPlayerVtable",
+                         L"GameData: the ServerPlayer vtable was not found; the server-side player of a local world is "
+                         L"not used (AutoTool is off, and HandRestock does not refill the server-side copy)",
+                         "AutoTool is off: the server player type could not be found");
     }
 }
 

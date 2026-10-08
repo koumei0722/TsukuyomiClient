@@ -18,7 +18,7 @@ inline constexpr int kOffhandSlotWidth = 20;
 inline constexpr int kOffhandWidth = 1 + kOffhandSlotWidth + 1;
 inline constexpr int kOffhandHeight = 22;
 inline constexpr int kOffhandGap = 7;
-inline constexpr bool kDefaultOffhand = true;
+inline constexpr const char* kOffhandCondition = "always_when_visible";
 
 inline constexpr const char* kBindVisible = "#tk_invhud_visible";
 inline constexpr const char* kBindVMid = "#tk_invhud_v_mid";

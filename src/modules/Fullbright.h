@@ -22,7 +22,6 @@ public:
     static constexpr int kNightVisionEffectId = 16;
 
 protected:
-    bool persistEnabled() const override { return true; }
 
 private:
     Fullbright() = default;

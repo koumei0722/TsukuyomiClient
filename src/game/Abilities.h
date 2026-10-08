@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 
 namespace tsukuyomi::abilities {
 
@@ -17,7 +18,6 @@ inline constexpr int kPlayerLayer = 1;
 inline constexpr ptrdiff_t kTypeOffset = 0x0;
 inline constexpr ptrdiff_t kValueOffset = 0x4;
 
-inline constexpr int kTypeUnset = 1;
 inline constexpr int kTypeBool = 2;
 inline constexpr int kTypeFloat = 3;
 
@@ -46,23 +46,31 @@ bool writeFloat(void* address, float value);
 
 class RestoreLedger {
 public:
+    void observeWorld(std::uint64_t world);
+
     void note(const void* who);
 
     void markAllDirty();
 
     void clearDirty();
 
-    bool needsRestore(const void* who) const;
+    bool needsRestore(const void* who);
 
     void markClean(const void* who);
+
+    void markDirty(const void* who);
 
     bool allClean() const;
 
 private:
     static constexpr size_t kMax = 8;
 
+    int find(const void* who);
+
+    std::atomic<std::uint64_t> m_world{0};
     std::atomic<const void*> m_who[kMax]{};
     std::atomic<bool> m_dirty[kMax]{};
+    std::atomic<std::uint64_t> m_seen[kMax]{};
 };
 
 }

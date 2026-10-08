@@ -28,14 +28,6 @@ MenuItem submenu(std::wstring title, std::vector<MenuItem> children)
     return item;
 }
 
-MenuItem back()
-{
-    MenuItem item;
-    item.kind = MenuItemKind::Back;
-    item.label = constant(L"..");
-    return item;
-}
-
 MenuItem toggle(std::wstring title, std::function<bool()> isOn, std::function<void()> flip)
 {
     MenuItem item;

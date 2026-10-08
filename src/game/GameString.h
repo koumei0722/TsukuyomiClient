@@ -12,5 +12,7 @@ void configure(void** allocatorAt, DeleteFn gameDelete);
 bool available();
 bool read(void* str, std::string& text);
 bool assign(void* str, std::string_view text);
+bool release(void* str);
+bool releaseVector(void* vec);
 
 }

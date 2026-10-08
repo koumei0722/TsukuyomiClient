@@ -6,6 +6,7 @@
 #include "input/Hotkey.h"
 #include "modules/Module.h"
 
+#include <mutex>
 #include <atomic>
 #include <cstdint>
 
@@ -14,6 +15,7 @@ namespace tsukuyomi {
 class DebugScreen : public Module {
 public:
     static DebugScreen& instance();
+    static bool localServerRunning();
 
     const wchar_t* name() const override { return L"DebugScreen"; }
     bool available() const override;
@@ -26,10 +28,11 @@ public:
     void shutdown() override;
 
     static void onFrameRendered();
-    static void onServerTick(void* level, long long qpcTicks);
+    static void onServerTick(long long qpcTicks);
     static void onPacketSent();
     static void onPacketReceived();
     static void onStartGame(const char* version);
+    static std::uint64_t worldEntry() { return s_startGameEntry.load(std::memory_order_acquire); }
     static void onChunkTicked();
     static void onChunkTickHookReady();
 
@@ -64,7 +67,6 @@ public:
 protected:
     void onUpdate() override;
     void onEnabledChanged(bool enabled) override;
-    bool handlesToggleKey() const override { return true; }
 
 private:
     DebugScreen() = default;
@@ -105,8 +107,6 @@ private:
     static std::atomic<std::uint64_t> s_startGameEntry;
     static std::atomic<std::uint64_t> s_versionEntry;
     static std::atomic<char> s_serverVersion[32];
-    static std::atomic<void*> s_serverLevel;
-    static std::atomic<std::uint64_t> s_lastServerTick;
     static std::atomic<bool> s_wantSounds;
     static std::atomic<bool> s_wantParticles;
     static std::atomic<std::uint64_t> s_soundSampleTick;
@@ -128,6 +128,7 @@ private:
     int m_fps = -1;
 
     std::uint64_t m_lastPublishTick = 0;
+    std::mutex m_publishMutex;
     leveldb::WorldIndex m_worldIndex;
     std::atomic<std::uint32_t> m_mainThreadId{0};
     std::atomic<bool> m_allowDbRead{false};

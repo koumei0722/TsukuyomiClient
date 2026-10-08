@@ -1,7 +1,5 @@
 #pragma once
 
-#include <Windows.h>
-
 #include <atomic>
 #include <chrono>
 
@@ -13,7 +11,7 @@ class Client {
 public:
     static Client& instance();
 
-    void run(HMODULE self);
+    void run();
 
     void requestUnload();
     bool unloadRequested() const;
@@ -28,8 +26,8 @@ private:
     void registerModules();
     void loadHotkeys();
 
-    HMODULE m_self = nullptr;
     bool m_settingsSavePending = false;
+    bool m_startupComplete = false;
     bool m_lateHooksDone = false;
     std::chrono::steady_clock::time_point m_settingsSaveAt{};
     std::chrono::steady_clock::time_point m_settingsCheckAt{};

@@ -16,8 +16,6 @@ public:
     enum ContainerId : std::uint8_t {
         kContainerInventory = 0,
         kContainerOffhand = 119,
-        kContainerArmor = 120,
-        kContainerPlayerUi = 124,
     };
 
     struct SlotRef {

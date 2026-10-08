@@ -18,6 +18,7 @@
 #include "game/TradeUi.h"
 #include "input/Hotkey.h"
 #include "modules/Module.h"
+#include "modules/ItemScrollerLogic.h"
 
 namespace tsukuyomi {
 
@@ -45,24 +46,15 @@ public:
     void onOffstackTradeReleased();
     void onPlayerViewUpdate();
 
-    enum class SortMethod {
-        CategoryName,
-        CategoryCount,
-        CategoryRarity,
-        CategoryRawId,
-        ItemName,
-        ItemCount,
-        ItemRarity,
-        ItemRawId,
-        Count
-    };
-
 protected:
     void onUpdate() override;
     void onEnabledChanged(bool enabled) override;
 
 private:
     ItemScroller() = default;
+    void applyDisable();
+    std::atomic<bool> m_disableRequested{false};
+    std::atomic<int> m_unloadRelease{0};
 
     struct StackRef;
 
@@ -81,7 +73,7 @@ private:
     static Group groupOf(const std::string& coll);
     std::vector<Slot> slotsOf(Group group) const;
     std::vector<Slot> otherSlotsOf(const Slot& slot) const;
-    bool screenHas(Group group) const;
+    bool screenHasStorage() const;
 
     bool leftClick(const Slot& s);
     bool rightClick(const Slot& s);
@@ -98,7 +90,6 @@ private:
     bool cursorEmpty() const;
 
     bool shiftClickWithCheck(const Slot& s);
-    void clickSlotsToMoveItemsFromSlot(const Slot& from, bool toOther);
     void enqueueMoveStacks(std::shared_ptr<StackRef> ref, const Slot& slot, bool matchingOnly, bool toOther,
                            bool firstOnly);
     void enqueueMoveStacksFrom(const Slot& slot, bool matchingOnly, bool toOther, bool firstOnly);
@@ -106,7 +97,7 @@ private:
     bool tryMoveAllButOneItemToOtherInventory(const Slot& slot);
     bool tryMoveSingleItemToThisInventory(const Slot& slot);
     void moveItemsToTargets(const Slot& source, const std::vector<Slot>& targets, bool one);
-    void enqueueDropStacks(std::shared_ptr<StackRef> ref, const Slot& refSlot, bool sameInventory);
+    void enqueueDropStacks(std::shared_ptr<StackRef> ref, const Slot& refSlot);
     bool shiftPlaceItems(const Slot& slot);
     bool shiftDropItems();
     void dropLeaveOne(const Slot& slot);
@@ -140,18 +131,8 @@ private:
     void dragApply(const Slot& slot, DragAction action);
     void stopDrag();
 
-    struct Ingredient {
-        std::string name;
-        int aux = 0;
-        bool empty() const { return name.empty(); }
-    };
-    struct Recipe {
-        Ingredient result;
-        int resultCount = 0;
-        std::array<Ingredient, 9> items{};
-        int gridSize = 0;
-        bool empty() const { return result.empty(); }
-    };
+    using Ingredient = itemscrollerlogic::Ingredient;
+    using Recipe = itemscrollerlogic::Recipe;
     static constexpr int kRecipesPerPage = 18;
     static constexpr int kRecipePages = 8;
     static constexpr int kRecipeCount = kRecipesPerPage * kRecipePages;
@@ -160,25 +141,31 @@ private:
     bool isOutputSlot(const Slot& s) const;
     std::vector<Slot> gridSlots() const;
     Slot outputSlot() const;
-    Recipe& selectedRecipe()
+    Recipe selectedRecipe()
     {
         if (!m_recipesLoaded) {
             loadRecipes();
         }
+        const std::lock_guard lock(m_recipesMutex);
         return m_recipes[static_cast<size_t>(m_selectedRecipe)];
     }
     bool matchesIngredient(const void* stack, const Ingredient& ing) const;
+    bool gridMatchesRecipe(const Recipe& recipe) const;
+    static bool wantedCells(const Recipe& recipe, int gridSize, std::vector<Ingredient>& want);
     enum class Step { Done, Yield, Fail };
-    int recipeBookIndexOf(const Ingredient& result);
-    int countIngredientInPlayer(const Ingredient& ing) const;
-    int countIngredientAvailable(const Ingredient& ing) const;
-    bool ingredientsAvailable(const Recipe& recipe) const;
-    bool massCraftWithRecipeBook(const Recipe& recipe);
-    int m_bookIndex = -1;
-    bool m_bookMissWarned = false;
+    Step dropCraftFromOutput(const Recipe& recipe);
+    bool pendingStacks() const;
+    bool craftPendingSettled();
+    unsigned long long m_craftPendingSince = 0;
+    bool gridOrCursorPending() const;
+    bool m_harvestReady = false;
+    bool m_mcActiveWas = false;
+    void endMassCraftSession();
+    void massCraftStep();
+    void putBackCursor(const Recipe& recipe);
     Ingredient ingredientOf(const void* stack) const;
     void storeRecipeFromGrid(bool clearIfEmpty);
-    Step clearGridStep(bool nonMatchingOnly);
+    Step clearGridStep();
     Step fillGridStep(const Recipe& recipe, bool fillStacks);
     Step throwCraftResultsStep(const Recipe& recipe);
     Step throwNonRecipeItemsStep(const Recipe& recipe);
@@ -253,10 +240,6 @@ private:
     int m_useButton = -1;
     int m_sneakButton = -1;
     bool autoTradeBypassed() const;
-    void logTradeState(void* ctrl);
-    std::string m_loggedVillager;
-    int m_loggedSelTier = -2;
-    int m_loggedSelIndex = -2;
     std::vector<std::pair<int, int>> m_favTier;
     std::vector<int> m_favTierCounts;
     bool m_favTierSet = false;
@@ -265,11 +248,10 @@ private:
     std::string m_orderSig;
     int m_orderTicks = 0;
     unsigned m_favVersion = 0;
-    int m_logTicks = 0;
     std::wstring favoritesFilePath() const;
     void loadFavorites();
     void saveFavorites() const;
-    int tradeFavorites(bool skipImpossible);
+    int tradeFavorites();
     int countItemInPlayer(const void* like) const;
     void tradeTick();
     static std::string favoriteStarJson();
@@ -277,7 +259,6 @@ private:
 
     void sortInventory(const Slot& focused);
     struct SortExtra {
-        int rarity = -1;
         int boxSlots = 0;
         int bundleFill = 0;
     };
@@ -293,32 +274,27 @@ private:
     std::uint64_t keySeq(int vk) const;
     void watchKeys();
     int recentMouseButton() const;
-    bool comboEdge(const std::vector<int>& combo, bool& wasDown, std::uint64_t& seenSeq, bool exactModifiers);
-    bool screenBlacklisted() const;
-    bool slotBlacklisted(const Slot& s) const;
-    void debugSlot(const Slot& s) const;
-    void dumpScreen(const wchar_t* why) const;
-    void logStats();
+    bool comboEdge(const std::vector<int>& combo, bool& wasDown, std::uint64_t& seenSeq);
     void pollHotkeys();
     void consumeWheel();
     void resyncWheelSeqs();
     unsigned long long wheelLastMs() const;
     static constexpr int kSafeClicksPerTick = 16;
-    int clickCap() const;
     bool budgetLeft() const;
     void pushJob(std::function<bool()> step);
     void runJobs();
     void pushListJob(std::function<std::vector<Slot>()> collect, std::function<bool(const Slot&)> unit);
 
-    static constexpr int kHotkeyCount = 31;
+    static constexpr int kHotkeyCount = 29;
     bool readHotkeys(const nlohmann::json& section, std::array<std::vector<int>, kHotkeyCount>& out,
-                     std::array<std::string, kHotkeyCount>& text, bool warn) const;
+                     std::array<std::string, kHotkeyCount>& text) const;
     void watchConfigFile();
     void applyPendingKeys();
     mutable std::mutex m_keysMutex;
     std::array<std::string, kHotkeyCount> m_keyText{};
     std::array<std::vector<int>, kHotkeyCount> m_pendingKeys{};
     std::atomic<bool> m_keysPending{false};
+    std::atomic<bool> m_listsPending{false};
     unsigned long long m_cfgCheckMs = 0;
     long long m_cfgStamp = 0;
     bool m_cfgWarned = false;
@@ -334,10 +310,8 @@ private:
         kCraftEverything,
         kDropAllMatching,
         kMassCraft,
-        kMassCraftToggle,
         kMoveCraftResults,
         kRecipeView,
-        kSlotDebug,
         kStoreRecipe,
         kThrowCraftResults,
         kVillagerTradeFavorites,
@@ -373,51 +347,20 @@ private:
     int m_namedButtons[6]{-1, -1, -1, -1, -1, -1};
     static std::array<KeySetting, kKeyCount> makeKeys();
 
-    int m_massCraftInterval = 2;
-    int m_massCraftIterations = 36;
-    bool m_massCraftSwapsOnly = false;
-    bool m_massCraftUseRecipeBook = true;
-    bool m_massCraftHold = false;
-    int m_packetRateLimit = 4;
-    bool m_rateLimitClickPackets = false;
-    int m_recipeBookFailureLimit = 0;
-    bool m_craftingRecipesSaveToFile = true;
-    bool m_craftingRecipesSaveFileIsGlobal = false;
-    bool m_craftingRenderRecipeItems = true;
-    bool m_debugMessages = false;
-    bool m_reverseScrollDirectionSingle = false;
-    bool m_reverseScrollDirectionStacks = false;
-    bool m_useSlotPositionAwareScrollDirection = false;
-    bool m_villagerTradeUseGlobalFavorites = true;
-    bool m_villagerTradeListRememberScrollPosition = true;
-    bool m_villagerTradeSortFavoritesFirst = true;
+    static constexpr const wchar_t* kDefaultTopPriority =
+        L"minecraft:diamond_sword,minecraft:diamond_spear,minecraft:diamond_pickaxe,"
+        L"minecraft:diamond_axe,minecraft:diamond_shovel,minecraft:diamond_hoe,"
+        L"minecraft:netherite_sword,minecraft:netherite_spear,minecraft:netherite_pickaxe,"
+        L"minecraft:netherite_axe,minecraft:netherite_shovel,minecraft:netherite_hoe";
+
+    static constexpr const wchar_t* kDefaultCategoryOrder = L"construction,equipment,items,nature,other";
+
+    std::atomic<bool> m_massCraftHold{false};
     bool m_villagerTradeUnlockAllTiers = false;
     bool m_villagerTradeFavoritesOnOpen = false;
     bool m_villagerTradeOnOpenThrowResults = false;
-    bool m_sortInventoryToggle = false;
-    bool m_sortAssumeEmptyBoxStacks = false;
-    bool m_sortShulkerBoxesAtEnd = true;
-    bool m_sortShulkerBoxesInverted = false;
-    bool m_sortBundlesAtEnd = true;
-    bool m_sortBundlesInverted = false;
-    std::wstring m_sortTopPriority;
-    std::wstring m_sortBottomPriority;
-    int m_sortMethod = static_cast<int>(SortMethod::CategoryName);
-    std::wstring m_sortCategoryOrder;
-    std::wstring m_guiBlacklist;
-    std::wstring m_slotBlacklist;
-    bool m_enableCraftingFeatures = true;
-    bool m_enableDropkeyDropMatching = true;
-    bool m_enableItemMovingFallback = false;
-    bool m_enableRightClickCraftingOneStack = true;
-    bool m_enableScrollingEverything = true;
-    bool m_enableScrollingMatchingStacks = true;
-    bool m_enableScrollingSingle = true;
-    bool m_enableScrollingStacks = true;
-    bool m_enableScrollingVillager = true;
-    bool m_enableShiftDropItems = true;
-    bool m_enableShiftPlaceItems = true;
-    bool m_enableVillagerTradeFeatures = true;
+    std::wstring m_sortTopPriority{kDefaultTopPriority};
+    std::wstring m_sortCategoryOrder{kDefaultCategoryOrder};
 
     std::uint32_t m_swallowId = 0;
     DragAction m_drag = DragAction::None;
@@ -432,12 +375,10 @@ private:
     bool m_wheelPrimed = false;
     static constexpr unsigned long long kWheelCarryGapMs = 150;
     bool m_wheelCarry = false;
-    unsigned long long m_lastStatsMs = 0;
     int m_clicksThisTick = 0;
-    bool m_inTick = false;
     std::deque<std::function<bool()>> m_jobs;
-    int m_massCraftTicker = 0;
-    int m_badRecipeClicks = 0;
+    mutable std::mutex m_recipesMutex;
+    mutable std::mutex m_recipeSaveMutex;
     std::array<Recipe, kRecipeCount> m_recipes{};
     int m_selectedRecipe = 0;
     bool m_recipesLoaded = false;
@@ -452,7 +393,6 @@ private:
     int m_viewHover = -1;
     POINT m_viewHoverAt{};
     int m_viewPress = -1;
-    bool m_viewPressRight = false;
     bool m_viewMiddleWas = false;
     std::map<std::string, int> m_idAuxCache;
     struct TradeJob {
@@ -460,7 +400,6 @@ private:
         int index = 0;
         int phase = 0;
         int steps = 0;
-        int lastPay = -1;
         int wait = 0;
     };
     std::vector<TradeJob> m_tradeJobs;
@@ -490,15 +429,8 @@ private:
     std::set<std::string> m_globalFavorites;
     std::map<std::string, std::set<std::string>> m_villagerFavorites;
     std::vector<std::string> m_topPriority;
-    std::vector<std::string> m_bottomPriority;
     std::vector<std::string> m_categoryOrder;
     void rebuildLists();
-    static constexpr int kMaxDebugLogs = 600;
-    mutable std::atomic<int> m_logs{0};
-    bool debugLog() const
-    {
-        return m_debugMessages && m_logs.fetch_add(1) < kMaxDebugLogs;
-    }
 };
 
 }

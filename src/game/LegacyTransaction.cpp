@@ -267,8 +267,7 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
             m_warnedMissing = true;
             if (m_faulted) {
                 log().warn(L"LegacyTransaction: the legacy inventory path was closed by an "
-                           L"earlier fault, the item will be moved through the request path "
-                           L"instead (the server refuses swords there)");
+                           L"earlier fault, the legacy inventory path is skipped");
             } else {
                 log().warn(L"LegacyTransaction: the helpers were not found, "
                            L"the legacy inventory path is skipped");

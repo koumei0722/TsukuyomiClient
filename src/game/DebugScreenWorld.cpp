@@ -193,6 +193,8 @@ const void* blockAt(void* region, int x, int y, int z, int layer = 0)
 Sample g_sample{};
 std::atomic<std::uint64_t> g_generation{0};
 
+static_assert(std::is_trivially_copyable_v<Sample>);
+
 void publish(const Sample& in)
 {
 
@@ -1445,11 +1447,6 @@ void collectClimate(const ServerView& view, int feetX, int feetY, int feetZ, Sam
         noteClimateMiss(9, nullptr);
         return;
     }
-    static std::atomic<bool> told{false};
-    if (!told.exchange(true)) {
-        log().info(L"DebugScreen: world generator noise T={} H={} C={} E={} D={} W={} (x10000)", values[0], values[1],
-                   values[2], values[3], values[4], values[5]);
-    }
     out.hasClimate = true;
     for (int i = 0; i < 6; ++i) {
         out.climate[i] = values[i];
@@ -1488,15 +1485,8 @@ void noteSurfaceMiss(int reason, const void* a)
 }
 
 struct SurfaceProbe {
-    const void* gen = nullptr;
-    const void* sampler = nullptr;
-    const void* factory = nullptr;
-    int noBlend = -1;
     int minY = 0;
     int maxY = 0;
-    float offset = 0.0f;
-    float factor = 0.0f;
-    int gridSlot = -1;
 };
 
 int sampleSurfaceColumn(const std::uint8_t* chunkSource, const void* level, const void* dimension, int feetX, int feetZ,
@@ -1525,14 +1515,8 @@ int sampleSurfaceColumn(const std::uint8_t* chunkSource, const void* level, cons
         }
         const std::int32_t quart[2] = {feetX >> 2, feetZ >> 2};
         g_surface.column(const_cast<std::uint8_t*>(sampler), out3, quart);
-        probe.gen = gen;
-        probe.sampler = sampler;
         probe.minY = minY;
         probe.maxY = maxY;
-        const auto* const factory =
-            *reinterpret_cast<const std::uint8_t* const*>(gen + kGeneratorSubObject + g_surface.factoryFromSub);
-        probe.factory = factory;
-        probe.noBlend = factory != nullptr ? factory[g_surface.noBlendFlag] : -1;
         return 0;
     } __except (accessFilter(GetExceptionCode())) {
         return 13;
@@ -1691,18 +1675,6 @@ void collectSurfaceLevel(const ServerView& view, int feetX, int feetY, int feetZ
         out.density = density / 128.0f;
     }
 
-    static std::atomic<bool> told{false};
-    if (!told.exchange(true)) {
-        log().info(L"DebugScreen: surface probe gen={} sampler={} factory={} noBlend={} y={}..{} offset={} factor={} "
-                   L"cells={}/{} PS={}{} grid={} slot={} {:.2f} ms",
-                   probe.gen, probe.sampler, probe.factory, probe.noBlend, probe.minY, probe.maxY, out3[0], out3[1],
-                   cellMin, count, out.surfaceLevelFound ? L"" : L"not found ", y, gridReason, slot, elapsed);
-    }
-    static std::atomic<bool> toldGrid{false};
-    if (gridReason == 0 && !toldGrid.exchange(true)) {
-        log().info(L"DebugScreen: density grid of chunk ({}, {}) in {:.2f} ms (slot {}), N={} at y {}", chunkX, chunkZ,
-                   elapsed, slot, out.hasDensity ? out.density : 0.0f, feetY);
-    }
     static std::atomic<bool> toldSlow{false};
     if (gridReason == 0 && elapsed > kGridBudgetMs && !toldSlow.exchange(true)) {
         log().warn(L"DebugScreen: the density grid took {:.2f} ms; N is computed only once in this world", elapsed);
@@ -2326,7 +2298,9 @@ bool read(Sample& out)
             continue;
         }
         out = g_sample;
-        if (g_generation.load(std::memory_order_acquire) == before) {
+
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (g_generation.load(std::memory_order_relaxed) == before) {
             return before != 0;
         }
     }

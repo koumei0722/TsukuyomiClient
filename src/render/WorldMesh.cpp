@@ -1,10 +1,11 @@
 #include "render/WorldMesh.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Strings.h"
 #include "game/BlockRegistry.h"
+#include "game/GameData.h"
 #include "hooks/HookManager.h"
-#include "hooks/HookCount.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 #include "memory/Signatures.h"
@@ -56,15 +57,11 @@ RendererFlagFn g_rendererFlag = nullptr;
 MeshRenderFn g_meshRender = nullptr;
 MeshDestroyFn g_meshDestroy = nullptr;
 std::atomic<bool> g_keptBroken{false};
-using StageHostFn = void*(__fastcall*)(void*, void*, void*, void*);
-constexpr std::ptrdiff_t kHostCtxAt = 0x28;
-StageHostFn g_hostOriginal = nullptr;
-std::atomic<unsigned long long> g_hostCalls{0};
-std::atomic<int> g_drawAt{0};
+std::atomic<bool> g_linesBroken{false};
+std::atomic<bool> g_debugRibbonsBroken{false};
 std::mutex g_debugMutex;
 std::vector<DebugLine> g_debugLines;
 std::atomic<unsigned> g_debugNoMaterial{0};
-std::atomic<bool> g_drewThisFrame{false};
 TessBeginFn g_begin = nullptr;
 TessVertexFn g_vertex = nullptr;
 TessColorFn g_color = nullptr;
@@ -143,54 +140,15 @@ struct Named {
 Named g_named[std::size(kChoices)];
 
 std::atomic<bool> g_modeBroken[8]{};
-constexpr int kDefaultMaxBoxes = 30000;
-std::atomic<std::uint32_t> g_lastCalls{0};
 
 std::atomic<unsigned long long> g_calls{0};
 std::atomic<unsigned long long> g_drawn{0};
-std::atomic<unsigned long long> g_failed{0};
-std::atomic<unsigned long long> g_capped{0};
 std::atomic<unsigned long long> g_noMaterial{0};
-std::atomic<unsigned long long> g_noQuads{0};
 std::atomic<unsigned long long> g_badCtx{0};
 std::atomic<unsigned long long> g_camShifted{0};
-std::atomic<unsigned long long> g_lines{0};
 std::atomic<unsigned long long> g_noLineMaterial{0};
-std::atomic<std::size_t> g_quadCount{0};
-std::atomic<std::size_t> g_edgeCount{0};
-std::atomic<std::size_t> g_cellCount{0};
-std::atomic<int> g_quadRadius{-1};
-std::atomic<unsigned long long> g_mergeMsLast{0};
-std::atomic<unsigned long long> g_mergeMsMax{0};
-std::atomic<std::size_t> g_mergeCount{0};
-std::atomic<std::size_t> g_selectCount{0};
-std::atomic<unsigned long long> g_selectUsMax{0};
-std::atomic<std::size_t> g_sortCount{0};
-std::atomic<unsigned long long> g_sortUsMax{0};
-std::atomic<std::uint32_t> g_lastLines{0};
-std::atomic<std::size_t> g_lastCap{0};
-std::atomic<unsigned long long> g_keptFrames{0};
-std::atomic<std::size_t> g_keptRegionCount{0};
 std::atomic<std::size_t> g_keptMeshCount{0};
-std::atomic<std::size_t> g_keptFaceCount{0};
-std::atomic<std::size_t> g_keptLineCount{0};
-std::atomic<std::uint32_t> g_keptLastDrawn{0};
-std::atomic<std::uint32_t> g_keptLastCulled{0};
-std::atomic<unsigned long long> g_keptDrawUsLast{0};
-std::atomic<unsigned long long> g_keptDrawUsMax{0};
-std::atomic<unsigned long long> g_keptRebuilt{0};
-std::atomic<unsigned long long> g_keptRebuildUsMax{0};
-std::atomic<unsigned long long> g_keptRegionUsMax{0};
-std::atomic<std::size_t> g_keptWaiting{0};
-std::atomic<std::size_t> g_groupCount{0};
-std::atomic<unsigned long long> g_groupMsLast{0};
-std::atomic<unsigned long long> g_groupMsMax{0};
-std::atomic<std::uint32_t> g_lastFaces[boxmesh::kMaxColor + 1]{};
-std::atomic<unsigned long long> g_edgesSkipped{0};
-constexpr std::size_t kEdgeCellLimit = 120000;
-std::atomic<unsigned long long> g_microsMax{0};
 std::atomic<bool> g_inside{false};
-std::atomic<unsigned> g_failLogs{0};
 
 __declspec(noinline) bool callMaterialCtor(MaterialPtr* out, void* group, const void* name)
 {
@@ -290,7 +248,7 @@ const void* materialFor(void* lrp, int mode)
             static std::atomic<unsigned> told{0};
             if (told.fetch_add(1, std::memory_order_relaxed) < 3) {
                 log().warn(L"WorldMesh: the material at LRP{:+#x} is not {} (object {:#x}). "
-                           L"This view falls back to the original drawing path",
+                           L"Color boxes are not drawn in this view",
                            choice->lrpOffset,
                            toUtf16(choice->name),
                            reinterpret_cast<std::uintptr_t>(info));
@@ -308,13 +266,6 @@ const void* materialFor(void* lrp, int mode)
     return &g_named[slot].ptr;
 }
 
-struct Segment {
-    std::uint8_t color = 0;
-    bool line = false;
-    std::uint32_t first = 0;
-    std::uint32_t count = 0;
-};
-
 struct RegionOut {
     boxmesh::RegionKey key;
     std::uint64_t generation = 0;
@@ -322,27 +273,9 @@ struct RegionOut {
 };
 
 struct Prepared {
-    unsigned long long version = ~0ULL;
     bool xray = false;
-    std::vector<boxmesh::Quad> quads;
-    std::size_t begin[boxmesh::kMaxColor + 1] = {};
-    std::size_t end[boxmesh::kMaxColor + 1] = {};
-    std::vector<boxmesh::Edge> edges;
-    std::size_t edgeBegin[boxmesh::kMaxColor + 1] = {};
-    std::size_t edgeEnd[boxmesh::kMaxColor + 1] = {};
-    std::size_t cells = 0;
-    std::size_t allQuads = 0;
-    std::size_t allEdges = 0;
-    std::size_t budget = 0;
-    float quadRadius = -1.0F;
-    std::vector<Segment> segments;
-    bool mixed = false;
-    std::size_t faceBudget = 0;
-    std::vector<std::uint32_t> mixedOrder;
     bool retained = false;
     std::vector<RegionOut> regions;
-    std::size_t regionFaces = 0;
-    std::size_t regionLines = 0;
 };
 Prepared g_prepared;
 std::uint64_t g_preparedSerial = 0;
@@ -354,45 +287,13 @@ bool keptAvailable()
            && !g_keptBroken.load(std::memory_order_relaxed);
 }
 
-constexpr std::size_t kMixedFacesPerCall = 16383;
-constexpr double kEdgeReach = 0.5;
 constexpr double kRibbonPixels = 1.5;
 constexpr double kRibbonNearW = 0.05;
-
-constexpr double kReorderBlocks = 4.0;
-constexpr double kResortBlocks = 1.0;
-
-struct Merged {
-    bool valid = false;
-    unsigned long long version = ~0ULL;
-    bool xray = false;
-    std::vector<boxmesh::Quad> quads;
-    std::vector<boxmesh::Edge> edges;
-    std::size_t cells = 0;
-};
-
-struct Selection {
-    bool valid = false;
-    unsigned long long version = ~0ULL;
-    bool xray = false;
-    std::size_t faceBudget = 0;
-    double edgeReach = 0.0;
-    double eye[3] = {};
-    std::vector<boxmesh::Quad> quads;
-    std::vector<boxmesh::Edge> edges;
-    float quadRadius = -1.0F;
-    double keepRadius = -1.0;
-};
 
 struct MeshRequest {
     unsigned long long version = ~0ULL;
     bool xray = false;
     std::shared_ptr<const std::vector<blocks::DiffBox>> list;
-    double eye[3] = {};
-    std::size_t budget = 0;
-    std::size_t faceBudget = 0;
-    bool mixed = false;
-    bool retained = false;
 };
 std::mutex g_workLock;
 std::condition_variable g_workCv;
@@ -405,189 +306,6 @@ HANDLE g_worker = nullptr;
 std::atomic<bool> g_workerRunning{false};
 unsigned long long g_requestedVersion = ~0ULL;
 bool g_requestedXray = false;
-double g_requestedEye[3] = {};
-std::size_t g_requestedBudget = 0;
-std::size_t g_requestedFaceBudget = 0;
-bool g_requestedMixed = false;
-bool g_requestedRetained = false;
-Merged g_merged;
-Selection g_selection;
-
-void mergeList(const MeshRequest& request, Merged& out)
-{
-    out.valid = true;
-    out.version = request.version;
-    out.xray = request.xray;
-    out.quads.clear();
-    out.edges.clear();
-    out.cells = 0;
-    if (!request.list || request.list->empty()) {
-        return;
-    }
-    std::vector<boxmesh::Cell> cells;
-    cells.reserve(request.list->size());
-    for (const blocks::DiffBox& box : *request.list) {
-        const auto color = static_cast<std::uint8_t>(box.color);
-        if (color == 0 || color > boxmesh::kMaxColor) {
-            continue;
-        }
-        cells.push_back(boxmesh::Cell{box.x, box.y, box.z, color, box.covered});
-    }
-    out.cells = cells.size();
-    out.quads = boxmesh::build(cells, !request.xray);
-    if (cells.size() > kEdgeCellLimit) {
-        g_edgesSkipped.fetch_add(1, std::memory_order_relaxed);
-        out.edges = boxmesh::edgesFromQuads(out.quads);
-    } else {
-        out.edges = boxmesh::buildEdges(
-            cells, request.xray ? boxmesh::EdgeStyle::BlockAll : boxmesh::EdgeStyle::BlockSurface);
-    }
-}
-
-void buildSegments(Prepared& out);
-
-void selectPrepared(const Merged& merged, const MeshRequest& request, Selection& selection,
-                    Prepared& out)
-{
-    out.version = request.version;
-    out.xray = request.xray;
-    out.cells = merged.cells;
-    out.allQuads = merged.quads.size();
-    out.allEdges = merged.edges.size();
-    out.budget = request.budget;
-    out.faceBudget = request.faceBudget;
-    out.mixed = request.mixed;
-    out.mixedOrder.clear();
-    LARGE_INTEGER t0{};
-    LARGE_INTEGER t1{};
-    LARGE_INTEGER freq{};
-    QueryPerformanceCounter(&t0);
-    bool sortOnly = false;
-    if (request.mixed) {
-        const double reach = kEdgeReach;
-        double moved = 0.0;
-        for (int k = 0; k < 3; ++k) {
-            const double d = request.eye[k] - selection.eye[k];
-            moved += d * d;
-        }
-        const double resort = selection.keepRadius < 0.0
-                                  ? kReorderBlocks
-                                  : (std::min)(kReorderBlocks, selection.keepRadius * 0.25);
-        sortOnly = selection.valid && selection.version == request.version
-                   && selection.xray == request.xray && selection.faceBudget == request.faceBudget
-                   && selection.edgeReach == reach && moved <= resort * resort;
-        if (sortOnly) {
-            out.quads = selection.quads;
-            out.edges = selection.edges;
-            out.quadRadius = selection.quadRadius;
-            boxmesh::paintOrder(out.quads, out.edges, request.eye, request.faceBudget, reach,
-                                out.mixedOrder);
-        } else {
-            out.quadRadius =
-                boxmesh::copyNearest(merged.quads, request.eye, request.faceBudget, out.quads);
-            boxmesh::copyNearest(merged.edges, request.eye, request.faceBudget, out.edges);
-            const float radius = boxmesh::paintOrder(out.quads, out.edges, request.eye,
-                                                     request.faceBudget, reach, out.mixedOrder);
-            if (radius >= 0.0F) {
-                out.quadRadius = radius;
-            }
-            selection.valid = true;
-            selection.version = request.version;
-            selection.xray = request.xray;
-            selection.faceBudget = request.faceBudget;
-            selection.edgeReach = reach;
-            std::copy(request.eye, request.eye + 3, selection.eye);
-            selection.quads = out.quads;
-            selection.edges = out.edges;
-            selection.quadRadius = out.quadRadius;
-            double keep = -1.0;
-            if (out.quads.size() < merged.quads.size()) {
-                double farthest = 0.0;
-                for (const boxmesh::Quad& quad : out.quads) {
-                    farthest = (std::max)(farthest, boxmesh::distanceSq(quad, request.eye));
-                }
-                keep = std::sqrt(farthest);
-            }
-            if (reach > 0.0 && !out.edges.empty() && out.edges.size() < merged.edges.size()) {
-                double farthest = 0.0;
-                for (const boxmesh::Edge& edge : out.edges) {
-                    farthest = (std::max)(farthest, boxmesh::distanceSq(edge, request.eye));
-                }
-                const double edgeKeep = std::sqrt(farthest) / reach;
-                keep = keep < 0.0 ? edgeKeep : (std::min)(keep, edgeKeep);
-            }
-            selection.keepRadius = keep;
-        }
-    } else {
-        out.quadRadius =
-            boxmesh::copyNearest(merged.quads, request.eye, request.faceBudget, out.quads);
-        boxmesh::copyNearest(merged.edges, request.eye, request.budget, out.edges);
-    }
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&freq);
-    const auto micros = static_cast<unsigned long long>(
-        (t1.QuadPart - t0.QuadPart) * 1000000LL / (freq.QuadPart != 0 ? freq.QuadPart : 1));
-    std::atomic<std::size_t>& count = sortOnly ? g_sortCount : g_selectCount;
-    std::atomic<unsigned long long>& longest = sortOnly ? g_sortUsMax : g_selectUsMax;
-    count.fetch_add(1, std::memory_order_relaxed);
-    unsigned long long was = longest.load(std::memory_order_relaxed);
-    while (micros > was && !longest.compare_exchange_weak(was, micros, std::memory_order_relaxed)) {
-    }
-    for (std::size_t c = 0; c <= boxmesh::kMaxColor; ++c) {
-        out.begin[c] = 0;
-        out.end[c] = 0;
-        out.edgeBegin[c] = 0;
-        out.edgeEnd[c] = 0;
-    }
-    for (std::size_t i = 0; i < out.quads.size(); ++i) {
-        const std::size_t c = out.quads[i].color;
-        if (c > boxmesh::kMaxColor) {
-            continue;
-        }
-        if (out.end[c] == 0) {
-            out.begin[c] = i;
-        }
-        out.end[c] = i + 1;
-    }
-    for (std::size_t i = 0; i < out.edges.size(); ++i) {
-        const std::size_t c = out.edges[i].color;
-        if (c > boxmesh::kMaxColor) {
-            continue;
-        }
-        if (out.edgeEnd[c] == 0) {
-            out.edgeBegin[c] = i;
-        }
-        out.edgeEnd[c] = i + 1;
-    }
-    buildSegments(out);
-}
-
-void buildSegments(Prepared& out)
-{
-    out.segments.clear();
-    constexpr std::uint8_t kColorOrder[] = {2, 3, 4, 1};
-    if (out.mixed) {
-        if (!out.mixedOrder.empty()) {
-            out.segments.push_back(
-                Segment{0, false, 0, static_cast<std::uint32_t>(out.mixedOrder.size())});
-        }
-        return;
-    }
-    for (const std::uint8_t color : kColorOrder) {
-        if (out.end[color] > out.begin[color]) {
-            out.segments.push_back(Segment{color, false,
-                                           static_cast<std::uint32_t>(out.begin[color]),
-                                           static_cast<std::uint32_t>(out.end[color]
-                                                                      - out.begin[color])});
-        }
-        if (out.edgeEnd[color] > out.edgeBegin[color]) {
-            out.segments.push_back(Segment{color, true,
-                                           static_cast<std::uint32_t>(out.edgeBegin[color]),
-                                           static_cast<std::uint32_t>(out.edgeEnd[color]
-                                                                      - out.edgeBegin[color])});
-        }
-    }
-}
 
 struct Regions {
     unsigned long long version = ~0ULL;
@@ -598,20 +316,9 @@ Regions g_regions;
 
 void buildRegions(const MeshRequest& request, Regions& state, Prepared& out)
 {
-    out.version = request.version;
     out.xray = request.xray;
     out.retained = true;
-    out.mixed = false;
-    out.budget = request.budget;
-    out.faceBudget = request.faceBudget;
-    out.quads.clear();
-    out.edges.clear();
-    out.segments.clear();
-    out.mixedOrder.clear();
-    out.allQuads = 0;
-    out.allEdges = 0;
     if (state.version != request.version || state.xray != request.xray) {
-        const unsigned long long began = GetTickCount64();
         std::vector<boxmesh::Cell> cells;
         if (request.list) {
             cells.reserve(request.list->size());
@@ -626,58 +333,20 @@ void buildRegions(const MeshRequest& request, Regions& state, Prepared& out)
         state.set.update(cells, request.xray);
         state.version = request.version;
         state.xray = request.xray;
-        const unsigned long long took = GetTickCount64() - began;
-        g_groupMsLast.store(took, std::memory_order_relaxed);
-        unsigned long long was = g_groupMsMax.load(std::memory_order_relaxed);
-        while (took > was && !g_groupMsMax.compare_exchange_weak(was, took, std::memory_order_relaxed)) {
-        }
-        g_groupCount.fetch_add(1, std::memory_order_relaxed);
     }
     out.regions.clear();
     out.regions.reserve(state.set.entries().size());
-    out.regionFaces = 0;
-    out.regionLines = 0;
     for (const auto& [key, entry] : state.set.entries()) {
         out.regions.push_back(RegionOut{key, entry.generation, entry.geometry});
-        out.regionFaces += entry.geometry->quads.size();
-        out.regionLines += entry.geometry->edges.size();
     }
 }
 
-void buildPrepared(const MeshRequest& request, Merged& merged, Selection& selection, Regions& regions,
-                   Prepared& out)
-{
-    if (request.retained) {
-        buildRegions(request, regions, out);
-        return;
-    }
-    out.retained = false;
-    out.regions.clear();
-    out.regionFaces = 0;
-    out.regionLines = 0;
-    if (!merged.valid || merged.version != request.version || merged.xray != request.xray) {
-        const unsigned long long began = GetTickCount64();
-        mergeList(request, merged);
-        const unsigned long long took = GetTickCount64() - began;
-        g_mergeMsLast.store(took, std::memory_order_relaxed);
-        unsigned long long was = g_mergeMsMax.load(std::memory_order_relaxed);
-        while (took > was
-               && !g_mergeMsMax.compare_exchange_weak(was, took, std::memory_order_relaxed)) {
-        }
-        g_mergeCount.fetch_add(1, std::memory_order_relaxed);
-    }
-    selectPrepared(merged, request, selection, out);
-}
-
-bool buildPreparedSafely(const MeshRequest& request, Merged& merged, Selection& selection, Regions& regions,
-                         Prepared& out)
+bool buildPreparedSafely(const MeshRequest& request, Regions& regions, Prepared& out)
 {
     try {
-        buildPrepared(request, merged, selection, regions, out);
+        buildRegions(request, regions, out);
         return true;
     } catch (const std::exception&) {
-        merged = Merged{};
-        selection = Selection{};
         regions = Regions{};
         static std::atomic<bool> told{false};
         if (!told.exchange(true)) {
@@ -692,12 +361,8 @@ bool buildPreparedSafely(const MeshRequest& request, Merged& merged, Selection& 
 Prepared emptyPrepared(const MeshRequest& request)
 {
     Prepared out;
-    out.version = request.version;
     out.xray = request.xray;
-    out.budget = request.budget;
-    out.faceBudget = request.faceBudget;
-    out.mixed = request.retained ? false : request.mixed;
-    out.retained = request.retained;
+    out.retained = true;
     return out;
 }
 
@@ -715,7 +380,7 @@ DWORD WINAPI workerLoop(LPVOID)
             g_workHas = false;
         }
         Prepared made;
-        if (!buildPreparedSafely(request, g_merged, g_selection, g_regions, made)) {
+        if (!buildPreparedSafely(request, g_regions, made)) {
             made = emptyPrepared(request);
         }
         {
@@ -726,78 +391,10 @@ DWORD WINAPI workerLoop(LPVOID)
     }
 }
 
-std::size_t frameBudget()
-{
-    return static_cast<std::size_t>((std::max)(1, kDefaultMaxBoxes));
-}
-
-bool needReorder(const double eye[3])
-{
-    if (g_prepared.retained) {
-        return false;
-    }
-    if (g_prepared.allQuads == 0 && g_prepared.allEdges == 0) {
-        return false;
-    }
-    const bool fits =
-        g_prepared.allQuads <= g_prepared.faceBudget && g_prepared.allEdges <= g_prepared.budget;
-    if (fits && !g_prepared.mixed) {
-        return false;
-    }
-    double step = kReorderBlocks;
-    if (g_prepared.mixed) {
-        step = kResortBlocks;
-    } else if (g_prepared.quadRadius >= 0.0F) {
-        step = std::clamp(static_cast<double>(g_prepared.quadRadius) * 0.25, 0.5, kReorderBlocks);
-    }
-    double d2 = 0.0;
-    for (int k = 0; k < 3; ++k) {
-        const double d = eye[k] - g_requestedEye[k];
-        d2 += d * d;
-    }
-    return d2 > step * step;
-}
-
-void prepare(bool xray, const double cam[3], bool borrowed, std::size_t quadsPerCall)
+void prepare(bool xray)
 {
     const unsigned long long version = boxes::boxVersion();
-    const Choice* const flatChoice = choiceOf(kDefaultFlat);
-    const Choice* const xrayChoice = choiceOf(kDefaultXray);
-    const bool retained =
-        keptAvailable()
-        && (xray ? (xrayChoice != nullptr && !xrayChoice->multiply && xrayChoice->mode != kLineMode)
-                 : (flatChoice != nullptr && flatChoice->multiply));
-    const std::size_t budget = frameBudget();
-    const bool mixed = xray;
-    const std::size_t faceBudget =
-        mixed ? (std::min)(budget, (std::min)(quadsPerCall, kMixedFacesPerCall)) : budget;
-    double eye[3] = {cam[0], cam[1], cam[2]};
-    if (borrowed) {
-        std::copy(g_requestedEye, g_requestedEye + 3, eye);
-    }
-    const bool reorder = !borrowed && needReorder(eye);
     if (!g_workerRunning.load(std::memory_order_acquire)) {
-        static Merged merged;
-        static Selection selection;
-        static Regions regions;
-        if (version != g_prepared.version || xray != g_prepared.xray
-            || budget != g_prepared.budget || faceBudget != g_prepared.faceBudget
-            || (!retained && mixed != g_prepared.mixed) || retained != g_prepared.retained || reorder) {
-            MeshRequest request;
-            request.version = version;
-            request.xray = xray;
-            request.list = boxes::boxSnapshot();
-            std::copy(eye, eye + 3, request.eye);
-            request.budget = budget;
-            request.faceBudget = faceBudget;
-            request.mixed = mixed;
-            request.retained = retained;
-            std::copy(eye, eye + 3, g_requestedEye);
-            if (!buildPreparedSafely(request, merged, selection, regions, g_prepared)) {
-                g_prepared = emptyPrepared(request);
-            }
-            ++g_preparedSerial;
-        }
         return;
     }
     {
@@ -808,26 +405,14 @@ void prepare(bool xray, const double cam[3], bool borrowed, std::size_t quadsPer
             ++g_preparedSerial;
         }
     }
-    if (version != g_requestedVersion || xray != g_requestedXray || budget != g_requestedBudget
-        || faceBudget != g_requestedFaceBudget || mixed != g_requestedMixed
-        || retained != g_requestedRetained || reorder) {
+    if (version != g_requestedVersion || xray != g_requestedXray) {
         g_requestedVersion = version;
         g_requestedXray = xray;
-        g_requestedBudget = budget;
-        g_requestedFaceBudget = faceBudget;
-        g_requestedMixed = mixed;
-        g_requestedRetained = retained;
-        std::copy(eye, eye + 3, g_requestedEye);
         {
             std::lock_guard<std::mutex> lock(g_workLock);
             g_work.version = version;
             g_work.xray = xray;
             g_work.list = boxes::boxSnapshot();
-            std::copy(eye, eye + 3, g_work.eye);
-            g_work.budget = budget;
-            g_work.faceBudget = faceBudget;
-            g_work.mixed = mixed;
-            g_work.retained = retained;
             g_workHas = true;
         }
         g_workCv.notify_one();
@@ -838,8 +423,9 @@ void startWorker()
 {
     g_worker = CreateThread(nullptr, 0, &workerLoop, nullptr, 0, nullptr);
     if (g_worker == nullptr) {
-        log().warn(L"WorldMesh: could not start the merge thread (merging on the render thread "
-                   L"instead)");
+        notice::failOnce("WorldMesh.worker",
+                         L"WorldMesh: could not start the merge thread; color boxes are not drawn",
+                         "Color boxes are not drawn: the background thread could not be started");
         return;
     }
     g_workerRunning.store(true, std::memory_order_release);
@@ -858,6 +444,7 @@ void stopWorker()
     if (g_worker != nullptr) {
         if (WaitForSingleObject(g_worker, 10000) != WAIT_OBJECT_0) {
             log().warn(L"WorldMesh: the merge thread did not stop within 10 seconds");
+            while (WaitForSingleObject(g_worker, INFINITE) != WAIT_OBJECT_0) Sleep(1);
         }
         CloseHandle(g_worker);
         g_worker = nullptr;
@@ -869,27 +456,17 @@ struct Job {
     void* tess;
     const void* material;
     double cam[3];
-    const boxmesh::Quad* quads;
-    std::size_t count;
-    const boxmesh::Edge* edges;
     const DebugLine* debugLines;
     std::size_t edgeCount;
     float rgba[4];
     std::uint32_t limit;
-    bool perQuadColor;
-    float palette[boxmesh::kMaxColor + 1][4];
-    std::uint32_t facesOf[boxmesh::kMaxColor + 1];
-    const std::uint32_t* order;
-    float linePalette[boxmesh::kMaxColor + 1][4];
     double ribbonScale;
     double forward[3];
     double forwardW;
     bool haveForward;
-    std::uint32_t ribbons;
-    std::uint32_t batches;
-    std::uint32_t faces;
     bool busy;
     bool failed;
+    bool ribbonFailed;
     DWORD code;
 };
 
@@ -906,107 +483,6 @@ void emitRect(const Job& job, const boxmesh::Quad& quad)
     void* const tess = job.tess;
     for (int i = 0; i < 4; ++i) {
         g_vertex(tess, v[i][0], v[i][1], v[i][2]);
-    }
-}
-
-bool emitRibbon(const Job& job, const boxmesh::Edge& edge)
-{
-    std::int32_t ends[2][3] = {};
-    boxmesh::edgeEnds(edge, ends);
-    double p[2][3] = {};
-    for (int i = 0; i < 2; ++i) {
-        for (int k = 0; k < 3; ++k) {
-            p[i][k] = static_cast<double>(ends[i][k]) - job.cam[k];
-        }
-    }
-    double v[4][3] = {};
-    if (!boxmesh::ribbonCorners(p[0], p[1], job.haveForward ? job.forward : nullptr, job.forwardW,
-                                job.ribbonScale, kRibbonNearW, v)) {
-        return false;
-    }
-    void* const tess = job.tess;
-    for (int i = 3; i >= 0; --i) {
-        g_vertex(tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]),
-                 static_cast<float>(v[i][2]));
-    }
-    return true;
-}
-
-__declspec(noinline) void runJob(Job& job)
-{
-    __try {
-        auto* const tess = static_cast<unsigned char*>(job.tess);
-        float* color = nullptr;
-        std::memcpy(&color, static_cast<unsigned char*>(job.ctx) + kCtxColor, sizeof(color));
-        std::size_t at = 0;
-        while (at < job.count) {
-            if (tess[kTessBuilding] != 0 || tess[kTessVoid] != 0) {
-                job.busy = true;
-                return;
-            }
-            g_begin(tess, nullptr, kPrimitiveQuads, 0, false);
-            if (tess[kTessBuilding] == 0) {
-                job.busy = true;
-                return;
-            }
-            const float zero[3] = {0.0F, 0.0F, 0.0F};
-            const float one[3] = {1.0F, 1.0F, 1.0F};
-            std::memcpy(tess + kTessOffset, zero, sizeof(zero));
-            std::memcpy(tess + kTessScale, one, sizeof(one));
-            tess[kTessUseMatrix] = 0;
-            tess[kTessNoColor] = job.perQuadColor ? 0 : 1;
-            std::uint8_t current = 0xFF;
-            std::uint32_t used = 0;
-            for (; at < job.count; ++at) {
-                if (used + 4U > job.limit && used != 0) {
-                    break;
-                }
-                if (job.perQuadColor) {
-                    const std::uint32_t item = job.order[at];
-                    const bool isEdge = (item & boxmesh::kEdgeItem) != 0;
-                    const std::uint32_t index = item & ~boxmesh::kEdgeItem;
-                    const std::uint8_t raw = isEdge ? job.edges[index].color : job.quads[index].color;
-                    const std::uint8_t quadColor = raw <= boxmesh::kMaxColor ? raw : 0;
-                    const auto key = static_cast<std::uint8_t>(quadColor | (isEdge ? 0x80U : 0U));
-                    if (key != current) {
-                        const float* const rgba =
-                            isEdge ? job.linePalette[quadColor] : job.palette[quadColor];
-                        g_color(tess, rgba[0], rgba[1], rgba[2], rgba[3]);
-                        current = key;
-                    }
-                    if (isEdge) {
-                        if (emitRibbon(job, job.edges[index])) {
-                            used += 4U;
-                            ++job.ribbons;
-                        }
-                    } else {
-                        emitRect(job, job.quads[index]);
-                        used += 4U;
-                        ++job.faces;
-                        ++job.facesOf[quadColor];
-                    }
-                    continue;
-                }
-                emitRect(job, job.quads[at]);
-                used += 4U;
-                ++job.faces;
-            }
-            if (used == 0) {
-                for (int i = 0; i < 4; ++i) {
-                    g_vertex(tess, 0.0F, 0.0F, 0.0F);
-                }
-            }
-            if (color != nullptr) {
-                std::memcpy(color, job.rgba, sizeof(job.rgba));
-                reinterpret_cast<unsigned char*>(color)[0x10] = 1;
-            }
-            alignas(16) unsigned char texture[0x40] = {};
-            g_render(job.ctx, tess, job.material, texture);
-            ++job.batches;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        job.failed = true;
-        job.code = GetExceptionCode();
     }
 }
 
@@ -1032,8 +508,12 @@ void emitDebugEdge(const Job& job, const DebugLine& edge)
     }
 }
 
+void resetTessellator(void* tess);
+
 __declspec(noinline) void runLineJob(Job& job)
 {
+    if (g_linesBroken.load(std::memory_order_relaxed)) return;
+    bool building = false;
     __try {
         auto* const tess = static_cast<unsigned char*>(job.tess);
         float* color = nullptr;
@@ -1046,7 +526,9 @@ __declspec(noinline) void runLineJob(Job& job)
                 return;
             }
             g_begin(tess, nullptr, kPrimitiveLines, 0, false);
+            building = true;
             if (tess[kTessBuilding] == 0) {
+                building = false;
                 job.busy = true;
                 return;
             }
@@ -1061,13 +543,8 @@ __declspec(noinline) void runLineJob(Job& job)
                 if (used + 2U > limit && used != 0) {
                     break;
                 }
-                if (job.debugLines != nullptr) {
-                    emitDebugEdge(job, job.debugLines[at]);
-                } else {
-                    emitEdge(job, job.edges[at]);
-                }
+                emitDebugEdge(job, job.debugLines[at]);
                 used += 2U;
-                ++job.faces;
             }
             if (color != nullptr) {
                 std::memcpy(color, job.rgba, sizeof(job.rgba));
@@ -1075,11 +552,13 @@ __declspec(noinline) void runLineJob(Job& job)
             }
             alignas(16) unsigned char texture[0x40] = {};
             g_render(job.ctx, tess, job.material, texture);
-            ++job.batches;
+            building = false;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         job.failed = true;
         job.code = GetExceptionCode();
+        if (building) resetTessellator(job.tess);
+        g_linesBroken.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -1115,6 +594,8 @@ bool emitDebugRibbon(const Job& job, const DebugLine& line)
 
 __declspec(noinline) void runDebugRibbonJob(Job& job)
 {
+    if (g_debugRibbonsBroken.load(std::memory_order_relaxed)) return;
+    bool building = false;
     __try {
         auto* const tess = static_cast<unsigned char*>(job.tess);
         float* color = nullptr;
@@ -1131,7 +612,9 @@ __declspec(noinline) void runDebugRibbonJob(Job& job)
                 return;
             }
             g_begin(tess, nullptr, kPrimitiveQuads, 0, false);
+            building = true;
             if (tess[kTessBuilding] == 0) {
+                building = false;
                 job.busy = true;
                 return;
             }
@@ -1148,7 +631,6 @@ __declspec(noinline) void runDebugRibbonJob(Job& job)
                 }
                 if (emitDebugRibbon(job, job.debugLines[at])) {
                     used += 4U;
-                    ++job.ribbons;
                 }
             }
             if (color != nullptr) {
@@ -1157,11 +639,14 @@ __declspec(noinline) void runDebugRibbonJob(Job& job)
             }
             alignas(16) unsigned char texture[0x40] = {};
             g_render(job.ctx, tess, job.material, texture);
-            ++job.batches;
+            building = false;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         job.failed = true;
         job.code = GetExceptionCode();
+        if (building) resetTessellator(job.tess);
+        g_debugRibbonsBroken.store(true, std::memory_order_relaxed);
+        job.ribbonFailed = true;
     }
 }
 
@@ -1256,7 +741,11 @@ void drawDebugLines(void* lrp, void* ctx)
             }
             job.material = onTopMaterial;
             runLineJob(job);
-        } else if (width > 1.0F && ribbonMaterial != nullptr && job.haveForward) {
+        } else if (width > 1.0F) {
+            if (ribbonMaterial == nullptr || !job.haveForward) {
+                at = end;
+                continue;
+            }
             job.material = ribbonMaterial;
             runDebugRibbonJob(job);
         } else {
@@ -1267,18 +756,23 @@ void drawDebugLines(void* lrp, void* ctx)
         at = end;
     }
     restoreState(ctx, tess, saved);
+    if (job.failed) {
+        const bool ribbons = job.ribbonFailed;
+        notice::failOnce(ribbons ? "WorldMesh.debugRibbonFailed" : "WorldMesh.lineFailed",
+                         std::format(L"WorldMesh: {} failed (exception {:08X}); this drawing path is disabled",
+                                     ribbons ? L"debug ribbons" : L"lines", job.code),
+                         "Debug lines: drawing failed inside the game; the affected drawing path is disabled");
+    }
     if (anyOnTop && onTopMaterial == nullptr) {
         static std::atomic<bool> told{false};
         if (!told.exchange(true, std::memory_order_relaxed)) {
             log().warn(L"WorldMesh: the always-on-top debug lines are not drawn (name_tag material missing)");
         }
     }
-    if (anyThick && (ribbonMaterial == nullptr || !job.haveForward)) {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true, std::memory_order_relaxed)) {
-            log().warn(L"WorldMesh: thick debug lines are drawn 1 px wide (material {} / projection {})",
-                       ribbonMaterial != nullptr ? L"ok" : L"missing", job.haveForward ? L"ok" : L"missing");
-        }
+    if (anyThick && ribbonMaterial == nullptr) {
+        notice::failOnce("WorldMesh.ribbon",
+                         L"WorldMesh: the material for thick debug lines was not found; thick debug lines are not drawn",
+                         "Thick debug lines (F3+B / F3+G) are not drawn: their material was not found");
     }
 }
 
@@ -1321,38 +815,6 @@ __declspec(noinline) void restoreState(void* ctx, void* tess, const TessSaved& s
     }
 }
 
-__declspec(noinline) bool readTopMatrix(void* ctx, float out[16])
-{
-    __try {
-        unsigned char* stack = nullptr;
-        std::memcpy(&stack, static_cast<unsigned char*>(ctx) + kCtxMatrices, sizeof(stack));
-        if (stack == nullptr) {
-            return false;
-        }
-        std::uint64_t map = 0;
-        std::uint64_t mapSize = 0;
-        std::uint64_t first = 0;
-        std::uint64_t size = 0;
-        std::memcpy(&map, stack + 0x48, 8);
-        std::memcpy(&mapSize, stack + 0x50, 8);
-        std::memcpy(&first, stack + 0x58, 8);
-        std::memcpy(&size, stack + 0x60, 8);
-        if (map == 0 || mapSize == 0 || size == 0 || (mapSize & (mapSize - 1)) != 0) {
-            return false;
-        }
-        const std::uint64_t index = (first + size - 1) & (mapSize - 1);
-        const float* top = nullptr;
-        std::memcpy(&top, reinterpret_cast<const unsigned char*>(map) + index * 8, sizeof(top));
-        if (top == nullptr) {
-            return false;
-        }
-        std::memcpy(out, top, sizeof(float) * 16);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 struct alignas(16) MeshStorage {
     unsigned char bytes[0x400];
 };
@@ -1360,7 +822,6 @@ struct KeptMesh {
     std::unique_ptr<MeshStorage> storage;
     std::uint8_t color = 0;
     bool line = false;
-    std::uint32_t count = 0;
 };
 struct KeptRegion {
     std::uint64_t generation = 0;
@@ -1381,8 +842,6 @@ std::unordered_map<boxmesh::RegionKey, RegionOut, boxmesh::RegionKeyHash>& g_kep
     *new std::unordered_map<boxmesh::RegionKey, RegionOut, boxmesh::RegionKeyHash>();
 std::uint64_t g_keptSyncedSerial = ~0ULL;
 std::size_t g_keptMeshes = 0;
-std::size_t g_keptFaces = 0;
-std::size_t g_keptLines = 0;
 constexpr unsigned long long kKeptRebuildBudgetUs = 3000;
 constexpr double kKeptNearOrderBlocks = 20.0;
 constexpr double kKeptWidthRatio = 1.5;
@@ -1402,13 +861,9 @@ enum class KeptWhy : std::uint8_t {
     Released,
     BoxesOff,
     Broken,
-    NotKept,
 };
 std::atomic<std::size_t> g_keptLastReturned{0};
 std::atomic<KeptWhy> g_keptLastWhy{KeptWhy::Released};
-std::atomic<unsigned long long> g_keptReordered{0};
-std::atomic<unsigned long long> g_keptUnordered{0};
-std::atomic<bool> g_keptLastXray{false};
 
 struct MeshName {
     const char* text;
@@ -1753,8 +1208,10 @@ __declspec(noinline) void resetTessellator(void* tess)
     __try {
         auto* const t = static_cast<unsigned char*>(tess);
         t[kTessBuilding] = 0;
-        t[0x255] = 0;
-        g_tessClear(t + 8);
+        if (g_tessClear != nullptr) {
+            t[kTessVoid] = 0;
+            g_tessClear(t + 8);
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
 }
@@ -1814,11 +1271,6 @@ void destroyKeptRegion(KeptRegion& region)
         if (mesh.storage) {
             destroyKeptMesh(mesh.storage->bytes);
         }
-        if (mesh.line) {
-            g_keptLines -= (std::min)(g_keptLines, static_cast<std::size_t>(mesh.count));
-        } else {
-            g_keptFaces -= (std::min)(g_keptFaces, static_cast<std::size_t>(mesh.count));
-        }
     }
     g_keptMeshes -= (std::min)(g_keptMeshes, region.meshes.size());
     region.meshes.clear();
@@ -1838,18 +1290,15 @@ void destroyKept(KeptWhy why)
     g_keptSyncedSerial = ~0ULL;
     g_keptStall = 0;
     g_keptMeshes = 0;
-    g_keptFaces = 0;
-    g_keptLines = 0;
-    g_keptRegionCount.store(0, std::memory_order_relaxed);
     g_keptMeshCount.store(0, std::memory_order_relaxed);
-    g_keptFaceCount.store(0, std::memory_order_relaxed);
-    g_keptLineCount.store(0, std::memory_order_relaxed);
 }
 
 void keptBroke(const wchar_t* where)
 {
     if (!g_keptBroken.exchange(true)) {
-        log().warn(L"WorldMesh: a kept mesh failed ({}). Boxes go back to the immediate drawing", where);
+        notice::failOnce("WorldMesh.keptBroke",
+                         std::wstring(L"WorldMesh: a kept mesh failed (") + where + L"); color boxes are not drawn",
+                         "Color boxes are not drawn: drawing them failed inside the game");
     }
     destroyKept(KeptWhy::Broken);
 }
@@ -2015,7 +1464,6 @@ KeptMade buildKeptRegionBody(const RegionOut& source, void* tess, const KeptFram
                 ok = false;
                 return;
             }
-            mesh.count = b.made;
             try {
                 fresh.meshes.push_back(std::move(mesh));
             } catch (...) {
@@ -2067,7 +1515,7 @@ KeptMade buildKeptRegionBody(const RegionOut& source, void* tess, const KeptFram
                 edges.push_back(piece);
             }
         }
-        boxmesh::paintOrder(quads, edges, eye, quads.size() + edges.size() + 1, 1.0, order);
+        boxmesh::paintOrder(quads, edges, eye, order);
         std::memcpy(b.palette, frame.palette, sizeof(b.palette));
         std::memcpy(b.linePalette, frame.linePalette, sizeof(b.linePalette));
         b.ribbonScale = frame.ribbonScale;
@@ -2145,7 +1593,6 @@ bool rebuildKept(void* tess, const KeptFrame& frame, bool& waiting)
                                                / (freq.QuadPart != 0 ? freq.QuadPart : 1));
     };
     std::size_t done = 0;
-    std::size_t reordered = 0;
     for (const Candidate& candidate : candidates) {
         if (done != 0 && elapsedUs() >= kKeptRebuildBudgetUs) {
             break;
@@ -2158,12 +1605,7 @@ bool rebuildKept(void* tess, const KeptFrame& frame, bool& waiting)
             source = RegionOut{candidate.key, region.generation, region.geometry};
         }
         KeptRegion fresh;
-        const unsigned long long before = elapsedUs();
         const KeptMade made = buildKeptRegion(source, tess, frame, fresh);
-        const unsigned long long one = elapsedUs() - before;
-        unsigned long long longest = g_keptRegionUsMax.load(std::memory_order_relaxed);
-        while (one > longest && !g_keptRegionUsMax.compare_exchange_weak(longest, one, std::memory_order_relaxed)) {
-        }
         if (made == KeptMade::Busy) {
             break;
         }
@@ -2187,26 +1629,11 @@ bool rebuildKept(void* tess, const KeptFrame& frame, bool& waiting)
             }
         }
         it->second = std::move(fresh);
-        for (const KeptMesh& mesh : it->second.meshes) {
-            ++g_keptMeshes;
-            if (mesh.line) {
-                g_keptLines += mesh.count;
-            } else {
-                g_keptFaces += mesh.count;
-            }
-        }
+        g_keptMeshes += it->second.meshes.size();
         if (candidate.content) {
             g_keptPending.erase(candidate.key);
-        } else {
-            ++reordered;
         }
         ++done;
-    }
-    g_keptRebuilt.fetch_add(done - reordered, std::memory_order_relaxed);
-    g_keptReordered.fetch_add(reordered, std::memory_order_relaxed);
-    const unsigned long long took = elapsedUs();
-    unsigned long long was = g_keptRebuildUsMax.load(std::memory_order_relaxed);
-    while (took > was && !g_keptRebuildUsMax.compare_exchange_weak(was, took, std::memory_order_relaxed)) {
     }
     return done != 0;
 }
@@ -2306,7 +1733,7 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
         if (haveVpDir) {
             const double col1 = std::sqrt(static_cast<double>(vp[1]) * vp[1] + static_cast<double>(vp[5]) * vp[5]
                                           + static_cast<double>(vp[9]) * vp[9]);
-            if (std::isfinite(col1) && col1 > 0.05 && col1 < 100.0) {
+            if (std::isfinite(col1) && col1 > 0.05 && col1 < 200.0) {
                 yScale = col1;
                 frame.scaleKnown = true;
             }
@@ -2344,10 +1771,8 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
     }
     std::vector<std::pair<double, const KeptRegion*>> visible;
     visible.reserve(g_kept.size());
-    std::uint32_t culled = 0;
     for (const auto& [key, region] : g_kept) {
         if (!regionVisible(region.origin, frame.cam, vp, haveVp)) {
-            ++culled;
             continue;
         }
         visible.emplace_back(boxmesh::manhattanKey(region.origin, boxmesh::kRegionSize, frame.cam), &region);
@@ -2362,14 +1787,8 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
         total += region->meshes.size();
     }
     TopMatrix m;
-    std::uint32_t drawnMeshes = 0;
     bool failed = false;
     bool matrixOk = false;
-    bool ordered = false;
-    LARGE_INTEGER t0{};
-    LARGE_INTEGER t1{};
-    LARGE_INTEGER freq{};
-    QueryPerformanceCounter(&t0);
     if (findTopMatrix(ctx, m)) {
         matrixOk = true;
         {
@@ -2391,7 +1810,6 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
                            !snapshot ? L"missing" : (haveVpDir ? L"odd" : L"away from the camera"));
             }
         }
-        ordered = m.sortControl;
         const float white[4] = {1.0F, 1.0F, 1.0F, 1.0F};
         std::size_t index = 0;
         for (const auto& [key, region] : visible) {
@@ -2423,7 +1841,6 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
                     failed = true;
                     break;
                 }
-                ++drawnMeshes;
             }
             if (failed) {
                 break;
@@ -2431,15 +1848,10 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
         }
         restoreTopMatrix(m);
     }
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&freq);
     restoreState(ctx, tess, saved);
     if (failed) {
         keptBroke(L"draw");
         return;
-    }
-    if (matrixOk && !ordered && drawnMeshes != 0) {
-        g_keptUnordered.fetch_add(1, std::memory_order_relaxed);
     }
     const bool stalled = !matrixOk || (waiting && !progressed);
     g_keptStall = stalled ? g_keptStall + 1 : 0;
@@ -2447,22 +1859,8 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
         keptBroke(matrixOk ? L"the tessellator stayed busy" : L"the matrix stack was unreadable");
         return;
     }
-    const auto micros = static_cast<unsigned long long>(
-        (t1.QuadPart - t0.QuadPart) * 1000000LL / (freq.QuadPart != 0 ? freq.QuadPart : 1));
     g_drawn.fetch_add(1, std::memory_order_relaxed);
-    g_keptFrames.fetch_add(1, std::memory_order_relaxed);
-    g_keptLastXray.store(xray, std::memory_order_relaxed);
-    g_keptLastDrawn.store(drawnMeshes, std::memory_order_relaxed);
-    g_keptLastCulled.store(culled, std::memory_order_relaxed);
-    g_keptDrawUsLast.store(micros, std::memory_order_relaxed);
-    unsigned long long was = g_keptDrawUsMax.load(std::memory_order_relaxed);
-    while (micros > was && !g_keptDrawUsMax.compare_exchange_weak(was, micros, std::memory_order_relaxed)) {
-    }
-    g_keptRegionCount.store(g_kept.size(), std::memory_order_relaxed);
     g_keptMeshCount.store(g_keptMeshes, std::memory_order_relaxed);
-    g_keptFaceCount.store(g_keptFaces, std::memory_order_relaxed);
-    g_keptLineCount.store(g_keptLines, std::memory_order_relaxed);
-    g_keptWaiting.store(g_keptPending.size(), std::memory_order_relaxed);
 }
 
 void drawKeptFrame(void* lrp, void* ctx, void* tess, const float camF[3], std::uint32_t limit, bool xray,
@@ -2513,13 +1911,12 @@ void drawBoxes(void* lrp, void* ctx)
         g_noMaterial.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const Choice* const choice = choiceOf(mode);
-    const bool multiply = choice != nullptr && choice->multiply;
-
-    LARGE_INTEGER t0{};
-    LARGE_INTEGER t1{};
-    LARGE_INTEGER freq{};
-    QueryPerformanceCounter(&t0);
+    if (!keptAvailable()) {
+        if (!g_kept.empty()) {
+            destroyKept(KeptWhy::Broken);
+        }
+        return;
+    }
 
     float cam[3] = {};
     if (!pageChecked(static_cast<unsigned char*>(lrp) + kLrpCamera, sizeof(cam), false)) {
@@ -2544,310 +1941,25 @@ void drawBoxes(void* lrp, void* ctx)
         limit = 65532;
     }
     limit &= ~3U;
-    {
-        const double eye[3] = {cam[0], cam[1], cam[2]};
-        prepare(xray, eye, FreeCamera::instance().borrowing(), limit / 4U);
-    }
+    prepare(xray);
     if (g_prepared.retained) {
         const bool keptXray = g_prepared.xray;
         const int flatMode = kDefaultFlat;
         const int xrayMode = kDefaultXray;
-        const Choice* const flatChoice = choiceOf(flatMode);
-        const Choice* const xrayChoice = choiceOf(xrayMode);
-        const bool flatOk = flatChoice != nullptr && flatChoice->multiply;
-        const bool xrayOk = xrayChoice != nullptr && !xrayChoice->multiply && xrayChoice->mode != kLineMode;
-        if (keptAvailable() && (keptXray ? xrayOk : flatOk)) {
-            const void* const flatMaterial = flatOk ? materialFor(lrp, flatMode) : nullptr;
-            const void* const xrayMaterial = xrayOk ? materialFor(lrp, xrayMode) : nullptr;
-            if ((keptXray ? xrayMaterial : flatMaterial) != nullptr) {
-                drawKeptFrame(lrp, ctx, tess, cam, limit, keptXray, flatMaterial, xrayMaterial,
-                              FreeCamera::instance().borrowing());
-            } else {
-                g_noMaterial.fetch_add(1, std::memory_order_relaxed);
-            }
+        const void* const flatMaterial = materialFor(lrp, flatMode);
+        const void* const xrayMaterial = materialFor(lrp, xrayMode);
+        if ((keptXray ? xrayMaterial : flatMaterial) != nullptr) {
+            drawKeptFrame(lrp, ctx, tess, cam, limit, keptXray, flatMaterial, xrayMaterial,
+                          FreeCamera::instance().borrowing());
+        } else {
+            g_noMaterial.fetch_add(1, std::memory_order_relaxed);
         }
         return;
     }
-    if (!g_kept.empty()) {
-        destroyKept(KeptWhy::NotKept);
-    }
-    g_quadCount.store(g_prepared.allQuads, std::memory_order_relaxed);
-    g_edgeCount.store(g_prepared.allEdges, std::memory_order_relaxed);
-    g_cellCount.store(g_prepared.cells, std::memory_order_relaxed);
-    g_quadRadius.store(static_cast<int>(std::ceil(g_prepared.quadRadius)),
-                       std::memory_order_relaxed);
-    if (g_prepared.quads.empty()) {
-        g_noQuads.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    TessSaved saved{};
-    if (!saveState(ctx, tess, saved)) {
-        return;
-    }
-
-    const float faceAlpha = boxes::boxFaceAlpha();
-    std::size_t budget = static_cast<std::size_t>(
-        (std::max)(1, kDefaultMaxBoxes));
-    std::uint32_t batches = 0;
-    std::uint32_t faces = 0;
-    bool busy = false;
-    bool failed = false;
-    DWORD code = 0;
-    std::size_t capped = 0;
-    const void* const lineMaterial = xray ? material : materialFor(lrp, kLineMode);
-    if (lineMaterial == nullptr) {
-        g_noLineMaterial.fetch_add(1, std::memory_order_relaxed);
-    }
-    std::size_t lineBudget = static_cast<std::size_t>(
-        (std::max)(1, kDefaultMaxBoxes));
-    std::uint32_t lines = 0;
-    std::uint32_t facesOf[boxmesh::kMaxColor + 1] = {};
-    std::uint32_t calls = 0;
-    for (const Segment& seg : g_prepared.segments) {
-        if (failed || busy) {
-            break;
-        }
-        const std::size_t color = seg.color;
-        if (color > boxmesh::kMaxColor) {
-            continue;
-        }
-        if (color == 0 && !seg.line) {
-            Job job{};
-            job.ctx = ctx;
-            job.tess = tess;
-            job.material = material;
-            job.cam[0] = cam[0];
-            job.cam[1] = cam[1];
-            job.cam[2] = cam[2];
-            job.perQuadColor = true;
-            for (std::size_t c = 1; c <= boxmesh::kMaxColor; ++c) {
-                float rgb[3] = {};
-                float alpha = faceAlpha;
-                if (!boxes::boxStyle(static_cast<blocks::DiffColor>(c), rgb, &alpha)) {
-                    alpha = 0.0F;
-                }
-                job.linePalette[c][0] = rgb[0];
-                job.linePalette[c][1] = rgb[1];
-                job.linePalette[c][2] = rgb[2];
-                job.linePalette[c][3] = alpha > 0.0F ? kLineAlpha : 0.0F;
-                if (multiply) {
-                    const float k = std::clamp(alpha, 0.0F, 1.0F);
-                    for (float& one : rgb) {
-                        one = 0.5F + (one - 0.5F) * k;
-                    }
-                    alpha = 1.0F;
-                }
-                job.palette[c][0] = rgb[0];
-                job.palette[c][1] = rgb[1];
-                job.palette[c][2] = rgb[2];
-                job.palette[c][3] = alpha;
-            }
-            {
-                double yScale = 1.0 / std::tan(35.0 * 3.14159265358979 / 180.0);
-                float camEye[3] = {};
-                float vp[16] = {};
-                if (boxes::cameraSnapshot(camEye, vp)) {
-                    const double col1 = std::sqrt(static_cast<double>(vp[1]) * vp[1]
-                                                  + static_cast<double>(vp[5]) * vp[5]
-                                                  + static_cast<double>(vp[9]) * vp[9]);
-                    const double col3 = std::sqrt(static_cast<double>(vp[3]) * vp[3]
-                                                  + static_cast<double>(vp[7]) * vp[7]
-                                                  + static_cast<double>(vp[11]) * vp[11]);
-                    if (std::isfinite(col1) && col1 > 0.05 && col1 < 100.0) {
-                        yScale = col1;
-                    }
-                    if (std::isfinite(col3) && col3 > 1e-3 && std::isfinite(vp[15])) {
-                        job.forward[0] = vp[3];
-                        job.forward[1] = vp[7];
-                        job.forward[2] = vp[11];
-                        job.forwardW = vp[15];
-                        job.haveForward = true;
-                    }
-                }
-                const render::Viewport view = render::overlayViewport();
-                const double height = view.valid && view.height >= 64.0F ? view.height : 1080.0;
-                job.ribbonScale = kRibbonPixels * 2.0 / (yScale * height);
-            }
-            const std::size_t total = seg.count;
-            const std::size_t count = (std::min)(total, budget);
-            capped += total - count;
-            budget -= count;
-            if (count == 0) {
-                continue;
-            }
-            job.order = g_prepared.mixedOrder.data() + seg.first + (total - count);
-            job.quads = g_prepared.quads.data();
-            job.edges = g_prepared.edges.data();
-            job.count = count;
-            job.rgba[0] = 1.0F;
-            job.rgba[1] = 1.0F;
-            job.rgba[2] = 1.0F;
-            job.rgba[3] = 1.0F;
-            job.limit = limit;
-            runJob(job);
-            batches += job.batches;
-            calls += job.batches;
-            faces += job.faces;
-            lines += job.ribbons;
-            for (std::size_t c = 0; c <= boxmesh::kMaxColor; ++c) {
-                facesOf[c] += job.facesOf[c];
-            }
-            busy = job.busy;
-            failed = job.failed;
-            code = job.code;
-            continue;
-        }
-        float baseRgb[3] = {};
-        float baseAlpha = faceAlpha;
-        if (!boxes::boxStyle(static_cast<blocks::DiffColor>(color), baseRgb, &baseAlpha)) {
-            continue;
-        }
-        if (!seg.line) {
-            float rgb[3] = {baseRgb[0], baseRgb[1], baseRgb[2]};
-            float alpha = baseAlpha;
-            if (multiply) {
-                const float k = std::clamp(alpha, 0.0F, 1.0F);
-                for (float& one : rgb) {
-                    one = 0.5F + (one - 0.5F) * k;
-                }
-                alpha = 1.0F;
-            }
-            const std::size_t total = seg.count;
-            const std::size_t count = (std::min)(total, budget);
-            capped += total - count;
-            budget -= count;
-            if (count == 0) {
-                continue;
-            }
-            Job job{};
-            job.ctx = ctx;
-            job.tess = tess;
-            job.material = material;
-            job.cam[0] = cam[0];
-            job.cam[1] = cam[1];
-            job.cam[2] = cam[2];
-            job.quads = g_prepared.quads.data() + seg.first;
-            job.count = count;
-            job.rgba[0] = rgb[0];
-            job.rgba[1] = rgb[1];
-            job.rgba[2] = rgb[2];
-            job.rgba[3] = alpha;
-            job.limit = limit;
-            runJob(job);
-            batches += job.batches;
-            calls += job.batches;
-            faces += job.faces;
-            facesOf[color] += job.faces;
-            busy = job.busy;
-            failed = job.failed;
-            code = job.code;
-            continue;
-        }
-        if (lineMaterial == nullptr) {
-            continue;
-        }
-        const std::size_t edgeTotal = seg.count;
-        const std::size_t edgeCount = (std::min)(edgeTotal, lineBudget);
-        capped += edgeTotal - edgeCount;
-        lineBudget -= edgeCount;
-        if (edgeCount == 0) {
-            continue;
-        }
-        Job job{};
-        job.ctx = ctx;
-        job.tess = tess;
-        job.material = lineMaterial;
-        job.cam[0] = cam[0];
-        job.cam[1] = cam[1];
-        job.cam[2] = cam[2];
-        job.edges = g_prepared.edges.data() + seg.first;
-        job.edgeCount = edgeCount;
-        job.rgba[0] = baseRgb[0];
-        job.rgba[1] = baseRgb[1];
-        job.rgba[2] = baseRgb[2];
-        job.rgba[3] = kLineAlpha;
-        job.limit = limit;
-        runLineJob(job);
-        batches += job.batches;
-        calls += job.batches;
-        lines += job.faces;
-        busy = job.busy;
-        failed = job.failed;
-        code = job.code;
-    }
-    g_lastCalls.store(calls, std::memory_order_relaxed);
-    g_lastLines.store(lines, std::memory_order_relaxed);
-    g_lines.fetch_add(lines, std::memory_order_relaxed);
-    restoreState(ctx, tess, saved);
-    capped += g_prepared.allQuads - g_prepared.quads.size();
-    if (lineMaterial != nullptr) {
-        capped += g_prepared.allEdges - g_prepared.edges.size();
-    }
-    for (std::size_t c = 0; c <= boxmesh::kMaxColor; ++c) {
-        g_lastFaces[c].store(facesOf[c], std::memory_order_relaxed);
-    }
-    g_lastCap.store(g_prepared.mixed ? g_prepared.faceBudget : frameBudget(),
-                    std::memory_order_relaxed);
-
-    QueryPerformanceCounter(&t1);
-    QueryPerformanceFrequency(&freq);
-    const auto micros = static_cast<unsigned long long>(
-        (t1.QuadPart - t0.QuadPart) * 1000000LL / (freq.QuadPart != 0 ? freq.QuadPart : 1));
-    unsigned long long was = g_microsMax.load(std::memory_order_relaxed);
-    while (micros > was
-           && !g_microsMax.compare_exchange_weak(was, micros, std::memory_order_relaxed)) {
-    }
-    if (capped != 0) {
-        g_capped.fetch_add(capped, std::memory_order_relaxed);
-    }
-    if (failed) {
-        g_failed.fetch_add(1, std::memory_order_relaxed);
-        if (g_failLogs.fetch_add(1, std::memory_order_relaxed) < 5) {
-            log().error(L"WorldMesh: faulted while stacking boxes {:#x} (material {} / faces "
-                        L"{})",
-                        code,
-                        mode,
-                        faces);
-        }
-    }
-    if (batches != 0) {
-        g_drawn.fetch_add(1, std::memory_order_relaxed);
-    }
-}
-
-void* __fastcall detourStageHost(void* lrp, void* arg2, void* view, void* arg4)
-{
-    void* const result =
-        (g_hostOriginal != nullptr) ? g_hostOriginal(lrp, arg2, view, arg4) : nullptr;
-    g_hostCalls.fetch_add(1, std::memory_order_relaxed);
-    if (g_drawAt.load(std::memory_order_relaxed) != 1
-        || g_teardown.load(std::memory_order_acquire)) {
-        return result;
-    }
-    void* ctx = nullptr;
-    if (arg2 == nullptr || !memory::isReadable(arg2, kHostCtxAt + sizeof(ctx))) {
-        return result;
-    }
-    std::memcpy(&ctx, static_cast<unsigned char*>(arg2) + kHostCtxAt, sizeof(ctx));
-    if (ctx == nullptr) {
-        return result;
-    }
-    if (g_drewThisFrame.exchange(true, std::memory_order_acq_rel)) {
-        return result;
-    }
-    if (g_inside.exchange(true, std::memory_order_seq_cst)) {
-        return result;
-    }
-    drawBoxes(lrp, ctx);
-    drawDebugLines(lrp, ctx);
-    g_inside.store(false, std::memory_order_release);
-    return result;
 }
 
 void __fastcall detourNameTagStage(void* lrp, void* ctx, void* view, void* extra)
 {
-    TSUKUYOMI_HOOK_COUNT("NameTagStage");
     callOriginal(lrp, ctx, view, extra);
     g_calls.fetch_add(1, std::memory_order_relaxed);
     if (g_teardown.load(std::memory_order_acquire)) {
@@ -2928,11 +2040,13 @@ bool installHooks()
                        L"and drawn without re-sending the vertices)",
                        boxmesh::kRegionSize);
         } else {
-            log().warn(L"WorldMesh: kept meshes are not available (signatures {}/{}/{}/{} / match the "
-                       L"immediate path {} / renderer flag {} / mesh name {}). Boxes use the immediate "
-                       L"drawing",
-                       end != nullptr, clear != nullptr, meshRender != nullptr, meshDestroy != nullptr,
-                       callsMatch, flagOk, nameOk);
+            notice::failOnce("WorldMesh.kept",
+                             std::format(L"WorldMesh: kept meshes are not available (signatures {}/{}/{}/{} / match "
+                                         L"the immediate path {} / renderer flag {} / mesh name {}); color boxes are "
+                                         L"not drawn",
+                                         end != nullptr, clear != nullptr, meshRender != nullptr,
+                                         meshDestroy != nullptr, callsMatch, flagOk, nameOk),
+                             "Color boxes are not drawn: the game functions for drawing them were not found");
         }
     }
     if (std::byte* const site = scanner.address(Target::MaterialPtrCtorSite)) {
@@ -2961,19 +2075,11 @@ bool installHooks()
         return false;
     }
     g_installed.store(true, std::memory_order_release);
-    {
-        void* const host = scanner.address(Target::NameTagStageCaller);
-        if (host != nullptr) {
-            HookManager::instance().create(host, reinterpret_cast<void*>(&detourStageHost),
-                                           reinterpret_cast<void**>(&g_hostOriginal),
-                                           L"NameTagStageCaller");
-        }
-    }
     startWorker();
     return true;
 }
 
-bool active(bool xray)
+static bool active(bool xray)
 {
     if (!g_installed.load(std::memory_order_acquire) || g_teardown.load(std::memory_order_acquire)) {
         return false;
@@ -2981,11 +2087,6 @@ bool active(bool xray)
     const int want = xray ? kDefaultXray
                           : kDefaultFlat;
     return !g_modeBroken[want & 7].load(std::memory_order_relaxed);
-}
-
-void onPresent()
-{
-    g_drewThisFrame.store(false, std::memory_order_relaxed);
 }
 
 void report()
@@ -3000,177 +2101,73 @@ void report()
         return;
     }
     static unsigned long long last = 0;
-    static unsigned reports = 0;
+    static unsigned long long lastCalls = 0;
+    static unsigned checks = 0;
     const unsigned long long now = GetTickCount64();
     if (last == 0) {
         last = now;
         return;
     }
-    const unsigned long long interval = reports < 3 ? 10000ULL : 300000ULL;
+    const unsigned long long interval = checks < 3 ? 10000ULL : 300000ULL;
     if (now - last < interval) {
         return;
     }
     const unsigned long long seconds = (now - last) / 1000ULL;
     last = now;
-    const unsigned long long calls = g_calls.exchange(0, std::memory_order_relaxed);
+    const unsigned long long totalCalls = g_calls.load(std::memory_order_relaxed);
+    const unsigned long long calls = totalCalls - lastCalls;
+    lastCalls = totalCalls;
     const unsigned long long drawn = g_drawn.exchange(0, std::memory_order_relaxed);
-    const unsigned long long failed = g_failed.exchange(0, std::memory_order_relaxed);
     const unsigned long long noMaterial = g_noMaterial.exchange(0, std::memory_order_relaxed);
     const unsigned long long camShifted = g_camShifted.exchange(0, std::memory_order_relaxed);
-    const unsigned long long noQuads = g_noQuads.exchange(0, std::memory_order_relaxed);
     const unsigned long long badCtx = g_badCtx.exchange(0, std::memory_order_relaxed);
-    const unsigned long long capped = g_capped.exchange(0, std::memory_order_relaxed);
-    const unsigned long long hostCalls = g_hostCalls.exchange(0, std::memory_order_relaxed);
-    const unsigned long long keptFrames = g_keptFrames.exchange(0, std::memory_order_relaxed);
-    if (boxes::boxesOn() && keptFrames != 0) {
-        log().info(L"WorldMesh: {} frame(s) drew kept meshes ({}; {} region(s) / {} mesh(es) / {} "
-                   L"face(s) / {} line(s); last frame drew {} mesh(es) and skipped {} region(s) off "
-                   L"screen in {:.2f} ms, longest {:.2f} ms; {} frame(s) could not set the drawing order; "
-                   L"rebuilt {} region(s) and re-sorted {} for the camera, longest {:.2f} ms in a frame (one region up to "
-                   L"{:.2f} ms), "
-                   L"{} waiting; grouped {} time(s), last {} ms, longest {} ms)",
-                   keptFrames,
-                   g_keptLastXray.load(std::memory_order_relaxed) ? L"see-through" : L"not see-through",
-                   g_keptRegionCount.load(std::memory_order_relaxed),
-                   g_keptMeshCount.load(std::memory_order_relaxed),
-                   g_keptFaceCount.load(std::memory_order_relaxed),
-                   g_keptLineCount.load(std::memory_order_relaxed),
-                   g_keptLastDrawn.load(std::memory_order_relaxed),
-                   g_keptLastCulled.load(std::memory_order_relaxed),
-                   static_cast<double>(g_keptDrawUsLast.load(std::memory_order_relaxed)) / 1000.0,
-                   static_cast<double>(g_keptDrawUsMax.exchange(0, std::memory_order_relaxed))
-                       / 1000.0,
-                   g_keptUnordered.exchange(0, std::memory_order_relaxed),
-                   g_keptRebuilt.exchange(0, std::memory_order_relaxed),
-                   g_keptReordered.exchange(0, std::memory_order_relaxed),
-                   static_cast<double>(g_keptRebuildUsMax.exchange(0, std::memory_order_relaxed))
-                       / 1000.0,
-                   static_cast<double>(g_keptRegionUsMax.exchange(0, std::memory_order_relaxed)) / 1000.0,
-                   g_keptWaiting.load(std::memory_order_relaxed),
-                   g_groupCount.exchange(0, std::memory_order_relaxed),
-                   g_groupMsLast.load(std::memory_order_relaxed),
-                   g_groupMsMax.exchange(0, std::memory_order_relaxed));
-    }
-    const unsigned long long immediateDrawn = drawn > keptFrames ? drawn - keptFrames : 0;
-    if (boxes::boxesOn() && (immediateDrawn != 0 || capped != 0)) {
-        const int radius = g_quadRadius.load(std::memory_order_relaxed);
-        log().info(L"WorldMesh: {} frame(s) drew boxes ({} quad(s) / {} line(s) ready, "
-                   L"{} dropped by the per-frame cap {}{}; last frame cyan {} red {} orange {} "
-                   L"pink {} and {} line(s) in {} draw call(s){}; merged {} time(s), last {} ms, "
-                   L"longest {} ms; picked the nearest {} time(s), longest {} us; re-sorted only "
-                   L"{} time(s), longest {} us)",
-                   immediateDrawn,
-                   g_quadCount.load(std::memory_order_relaxed),
-                   g_edgeCount.load(std::memory_order_relaxed),
-                   capped,
-                   g_lastCap.load(std::memory_order_relaxed),
-                   radius >= 0 ? std::format(L", keeping those within {} block(s) of the camera",
-                                             radius)
-                               : std::wstring{},
-                   g_lastFaces[1].load(std::memory_order_relaxed),
-                   g_lastFaces[2].load(std::memory_order_relaxed),
-                   g_lastFaces[3].load(std::memory_order_relaxed),
-                   g_lastFaces[4].load(std::memory_order_relaxed),
-                   g_lastLines.load(std::memory_order_relaxed),
-                   g_lastCalls.load(std::memory_order_relaxed),
-                   boxes::boxXray()
-                       ? L" (see-through faces and outlines in one call, far to near)"
-                       : L"",
-                   g_mergeCount.exchange(0, std::memory_order_relaxed),
-                   g_mergeMsLast.load(std::memory_order_relaxed),
-                   g_mergeMsMax.exchange(0, std::memory_order_relaxed),
-                   g_selectCount.exchange(0, std::memory_order_relaxed),
-                   g_selectUsMax.exchange(0, std::memory_order_relaxed),
-                   g_sortCount.exchange(0, std::memory_order_relaxed),
-                   g_sortUsMax.exchange(0, std::memory_order_relaxed));
-    }
-    static unsigned toldFallback = 0;
-    if (boxes::boxesOn() && toldFallback < 12) {
-        const bool xray = boxes::boxXray();
-        const int want = xray ? kDefaultXray
-                              : kDefaultFlat;
-        if (!active(xray)) {
-            ++toldFallback;
-            log().warn(L"WorldMesh: the color boxes cannot be drawn ({} material {} / "
-                       L"resolved {} / stage calls {} / host calls {}); nothing else draws "
-                       L"them since stage FB",
-                       xray ? L"see-through (name tag)" : L"not see-through (selection overlay)",
-                       want,
-                       (want > 0 && !g_modeBroken[want & 7].load(std::memory_order_relaxed))
-                           ? L"yes"
-                           : L"no",
-                       calls,
-                       hostCalls);
-        }
-    }
-    if (const unsigned long long skipped = g_edgesSkipped.exchange(0, std::memory_order_relaxed);
-        skipped != 0) {
-        static std::atomic<bool> toldEdges{false};
-        if (!toldEdges.exchange(true, std::memory_order_relaxed)) {
-            log().info(L"WorldMesh: {} cell(s) is over {}, so the outlines follow the merged "
-                       L"rectangles instead of the shape of each group",
-                       g_cellCount.load(std::memory_order_relaxed),
-                       kEdgeCellLimit);
-        }
-    }
-    const unsigned long long lines = g_lines.exchange(0, std::memory_order_relaxed);
-    if (const unsigned long long noLine = g_noLineMaterial.exchange(0, std::memory_order_relaxed);
-        noLine != 0 && lines == 0) {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true, std::memory_order_relaxed)) {
+    if (const unsigned long long noLine = g_noLineMaterial.exchange(0, std::memory_order_relaxed); noLine != 0) {
+        static bool toldLine = false;
+        if (!toldLine) {
+            toldLine = true;
             log().warn(L"WorldMesh: the outline material could not be resolved, so color boxes "
-                       L"are drawn without outlines ({} frame(s))",
-                       noLine);
+                       L"are drawn without outlines ({} frame(s))", noLine);
         }
     }
-    if (drawn == 0 && failed == 0 && noMaterial == 0 && camShifted == 0 && noQuads == 0
-        && badCtx == 0 && !boxes::boxesOn()) {
+    if (drawn != 0 || noMaterial != 0 || camShifted != 0 || badCtx != 0 || boxes::boxesOn()) {
+        if (checks < 3) {
+            ++checks;
+        }
+    }
+    if (!boxes::boxesOn()) {
         return;
     }
-    if (reports >= 60) {
+    const auto list = boxes::boxSnapshot();
+    if (!list || list->empty()) {
         return;
     }
-    ++reports;
-    if (boxes::boxesOn() && drawn == 0) {
-        const auto list = boxes::boxSnapshot();
-        const bool haveBoxes = list && !list->empty();
-        if (!haveBoxes) {
-            return;
-        }
-        if (calls == 0 && hostCalls == 0 && badCtx == 0) {
-            static std::atomic<bool> toldIdle{false};
-            if (!toldIdle.exchange(true, std::memory_order_relaxed)) {
-                log().info(L"WorldMesh: the world was not drawn in the last {} seconds "
-                           L"(no name-tag stage and no host call), so the color boxes wait",
-                           seconds);
-            }
-            return;
-        }
-        if (calls == 0 && hostCalls != 0 && g_drawAt.load(std::memory_order_relaxed) == 0) {
-            g_drawAt.store(1, std::memory_order_relaxed);
-            log().warn(L"WorldMesh: the name-tag stage never ran in {} seconds (host calls "
-                       L"{}). Drawing at the end of the host call instead",
-                       seconds,
-                       hostCalls);
-            return;
-        }
+    const bool worldDrawn = GameData::instance().msSinceView() <= 2000ULL;
+    if (totalCalls == 0 && worldDrawn) {
+        notice::failOnce("WorldMesh.noStage",
+                         L"WorldMesh: the name-tag stage was never called, so color boxes cannot be drawn",
+                         "Schematica cannot draw color boxes: the name-tag stage was not called");
+    }
+    static unsigned toldMaterial = 0;
+    const bool xray = boxes::boxXray();
+    const int want = xray ? kDefaultXray : kDefaultFlat;
+    if (!active(xray) && toldMaterial < 12) {
+        ++toldMaterial;
+        log().warn(L"WorldMesh: the color boxes cannot be drawn ({} material {} / "
+                   L"resolved {} / stage calls {}); no other path draws them",
+                   xray ? L"see-through (name tag)" : L"not see-through (selection overlay)", want,
+                   (want > 0 && !g_modeBroken[want & 7].load(std::memory_order_relaxed)) ? L"yes" : L"no",
+                   calls);
+    }
+    if (drawn == 0 && (calls != 0 || worldDrawn || badCtx != 0 || noMaterial != 0 || camShifted != 0)) {
         static unsigned toldStuck = 0;
         if (toldStuck < 12) {
             ++toldStuck;
             log().warn(L"WorldMesh: {} box(es) are waiting but nothing was drawn in {} seconds "
-                       L"(stage calls {} / host calls {} / no faces {} / unreadable context {} "
-                       L"/ no material {})",
-                       list->size(),
-                       seconds,
-                       calls,
-                       hostCalls,
-                       noQuads,
-                       badCtx,
-                       noMaterial);
+                       L"(stage calls {} / unreadable context {} / no material {} / shifted camera {})",
+                       list->size(), seconds, calls, badCtx, noMaterial, camShifted);
         }
     }
 }
-
 void shutdown()
 {
     setDebugLines({});
@@ -3192,7 +2189,6 @@ void shutdown()
     } else if (last != 0) {
         const wchar_t* const reason = why == KeptWhy::BoxesOff  ? L"when the boxes went off"
                                       : why == KeptWhy::Broken  ? L"after giving up on them"
-                                      : why == KeptWhy::NotKept ? L"when the boxes left the kept drawing"
                                                                 : L"on request";
         log().info(L"WorldMesh: no kept mesh left at shutdown (the last {} were returned on the render thread "
                    L"{})", last, reason);

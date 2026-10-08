@@ -97,18 +97,6 @@ std::string PaletteEntry::key() const
     return out;
 }
 
-std::int32_t Structure::entryAt(std::int32_t x, std::int32_t y, std::int32_t z, int layer) const
-{
-    const std::size_t at = indexOf(x, y, z);
-    if (at >= blocks.size()) {
-        return -1;
-    }
-    if (layer == 1) {
-        return at < blocks2.size() ? blocks2[at] : -1;
-    }
-    return blocks[at];
-}
-
 std::size_t Structure::indexOf(std::int32_t x, std::int32_t y, std::int32_t z) const
 {
     if (x < 0 || y < 0 || z < 0 || x >= sizeX || y >= sizeY || z >= sizeZ) {
@@ -159,9 +147,6 @@ LoadResult loadBytes(const char* bytes, std::size_t size)
         result.why = "structure is too large";
         return result;
     }
-
-    readTriple(root.find("structure_world_origin"), result.value.originX, result.value.originY,
-               result.value.originZ);
 
     const nbt::Value* const structureNode = root.find("structure", nbt::Tag::Compound);
     if (structureNode == nullptr) {

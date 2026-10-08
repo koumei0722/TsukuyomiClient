@@ -2,27 +2,27 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <exception>
-#include <filesystem>
-#include <fstream>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "core/Logger.h"
-#include "core/Paths.h"
 #include "core/Strings.h"
 #include "game/BlockRegistry.h"
+#include "game/ChatCommand.h"
 #include "game/ChatCommandComplete.h"
+#include "game/SettingsCommand.h"
 #include "memory/Memory.h"
+#include "memory/Scanner.h"
 
 namespace tsukuyomi::availablecommands {
 namespace {
@@ -43,17 +43,19 @@ static_assert(sizeof(std::string) == kStringSize);
 
 struct RawVector { const std::byte* begin; const std::byte* end; const std::byte* capacity; };
 static_assert(sizeof(RawVector) == 0x18);
-std::mutex g_fileMutex;
 std::atomic_bool g_missingLogged{false};
-std::atomic_bool g_namesLogged{false};
 std::atomic_bool g_faultLogged{false};
 std::atomic_bool g_badPacketLogged{false};
-std::atomic_bool g_cacheWriteLogged{false};
 std::atomic_bool g_disablePatch{false};
 std::atomic_bool g_flagsLogged{false};
 std::atomic_bool g_registrySourceLogged{false};
 std::atomic_bool g_packetSourceLogged{false};
-std::atomic_bool g_cacheSourceLogged{false};
+std::atomic_bool g_lateLogged{false};
+std::array<std::atomic_bool, 5> g_typeMissingLogged{};
+std::array<std::atomic_bool, 5> g_typeFoundLogged{};
+std::array<std::atomic_bool, 2> g_booleanLogged{};
+std::atomic<void*> g_patchedRegistry{nullptr};
+std::atomic<void*> g_lateTriedRegistry{nullptr};
 
 template<class T> T readAt(const std::byte* base, std::size_t offset)
 {
@@ -139,48 +141,6 @@ std::byte* appendVector(OwnedBytes& owned, std::byte* packet, std::size_t offset
     return result + count * stride;
 }
 
-std::filesystem::path itemFile()
-{
-    const auto& dir = paths::dataDir();
-    return dir.empty() ? std::filesystem::path{} : dir / "ChatCommand" / "items.txt";
-}
-
-std::vector<std::string> readCache()
-{
-    std::lock_guard lock(g_fileMutex);
-    std::vector<std::string> lines;
-    const auto file = itemFile();
-    if (file.empty()) return lines;
-    std::ifstream input(file, std::ios::binary);
-    for (std::string line; std::getline(input, line); ) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (!line.empty()) lines.push_back(std::move(line));
-    }
-    return lines;
-}
-
-void writeCache(const std::vector<std::string>& lines)
-{
-    std::lock_guard lock(g_fileMutex);
-    const auto file = itemFile();
-    if (file.empty()) return;
-    std::vector<std::string> old;
-    {
-        std::ifstream input(file, std::ios::binary);
-        for (std::string line; std::getline(input, line); ) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (!line.empty()) old.push_back(std::move(line));
-        }
-    }
-    if (old == lines) return;
-    std::error_code ec;
-    std::filesystem::create_directories(file.parent_path(), ec);
-    std::ofstream output(file, std::ios::binary | std::ios::trunc);
-    for (const auto& line : lines) output << line << '\n';
-    if ((!output || ec) && !g_cacheWriteLogged.exchange(true))
-        log().warn(L"ChatCommand: item completion cache could not be written");
-}
-
 bool itemNames(const RawVector& values, std::size_t valueCount,
                const std::byte* enumData, std::vector<std::string>& out)
 {
@@ -198,8 +158,22 @@ bool itemNames(const RawVector& values, std::size_t valueCount,
     return true;
 }
 
-bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet,
-                std::vector<std::string>& foundItems)
+bool registeredParamType(Target target, const char* expectedName, std::uint32_t& type)
+{
+    const auto* site = Scanner::instance().address(target);
+    if (site == nullptr || !memory::isReadable(site, 14)) return false;
+    const auto* registration = static_cast<const std::byte*>(memory::ripTarget(site, 3));
+    const auto* name = memory::ripTarget(site + 7, 3);
+    const std::size_t length = std::strlen(expectedName) + 1;
+    std::vector<char> text(length);
+    if (registration == nullptr || !memory::isReadable(registration + 8, sizeof(type))
+        || !memory::isReadable(name, length)
+        || !memory::copyGuarded(name, text.data(), length) || std::memcmp(text.data(), expectedName, length) != 0) return false;
+    if (!memory::copyGuarded(registration + 8, &type, sizeof(type))) return false;
+    return (type & 0xfff00000u) == 0x100000u && (type & 0xfffffu) != 0;
+}
+
+bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet)
 {
     if (source == nullptr || !memory::isReadable(source, kPacketSize)) return false;
     std::memcpy(packet, source, kPacketSize);
@@ -210,21 +184,15 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet,
         || !getVector(packet, kCommands, kCommandSize, commands, commandCount)
         || enumCount > UINT32_MAX - 5) return false;
 
-    std::optional<std::uint32_t> itemIndex;
-    std::vector<std::string> nearNames;
-    for (std::size_t i = 0; i < enumCount; ++i) {
+    std::optional<std::uint32_t> itemIndex, booleanIndex;
+    for (std::size_t i = 0; i < enumCount && !(itemIndex && booleanIndex); ++i) {
         std::string name;
         if (!getString(enums.begin + i * kEnumSize, name)) return false;
-        if (name == "Item") { itemIndex = static_cast<std::uint32_t>(i); break; }
-        std::string lower = name;
-        for (char& ch : lower) if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-        if (lower.find("item") != std::string::npos) nearNames.push_back(std::move(name));
-    }
-    if (!itemIndex && !g_namesLogged.exchange(true)) {
-        for (std::size_t i = 0; i < nearNames.size() && i < 32; ++i)
-            log().info(L"ChatCommand: Item-like enum: {}", toUtf16(nearNames[i]));
+        if (name == "Item") { itemIndex = static_cast<std::uint32_t>(i); continue; }
+        if (name == "Boolean") { booleanIndex = static_cast<std::uint32_t>(i); continue; }
     }
 
+    std::vector<std::string> foundItems;
     std::vector<std::string> itemValues;
     if (itemIndex) {
         std::vector<std::string> packetItems;
@@ -238,16 +206,45 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet,
             if (!g_registrySourceLogged.exchange(true))
                 log().info(L"ChatCommand: item completion from ItemRegistry ({} names)", foundItems.size());
         } else {
-            foundItems = chatcommand::normalizeItemCandidates(readCache());
-            if (!foundItems.empty() && !g_cacheSourceLogged.exchange(true))
-                log().info(L"ChatCommand: item completion from cache ({} names)", foundItems.size());
+            if (!g_missingLogged.exchange(true)) {
+                log().error(L"ChatCommand: the item registry gave {} names, so item suggestions are off",
+                            foundItems.size());
+                chatcommand::postNotice("Item suggestions for /tk are off: the item registry could not be read "
+                                        "(see Tsukuyomi.log)");
+            }
+            foundItems.clear();
         }
         itemValues = chatcommand::itemEnumValues(foundItems);
     }
-    const auto spec = chatcommand::buildTkCommandSpec(static_cast<std::uint32_t>(enumCount), itemIndex,
-                                                       itemValues);
-    if (foundItems.empty() && !g_missingLogged.exchange(true))
-        log().warn(L"ChatCommand: item completion is unavailable; enter a cheats-enabled world once to cache it");
+    if (!g_booleanLogged[booleanIndex ? 0 : 1].exchange(true))
+        log().info(L"ChatCommand: toggles use {} Boolean enum", booleanIndex ? L"the packet's" : L"an added");
+    auto spec = chatcommand::buildTkCommandSpec(static_cast<std::uint32_t>(enumCount), itemIndex,
+                                                 itemValues, settingscommand::completion(), booleanIndex);
+    using chatcommand::ParamType;
+    std::array<std::uint32_t, 5> paramTypes{};
+    struct TypeSite { ParamType type; Target target; const char* name; const char* label; };
+    const TypeSite sites[] = {
+        {ParamType::Json, Target::JsonCommandParamSite, "raw json message", "json"},
+        {ParamType::Int, Target::IntCommandParamSite, "data", "int"},
+        {ParamType::Float, Target::FloatCommandParamSite, "minimumVolume", "float"},
+        {ParamType::String, Target::StringCommandParamSite, "criteria", "string"}
+    };
+    for (const auto& site : sites) {
+        const auto at = static_cast<std::size_t>(site.type);
+        if (registeredParamType(site.target, site.name, paramTypes[at])) {
+            if (!g_typeFoundLogged[at].exchange(true))
+                log().info(L"ChatCommand: the {} parameter type is {:#x} (from the game's type registration)",
+                           toUtf16(site.label), paramTypes[at]);
+        } else {
+            std::erase_if(spec.overloads, [&](const auto& overload) {
+                return std::any_of(overload.begin(), overload.end(), [&](const auto& param) { return param.type == site.type; });
+            });
+            if (!g_typeMissingLogged[at].exchange(true)) {
+                log().error(L"ChatCommand: the {} parameter type could not be read; its /tk forms are not registered", toUtf16(site.label));
+                chatcommand::postNotice("The " + std::string(site.label) + " forms of /tk are unavailable: the parameter type could not be read (see Tsukuyomi.log)");
+            }
+        }
+    }
     std::size_t addedValues = 0;
     for (const auto& one : spec.enums) {
         if (one.values.size() > UINT32_MAX - addedValues) return false;
@@ -288,9 +285,11 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet,
         for (std::size_t j = 0; j < definition.size(); ++j) {
             auto* param = params + j * kParamSize;
             putString(owned, param, definition[j].name);
-            writeAt<std::uint32_t>(param, 0x20, kEnumType | definition[j].enumIndex);
+            const bool isEnum = definition[j].type == ParamType::Enum;
+            writeAt<std::uint32_t>(param, 0x20, isEnum ? kEnumType | definition[j].enumIndex
+                                                    : paramTypes[static_cast<std::size_t>(definition[j].type)]);
             writeAt<std::uint8_t>(param, 0x24, definition[j].optional ? 1 : 0);
-            writeAt<std::uint8_t>(param, 0x25, kParamAutocompleteExpansion);
+            writeAt<std::uint8_t>(param, 0x25, isEnum ? kParamAutocompleteExpansion : 0);
         }
     }
     return true;
@@ -316,9 +315,8 @@ void loadWithTk(LoadPacketFn original, void* registry, const void* packet)
     if (g_disablePatch.load()) { callOriginal(original, registry, packet); return; }
     alignas(16) std::array<std::byte, 0x100> copy{};
     OwnedBytes owned;
-    std::vector<std::string> foundItems;
     bool ready = false;
-    try { ready = makePacket(packet, owned, copy.data(), foundItems); }
+    try { ready = makePacket(packet, owned, copy.data()); }
     catch (const std::exception&) { ready = false; }
     if (!ready) {
         if (!g_badPacketLogged.exchange(true)) log().warn(L"ChatCommand: completion packet could not be copied");
@@ -331,13 +329,36 @@ void loadWithTk(LoadPacketFn original, void* registry, const void* packet)
         callOriginal(original, registry, packet);
         return;
     }
-    if (!foundItems.empty()) {
-        try { writeCache(foundItems); }
-        catch (const std::exception&) {
-            if (!g_cacheWriteLogged.exchange(true))
-                log().warn(L"ChatCommand: item completion cache could not be written");
-        }
+    g_patchedRegistry.store(registry);
+}
+
+void* clientRegistry()
+{
+    return g_patchedRegistry.load();
+}
+
+void ensureTk(LoadPacketFn original, void* registry)
+{
+    if (original == nullptr || registry == nullptr || g_disablePatch.load()) return;
+    if (g_patchedRegistry.load() == registry || g_lateTriedRegistry.exchange(registry) == registry) return;
+    alignas(16) std::array<std::byte, 0x100> empty{};
+    alignas(16) std::array<std::byte, 0x100> copy{};
+    OwnedBytes owned;
+    bool ready = false;
+    try { ready = makePacket(empty.data(), owned, copy.data()); }
+    catch (const std::exception&) { ready = false; }
+    if (!ready) {
+        if (!g_badPacketLogged.exchange(true)) log().warn(L"ChatCommand: the late tk packet could not be built");
+        return;
     }
+    if (!callOriginal(original, registry, copy.data())) {
+        g_disablePatch.store(true);
+        if (!g_faultLogged.exchange(true)) log().error(L"ChatCommand: the late tk packet faulted; tk is off until the next injection");
+        return;
+    }
+    g_patchedRegistry.store(registry);
+    if (!g_lateLogged.exchange(true))
+        log().info(L"ChatCommand: the command list had been read before the hook was ready; added tk to it now");
 }
 
 }

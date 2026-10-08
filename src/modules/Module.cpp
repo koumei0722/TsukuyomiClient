@@ -8,6 +8,7 @@
 #include "core/Logger.h"
 #include "core/Strings.h"
 #include "input/Foreground.h"
+#include "modules/ModuleManager.h"
 
 #include <utility>
 #include <vector>
@@ -29,13 +30,34 @@ void Module::setEnabled(bool value)
         return;
     }
 
+    const bool before = enabled();
     m_enabled = value;
-    onEnabledChanged(m_enabled);
+    if (m_parent == nullptr) {
+        onEnabledChanged(value);
+    } else if (enabled() != before) {
+        onEnabledChanged(enabled());
+    }
 
     if (m_enabled) {
-        log().success(L"{} enabled", name());
+        log().success(L"{} enabled{}", name(), enabled() ? L"" : L" (its parent is OFF)");
     } else {
         log().info(L"{} disabled", name());
+    }
+}
+
+void Module::parentEnabledChanged()
+{
+    if (m_enabled.load() && !m_writeBlocked) {
+        onEnabledChanged(enabled());
+    }
+}
+
+void Module::toggleByKey()
+{
+    const bool before = m_enabled.load();
+    toggle();
+    if (m_enabled.load() != before) {
+        ModuleManager::instance().postToggleNotice(name(), m_enabled.load());
     }
 }
 
@@ -46,12 +68,12 @@ void Module::update()
         onUpdate();
         return;
     }
-    if (handlesToggleKey()) {
+    if (m_parent != nullptr) {
         onUpdate();
         return;
     }
     if (toggleRequested && input::isInGameplay()) {
-        toggle();
+        toggleByKey();
         UiSound::instance().request();
         if (persistEnabled()) {
             uiprobe::markSettingsDirty();
@@ -83,19 +105,20 @@ MenuItem Module::enabledItem()
 
 MenuItem Module::toggleKeyItem()
 {
-    return menu::keybind(
+    auto item = menu::keybind(
         L"Toggle key", [this] { return m_toggleKey.combo(); },
         [this](std::vector<int> combo) {
             m_toggleKey.set(std::move(combo));
             log().info(L"{}: toggle key set to {}", name(), m_toggleKey.name());
         },
         {});
+    bindPad(item, m_toggleKey);
+    return item;
 }
 
 MenuItem Module::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
 
@@ -114,6 +137,9 @@ void Module::loadConfig(const nlohmann::json& section)
         }
     }
 
+    if (m_parent != nullptr) {
+        return;
+    }
     std::vector<int> combo;
     if (const auto it = section.find("keys"); it != section.end() && it->is_array()) {
         for (const auto& value : *it) {
@@ -128,9 +154,11 @@ void Module::loadConfig(const nlohmann::json& section)
 void Module::saveConfig(nlohmann::json& section) const
 {
     if (persistEnabled()) {
-        section["enabled"] = m_enabled;
+        section["enabled"] = m_enabled.load();
     }
-    section["keys"] = m_toggleKey.combo();
+    if (m_parent == nullptr) {
+        section["keys"] = m_toggleKey.combo();
+    }
 }
 
 }

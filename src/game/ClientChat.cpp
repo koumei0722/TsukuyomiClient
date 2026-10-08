@@ -41,27 +41,43 @@ void release(GuiHandle& handle)
     }
 }
 
+bool releaseGuarded(GuiHandle& handle)
+{
+    __try {
+        release(handle);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
+                    || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
+                    ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
 bool callGuarded(void* client, std::ptrdiff_t slot, Display display, const StdString* message,
                  const OptionalString* filtered, const StdString* extra)
 {
     GuiHandle handle{};
-    bool shown = false;
+    volatile bool shown = false;
+    volatile bool got = false;
     __try {
         auto** vt = *reinterpret_cast<void***>(client);
         reinterpret_cast<GetGui>(vt[slot / 8])(client, &handle);
+        got = true;
         if (handle.block != nullptr && *static_cast<const std::uint8_t*>(handle.block) != 0
             && handle.gui != nullptr) {
             display(handle.gui, message, filtered, extra, 4);
             shown = true;
         }
-        release(handle);
-        return shown;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
                     || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
                     ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         g_failed = true;
-        return false;
+        shown = false;
     }
+    if (got && !releaseGuarded(handle)) {
+        g_failed = true;
+    }
+    return shown;
 }
 
 StdString wrap(const std::string& value)

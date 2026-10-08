@@ -19,15 +19,17 @@ void __fastcall onGameButton(void*, int, const void*, void*);
 void* __fastcall gameButtonActionName(void*, int);
 void* __fastcall gameButtonFindKeymap(void*, const void*);
 void __fastcall gameButtonBindAction(void*, void*, void*, const void*, int, bool);
+void __fastcall gameButtonPadBind(void*, void*, const void*, int);
 void __fastcall gameButtonInputUpdate(void*, void*, void*, void*, std::uint64_t);
 
 namespace gamebuttonlogic {
 constexpr int kMaxSlots = 96;
 constexpr int kMaxWatchedButtons = 32;
 constexpr int kMaxInputRows = 32;
+constexpr int kMaxPadInputRows = 16;
 constexpr int kMaxComboKeys = 4;
 constexpr std::uint64_t kPressLifetimeMs = 100;
-enum class CallbackKind : int { KeyDown, KeyUp, ButtonDown, ButtonUp, InputDown, InputUp };
+enum class CallbackKind : int { KeyDown, KeyUp, ButtonDown, ButtonUp, InputDown, InputUp, PadInputDown, PadInputUp };
 constexpr int packCallback(CallbackKind kind, int index) { return (static_cast<int>(kind) << 12) | index; }
 constexpr CallbackKind callbackKind(int value) { return static_cast<CallbackKind>(value >> 12); }
 constexpr int callbackIndex(int value) { return value & 0xFFF; }
@@ -52,13 +54,6 @@ inline constexpr char menuCancel[] = "button.menu_cancel";
 inline constexpr char inventoryLeft[] = "button.inventory_left";
 inline constexpr char inventoryRight[] = "button.inventory_right";
 }
-inline constexpr std::array<const char*, 18> kWatchedNames = {
-    button::destroyOrAttack, button::buildOrInteract, button::up, button::down,
-    button::left, button::right, button::jump, button::sneak, button::sprint,
-    button::shift, button::control, button::alt, button::pointerPressed,
-    button::menuSecondarySelect, button::menuTertiarySelect, button::menuCancel,
-    button::inventoryLeft, button::inventoryRight};
-
 inline int wheelNotches(std::uint64_t leftSeq, std::uint64_t leftSeen,
                         std::uint64_t rightSeq, std::uint64_t rightSeen)
 {
@@ -95,6 +90,32 @@ public:
         if (it == m_keys.end()) return {};
         const int row = static_cast<int>(it - m_keys.begin());
         std::string name = "button.tk.kb";
+        name.push_back(static_cast<char>('0' + row / 10));
+        name.push_back(static_cast<char>('0' + row % 10));
+        return name;
+    }
+private:
+    std::vector<int> m_keys;
+};
+
+class PadChordInputs {
+public:
+    bool add(std::span<const int> combo)
+    {
+        for (int key : combo) {
+            if (std::find(m_keys.begin(), m_keys.end(), key) != m_keys.end()) continue;
+            if (m_keys.size() == kMaxPadInputRows) return false;
+            m_keys.push_back(key);
+        }
+        return true;
+    }
+    const std::vector<int>& keys() const { return m_keys; }
+    std::string buttonName(int key) const
+    {
+        const auto it = std::find(m_keys.begin(), m_keys.end(), key);
+        if (it == m_keys.end()) return {};
+        const int row = static_cast<int>(it - m_keys.begin());
+        std::string name = "button.tk.pb";
         name.push_back(static_cast<char>('0' + row / 10));
         name.push_back(static_cast<char>('0' + row % 10));
         return name;
@@ -158,11 +179,6 @@ inline std::uint64_t aloneAfterRelease(std::uint64_t before, std::uint64_t now,
     return sequence + (before == now ? 1 : 0);
 }
 
-inline std::vector<int> migrateOldCombo(std::vector<int> combo, int oldKey, std::vector<int> replacement)
-{
-    return combo == std::vector<int>{oldKey} ? replacement : combo;
-}
-
 inline int gameKeyCode(int key)
 {
     switch (key) {
@@ -201,6 +217,7 @@ public:
     int watchKey(int vk);
     int watchButton(const char* buttonName);
     void setKeys(int slot, std::vector<int> combo);
+    void setPadKeys(int slot, std::vector<int> combo);
     void install();
     void shutdown();
 
@@ -224,6 +241,8 @@ private:
         std::atomic<int> key{0};
         std::array<int, gamebuttonlogic::kMaxComboKeys> combo{};
         int comboCount = 0;
+        std::array<int, gamebuttonlogic::kMaxComboKeys> pad{};
+        std::atomic<int> padCount{0};
         std::atomic<std::uint64_t> aloneSeq{0};
         std::uint64_t modifierAtPress = 0;
         std::atomic<std::uint64_t> pressSeq{0};
@@ -253,15 +272,19 @@ private:
     std::atomic<bool> m_anyChords{false};
     std::array<std::atomic<std::uint64_t>, 256> m_modifierUses{};
     std::atomic<bool> m_installed{false};
+    std::atomic<bool> m_padInstalled{false};
     std::atomic<bool> m_stopping{false};
     std::atomic<std::uint64_t> m_revision{0};
     std::atomic<int> m_registeredCount{0};
     std::atomic<int> m_registeredWatchCount{0};
     std::array<std::atomic<bool>, gamebuttonlogic::kMaxInputRows> m_inputHeld{};
     std::atomic<int> m_registeredInputCount{0};
+    std::array<std::atomic<bool>, gamebuttonlogic::kMaxPadInputRows> m_padInputHeld{};
+    std::atomic<int> m_registeredPadInputCount{0};
     int m_modifierWatch[3] = {-1, -1, -1};
     bool keyHeldForChord(int vk) const;
     bool chordPartsHeld(int key) const;
+    bool padChordPartsHeld(int pad) const;
     void* m_registeredHandler = nullptr;
     std::uint64_t m_lastRebuildMs = 0;
     unsigned char m_handlerOffset = 0;
@@ -280,6 +303,7 @@ private:
     friend void* __fastcall gameButtonActionName(void*, int);
     friend void* __fastcall gameButtonFindKeymap(void*, const void*);
     friend void __fastcall gameButtonBindAction(void*, void*, void*, const void*, int, bool);
+    friend void __fastcall gameButtonPadBind(void*, void*, const void*, int);
     friend void __fastcall gameButtonInputUpdate(void*, void*, void*, void*, std::uint64_t);
 };
 

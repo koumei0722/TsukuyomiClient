@@ -13,6 +13,4 @@ inline int perBox(int stackSize) { return kSlotsPerBox * stackSize; }
 
 std::string formatStacks(std::size_t count, int stackSize);
 
-std::string formatStacksOf(std::size_t count, std::string_view name);
-
 }

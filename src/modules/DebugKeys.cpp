@@ -19,7 +19,6 @@
 #include "memory/Scanner.h"
 #include "modules/DebugScreen.h"
 #include "game/GameModeState.h"
-#include "render/BoxRenderer.h"
 #include "render/WorldMesh.h"
 
 #include <windows.h>
@@ -321,6 +320,7 @@ void DebugKeys::onScansReady()
         m_chatCommand = memory::ripTarget(commandSite, 0x2E);
         if (!memory::inGameModule(m_chatCommand) || !memory::isExecutable(m_chatCommand, 1)) m_chatCommand = nullptr;
     }
+    m_scansReady.store(true, std::memory_order_release);
 }
 
 bool DebugKeys::active()
@@ -395,17 +395,16 @@ void DebugKeys::onPlayerViewUpdate()
     }
     m_perspectiveKnown = m_clientOptionsSlot != 0
         && viewPerspectiveRaw(hooks::gameClientInstance(), m_clientOptionsSlot, m_viewPerspective, m_perspective);
-    if (m_perspectiveKnown) {
-        boxes::noteViewPerspective(m_perspective);
-    } else {
+    if (!m_perspectiveKnown) {
         m_perspective = 0;
     }
-    m_perspectiveUnknownFrames = m_perspectiveKnown ? 0 : m_perspectiveUnknownFrames + 1;
+    if (m_scansReady.load(std::memory_order_acquire)) {
+        m_perspectiveUnknownFrames = m_perspectiveKnown ? 0 : m_perspectiveUnknownFrames + 1;
+    }
     if (m_perspectiveUnknownFrames == 300) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true)) {
-            log().warn(L"DebugKeys: the view perspective could not be read; your own hitbox is not drawn and "
-                       L"boxes use the first person camera direction");
+            log().warn(L"DebugKeys: the view perspective could not be read; your own hitbox is not drawn");
         }
     }
     if (!active()) {

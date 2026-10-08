@@ -56,7 +56,7 @@ private:
 
     void captureHeight();
 
-    const wchar_t* readFeet(float& outX, float& outY, float& outZ) const;
+    bool readFeet(float& outX, float& outY, float& outZ) const;
 
     bool resolveY(float footY, int& outY) const;
 
@@ -89,7 +89,8 @@ private:
 
     bool m_warnedNoGameMode = false;
 
-    mutable bool m_warnedFeetFallback = false;
+    static constexpr int kFeetMissNotice = 120;
+    mutable int m_feetMisses = 0;
 
     Clock::time_point m_nextResend{};
     Clock::time_point m_nextLog{};

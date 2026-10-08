@@ -2,7 +2,6 @@
 
 #include "config/WriteSwitches.h"
 #include "core/Logger.h"
-#include "core/Perf.h"
 #include "core/Strings.h"
 
 #include <MinHook.h>
@@ -38,7 +37,6 @@ const wchar_t* groupName(HookGroup group)
     switch (group) {
     case HookGroup::Always:     return L"always";
     case HookGroup::Ghost:      return L"ghost";
-    case HookGroup::Diag:       return L"diag";
     case HookGroup::Fullbright: return L"fullbright";
     case HookGroup::Ability:    return L"ability";
     case HookGroup::Tool:       return L"tool";
@@ -127,11 +125,7 @@ bool HookManager::applyQueued()
         return false;
     }
 
-    MH_STATUS status = MH_OK;
-    {
-        const perf::Scope perfScope{perf::Slot::HookApply};
-        status = MH_ApplyQueued();
-    }
+    const MH_STATUS status = MH_ApplyQueued();
     if (status != MH_OK) {
         log().error(L"Failed to enable hooks: {}", statusText(status));
         return false;
@@ -178,11 +172,7 @@ bool HookManager::setGroupEnabled(HookGroup group, bool on)
         }
         ++queued;
     }
-    MH_STATUS status = MH_OK;
-    {
-        const perf::Scope perfScope{perf::Slot::HookApply};
-        status = MH_ApplyQueued();
-    }
+    const MH_STATUS status = MH_ApplyQueued();
     if (status != MH_OK) {
         log().error(L"Failed to switch the {} hooks {}: {}", groupName(group),
                     on ? L"on" : L"off", statusText(status));
@@ -202,6 +192,7 @@ void HookManager::shutdown()
     if (const MH_STATUS status = MH_DisableHook(MH_ALL_HOOKS); status != MH_OK) {
         log().warn(L"MinHook: disabling all hooks failed: {}", statusText(status));
     }
+    Sleep(250);
     for (const Entry& entry : m_entries) {
         MH_RemoveHook(entry.target);
     }

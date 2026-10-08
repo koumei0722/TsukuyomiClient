@@ -26,9 +26,13 @@ public:
     void onScansReady() override;
     void shutdown() override;
 
+    bool active() const { return m_active.load(std::memory_order_acquire); }
+
 public:
 
-    void onCameraWrite(void* cameraBase);
+    void onCameraWrite(void* cameraBase, void* frame);
+
+    bool freezesAim() const { return active() || m_look.load(std::memory_order_acquire) != kLookIdle; }
 
     void onMoveInput(void* input);
 
@@ -49,11 +53,45 @@ public:
 
 protected:
     void onEnabledChanged(bool enabled) override;
-
-    bool persistEnabled() const override { return false; }
+    void onUpdate() override;
 
 private:
     FreeCamera() = default;
+
+    void setActive(bool value);
+
+    Hotkey m_cameraKey;
+    std::atomic<bool> m_active{false};
+
+    void freezeBody(bool on);
+
+    Hotkey m_lookKey;
+    static constexpr int kLookIdle = 0;
+    static constexpr int kLookHolding = 1;
+    static constexpr int kLookReleasing = 2;
+    std::atomic<int> m_look{kLookIdle};
+    std::atomic<bool> m_lookSnapWanted{false};
+    std::atomic<bool> m_lookSnapped{false};
+    bool m_lookPerspective = false;
+    std::atomic<bool> m_lookRestored{false};
+    unsigned long long m_lookReleasedAt = 0;
+    static constexpr unsigned long long kLookRestoreTimeoutMs = 300;
+    void updateLook();
+    void takeLookSnapshot(void* frame);
+    bool restoreLookSnapshot(void* frame);
+
+    int m_ctxOffset = -1;
+
+    struct LookSnapshot {
+        std::uintptr_t registry = 0;
+        std::uint32_t id = 0;
+        bool hasDirect = false;
+        bool hasOrbit = false;
+        std::byte direct[0x14]{};
+        std::byte orbit[0x18]{};
+    };
+    LookSnapshot m_lookSnap;
+    bool m_lookSnapValid = false;
 
     static constexpr ptrdiff_t kCameraX = 0x40;
     static constexpr ptrdiff_t kCameraY = 0x44;
@@ -92,7 +130,9 @@ private:
     static constexpr float kMaxSpeed = 1.0f;
 
     static constexpr float kNoMovement = 360.0f;
-    float movementOffset() const;
+    bool directionHeld() const;
+    static constexpr int kStaleIntentNotice = 120;
+    int m_staleIntentFrames = 0;
 
     static float cameraYaw(const float* quat);
 

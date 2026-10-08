@@ -299,10 +299,6 @@ std::vector<Edge> buildEdges(const std::vector<Cell>& cells, EdgeStyle style)
             unique.push_back(cell);
         }
     }
-    const auto same = [&occupied](const Key3& at, std::uint8_t color) {
-        const auto found = occupied.find(at);
-        return found != occupied.end() && found->second == color;
-    };
     const auto any = [&occupied](const Key3& at) { return occupied.find(at) != occupied.end(); };
 
     std::unordered_set<Key4, Key4Hash> seen;
@@ -322,19 +318,8 @@ std::vector<Edge> buildEdges(const std::vector<Cell>& cells, EdgeStyle style)
                     if (!seen.insert(Key4{tag, a, b, t}).second) {
                         continue;
                     }
-                    const bool c00 = same(cellOnAxis(axis, t, a - 1, b - 1), cell.color);
-                    const bool c10 = same(cellOnAxis(axis, t, a, b - 1), cell.color);
-                    const bool c01 = same(cellOnAxis(axis, t, a - 1, b), cell.color);
-                    const bool c11 = same(cellOnAxis(axis, t, a, b), cell.color);
-                    const int count = static_cast<int>(c00) + static_cast<int>(c10)
-                                      + static_cast<int>(c01) + static_cast<int>(c11);
                     bool draw = false;
                     switch (style) {
-                    case EdgeStyle::Shape: {
-                        const bool diagonal = count == 2 && ((c00 && c11) || (c10 && c01));
-                        draw = count == 1 || count == 3 || diagonal;
-                        break;
-                    }
                     case EdgeStyle::BlockSurface:
                         draw = !(any(cellOnAxis(axis, t, a - 1, b - 1)) && any(cellOnAxis(axis, t, a, b - 1))
                                  && any(cellOnAxis(axis, t, a - 1, b)) && any(cellOnAxis(axis, t, a, b)));
@@ -400,280 +385,12 @@ void edgeEnds(const Edge& edge, std::int32_t out[2][3])
     }
 }
 
-std::vector<Edge> edgesFromQuads(const std::vector<Quad>& quads)
-{
-    std::vector<Edge> out;
-    out.reserve(quads.size() * 4);
-    const auto push = [&out](std::uint8_t axis, std::uint8_t color, std::int32_t a,
-                             std::int32_t b, std::int32_t t0, std::int32_t t1) {
-        if (t1 <= t0) {
-            return;
-        }
-        Edge edge;
-        edge.axis = axis;
-        edge.color = color;
-        edge.a = a;
-        edge.b = b;
-        edge.t0 = t0;
-        edge.t1 = t1;
-        out.push_back(edge);
-    };
-    for (const Quad& quad : quads) {
-        if (quad.color == 0 || quad.color > kMaxColor) {
-            continue;
-        }
-        switch (quad.dir) {
-        case kDown:
-        case kUp:
-            push(0, quad.color, quad.plane, quad.v0, quad.u0, quad.u1);
-            push(0, quad.color, quad.plane, quad.v1, quad.u0, quad.u1);
-            push(2, quad.color, quad.u0, quad.plane, quad.v0, quad.v1);
-            push(2, quad.color, quad.u1, quad.plane, quad.v0, quad.v1);
-            break;
-        case kNorth:
-        case kSouth:
-            push(0, quad.color, quad.v0, quad.plane, quad.u0, quad.u1);
-            push(0, quad.color, quad.v1, quad.plane, quad.u0, quad.u1);
-            push(1, quad.color, quad.u0, quad.plane, quad.v0, quad.v1);
-            push(1, quad.color, quad.u1, quad.plane, quad.v0, quad.v1);
-            break;
-        default:
-            push(2, quad.color, quad.plane, quad.v0, quad.u0, quad.u1);
-            push(2, quad.color, quad.plane, quad.v1, quad.u0, quad.u1);
-            push(1, quad.color, quad.plane, quad.u0, quad.v0, quad.v1);
-            push(1, quad.color, quad.plane, quad.u1, quad.v0, quad.v1);
-            break;
-        }
-    }
-    return out;
-}
-
-namespace {
-
-double gap(double at, std::int32_t lo, std::int32_t hi)
-{
-    if (at < lo) {
-        return static_cast<double>(lo) - at;
-    }
-    if (at > hi) {
-        return at - static_cast<double>(hi);
-    }
-    return 0.0;
-}
-
-double boxDistanceSq(const double eye[3], const std::int32_t lo[3], const std::int32_t hi[3])
-{
-    double sum = 0.0;
-    for (int k = 0; k < 3; ++k) {
-        const double d = gap(eye[k], lo[k], hi[k]);
-        sum += d * d;
-    }
-    return sum;
-}
-
-template <class T>
-float copyNearestOf(const std::vector<T>& from, const double eye[3], std::size_t budget,
-                    std::vector<T>& to)
-{
-    if (from.size() <= budget) {
-        to = from;
-        return -1.0F;
-    }
-    to.clear();
-    if (budget == 0) {
-        return 0.0F;
-    }
-    std::vector<std::pair<double, std::uint32_t>> order;
-    order.reserve(from.size());
-    for (std::size_t i = 0; i < from.size(); ++i) {
-        order.emplace_back(distanceSq(from[i], eye), static_cast<std::uint32_t>(i));
-    }
-    std::nth_element(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(budget),
-                     order.end());
-    order.resize(budget);
-    std::sort(order.begin(), order.end(),
-              [&from](const std::pair<double, std::uint32_t>& p,
-                      const std::pair<double, std::uint32_t>& q) {
-                  const std::uint8_t pc = from[p.second].color;
-                  const std::uint8_t qc = from[q.second].color;
-                  if (pc != qc) {
-                      return pc < qc;
-                  }
-                  return p < q;
-              });
-    double farthest = 0.0;
-    to.reserve(budget);
-    for (const auto& [d2, at] : order) {
-        to.push_back(from[at]);
-        farthest = (std::max)(farthest, d2);
-    }
-    return static_cast<float>(std::sqrt(farthest));
-}
-
-template <class T>
-float keepNearestOf(std::vector<T>& items, const double eye[3], std::size_t budget)
-{
-    if (items.size() <= budget) {
-        return -1.0F;
-    }
-    std::vector<T> kept;
-    const float radius = copyNearestOf(items, eye, budget, kept);
-    items.swap(kept);
-    return radius;
-}
-
-}
-
-double distanceSq(const Quad& quad, const double eye[3])
-{
-    std::int32_t lo[3] = {};
-    std::int32_t hi[3] = {};
-    const auto span = [&lo, &hi](int axis, std::int32_t from, std::int32_t to) {
-        lo[axis] = from;
-        hi[axis] = to;
-    };
-    switch (quad.dir) {
-    case kDown:
-    case kUp:
-        span(0, quad.u0, quad.u1);
-        span(1, quad.plane, quad.plane);
-        span(2, quad.v0, quad.v1);
-        break;
-    case kNorth:
-    case kSouth:
-        span(0, quad.u0, quad.u1);
-        span(1, quad.v0, quad.v1);
-        span(2, quad.plane, quad.plane);
-        break;
-    default:
-        span(0, quad.plane, quad.plane);
-        span(1, quad.v0, quad.v1);
-        span(2, quad.u0, quad.u1);
-        break;
-    }
-    return boxDistanceSq(eye, lo, hi);
-}
-
-double distanceSq(const Edge& edge, const double eye[3])
-{
-    std::int32_t ends[2][3] = {};
-    edgeEnds(edge, ends);
-    std::int32_t lo[3] = {};
-    std::int32_t hi[3] = {};
-    for (int k = 0; k < 3; ++k) {
-        lo[k] = (std::min)(ends[0][k], ends[1][k]);
-        hi[k] = (std::max)(ends[0][k], ends[1][k]);
-    }
-    return boxDistanceSq(eye, lo, hi);
-}
-
-float keepNearest(std::vector<Quad>& quads, const double eye[3], std::size_t budget)
-{
-    return keepNearestOf(quads, eye, budget);
-}
-
-float keepNearest(std::vector<Edge>& edges, const double eye[3], std::size_t budget)
-{
-    return keepNearestOf(edges, eye, budget);
-}
-
-float copyNearest(const std::vector<Quad>& from, const double eye[3], std::size_t budget,
-                  std::vector<Quad>& to)
-{
-    return copyNearestOf(from, eye, budget, to);
-}
-
-float copyNearest(const std::vector<Edge>& from, const double eye[3], std::size_t budget,
-                  std::vector<Edge>& to)
-{
-    return copyNearestOf(from, eye, budget, to);
-}
-
-RadiusCut radiusCut(const std::vector<std::size_t>& histogram, std::size_t limit)
-{
-    RadiusCut cut;
-    std::size_t taken = 0;
-    for (std::size_t r = 0; r < histogram.size(); ++r) {
-        if (histogram[r] > limit - taken) {
-            cut.full = r;
-            cut.partial = limit - taken;
-            return cut;
-        }
-        taken += histogram[r];
-    }
-    cut.full = histogram.size();
-    cut.partial = 0;
-    return cut;
-}
-
-float paintOrder(std::vector<Quad>& quads, std::vector<Edge>& edges, const double eye[3],
-                 std::size_t budget, double edgeReach, std::vector<std::uint32_t>& order)
+void paintOrder(const std::vector<Quad>& quads, const std::vector<Edge>& edges, const double eye[3],
+                std::vector<std::uint32_t>& order)
 {
     order.clear();
-    struct Pick {
-        double key;
-        std::uint32_t item;
-    };
-    const bool withEdges = edgeReach > 0.0;
-    std::vector<Pick> picks;
-    picks.reserve(quads.size() + (withEdges ? edges.size() : 0));
-    for (std::size_t i = 0; i < quads.size(); ++i) {
-        picks.push_back(Pick{distanceSq(quads[i], eye), static_cast<std::uint32_t>(i)});
-    }
-    if (withEdges) {
-        const double scale = 1.0 / (edgeReach * edgeReach);
-        for (std::size_t i = 0; i < edges.size(); ++i) {
-            picks.push_back(
-                Pick{distanceSq(edges[i], eye) * scale, kEdgeItem | static_cast<std::uint32_t>(i)});
-        }
-    }
-    float radius = -1.0F;
-    if (picks.size() > budget) {
-        const auto nearer = [](const Pick& a, const Pick& b) {
-            return a.key != b.key ? a.key < b.key : a.item < b.item;
-        };
-        std::nth_element(picks.begin(), picks.begin() + static_cast<std::ptrdiff_t>(budget),
-                         picks.end(), nearer);
-        bool droppedFace = false;
-        for (std::size_t i = budget; i < picks.size() && !droppedFace; ++i) {
-            droppedFace = (picks[i].item & kEdgeItem) == 0;
-        }
-        picks.resize(budget);
-        if (droppedFace) {
-            double farthest = 0.0;
-            for (const Pick& pick : picks) {
-                if ((pick.item & kEdgeItem) == 0) {
-                    farthest = (std::max)(farthest, pick.key);
-                }
-            }
-            radius = static_cast<float>(std::sqrt(farthest));
-        }
-    }
-    std::vector<char> keepQuad(quads.size(), 0);
-    std::vector<char> keepEdge(edges.size(), 0);
-    for (const Pick& pick : picks) {
-        if ((pick.item & kEdgeItem) != 0) {
-            keepEdge[pick.item & ~kEdgeItem] = 1;
-        } else {
-            keepQuad[pick.item] = 1;
-        }
-    }
-    std::size_t kept = 0;
-    for (std::size_t i = 0; i < quads.size(); ++i) {
-        if (keepQuad[i] != 0) {
-            quads[kept++] = quads[i];
-        }
-    }
-    quads.resize(kept);
-    kept = 0;
-    for (std::size_t i = 0; i < edges.size(); ++i) {
-        if (keepEdge[i] != 0) {
-            edges[kept++] = edges[i];
-        }
-    }
-    edges.resize(kept);
     std::vector<std::pair<double, std::uint32_t>> byCenter;
-    byCenter.reserve(picks.size());
+    byCenter.reserve(quads.size() + edges.size());
     for (std::size_t i = 0; i < quads.size(); ++i) {
         std::int32_t c[4][3] = {};
         corners(quads[i], c);
@@ -703,7 +420,6 @@ float paintOrder(std::vector<Quad>& quads, std::vector<Edge>& edges, const doubl
     for (const auto& [d2, item] : byCenter) {
         order.push_back(item);
     }
-    return radius;
 }
 
 bool ribbonCorners(const double p0[3], const double p1[3], const double* forward, double forwardW,

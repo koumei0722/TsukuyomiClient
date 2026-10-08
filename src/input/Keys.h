@@ -13,6 +13,7 @@ std::wstring name(int virtualKey);
 std::wstring comboName(std::span<const int> combo);
 
 bool parseCombo(const std::wstring& text, std::vector<int>& out);
+std::vector<std::string> commandNames();
 
 bool isModifier(int virtualKey);
 

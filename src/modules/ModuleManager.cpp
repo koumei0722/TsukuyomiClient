@@ -1,10 +1,11 @@
 #include "modules/ModuleManager.h"
 
 #include "config/Config.h"
-#include "core/Logger.h"
 #include "core/Strings.h"
+#include "game/ClientChat.h"
 
 #include <algorithm>
+#include <utility>
 
 namespace tsukuyomi {
 
@@ -27,15 +28,6 @@ void ModuleManager::registerModule(Module* module)
 
 void ModuleManager::loadConfig()
 {
-    constexpr std::pair<std::string_view, std::string_view> renames[] = {
-        {"FastRightClick", "FastUseItem"},
-    };
-    for (const auto& [from, to] : renames) {
-        if (Config::instance().renameSection(from, to)) {
-            log().info(L"Config: renamed section {} -> {}", toUtf16(std::string(from)),
-                       toUtf16(std::string(to)));
-        }
-    }
     for (Module* module : m_modules) {
         const std::string key = toUtf8(module->name());
         module->loadConfig(Config::instance().section(key));
@@ -46,7 +38,13 @@ void ModuleManager::saveConfig()
 {
     for (const Module* module : m_modules) {
         const std::string key = toUtf8(module->name());
-        module->saveConfig(Config::instance().section(key));
+        nlohmann::json& section = Config::instance().section(key);
+        nlohmann::json fresh = nlohmann::json::object();
+        if (const auto pad = section.find("padKeys"); pad != section.end()) {
+            fresh["padKeys"] = *pad;
+        }
+        module->saveConfig(fresh);
+        section = std::move(fresh);
     }
 }
 
@@ -61,6 +59,36 @@ void ModuleManager::update()
 {
     for (Module* module : m_modules) {
         module->update();
+    }
+}
+
+void ModuleManager::postToggleNotice(const wchar_t* moduleName, bool enabled)
+{
+    std::string text = "\xC2\xA7" "b[Tsukuyomi]" "\xC2\xA7" "r " + toUtf8(moduleName)
+        + (enabled ? " \xC2\xA7" "aON" : " \xC2\xA7" "cOFF");
+    postNotice(std::move(text));
+}
+
+void ModuleManager::postNotice(std::string text)
+{
+    const std::lock_guard<std::mutex> lock(m_noticeMutex);
+    if (m_notices.size() < 16) {
+        m_notices.push_back(std::move(text));
+    }
+}
+
+void ModuleManager::pumpToggleNotices()
+{
+    std::vector<std::string> notices;
+    {
+        const std::lock_guard<std::mutex> lock(m_noticeMutex);
+        if (m_notices.empty()) {
+            return;
+        }
+        notices.swap(m_notices);
+    }
+    for (const std::string& text : notices) {
+        clientchat::printLocal(text);
     }
 }
 

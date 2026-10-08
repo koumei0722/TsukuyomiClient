@@ -43,30 +43,34 @@ json line(const char* kind, int index, int width, int height, int x, int y, bool
     return named(std::string("tk_invhud_") + kind + std::to_string(index), body);
 }
 
-json itemParts(const char* collectionName)
+json itemParts(const char* collectionName, const char* condition = nullptr)
 {
-    const json icon = {{"size", {kPitch - 2, kPitch - 2}},
-                       {"$item_collection_name", collectionName},
-                       {"property_bag", {{"force_update", true}}}};
+    json icon = {{"size", {kPitch - 2, kPitch - 2}},
+                 {"$item_collection_name", collectionName},
+                 {"property_bag", {{"force_update", true}}}};
+    if (condition != nullptr) {
+        icon["$item_renderer_binding_condition"] = condition;
+    }
     const json details = {{"binding_type", "collection_details"}, {"binding_collection_name", collectionName}};
+    auto collection = [collectionName, condition](const char* name, const char* over) {
+        json binding = {{"binding_name", name},
+                        {"binding_type", "collection"},
+                        {"binding_collection_name", collectionName}};
+        if (over != nullptr) {
+            binding["binding_name_override"] = over;
+        }
+        if (condition != nullptr) {
+            binding["binding_condition"] = condition;
+        }
+        return binding;
+    };
     const json count = {{"ignored", false},
                         {"$item_collection_name", collectionName},
                         {"bindings", json::array({
                             details,
-                            {{"binding_name", "#inventory_stack_count"},
-                             {"binding_type", "collection"},
-                             {"binding_collection_name", collectionName}},
-                            {{"binding_name", "#stack_count_visible"},
-                             {"binding_name_override", "#visible"},
-                             {"binding_type", "collection"},
-                             {"binding_collection_name", collectionName}}
+                            collection("#inventory_stack_count", nullptr),
+                            collection("#stack_count_visible", "#visible")
                         })}};
-    auto collection = [collectionName](const char* name, const char* over) {
-        return json{{"binding_name", name},
-                    {"binding_name_override", over},
-                    {"binding_type", "collection"},
-                    {"binding_collection_name", collectionName}};
-    };
     const json dura = {{"ignored", false},
                        {"$item_collection_name", collectionName},
                        {"bindings", json::array({
@@ -237,7 +241,7 @@ std::string offhandJson()
                                  {{"type", "panel"},
                                   {"size", {kPitch, kPitch}},
                                   {"layer", 3},
-                                  {"controls", itemParts("offhand_items")}})
+                                  {"controls", itemParts("offhand_items", kOffhandCondition)}})
                        })}};
     const json box = {{"type", "stack_panel"},
                       {"orientation", "horizontal"},

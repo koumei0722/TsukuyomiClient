@@ -298,6 +298,7 @@ void ItemScroller::registerUiDefinitions()
 
 void ItemScroller::onScreenCreated(void* ctrl)
 {
+    applyDisable();
     int ok = 0;
     int tried = 0;
     auto count = [&ok, &tried](bool r) {
@@ -350,7 +351,7 @@ void ItemScroller::onScreenCreated(void* ctrl)
     m_autoTradeTicks = 0;
     m_autoTradeGains.clear();
     m_autoTradeOffstack = false;
-    m_autoTradeWanted = enabled() && m_enableVillagerTradeFeatures && m_villagerTradeFavoritesOnOpen
+    m_autoTradeWanted = enabled() && m_villagerTradeFavoritesOnOpen
                         && !autoTradeBypassed();
     std::memset(&m_view, 0, sizeof(m_view));
     std::memset(&m_favView, 0, sizeof(m_favView));
@@ -441,6 +442,7 @@ void ItemScroller::viewText(std::uintptr_t a, char* out, std::size_t cap)
 void ItemScroller::viewButton(std::uintptr_t a)
 {
     ItemScroller& self = instance();
+    self.applyDisable();
     const int kind = static_cast<int>(a >> 8);
     const int i = static_cast<int>(a & 0xFF);
     if (kind == kBtnHover) {
@@ -454,7 +456,6 @@ void ItemScroller::viewButton(std::uintptr_t a)
         return;
     }
     self.m_viewPress = i;
-    self.m_viewPressRight = (kind == kBtnRight);
 }
 
 int ItemScroller::idAuxOf(const Ingredient& ing)
@@ -470,9 +471,7 @@ int ItemScroller::idAuxOf(const Ingredient& ing)
     const void* const item = blocks::itemByName(ing.name);
     const int value = (item != nullptr) ? cui::idAuxOfItem(item, ing.aux) : 0;
     m_idAuxCache.emplace(key, value);
-    if (value == 0 && debugLog()) {
-        log().warn(L"ItemScroller: no icon for {} (aux {})", toUtf16(ing.name), ing.aux);
-    }
+
     return value;
 }
 
@@ -499,13 +498,28 @@ void ItemScroller::updateRecipeView()
         if (!m_recipesLoaded) {
             loadRecipes();
         }
-        const int first = (m_selectedRecipe / kRecipesPerPage) * kRecipesPerPage;
+        std::array<Recipe, kRecipesPerPage> recipes;
+        Recipe shownRecipe;
+        int selected;
+        int first;
+        int hovered = -1;
+        const bool overRecipe = viewHovered(hovered);
+        {
+            const std::lock_guard lock(m_recipesMutex);
+            selected = m_selectedRecipe;
+            first = (selected / kRecipesPerPage) * kRecipesPerPage;
+            for (int i = 0; i < kRecipesPerPage; ++i) {
+                recipes[static_cast<size_t>(i)] = m_recipes[static_cast<size_t>(first + i)];
+            }
+            const int shown = overRecipe ? first + hovered : selected;
+            if (shown >= 0 && shown < kRecipeCount) shownRecipe = m_recipes[static_cast<size_t>(shown)];
+        }
         std::snprintf(next.page, sizeof(next.page), "Page %d/%d", first / kRecipesPerPage + 1,
                       kRecipePages);
         for (int i = 0; i < kRecipesPerPage; ++i) {
-            const Recipe& r = m_recipes[static_cast<size_t>(first + i)];
+            const Recipe& r = recipes[static_cast<size_t>(i)];
             std::snprintf(next.number[i], sizeof(next.number[i]), "%d", first + i + 1);
-            next.selected[i] = (first + i == m_selectedRecipe);
+            next.selected[i] = (first + i == selected);
             if (!r.empty()) {
                 next.item[i] = idAuxOf(r.result);
                 if (r.resultCount > 1) {
@@ -513,52 +527,41 @@ void ItemScroller::updateRecipeView()
                 }
             }
         }
-        if (m_craftingRenderRecipeItems) {
-            int hovered = -1;
-            const int shown = viewHovered(hovered) ? first + hovered : m_selectedRecipe;
-            if (shown >= 0 && shown < kRecipeCount) {
-                const Recipe& r = m_recipes[static_cast<size_t>(shown)];
-                if (!r.empty()) {
-                    const int width = (r.gridSize == 4) ? 2 : 3;
-                    for (int j = 0; j < 9; ++j) {
-                        const Ingredient& ing = r.items[static_cast<size_t>(j)];
-                        if (ing.empty()) {
-                            continue;
-                        }
-                        const int cellIndex = (width == 2) ? ((j / 2) * 3 + (j % 2)) : j;
-                        if (width == 2 && j >= 4) {
-                            continue;
-                        }
-                        next.ing[cellIndex] = idAuxOf(ing);
+
+        const int shown = overRecipe ? first + hovered : selected;
+        if (shown >= 0 && shown < kRecipeCount) {
+            const Recipe& r = shownRecipe;
+            if (!r.empty()) {
+                const int width = (r.gridSize == 4) ? 2 : 3;
+                for (int j = 0; j < 9; ++j) {
+                    const Ingredient& ing = r.items[static_cast<size_t>(j)];
+                    if (ing.empty()) {
+                        continue;
                     }
-                    next.res = idAuxOf(r.result);
-                    if (r.resultCount > 1) {
-                        std::snprintf(next.resCount, sizeof(next.resCount), "%d", r.resultCount);
+                    const int cellIndex = (width == 2) ? ((j / 2) * 3 + (j % 2)) : j;
+                    if (width == 2 && j >= 4) {
+                        continue;
                     }
+                    next.ing[cellIndex] = idAuxOf(ing);
+                }
+                next.res = idAuxOf(r.result);
+                if (r.resultCount > 1) {
+                    std::snprintf(next.resCount, sizeof(next.resCount), "%d", r.resultCount);
                 }
             }
         }
+
     }
     if (std::memcmp(&next, &m_view, sizeof(next)) != 0) {
         std::memcpy(&m_view, &next, sizeof(next));
         cui::requestRefresh();
-        if (next.visible && debugLog()) {
-            std::wstring items;
-            for (int i = 0; i < kRecipesPerPage; ++i) {
-                if (next.item[i] != 0) {
-                    items += std::format(L" {}={:#x}", i + 1, static_cast<unsigned>(next.item[i]));
-                }
-            }
-            log().info(L"ItemScroller: recipe view {} /{} / grid res {:#x}", toUtf16(next.page), items,
-                       static_cast<unsigned>(next.res));
-        }
+
     }
 }
 
 void ItemScroller::handleViewInput()
 {
     const int pressed = m_viewPress;
-    const bool right = m_viewPressRight;
     m_viewPress = -1;
     if (pressed >= 0 && m_recipeViewOpen) {
         const int first = (m_selectedRecipe / kRecipesPerPage) * kRecipesPerPage;
@@ -572,10 +575,7 @@ void ItemScroller::handleViewInput()
                 const bool shift = keyHeld(VK_SHIFT);
                 enqueueFillGrid(shift);
             }
-            if (debugLog()) {
-                log().info(L"ItemScroller: recipe view {} click on {} ({})", right ? L"right" : L"left",
-                           index + 1, changed ? L"selected" : L"filled the grid");
-            }
+
         }
     }
     const bool middle = keyHeld(VK_MBUTTON);

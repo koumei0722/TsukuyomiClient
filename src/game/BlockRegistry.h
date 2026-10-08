@@ -117,9 +117,7 @@ struct DiffBox {
     std::uint8_t covered = 0;
 };
 
-std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
-                             std::size_t* dropped, const double* eye = nullptr,
-                             int* keptRadius = nullptr);
+std::size_t collectDiffBoxes(std::vector<DiffBox>& out);
 
 std::size_t appendStateVariants(const void* block, std::vector<const void*>& out);
 
@@ -152,7 +150,7 @@ const void* itemByName(const std::string& name);
 
 std::vector<std::string> registeredItemNames();
 
-bool maxStackSizeOf(const char* name, const void* block, int& out);
+bool maxStackSizeOf(const char* name, int& out);
 
 bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z);
 

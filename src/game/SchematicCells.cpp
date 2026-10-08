@@ -1,7 +1,9 @@
 #include "game/SchematicCells.h"
 
 #include <algorithm>
+#include <array>
 #include <map>
+#include <set>
 
 #include "game/Rotation.h"
 #include "game/SchematicLimits.h"
@@ -57,6 +59,42 @@ std::uint64_t packCell(std::int32_t x, std::int32_t y, std::int32_t z)
     return (ux << 42) | (uy << 21) | uz;
 }
 
+std::size_t CellPosHash::operator()(const CellPos& pos) const noexcept
+{
+    std::size_t hash = std::hash<std::int32_t>{}(pos.x);
+    hash ^= std::hash<std::int32_t>{}(pos.y) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    hash ^= std::hash<std::int32_t>{}(pos.z) + 0x9e3779b9u + (hash << 6) + (hash >> 2);
+    return hash;
+}
+
+std::vector<CellPos> regionChunks(const std::vector<Box>& boxes, std::size_t limit,
+                                  bool& truncated)
+{
+    truncated = false;
+    std::set<std::array<std::int32_t, 3>> seen;
+    for (const Box& box : boxes) {
+        if (box.x0 >= box.x1 || box.y0 >= box.y1 || box.z0 >= box.z1) continue;
+        for (std::int32_t x = box.x0 >> 4; x <= ((box.x1 - 1) >> 4); ++x) {
+            for (std::int32_t y = box.y0 >> 4; y <= ((box.y1 - 1) >> 4); ++y) {
+                for (std::int32_t z = box.z0 >> 4; z <= ((box.z1 - 1) >> 4); ++z) {
+                    const std::array<std::int32_t, 3> key{x, y, z};
+                    if (seen.find(key) != seen.end()) continue;
+                    if (seen.size() == limit) {
+                        truncated = true;
+                        goto finished;
+                    }
+                    seen.insert(key);
+                }
+            }
+        }
+    }
+finished:
+    std::vector<CellPos> out;
+    out.reserve(seen.size());
+    for (const auto& key : seen) out.push_back({key[0] * 16, key[1] * 16, key[2] * 16});
+    return out;
+}
+
 void CellIndex::reset(const Box& region)
 {
     clear();
@@ -104,7 +142,7 @@ bool CellIndex::insert(std::int32_t x, std::int32_t y, std::int32_t z, std::size
         ++m_count;
         return true;
     }
-    if (!m_sparse.emplace(packCell(x, y, z), value).second) {
+    if (!m_sparse.emplace(CellPos{x, y, z}, value).second) {
         return false;
     }
     ++m_count;
@@ -120,7 +158,7 @@ std::size_t CellIndex::find(std::int32_t x, std::int32_t y, std::int32_t z) cons
         }
         return static_cast<std::size_t>(m_slots[slot]) - 1;
     }
-    const auto it = m_sparse.find(packCell(x, y, z));
+    const auto it = m_sparse.find(CellPos{x, y, z});
     return it == m_sparse.end() ? kNone : static_cast<std::size_t>(it->second) - 1;
 }
 
@@ -150,11 +188,6 @@ void CellIndex::swap(CellIndex& other) noexcept
 Loaded loadBlueprint(const std::filesystem::path& path)
 {
     return finishLoad(structure::loadFile(path));
-}
-
-Loaded loadBlueprintBytes(const char* bytes, std::size_t size)
-{
-    return finishLoad(structure::loadBytes(bytes, size));
 }
 
 std::size_t assignPaletteBases(std::vector<Placement>& placements)

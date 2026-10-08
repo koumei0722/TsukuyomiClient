@@ -12,6 +12,8 @@ void removeEarlyFileHook();
 
 bool patchReady();
 
+const wchar_t* patchFailure();
+
 const char* ownGroupId(int index);
 int ownGroupIdCount();
 

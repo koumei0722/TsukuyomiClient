@@ -26,15 +26,11 @@ inline constexpr std::uint32_t kDropOne = buttonId("button.drop_one");
 inline constexpr std::uint32_t kDropAll = buttonId("button.drop_all");
 inline constexpr std::uint32_t kCoalesce = buttonId("button.coalesce_stack");
 inline constexpr std::uint32_t kHover = buttonId("button.shape_drawing");
-inline constexpr std::uint32_t kSlotHovered = buttonId("button.container_slot_hovered");
 inline constexpr std::uint32_t kCursorDropAll = buttonId("button.cursor_drop_all");
 inline constexpr std::uint32_t kCursorDropOne = buttonId("button.cursor_drop_one");
 inline constexpr std::uint32_t kOutputPrimary = buttonId("button.crafting_output_primary");
 inline constexpr std::uint32_t kOutputSecondary = buttonId("button.crafting_output_secondary");
 inline constexpr std::uint32_t kOutputTertiary = buttonId("button.crafting_output_tertiary");
-inline constexpr std::uint32_t kRecipeSelect = buttonId("button.recipe_select");
-inline constexpr std::uint32_t kRecipeSecondary = buttonId("button.recipe_secondary");
-inline constexpr std::uint32_t kRecipeTertiary = buttonId("button.recipe_tertiary");
 }
 
 inline constexpr int kStatePressed = 0;
@@ -92,7 +88,6 @@ void* hudContainerManager(void* ctrl);
 void onScreenDestroyed(void* ctrl);
 
 bool hasScreen();
-std::uintptr_t screenKind();
 void* screenController();
 
 int collectionSize(const std::string& coll);
@@ -106,13 +101,11 @@ int maxStackOf(const void* stack);
 bool sameItem(const void* a, const void* b);
 std::string itemName(const void* stack);
 int auxOf(const void* stack);
+int netTagOf(const void* stack);
 std::uintptr_t itemKey(const void* stack);
 
 bool click(const std::string& coll, int index, Click kind);
 bool dropCursor(bool all);
-
-int itemRarityOf(const void* item);
-int rarityOf(const void* stack);
 
 int creativeCategoryOf(const void* stack);
 
@@ -128,6 +121,7 @@ struct NbtItem {
 };
 bool nbtItemsOfTag(const void* root, std::vector<NbtItem>& out);
 const void* userDataOf(const void* stack);
+bool tagHashOf(const void* stack, std::uint64_t& out);
 std::string enchantKey(const void* stack);
 int nbtTagCount(const void* stack);
 bool nbtInt(const void* stack, std::string_view key, std::int32_t& out);
@@ -136,16 +130,11 @@ bool itemsListBounds(const void* root, const void*& first, const void*& last);
 inline constexpr int kGlintBit = 0x8000;
 
 int maxStackOfItem(const void* item);
-int screenCollectionSize(const std::string& coll);
-const void* screenStackAt(const std::string& coll, int index);
-bool press(std::uint32_t id, const std::string& coll, int index);
 
 bool hovered(std::string& coll, int& index);
 bool lastHovered(std::string& coll, int& index);
 
 int slotPitchPixels();
-
-bool slotScreenPos(const std::string& coll, int index, int& x, int& y);
 
 using BoolGetter = bool (*)(std::uintptr_t arg);
 using IntGetter = int (*)(std::uintptr_t arg);
@@ -156,15 +145,19 @@ bool bindingsAvailable();
 bool bindBool(void* ctrl, const char* name, BoolGetter fn, std::uintptr_t arg);
 bool bindInt(void* ctrl, const char* name, IntGetter fn, std::uintptr_t arg);
 bool bindText(void* ctrl, const char* name, TextGetter fn, std::uintptr_t arg);
-inline constexpr int kPersistentSlots = 256;
+using LongTextGetter = void (*)(std::uintptr_t arg, std::string& out);
+bool bindLongText(void* ctrl, const char* name, LongTextGetter fn, std::uintptr_t arg);
+using FloatGetter = float (*)(std::uintptr_t arg);
+bool bindFloat(void* ctrl, const char* name, FloatGetter fn, std::uintptr_t arg);
+inline constexpr int kPersistentSlots = 512;
 bool floatBindingsAvailable();
 volatile std::uint8_t* persistentBool(int slot);
 volatile float* persistentFloat(int slot);
 bool bindPersistentBool(void* ctrl, const char* name, int slot);
 bool bindPersistentFloat(void* ctrl, const char* name, int slot);
 
-inline constexpr int kPersistentTextSlots = 96;
-inline constexpr int kPersistentTextBytes = 128;
+inline constexpr int kPersistentTextSlots = 383;
+inline constexpr int kPersistentTextBytes = 256;
 inline constexpr int kPersistentTextMax = kPersistentTextBytes - 17;
 bool writePersistentText(int slot, const char* text, std::size_t length);
 bool bindPersistentText(void* ctrl, const char* name, int slot);
@@ -178,14 +171,13 @@ bool collectionBindingsAvailable();
 bool bindCollectionInt(void* ctrl, const char* name, CollIntGetter fn, std::uintptr_t arg);
 const void* screenStackOf(void* ctrl, const std::string& coll, int index);
 
-int idAuxOfItem(const void* item, int aux);
+inline constexpr int kPersistentCollSlots = 4;
+bool bindPersistentCollectionInt(void* ctrl, const char* name, int slot, CollIntGetter fn, std::uintptr_t arg);
+void detachPersistentCollectionInt();
+bool locateHudCollectionResolver(const void* site, void*& resolver, void*& base);
+bool hudForwardsToBase(std::uint32_t nameHash);
+const void* hudStackOf(void* ctrl, const std::string& coll, int index);
 
-struct Stats {
-    unsigned long long smEvents = 0;
-    unsigned long long hoverEvents = 0;
-    unsigned long long ticks = 0;
-    unsigned long long tickCalls = 0;
-};
-Stats stats();
+int idAuxOfItem(const void* item, int aux);
 
 }

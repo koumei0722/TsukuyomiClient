@@ -1,4 +1,5 @@
 #include "game/DebugScreenText.h"
+#include "game/AppleSkinMath.h"
 
 #include <algorithm>
 #include <bit>
@@ -578,6 +579,22 @@ int formatTps(const Sample& s, char out[][kLineBytes], int maxRows)
     return n;
 }
 
+int formatFoodStats(const Sample& s, char out[][kLineBytes], int maxRows)
+{
+    if (!s.foodHunger.available || !s.foodSaturation.available || !s.foodExhaustion.available
+        || !std::isfinite(s.foodSaturation.value) || !std::isfinite(s.foodExhaustion.value)) return 0;
+    char sat[32]{};
+    std::snprintf(sat, sizeof sat, "%.2f", static_cast<double>(s.foodSaturation.value));
+
+    std::size_t length = std::strlen(sat);
+    while (length > 0 && sat[length - 1] == '0') sat[--length] = '\0';
+    if (length > 0 && sat[length - 1] == '.') sat[--length] = '\0';
+    int n = 0;
+    add(out, maxRows, n, "hunger: %d, sat: %s, exh: %.2f/%g", s.foodHunger.value, sat,
+        static_cast<double>(s.foodExhaustion.value), static_cast<double>(appleskin::kExhaustionThreshold));
+    return n;
+}
+
 int formatElement(const char* id, const Sample& s, char out[][kLineBytes], int maxRows)
 {
     if (id == nullptr) {
@@ -594,6 +611,7 @@ int formatElement(const char* id, const Sample& s, char out[][kLineBytes], int m
         {"chunk_source_stats", formatChunkSourceStats},
         {"day_count", formatDayCount},
         {"entity_render_stats", formatEntityRenderStats},
+        {"food_stats", formatFoodStats},
         {"fps", formatFps},
         {"game_version", formatGameVersion},
         {"gpu_utilization", formatGpuUtilization},
@@ -616,7 +634,7 @@ int formatElement(const char* id, const Sample& s, char out[][kLineBytes], int m
         {"system_specs", formatSystemSpecs},
         {"tps", formatTps},
     };
-    static_assert(sizeof kTable / sizeof kTable[0] == 27);
+    static_assert(sizeof kTable / sizeof kTable[0] == 28);
     for (const Entry& entry : kTable) {
         if (std::strcmp(entry.id, id) == 0) {
             return entry.fn(s, out, maxRows);

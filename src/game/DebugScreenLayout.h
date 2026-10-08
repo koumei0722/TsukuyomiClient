@@ -19,7 +19,7 @@ struct Element {
     ElementState performanceState;
 };
 
-inline constexpr int kElementCount = 27;
+inline constexpr int kElementCount = 28;
 inline constexpr int kMaxRowsPerElement = 7;
 inline constexpr int kRowsPerColumn = 48;
 inline constexpr int kTextSlotCount = 2 * kRowsPerColumn;
@@ -34,6 +34,7 @@ inline constexpr Element kElements[kElementCount] = {
     {"chunk_source_stats", L"Chunk source stats", Port::Regular, nullptr, ElementState::Off, ElementState::Off},
     {"day_count", L"Day count", Port::Regular, nullptr, ElementState::Off, ElementState::Off},
     {"entity_render_stats", L"Entity render stats", Port::Regular, nullptr, ElementState::Off, ElementState::Off},
+    {"food_stats", L"Food stats (AppleSkin)", Port::Group, "appleskin_debug_info", ElementState::InOverlay, ElementState::Off},
     {"fps", L"FPS", Port::Priority, nullptr, ElementState::InOverlay, ElementState::Always},
     {"game_version", L"Game version", Port::Priority, nullptr, ElementState::InOverlay, ElementState::Off},
     {"gpu_utilization", L"GPU utilization", Port::Regular, nullptr, ElementState::Off, ElementState::InOverlay},

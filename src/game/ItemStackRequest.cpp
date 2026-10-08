@@ -90,12 +90,9 @@ struct SendPayload {
     const void* to;
     const std::uint8_t* amount;
 
-    void* pendingBefore = nullptr;
     void* pendingAfterBegin = nullptr;
     void* firstAction = nullptr;
     void* secondAction = nullptr;
-    std::uint64_t actionCount = 0;
-    void* pendingAfterEnd = nullptr;
     std::int32_t requestId = 0;
 };
 
@@ -103,28 +100,27 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
 {
     __try {
         auto* const bytes = static_cast<std::byte*>(p.client);
-        p.pendingBefore = *reinterpret_cast<void**>(bytes + 0x60);
-
-        p.begin(p.client, nullptr);
-        p.pendingAfterBegin = *reinterpret_cast<void**>(bytes + 0x60);
 
         if (p.useSwap) {
             p.makeSwap(&p.firstAction, p.from, p.to);
         } else {
             p.makeTake(&p.firstAction, p.amount, p.from, p.cursorEmpty);
+            if (p.firstAction != nullptr) {
+                p.makePlace(&p.secondAction, p.amount, p.cursorHeld, p.to);
+            }
         }
-        if (p.firstAction == nullptr) {
+        if (p.firstAction == nullptr || (!p.useSwap && p.secondAction == nullptr)) {
             return false;
         }
+
+        p.begin(p.client, nullptr);
+        p.pendingAfterBegin = *reinterpret_cast<void**>(bytes + 0x60);
+
         void* holderA = p.client;
         void* first = p.firstAction;
         p.addAction(&holderA, &first);
 
         if (!p.useSwap) {
-            p.makePlace(&p.secondAction, p.amount, p.cursorHeld, p.to);
-            if (p.secondAction == nullptr) {
-                return false;
-            }
             void* holderB = p.client;
             void* second = p.secondAction;
             p.addAction(&holderB, &second);
@@ -132,14 +128,10 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
 
         if (p.pendingAfterBegin != nullptr) {
             auto* const req = static_cast<std::byte*>(p.pendingAfterBegin);
-            const auto begin = *reinterpret_cast<std::uintptr_t*>(req + 0x30);
-            const auto end = *reinterpret_cast<std::uintptr_t*>(req + 0x38);
-            p.actionCount = end >= begin ? (end - begin) / sizeof(void*) : 0;
-            p.requestId = *reinterpret_cast<std::int32_t*>(req + 0x08);
+            p.requestId = *reinterpret_cast<std::int32_t*>(req + ItemStackRequest::kRequestIdOffset);
         }
 
         p.end(p.client);
-        p.pendingAfterEnd = *reinterpret_cast<void**>(bytes + 0x60);
         return true;
     } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
         return false;
@@ -274,11 +266,6 @@ bool ItemStackRequest::available() const
            && m_endRequest != nullptr;
 }
 
-void ItemStackRequest::forget()
-{
-    m_client.store(nullptr, std::memory_order_release);
-}
-
 int ItemStackRequest::packetId(void* packet)
 {
     void** vtable = nullptr;
@@ -321,15 +308,7 @@ void ItemStackRequest::observePacket(void* packet)
             if (packet != m_closeCopy
                 && readBytesGuarded(packet, m_closeCopy, sizeof(m_closeCopy))) {
                 m_hasCloseCopy.store(true, std::memory_order_release);
-                m_closeSynthetic.store(false, std::memory_order_release);
-                if (!m_loggedRealClose.exchange(true, std::memory_order_acq_rel)) {
-                    std::uint64_t words[sizeof(m_closeCopy) / sizeof(std::uint64_t)] = {};
-                    std::memcpy(words, m_closeCopy, sizeof(words));
-                    log().info(L"ItemStackRequest: a real inventory-close packet ({:#x} {:#x} {:#x} {:#x} "
-                               L"{:#x} {:#x} {:#x}); our vtable {:#x}",
-                               words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-                               reinterpret_cast<std::uintptr_t>(m_closeVtable.load(std::memory_order_acquire)));
-                }
+
             }
         }
     }
@@ -462,13 +441,8 @@ bool ItemStackRequest::synthesizeClose()
     built[kContainerCloseTypeOffset] = std::byte{kContainerTypeNone};
     built[0x32] = std::byte{0};
     std::memcpy(m_closeCopy, built, sizeof(built));
-    m_closeSynthetic.store(true, std::memory_order_release);
     m_hasCloseCopy.store(true, std::memory_order_release);
-    std::uint64_t words[sizeof(built) / sizeof(std::uint64_t)] = {};
-    std::memcpy(words, built, sizeof(words));
-    log().info(L"ItemStackRequest: built the inventory-close packet ourselves ({:#x} {:#x} {:#x} {:#x} "
-               L"{:#x} {:#x} {:#x})",
-               words[0], words[1], words[2], words[3], words[4], words[5], words[6]);
+    log().info(L"ItemStackRequest: built the inventory-close packet ourselves");
     return true;
 }
 
@@ -583,25 +557,20 @@ bool ItemStackRequest::takeInventoryOpen(void* packet, const void* result, const
     return writeBytesGuarded(static_cast<std::byte*>(packet) + kOpenShellOffset, shell, kOpenShellBytes);
 }
 
-void ItemStackRequest::rememberContainerOpenResult(const void* result)
+void ItemStackRequest::waitPendingClose(unsigned long long maxMs)
 {
-    if (result == nullptr || m_loggedOpenResult.load(std::memory_order_acquire)) {
+    if (m_pendingCloseAtMs.load(std::memory_order_acquire) == 0) {
         return;
     }
-    std::byte copy[kOpenResultSize];
-    if (!readBytesGuarded(result, copy, sizeof(copy))) {
-        return;
+    const unsigned long long until = GetTickCount64() + maxMs;
+    while (m_pendingCloseAtMs.load(std::memory_order_acquire) != 0 && GetTickCount64() < until) {
+        Sleep(5);
     }
-
-    if (!m_loggedOpenResult.exchange(true, std::memory_order_acq_rel)) {
-        std::uint64_t words[sizeof(copy) / sizeof(std::uint64_t)]{};
-        std::memcpy(words, copy, sizeof(words));
-        log().info(L"ItemStackRequest: container-open result "
-                   L"({:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x})",
-                   words[0], words[1], words[2], words[3], words[4], words[5], words[6],
-                   words[7], words[8]);
+    if (m_pendingCloseAtMs.load(std::memory_order_acquire) != 0) {
+        log().warn(L"ItemStackRequest: the pending inventory close was not sent before unloading (no frames came)");
+    } else {
+        log().info(L"ItemStackRequest: sent the pending inventory close before unloading");
     }
-
 }
 
 void ItemStackRequest::onFrame()
@@ -768,6 +737,24 @@ bool ItemStackRequest::readStackAt(const void* stack, NetId& net, std::uint8_t& 
     return true;
 }
 
+static void* findNetManagerInRegionGuarded(std::byte* base, std::size_t size, const std::byte* vtable,
+                                    std::size_t validOffset)
+{
+    __try {
+        const std::size_t alignedSize = size & ~static_cast<std::size_t>(7);
+        for (std::size_t offset = 0; offset + sizeof(void*) <= alignedSize; offset += sizeof(void*)) {
+            auto* const p = base + offset;
+            if (*reinterpret_cast<const std::byte* const*>(p) != vtable) continue;
+            if (validOffset >= size - offset) continue;
+            const volatile std::uint8_t valid = *reinterpret_cast<const std::uint8_t*>(p + validOffset);
+            (void)valid;
+            return p;
+        }
+    } __except (accessViolationFilter(GetExceptionCode())) {
+    }
+    return nullptr;
+}
+
 void* ItemStackRequest::findNetManager()
 {
     std::byte* const ref = Scanner::instance().address(Target::NetManagerVtableRef);
@@ -794,17 +781,7 @@ void* ItemStackRequest::findNetManager()
                                 || region.Protect == PAGE_WRITECOPY)
                             && (region.Protect & PAGE_GUARD) == 0;
         if (usable) {
-            auto* const end = base + (size & ~static_cast<std::size_t>(7));
-            for (auto* p = base; p + sizeof(void*) <= end; p += sizeof(void*)) {
-                if (*reinterpret_cast<const std::byte* const*>(p) != vtable) {
-                    continue;
-                }
-                std::uint8_t valid = 0;
-                if (!readU8Guarded(p + kValidFlagOffset, valid)) {
-                    continue;
-                }
-                return p;
-            }
+            if (void* const found = findNetManagerInRegionGuarded(base, size, vtable, kValidFlagOffset)) return found;
         }
         address = base + size;
     }
@@ -999,23 +976,13 @@ bool ItemStackRequest::sendSwap(const SlotRef& a, const SlotRef& b)
     m_sentIds[m_sentNext.fetch_add(1, std::memory_order_acq_rel) % kTrackedRequests].store(
         payload.requestId, std::memory_order_release);
 
-    log().info(L"ItemStackRequest: {} {}:{} -> {}:{} (count {}, netId {} tag {}, "
-               L"pending {:#x}->{:#x}->{:#x}, actions {}, request {}, screen {})",
-               useSwap ? L"swap" : L"move", srcRef.container,
-               srcRef.slot, dstRef.container,
-               dstRef.slot, amount, srcNet.value, srcNet.tag,
-               reinterpret_cast<std::uintptr_t>(payload.pendingBefore),
-               reinterpret_cast<std::uintptr_t>(payload.pendingAfterBegin),
-               reinterpret_cast<std::uintptr_t>(payload.pendingAfterEnd),
-               payload.actionCount, payload.requestId, alreadyOpen ? L"kept" : L"opened");
-
     return true;
 }
 
 void ItemStackRequest::onResponse(const void* entries)
 {
     const std::int32_t wanted = m_lastRequestId.load(std::memory_order_acquire);
-    if (entries == nullptr || wanted == 0) {
+    if (entries == nullptr) {
         return;
     }
 
@@ -1038,7 +1005,7 @@ void ItemStackRequest::onResponse(const void* entries)
         }
         std::int32_t id = 0;
         std::memcpy(&id, raw + kResponseRequestIdOffset, sizeof(id));
-        if (id != 0 && isOurRequest(id)) {
+        if (wanted != 0 && id != 0 && isOurRequest(id)) {
             const int code =
                 static_cast<int>(static_cast<std::uint8_t>(raw[kResponseResultOffset]));
             const unsigned slot = m_answerNext.fetch_add(1, std::memory_order_acq_rel) % kTrackedRequests;
@@ -1050,11 +1017,7 @@ void ItemStackRequest::onResponse(const void* entries)
                 log().info(L"ItemStackRequest: request {} was answered before any container-open packet; "
                            L"not waiting for one any more", id);
             }
-            std::uint64_t words[kResponseEntrySize / sizeof(std::uint64_t)] = {};
-            std::memcpy(words, raw, sizeof(words));
-            log().info(L"ItemStackRequest: request {} answered with result {} "
-                       L"({:#x} {:#x} {:#x} {:#x} {:#x} {:#x})",
-                       id, code, words[0], words[1], words[2], words[3], words[4], words[5]);
+
         }
         it += kResponseEntrySize;
     }

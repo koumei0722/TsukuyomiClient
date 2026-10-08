@@ -4,6 +4,7 @@
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "game/GameData.h"
+#include "game/HeldItem.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
 #include "memory/Memory.h"
@@ -26,13 +27,15 @@ FastBlockPlacement& FastBlockPlacement::instance()
 
 void FastBlockPlacement::onScansReady()
 {
+    helditem::resolve();
     m_useButton = GameButtons::instance().watchButton(gamebuttonlogic::button::buildOrInteract);
 }
 
 bool FastBlockPlacement::available() const
 {
     const Scanner& scanner = Scanner::instance();
-    return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView);
+    return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView)
+        && helditem::ready();
 }
 
 const wchar_t* FastBlockPlacement::axisName() const
@@ -145,7 +148,6 @@ void FastBlockPlacement::rememberPlaced(const BlockPos& pos)
 MenuItem FastBlockPlacement::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::choice(
@@ -180,14 +182,21 @@ void FastBlockPlacement::saveConfig(nlohmann::json& section) const
     section["mode"] = static_cast<int>(m_axis);
     section["distance"] = m_range;
 
-    section.erase("feet");
 }
 
 void FastBlockPlacement::onEnabledChanged(bool enabled)
 {
     if (!enabled) {
+        m_resetRequested.store(true, std::memory_order_release);
+    }
+}
+
+void FastBlockPlacement::applyReset()
+{
+    if (m_resetRequested.exchange(false, std::memory_order_acq_rel)) {
         m_hasBase = false;
         m_manualDone = false;
+        m_seenEmptyHand = false;
         m_placed.clear();
     }
 }
@@ -195,30 +204,37 @@ void FastBlockPlacement::onEnabledChanged(bool enabled)
 bool FastBlockPlacement::onBuildBlock(void* gameMode, void* blockPos, unsigned char face,
                                       unsigned char extra, bool simTick)
 {
+    if (!m_placing) applyReset();
     if (m_placing) {
         return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
 
     m_gameMode = gameMode;
 
-    if (!enabled() || !memory::isReadable(blockPos, sizeof(int) * 3)) {
+    if (!enabled()) {
         return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
 
     m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
 
     if (m_manualDone) {
+        if (!handReady(gameMode)) return false;
+
         BlockPos redirect = m_base;
         const bool result = hooks::callBuildBlock(gameMode, &redirect, face, extra, simTick);
         placeRange();
         return result;
     }
 
-    const auto* const pos = reinterpret_cast<const int*>(blockPos);
+    int pos[3]{};
+    if (!memory::copyGuarded(blockPos, pos, sizeof(pos))) {
+        return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
+    }
 
     m_base = shiftByFace(BlockPos{pos[0], pos[1], pos[2]}, face);
     m_hasBase = true;
     m_manualDone = true;
+    m_seenEmptyHand = false;
 
     rememberPlaced(m_base);
 
@@ -232,6 +248,7 @@ bool FastBlockPlacement::onBuildBlock(void* gameMode, void* blockPos, unsigned c
 
 void FastBlockPlacement::onPlayerViewUpdate()
 {
+    if (!m_placing) applyReset();
     if (!m_hasBase || m_placing) {
         return;
     }
@@ -245,8 +262,20 @@ void FastBlockPlacement::onPlayerViewUpdate()
     if (Clock::now() > m_holdUntil) {
         m_hasBase = false;
         m_manualDone = false;
+        m_seenEmptyHand = false;
         m_placed.clear();
     }
+}
+
+bool FastBlockPlacement::handReady(void* gameMode)
+{
+    bool empty = false;
+    if (!helditem::mainHandEmpty(gameMode, empty)) return false;
+    if (empty && !m_seenEmptyHand) {
+        m_seenEmptyHand = true;
+        log().info(L"FastBlockPlacement: the hand is empty; waiting for a refill");
+    }
+    return !empty;
 }
 
 void FastBlockPlacement::placeRange()
@@ -255,6 +284,8 @@ void FastBlockPlacement::placeRange()
         || !input::isInGameplay()) {
         return;
     }
+
+    if (!handReady(m_gameMode)) return;
 
     const Clock::time_point now = Clock::now();
     const PlayerView view = GameData::instance().playerView();
@@ -286,8 +317,6 @@ void FastBlockPlacement::placeRange()
     stepY /= length;
     stepZ /= length;
 
-    const float footY = view.y - GameData::kEyeHeight;
-
     const bool resendDue = now >= m_nextResend;
 
     constexpr int firstStep = kFirstStep;
@@ -299,7 +328,7 @@ void FastBlockPlacement::placeRange()
 
         BlockPos target;
         target.x = static_cast<int>(std::floor(view.x + stepX * distance));
-        target.y = static_cast<int>(std::floor(footY + stepY * distance));
+        target.y = static_cast<int>(std::floor(view.y + stepY * distance));
         target.z = static_cast<int>(std::floor(view.z + stepZ * distance));
 
         switch (m_axis) {
@@ -344,8 +373,10 @@ void FastBlockPlacement::placeRange()
         const unsigned char face = faceForCell(target, candidates, targets, count);
         lastFace = face;
 
+        if (!handReady(m_gameMode)) break;
+
         ++attempted;
-        if (hooks::callBuildBlock(m_gameMode, &target, face, 0, simTick)) {
+        if (hooks::callBuildBlockWithoutSwing(m_gameMode, &target, face, 0, simTick)) {
             ++placed;
         }
         rememberPlaced(target);

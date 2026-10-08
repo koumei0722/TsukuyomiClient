@@ -46,7 +46,6 @@ struct Value {
 
 struct Result {
     ValuePtr root;
-    std::string rootName;
     const char* why = nullptr;
 };
 

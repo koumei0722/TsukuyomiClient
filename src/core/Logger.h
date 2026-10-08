@@ -2,11 +2,9 @@
 
 #include <format>
 #include <fstream>
-#include <functional>
 #include <mutex>
 #include <string>
 #include <utility>
-#include <vector>
 
 namespace tsukuyomi {
 

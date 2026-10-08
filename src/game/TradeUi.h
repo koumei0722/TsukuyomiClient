@@ -39,11 +39,9 @@ using RowBoolGetter = bool (*)(int tier, int index);
 bool bindRowBool(void* ctrl, const char* name, RowBoolGetter fn);
 
 void setClientScreen(void* ctrl);
-const void* offerRaw(void* ctrl, int tier, int rawIndex);
 void setUnlockTier(int maxTier);
 
 int currentTier(void* ctrl);
-bool selectedOffer(void* ctrl, int& tier, int& rawIndex);
 
 int overrideTier(void* owner, int value, const void* returnAddress);
 void setCurrentTierOriginal(const void* original);

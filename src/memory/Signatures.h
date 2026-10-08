@@ -6,9 +6,13 @@ namespace tsukuyomi {
 
 enum class Target {
     CameraUpdate,
+
+    CameraUpdateContext,
     PlayerView,
     PacketSend,
     BuildBlock,
+
+    MobSwing,
     GameModeContinueDestroyBlock,
     GameModeDestroyBlock,
     GameModeStopDestroyBlock,
@@ -16,6 +20,8 @@ enum class Target {
     GetDestroySpeed,
     SetSelectedSlot,
     AbilitiesAccess,
+
+    PoseDecision,
     UseItem,
     UseItemTransaction,
 
@@ -38,6 +44,16 @@ enum class Target {
     HandleItemStackResponse,
     SendCommandRequest,
     CommandRegistryLoadPacket,
+
+    JsonCommandParamSite,
+    StringCommandParamSite,
+    IntCommandParamSite,
+    FloatCommandParamSite,
+
+    CommandParserCtorSite,
+    CommandParseSite,
+    CommandParserDtorSite,
+    CommandParseErrorParamsSite,
 
     CommandAutoComplete,
     CommandAutoCompleteFilter,
@@ -119,6 +135,8 @@ enum class Target {
     MoveIntentFromInput,
     InputGather,
 
+    InputGatherKeyCallSite,
+
     ContainerSmHandle,
     ContainerSmOffsetSite,
     ContainerMcOffsetSite,
@@ -143,11 +161,9 @@ enum class Target {
     ItemStorageInfo,
     TradeToggleInvoke,
 
-    TradeSelectModel,
     TradeCurrentTier,
 
     TradePossible,
-    ScenePopCall,
 
     ItemCreativeCategoryStore,
 
@@ -166,7 +182,8 @@ enum class Target {
     HoverBoxSizeStore,
     UiDrawItem,
     ShulkerHoverAppend,
-    ItemGlintSlotSite,
+
+    ItemStackHoverName,
 
     ItemMaxDamageSlotSite,
     ItemStackDamageValue,
@@ -219,6 +236,7 @@ enum class Target {
     GameButtonInputUpdate,
     GameButtonRebuild,
     GameButtonRegisterUpSite,
+    GameButtonPadBind,
 
     PauseMenuOnFocusLostSite,
     SmoothLightingGetter,
@@ -236,6 +254,57 @@ enum class Target {
     ProfanityFilterGetter,
 
     ActorAttachPos,
+
+    HealthAttributeLoad,
+
+    ItemIsFood,
+
+    HungerRendererUpdate,
+    HeartRendererUpdate,
+
+    FoodAttributeSite,
+    ExhaustionAttributeSite,
+    DifficultySite,
+    GameRulesSite,
+
+    SelectedItemSlotSite,
+
+    ArmorContainerGetter,
+    SimpleContainerGetItem,
+
+    FovOptionCtor,
+
+    FovRenderClamp,
+
+    KeyBindingUnassignConflicts,
+
+    KeyBindingUnassignOthers,
+
+    EnchantCommandExecute,
+    EnchantLevelRangeCheckSite,
+    ApplyEnchantCanEnchantSite,
+    EnchantCanEnchantCheckSite,
+
+    StructureSizeClampServer,
+
+    MobEffectScreenListLoop,
+    MobEffectInstanceDisplayName,
+    MobEffectDurationText,
+    MobEffectIconNameSite,
+    MobEffectColorStore,
+
+    MobEffectsRendererRender,
+    MobEffectsRendererOwnerSite,
+    MobEffectsRendererLoop,
+    MobEffectsRendererBackground,
+    UiControlPositionStore,
+    GuiDataGuiScale,
+    MobEffectsLayout,
+    MobEffectsLayoutRects,
+
+    TickingTextureRender,
+
+    ItemActorRender,
     Count,
 };
 
@@ -256,6 +325,9 @@ inline constexpr TargetInfo kTargets[] = {
      "F3 0F 10 ? 44 F3 0F 11 ? 44 F3 0F 10 ? 48 F3 0F 11 ? 48 "
      "F3 0F 10 ? 3C F3 0F 11 ? 3C F3 0F 10 ? 30 F3 0F 11 ? 30"},
 
+    {Target::CameraUpdateContext, L"CameraUpdateContext", L"camera entity context on the stack (FreeLook)",
+     "0F 28 F2 48 89 D6 48 89 CF 48 83 C2 28 48 8D 4C 24 ? E8 ? ? ? ? 80 7C 24 ? 01"},
+
     {Target::PlayerView, L"PlayerView", L"player position and view angles",
      "41 57 41 56 56 57 53 48 83 EC 70 4C 89 CE 4C 89 C7 49 89 D7 48 89 CB "
      "F3 0F 10 9C 24 C8 00 00 00"},
@@ -268,6 +340,10 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::BuildBlock, L"buildBlock", L"block placement (FastBlockPlacement)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 58 01 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 D0 00 00 00 FE FF FF FF 44 89 CB 44 88 85 CE 00 00 00 49 89 D7 48 89 CE"},
+
+    {Target::MobSwing, L"MobSwing", L"arm swing (no swing on mod-issued placements)",
+     "56 57 53 48 81 EC 90 00 00 00 89 D3 48 89 CE 80 B9 34 04 00 00 01 75 ? "
+     "8B BE 10 04 00 00 48 89 F1 E8"},
 
     {Target::GameModeContinueDestroyBlock, L"GameModeContinueDestroyBlock",
      L"continued block breaking (FastBlockBreak)",
@@ -301,6 +377,10 @@ inline constexpr TargetInfo kTargets[] = {
 
     {Target::AbilitiesAccess, L"AbilitiesAccess", L"ability lookup (CreativeNoClip)",
      "56 57 55 53 48 83 EC 28 48 83 F9 01 0F 84 ? ? ? ? 48 83 F9 02"},
+
+    {Target::PoseDecision, L"PoseDecision", L"pose decision: auto sneak / crawl in low spaces (CreativeNoClip)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 48 48 8D 6C 24 40 48 C7 45 00 FE FF FF FF 4C 89 CF "
+     "4C 89 C3 48 89 D6 48 8B 8D 90 00 00 00 8B 05 ? ? ? ? 8B 15 ? ? ? ?"},
 
     {Target::UseItem, L"useItem", L"item use (FastUseItem)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 38 03 00 00 48 8D AC 24 80 00 00 00 48 "
@@ -345,7 +425,7 @@ inline constexpr TargetInfo kTargets[] = {
      L"assign an item stack net id (ItemStackOps)",
      "56 57 53 48 83 EC 20 48 8B 32 48 0F BE 46 10 4C 8D 0D ? ? ? ? 49 63 0C 89"},
 
-    {Target::MakeSwapAction, L"makeSwapAction", L"build a swap request action (reserved)",
+    {Target::MakeSwapAction, L"makeSwapAction", L"build a swap request action",
      "41 56 56 57 53 48 83 EC 28 4C 89 C7 48 89 D3 48 89 CE 48 8B 0D ? ? ? ? 48 8B 01 48 "
      "8B 40 08 BA 68 00 00 00 FF 15 ? ? ? ? 48 85 C0"},
 
@@ -420,6 +500,34 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 02 00 00 48 8D AC 24 80 00 00 00 "
      "0F 29 B5 20 02 00 00 48 C7 85 18 02 00 00 FE FF FF FF 48 89 8D E0 01 00 00 "
      "0F 57 F6 0F 29 B5 C0 00 00 00"},
+
+    {Target::JsonCommandParamSite, L"JsonCommandParamSite", L"the json command parameter type registration (tellraw)",
+     "4C 8D 05 ? ? ? ? 4C 8D 0D ? ? ? ? 48 8D BD 90 00 00 00 48 8D 55 D8 48 89 F9 E8 ? ? ? ? 8B 05 ? ? ? ? "
+     "8B 0D ? ? ? ? 65 48 8B 14 25 58 00 00 00 48 8B 0C CA 3B 81 04 00 00 00 0F 8F ? ? ? ? 0F B7 05 ? ? ? ? "
+     "66 89 45 50 0F 11 74 24 28 C7 44 24 48 FF FF FF FF C6 44 24 40 00 C7 44 24 38 28 00 00 00 "
+     "C7 44 24 20 00 00 00 00 4C 8D 05 ? ? ? ?"},
+
+    {Target::StringCommandParamSite, L"StringCommandParamSite", L"the string command parameter type registration (criteria)",
+     "4C 8D 05 ? ? ? ? 4C 8D 0D ? ? ? ? 48 8D 9D 00 03 00 00 48 8D 95 80 02 00 00 48 89 D9 E8 ? ? ? ?"},
+    {Target::IntCommandParamSite, L"IntCommandParamSite", L"the int command parameter type registration (replaceitem)",
+     "4C 8D 05 ? ? ? ? 4C 8D 0D ? ? ? ? 4C 8D B5 10 04 00 00 48 8D 95 10 03 00 00 4C 89 F1 E8 ? ? ? ?"},
+    {Target::FloatCommandParamSite, L"FloatCommandParamSite", L"the float command parameter type registration (playsound)",
+     "4C 8D 05 ? ? ? ? 4C 8D 0D ? ? ? ? 48 8D BD 70 02 00 00 48 8D 55 D8 48 89 F9 E8 ? ? ? ? "
+     "8B 05 ? ? ? ? 8B 0D ? ? ? ? 65 48 8B 14 25 58 00 00 00 48 8B 0C CA 3B 81 04 00 00 00 "
+     "0F 8F ? ? ? ? 0F B7 05 ? ? ? ? 66 89 45 50 0F 11 74 24 28 C7 44 24 48 FF FF FF FF "
+     "C6 44 24 40 01 C7 44 24 38 1C 01 00 00 C7 44 24 20 00 00 00 00 4C 8D 05 ? ? ? ?"},
+
+    {Target::CommandParserCtorSite, L"CommandParserCtorSite", L"command parser construction in getAutoCompleteOptions",
+     "4C 8D 7D B0 4C 89 F9 48 89 FA 41 B8 ? ? ? ? E8 ? ? ? ? 44 89 6C 24 20 C6 44 24 28 01 4C 8D B5 50 01 00 00"},
+
+    {Target::CommandParseSite, L"CommandParseSite", L"parse a command string (stage IE)",
+     "48 8D 4D C0 48 8D 95 80 00 00 00 E8 ? ? ? ? 84 C0 74 ? 4C 8B 45 38 4D 85 C0 74 ?"},
+
+    {Target::CommandParserDtorSite, L"CommandParserDtorSite", L"command parser destruction in getAutoCompleteOptions",
+     "48 8D 4D B0 E8 ? ? ? ? 48 8B 85 70 01 00 00 48 81 C4 08 02 00 00 5B 5F 5E"},
+
+    {Target::CommandParseErrorParamsSite, L"CommandParseErrorParamsSite", L"build the parse error parameters (stage IE)",
+     "48 8D 4D C0 48 8D BD C0 00 00 00 48 89 FA E8 ? ? ? ? 48 8B B5 60 01 00 00 48 39 FE 74 ?"},
 
     {Target::CommandAutoComplete, L"CommandAutoComplete", L"build chat command completions (stage GB-5)",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 08 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 80 01 00 00 "
@@ -656,7 +764,7 @@ inline constexpr TargetInfo kTargets[] = {
      "0F 29 75 00 48 C7 45 F8 FE FF FF FF 48 89 CE 48 8B 79 ? 48 8B 59 ? 48 39 DF 75 ? EB ?"},
 
     {Target::NameTagStageCaller, L"name tag stage caller",
-     L"count whether the frame stage host runs (stage CQ-7)",
+     L"render schematics and apply NoRender at the frame stage host",
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 0C 00 00 48 8D AC 24 80 00 00 00 "
      "44 0F 29 A5 00 0C 00 00"},
 
@@ -706,6 +814,10 @@ inline constexpr TargetInfo kTargets[] = {
      L"builds the held-input bits and move amounts (FreeCamera takes them)",
      "56 57 44 0F B7 49 02 45 89 C8 41 81 E0 80 00 00 00 44 89 C8 25 00 01 00 00 "
      "45 89 CA 41 81 E2 00 02 00 00 41 81 E1 00 04 00 00"},
+
+    {Target::InputGatherKeyCallSite, L"input gather key call site",
+     L"the call that passes the raw key bits to InputGather (ToggleSneakSprint edits only these)",
+     "41 0F 10 04 24 0F 29 44 24 60 48 8D 54 24 60 4C 89 F9 E8 ? ? ? ? 44 8B 7C 24 60"},
 
     {Target::MoveIntentFromInput, L"move intent from input",
      L"turns the held keys into a move amount (FreeCamera zeroes it)",
@@ -817,10 +929,6 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 78 48 8D 6C 24 70 48 C7 45 00 FE FF FF FF 48 89 CE "
      "48 8B 42 08 48 85 C0 0F 84 ? ? ? ? 48 8B 08 48 85 C9 0F 84 ? ? ? ? 4C 89 C7 48 89 D3 48 8B 01 48 8B 40 48"},
 
-    {Target::TradeSelectModel, L"tradeSelectModel", L"select a trade by tier and index in the trade model",
-     "55 41 57 41 56 41 54 56 57 53 48 83 EC 40 48 8D 6C 24 40 48 C7 45 F8 FE FF FF FF 44 89 C7 89 D3 "
-     "48 89 CE 0F 57 C0 0F 29 45 E0 48 8B 89 C0 00 00 00 8B 41 08 66 66 66 2E 0F 1F 84 00 00 00 00 00"},
-
     {Target::TradeCurrentTier, L"tradeCurrentTier", L"the trader's current tier",
      "56 57 53 48 83 EC 20 48 89 CE 48 8B 49 30 48 8B 91 D0 01 00 00 8B 42 08 0F 1F 84 00 00 00 00 00 "
      "44 8D 40 01 F0 44 0F B1 42 08 75 F4 48 8B B9 C8 01 00 00 48 8B 99 D0 01 00 00 48 85 DB 74 2B F0 "
@@ -833,9 +941,6 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC A8 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 10 "
      "48 C7 45 08 FE FF FF FF 48 89 D6 48 89 CF 0F 57 C0 0F 29 45 D0 48 8B 89 ? ? 00 00 48 85 C9 74 ? "
      "8B 41 08"},
-
-    {Target::ScenePopCall, L"scenePopCall", L"pop the top screen from the scene stack (call site)",
-     "48 8B 4D D8 48 8B 01 48 8B 80 ? ? ? ? BA 01 00 00 00 FF 15 ? ? ? ? 0F 57 C0 48 8B 7D D0 0F 11 45 C8"},
 
     {Target::ItemCreativeCategoryStore, L"itemCreativeCategoryStore", L"store of an item's creative category",
      "48 8D 05 ? ? ? ? 48 89 85 80 00 00 00 48 C7 85 88 00 00 00 11 00 00 00 48 89 F9 4C 89 FA E8 ? ? ? ? "
@@ -867,7 +972,7 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC A8 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 10 01 00 00 48 C7 85 08 01 00 00 "
      "FE FF FF FF 44 88 CE 4C 89 45 38 48 89 D0 48 89 4D 60 0F 57 C0 0F 11 02 48 C7 42 10 00 00 00 00 48 C7 42 18 0F 00 00 00 C6 42 40 00"},
 
-    {Target::HoverRendererRender, L"HoverRendererRender", L"draw the item tooltip box (ShulkerPreview)",
+    {Target::HoverRendererRender, L"HoverRendererRender", L"draw the item tooltip box (AppleSkin)",
      "55 41 57 41 56 56 57 53 48 81 EC 78 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 85 E0 00 00 00 "
      "0F 29 BD D0 00 00 00 0F 29 B5 C0 00 00 00 48 C7 85 B8 00 00 00 FE FF FF FF 48 83 79 20 00 "
      "0F 84 ? ? ? ? 48 89 CF 48 83 79 68 00 0F 84 ? ? ? ? 4C 89 C3 F3 44 0F 10 47 08 "
@@ -887,14 +992,14 @@ inline constexpr TargetInfo kTargets[] = {
      "4C 89 CE 48 89 D7 0F B6 45 70 88 44 24 20 E8 ? ? ? ? 48 8B 57 10 48 8D 7D B0 48 89 F9 E8 ? ? ? ? "
      "48 8B 5D C0 48 85 DB 0F 84"},
 
-    {Target::ItemGlintSlotSite, L"ItemGlintSlotSite", L"Item::isGlint vtable slot (ShulkerPreview)",
-     "B0 01 66 45 85 FF 48 8D B5 ? ? ? ? 78 ? 48 8B 85 ? ? ? ? 48 85 C0 74 ? 48 8B 08 48 85 C9 74 ? "
-     "48 8B 01 48 8B 80 ? ? ? ? 48 8D 95"},
+    {Target::ItemStackHoverName, L"ItemStackHoverName", L"the display name of an item stack (ShulkerPreview)",
+     "55 41 57 41 56 41 54 56 57 53 48 83 EC 70 48 8D 6C 24 70 48 C7 45 F8 FE FF FF FF 48 89 D6 48 8D 55 B0 E8 ? ? ? ? "
+     "0F B6 45 F0 0F 57 C0 0F 11 46 10"},
 
-    {Target::ItemMaxDamageSlotSite, L"ItemMaxDamageSlotSite", L"Item::getMaxDamage vtable slot (ShulkerPreview)",
+    {Target::ItemMaxDamageSlotSite, L"ItemMaxDamageSlotSite", L"Item::getMaxDamage vtable slot (ArmorHUD)",
      "48 8B 01 48 8B 80 ? ? ? ? FF 15 ? ? ? ? 98 0F 57 F6 F3 0F 2A F0 F3 0F 11 B5 ? ? ? ? 48 8B 47 10"},
 
-    {Target::ItemStackDamageValue, L"ItemStackDamageValue", L"ItemStackBase::getDamageValue (ShulkerPreview)",
+    {Target::ItemStackDamageValue, L"ItemStackDamageValue", L"ItemStackBase::getDamageValue (ArmorHUD)",
      "56 57 48 83 EC 38 48 8B 05 ? ? ? ? 48 31 E0 48 89 44 24 30 48 8B 41 08 48 85 C0 74 ? "
      "48 83 38 00 74 ? 48 8B 71 10 48 85 F6 74 ? 48 8D 3D ? ? ? ? 48 89 7C 24 20 "
      "48 C7 44 24 28 06 00 00 00"},
@@ -1038,6 +1143,9 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::GameButtonRegisterUpSite, L"gameButtonRegisterUpSite", L"call of InputHandler button-up registration (game button states)",
      "C7 85 B8 16 00 00 6D 6F 74 65 48 8D 95 B0 16 00 00 45 31 C9 E8 ? ? ? ?"},
 
+    {Target::GameButtonPadBind, L"gameButtonPadBind", L"controller input mapping row binding (hotkeys)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88 00 00 00 48 8D AC 24 80 00 00 00 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 4C 89 C6 48 89 D7 48 89 CB C7 45 D8 00 00 80 BF C7 45 E0 00 00 80 BF"},
+
     {Target::PauseMenuOnFocusLostSite, L"pauseMenuOnFocusLostSite", L"read of options.pauseMenuOnFocusLost (DebugKeys F3+P)",
      "48 8B 4D 18 48 8B 01 48 8B 80 78 05 00 00 FF 15 ? ? ? ? 48 8B 08 4C 8B 89 D8 00 00 00 48 8D 55 F0 48 89 C1 41 B8 2E 03 00 00"},
 
@@ -1076,6 +1184,165 @@ inline constexpr TargetInfo kTargets[] = {
 
     {Target::ActorAttachPos, L"actorAttachPos", L"Actor::getAttachPos (DebugScreen F3+B)",
      "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 78 0F 29 74 24 60 44 89 C7 48 89 D6 8D 47 FF 83 F8 01 77 ? 48 8B 81 20 02 00 00 F3 0F 10 40 14"},
+
+    {Target::HealthAttributeLoad, L"healthAttributeLoad", L"health attribute global (PlayerList hearts)",
+     "80 FA 03 75 ? 4C 8D 05 ? ? ? ? 48 8D 54 24 20 E8 ? ? ? ? 48 8B 44 24 20 48 85 C0 74 ?"},
+
+    {Target::ItemIsFood, L"ItemIsFood", L"Item::isFood (AppleSkin getFood slot)",
+     "48 83 EC 28 48 8B 01 48 8B 80 C8 00 00 00 FF 15 ? ? ? ? 48 85 C0 0F 95 C0 48 83 C4 28 C3"},
+
+    {Target::HungerRendererUpdate, L"HungerRendererUpdate", L"HUD hunger bar update (AppleSkin)",
+     "55 41 57 41 56 56 57 53 48 81 EC 28 05 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 90 04 00 00 48 C7 85 88 04 00 00 "
+     "FE FF FF FF 48 89 CE FF 41 10 48 89 D7 80 79 14 00"},
+
+    {Target::HeartRendererUpdate, L"HeartRendererUpdate", L"HUD hearts update (AppleSkin)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 0A 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 20 0A 00 00 48 C7 85 "
+     "18 0A 00 00 FE FF FF FF 48 89 D3 48 89 CE 48 8D 4D B0"},
+
+    {Target::FoodAttributeSite, L"FoodAttributeSite", L"hunger / saturation attributes and Actor::getEffect (AppleSkin)",
+     "48 89 D9 BA 11 00 00 00 E8 ? ? ? ? 48 85 C0 0F 95 46 16 4C 8D 05 ? ? ? ? 48 8D 55 B0 48 89 D9"},
+
+    {Target::ExhaustionAttributeSite, L"ExhaustionAttributeSite", L"exhaustion attribute (AppleSkin)",
+     "48 89 F1 E8 ? ? ? ? 84 C0 74 ? 0F 28 75 40 48 81 C4 D8 00 00 00 5E 5D C3 4C 8D 05 ? ? ? ?"},
+
+    {Target::DifficultySite, L"DifficultySite", L"Actor level and Level::getDifficulty slot (AppleSkin)",
+     "48 8B 8B D8 01 00 00 48 8B 01 48 8B 80 20 01 00 00 FF 15 ? ? ? ? 85 C0 74 ? 4C 8D 05 ? ? ? ? 48 8D 54 24 20 48 89 D9 E8 ? ? ? ? "
+     "48 8B 44 24 20 F3 0F 10 40 78 0F 2E 40 7C 77 ? 41 80 7E 7C 01 75 ? 48 8B 47 08"},
+
+    {Target::GameRulesSite, L"GameRulesSite", L"Level::getGameRules slot (AppleSkin natural regeneration)",
+     "48 8B 46 20 48 8B 88 D8 01 00 00 48 8B 01 48 8B 80 B0 0A 00 00 FF 15 ? ? ? ? 48 8B 48 18 45 31 ED"},
+
+    {Target::SelectedItemSlotSite, L"SelectedItemSlotSite", L"selected item vtable slot (HeldItem (FastBlockPlacement))",
+     "48 8B 4E 08 80 FB 01 74 ? 45 85 E4 48 8B 01 48 8B 80 ? ? ? ? FF 15"},
+
+    {Target::ArmorContainerGetter, L"ArmorContainerGetter", L"armor container field of ActorEquipmentComponent (ArmorHUD)",
+     "48 83 EC 28 48 8B 51 08 8B 41 10 48 8B 4A 48 4C 8B 42 50 49 29 C8 49 C1 E8 03 41 FF C8 41 81 E0 A9 41 61 B0 "
+     "4E 8D 0C C1 48 8B 4A 68 0F 1F 40 00 4D 8B 01 49 83 F8 FF 0F 84 ? ? ? ? 49 C1 E0 05 4E 8D 0C 01 42 81 7C 01 08 "
+     "A9 41 61 B0 75 E0 4C 01 C1 48 39 4A 70 74 ? 48 8B 49 10 48 85 C9 74 ? 89 C2 81 E2 FF FF 03 00 41 89 D0 41 C1 E8 0B "
+     "4C 8B 49 08 4C 8B 51 10 4D 29 CA 49 C1 FA 03 4D 39 D0 73 ? 4F 8B 04 C1 4D 85 C0 74 ? 81 E2 FF 07 00 00 25 00 00 FC FF "
+     "41 8B 14 90 31 D0 3D FE FF 03 00 77 ? 48 8B 41 50 89 D1 C1 E9 04 81 E1 F8 3F 00 00 48 8B 04 08 48 85 C0 74 ? "
+     "81 E2 FF FF 03 00 83 E2 7F C1 E2 ? 48 8B 44 10 ? 48 83 C4 28 C3"},
+
+    {Target::SimpleContainerGetItem, L"SimpleContainerGetItem", L"SimpleContainer::getItem item vector (ArmorHUD)",
+     "85 D2 75 ? 80 79 08 ? 75 ? 48 8B 89 ? ? ? ? 48 8B 01 48 8B 80 ? ? ? ? 48 8B 15 ? ? ? ? 48 FF E2 48 8D 05 ? ? ? ? "
+     "85 D2 78 ? 4C 8B 81 ? ? ? ? 48 8B 89 ? ? ? ? 4C 29 C1 48 C1 E9 03 69 C9 ? ? ? ? 39 CA 7D ? 89 D0 48 69 C0 ? ? ? ? "
+     "49 01 C0 4C 89 C0 C3"},
+
+    {Target::FovOptionCtor, L"FovOptionCtor", L"field of view FloatOption vtable and range (ExtendedFov)",
+     "BA 2F 00 00 00 45 31 C0 41 B9 10 00 00 00 E8 ? ? ? ? 48 8D 05 ? ? ? ? 48 89 03 48 B8 00 00 F0 41 00 00 DC 42 "
+     "48 89 43 10 C7 43 20 6F 12 83 3A 48 B8 00 00 70 42 00 00 70 42 48 89 43 18"},
+
+    {Target::FovRenderClamp, L"FovRenderClamp", L"upper clamp of the rendered field of view (ExtendedFov)",
+     "F3 0F 5E FA 0F 28 C7 F3 0F 5F 05 ? ? ? ? F3 0F 10 0D ? ? ? ? 0F 28 F1 F3 0F C2 F7 01 0F 54 CE 0F 55 F0 0F 56 F1"},
+
+    {Target::KeyBindingUnassignConflicts, L"KeyBindingUnassignConflicts",
+     L"unassign other key bindings that use the key just bound (AllowDuplicateKeys)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45 00 FE FF FF FF 48 89 D7 48 89 CB "
+     "48 8D 55 C8 E8 ? ? ? ? 48 8B 75 C8 4C 8B 65 D0 4C 39 E6 0F 84 ? ? ? ? 4C 8D 7D E0 EB ? C7 02 00 00 00 00 "
+     "48 83 40 28 04 48 8B 4B 10 4C 89 FA E8"},
+
+    {Target::KeyBindingUnassignOthers, L"KeyBindingUnassignOthers",
+     L"unassign other key bindings after resetting a binding (AllowDuplicateKeys)",
+     "55 41 57 41 56 56 57 53 48 83 EC 68 48 8D 6C 24 60 48 C7 45 00 FE FF FF FF 48 89 D7 48 89 CB 48 8D 55 E8 "
+     "E8 ? ? ? ? 48 8B 75 E8 4C 8B 7D F0 4C 39 FE 74 ? 4C 8D 75 D0 EB ? 0F 1F 44 00 00 48 83 C6 10 4C 39 FE 74 ? "
+     "48 39 3E 74 ? 0F 10 06 0F 29 45 D0 48 89 D9 4C 89 F2 E8"},
+
+    {Target::EnchantCommandExecute, L"EnchantCommandExecute", L"EnchantCommand::execute (ExtendedEnchantLevel)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 04 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 00 04 00 00 "
+     "48 C7 85 F8 03 00 00 FE FF FF FF 4D 89 C5 48 89 CB 44 8B B1 E8 00 00 00 41 80 FE 2B 75"},
+
+    {Target::EnchantLevelRangeCheckSite, L"EnchantLevelRangeCheckSite",
+     L"/enchant's level range check call (ExtendedEnchantLevel)",
+     "48 8B 01 48 8B 40 28 FF 15 ? ? ? ? 8B 8B F0 00 00 00 BA 01 00 00 00 41 89 C0 4D 89 E9 E8 ? ? ? ? 84 C0 0F 84"},
+
+    {Target::ApplyEnchantCanEnchantSite, L"ApplyEnchantCanEnchantSite",
+     L"EnchantUtils::applyEnchant's can-enchant call (ExtendedEnchantLevel)",
+     "48 8B 3F 48 89 7D F8 48 89 EA 4C 89 F1 49 89 F8 41 89 D9 E8 ? ? ? ? B8 04 00 00 00"},
+
+    {Target::EnchantCanEnchantCheckSite, L"EnchantCanEnchantCheckSite",
+     L"EnchantUtils::canEnchant's can-enchant call (ExtendedEnchantLevel)",
+     "4C 89 C7 48 89 CE 4C 8D 75 A8 48 89 D1 4C 89 F2 E8 ? ? ? ? 4C 8B 07 4C 89 F1 48 89 F2 41 89 D9 E8 ? ? ? ?"},
+
+    {Target::StructureSizeClampServer, L"StructureSizeClampServer",
+     L"integrated server's 64-block clamp of the structure block size (ExtendedStructureSize)",
+     "41 29 C9 41 83 FA 40 41 BB 40 00 00 00 45 0F 4D D3"},
+
+    {Target::MobEffectScreenListLoop, L"MobEffectScreenListLoop",
+     L"vanilla mob effect screen's effect list walk (InventoryEffects)",
+     "41 FF C4 0F B6 47 26 41 88 46 F8 8B 05 ? ? ? ? 4C 8D 45 C8 44 8B 75 BC 0F 1F 00 48 81 C7 90 00 00 00 48 39 DF "
+     "0F 84 ? ? ? ? 8B 0F 48 83 F9 25 77 ? 39 C1 74 ? 49 8B 4C CD 00 48 85 C9 74 ? 83 B9 A0 00 00 00 00 78 ? "
+     "8B 4F 04 85 C9 74 ? 83 F9 FF"},
+
+    {Target::MobEffectInstanceDisplayName, L"MobEffectInstanceDisplayName",
+     L"MobEffectInstance::getDisplayName (InventoryEffects)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 70 FE FF FF FF "
+     "48 89 D6 48 89 CB 8B 05 ? ? ? ? 8B 0D ? ? ? ? 65 48 8B 14 25 58 00 00 00 48 8B 0C CA 3B 81 04 00 00 00 "
+     "0F 8F ? ? ? ? 0F 57 C0 0F 29 45 B0 8B 03 48 83 F8 25 76 09 4C 8D 05 ? ? ? ? EB 20 48 8D 0D ? ? ? ? "
+     "48 8B 04 C1 48 8D 88 80 00 00 00 48 85 C0 4C 8D 05 ? ? ? ? 4C 0F 45 C1 48 8D 0D ? ? ? ? 48 8B 05 ? ? ? ? "
+     "48 8B 80 80 00 00 00 48 8D 7D F8 4C 8D 4D B0 48 89 FA FF 15 ? ? ? ? 8B 43 20 FF C8 83 F8 04"},
+
+    {Target::MobEffectDurationText, L"MobEffectDurationText", L"mob effect duration as m:ss (InventoryEffects)",
+     "55 56 57 53 48 81 EC 98 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 10 FE FF FF FF 48 89 CE 48 63 C2 "
+     "48 69 C8 67 66 66 66 48 89 CA 48 C1 EA 3F 48 C1 E9 20 C1 F9 03 01 D1 48 69 F8 B5 81 4E 1B"},
+
+    {Target::MobEffectIconNameSite, L"MobEffectIconNameSite", L"mob effect icon name fields (InventoryEffects)",
+     "8B 04 01 48 83 F8 25 0F 87 ? ? ? ? 48 8D 0D ? ? ? ? 48 8B 04 C1 48 85 C0 0F 84 ? ? ? ? 48 8D 0D ? ? ? ? "
+     "48 89 4D B0 48 C7 45 B8 0C 00 00 00 31 C9 48 83 B8 E0 00 00 00 00 0F 95 C1 C1 E1 05 48 8B 94 01 C0 00 00 00 "
+     "48 83 BC 01 C8 00 00 00 10"},
+
+    {Target::MobEffectColorStore, L"MobEffectColorStore", L"MobEffect colour fields (InventoryEffects)",
+     "F3 0F 2A D7 F3 0F 5E D1 F3 0F 2A D9 F3 0F 5E D9 F3 0F 11 46 10 F3 0F 11 56 14 F3 0F 11 5E 18 "
+     "C7 46 1C 00 00 80 3F"},
+
+    {Target::MobEffectsRendererRender, L"MobEffectsRendererRender", L"HUD mob effect icons renderer (EffectTimer)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 98 06 00 00 48 8D AC 24 80 00 00 00 44 0F 29 BD 00 06 00 00 "
+     "44 0F 29 B5 F0 05 00 00 44 0F 29 AD E0 05 00 00 44 0F 29 A5 D0 05 00 00 44 0F 29 9D C0 05 00 00 44 0F 29 95 B0 05 00 00 "
+     "44 0F 29 8D A0 05 00 00 44 0F 29 85 90 05 00 00 0F 29 BD 80 05 00 00 0F 29 B5 70 05 00 00 48 C7 85 68 05 00 00 FE FF FF FF "
+     "4C 89 CF 4D 89 C5 48 89 D3 49 89 CF 48 8D 05 ? ? ? ? 48 89 85 E0 03 00 00 48 C7 85 E8 03 00 00 25 00 00 00"},
+
+    {Target::MobEffectsRendererOwnerSite, L"MobEffectsRendererOwnerSite", L"GuiData slot and owner position in the effect renderer (EffectTimer)",
+     "49 8B 45 00 48 8B 80 C8 07 00 00 4C 89 E9 FF 15 ? ? ? ? 49 89 C7 F6 47 18 01 74 ? 48 89 F9 E8 ? ? ? ? "
+     "F3 0F 2C 47 10 41 89 47 44"},
+
+    {Target::MobEffectsRendererLoop, L"MobEffectsRendererLoop", L"effect layout records walk in the effect renderer (EffectTimer)",
+     "44 89 C8 49 8B 78 18 49 8B 48 20 48 29 F9 48 C1 F9 02 49 0F AF CA 48 39 C1 0F 86 ? ? ? ? 4C 8B 32 48 8B 4A 08 4C 29 F1 "
+     "48 C1 F9 04 49 0F AF CA 48 39 C1 0F 86 ? ? ? ? 41 83 F9 25 77 ? 49 8B 1C C3 48 85 DB 74 ? 4C 8D 24 C0 4C 89 E0 48 C1 E0 04 "
+     "49 01 C6 8B 05 ? ? ? ? 41 39 06 74 ? 83 BB A0 00 00 00 00 78"},
+
+    {Target::MobEffectsRendererBackground, L"MobEffectsRendererBackground", L"effect background rect field in the effect renderer (EffectTimer)",
+     "4E 8D 24 A7 49 8D 54 24 14 F3 0F 11 5C 24 38 F3 0F 11 54 24 30 F3 0F 11 4C 24 28 F3 0F 11 44 24 20 "
+     "C7 44 24 48 00 00 00 00 C7 44 24 40 00 00 00 00 48 8B 8D ? ? ? ? E8"},
+
+    {Target::UiControlPositionStore, L"UiControlPositionStore", L"UIControl absolute position fields (EffectTimer)",
+     "F3 0F 58 7E 44 F3 0F 58 76 40 F3 0F 11 76 10 F3 0F 11 7E 14 80 66 18 FE"},
+
+    {Target::GuiDataGuiScale, L"GuiDataGuiScale", L"GuiData::getGuiScale (EffectTimer)",
+     "55 56 57 53 48 83 EC 58 48 8D 6C 24 50 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 48 89 CE 80 B9 F8 0C 00 00 01 "
+     "0F 85 ? ? ? ? 48 8B 8E 98 00 00 00 48 8B 01 48 8B 80 10 01 00 00"},
+
+    {Target::MobEffectsLayout, L"MobEffectsLayout", L"HUD mob effect icon layout (EffectTimer columns)",
+     "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC F8 00 00 00 44 0F 29 BC 24 E0 00 00 00 44 0F 29 B4 24 D0 00 00 00 "
+     "44 0F 29 AC 24 C0 00 00 00 44 0F 29 A4 24 B0 00 00 00 44 0F 29 9C 24 A0 00 00 00 44 0F 29 94 24 90 00 00 00 "
+     "44 0F 29 8C 24 80 00 00 00 44 0F 29 44 24 70 0F 29 7C 24 60 0F 29 74 24 50 48 89 CE 48 8B 05 ? ? ? ? 48 31 E0 "
+     "48 89 44 24 48 48 8B 09 48 8B 01 48 8B 80 F8 00 00 00 FF 15 ? ? ? ? 48 85 C0 0F 84 ? ? ? ? 80 B8 ? ? 00 00 00 "
+     "0F 85 ? ? ? ? 48 89 C7 C7 46 08 FF FF 7F 7F C7 46 14 00 00 80 00"},
+
+    {Target::MobEffectsLayoutRects, L"MobEffectsLayoutRects", L"HUD mob effect rect fields written by the layout (EffectTimer columns)",
+     "F3 0F 11 4F 14 F3 0F 11 5F 18 F3 0F 11 6F 1C F3 0F 11 57 20 8B 4E 38 8B 56 3C 44 8D 04 02 0F 57 D2 F3 41 0F 2A D0 "
+     "01 CA 0F 57 DB F3 0F 2A DA F3 0F 58 D8 0F 57 E4 F3 0F 2A E0 0F 57 ED F3 0F 2A E9 F3 0F 58 E8 F3 0F 11 6F 04 "
+     "F3 0F 11 5F 08 F3 0F 11 67 0C F3 0F 11 57 10"},
+
+    {Target::TickingTextureRender, L"TickingTextureRender", L"TickingTextureStage::render (NoBlockAnimation)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 78 01 00 00 48 8D AC 24 80 00 00 00 0F 29 B5 E0 00 00 00 "
+     "48 C7 85 D8 00 00 00 FE FF FF FF 48 89 D3 48 89 CF 8B 05 ? ? ? ? 8B 0D ? ? ? ? 65 48 8B 14 25 58 00 00 00"},
+
+    {Target::ItemActorRender, L"ItemActorRender", L"ItemRenderer::render for dropped items (NoRender Item)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 28 01 00 00 48 8D AC 24 80 00 00 00 44 0F 29 9D 90 00 00 00 "
+     "44 0F 29 95 80 00 00 00 44 0F 29 4D 70 44 0F 29 45 60 0F 29 7D 50 0F 29 75 40 48 C7 45 38 FE FF FF FF "
+     "49 8B 30 48 85 F6 0F 84 ? ? ? ? 4D 89 C7 48 89 D7 48 89 CB 48 89 F1 BA 40 00 00 00 E8 ? ? ? ? 84 C0 "
+     "0F 84 ? ? ? ? 80 BE D3 03 00 00 01 0F 85 ? ? ? ? 48 8B 86 B8 03 00 00 48 85 C0 0F 84 ? ? ? ? "
+     "48 83 38 00 0F 84 ? ? ? ? 4C 8D B6 B0 03 00 00"},
+
 };
 
 static_assert(std::size(kTargets) == static_cast<size_t>(Target::Count));

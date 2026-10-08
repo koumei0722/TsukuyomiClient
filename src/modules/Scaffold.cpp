@@ -2,6 +2,7 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Strings.h"
 #include "game/GameData.h"
 #include "hooks/Detours.h"
@@ -76,35 +77,27 @@ void Scaffold::captureHeight()
     float footX = 0.0f;
     float footY = 0.0f;
     float footZ = 0.0f;
-    const wchar_t* const source = readFeet(footX, footY, footZ);
+    if (!readFeet(footX, footY, footZ)) {
+        return;
+    }
     m_capturedY = static_cast<int>(std::floor(footY)) - 1;
     m_hasCapturedY = true;
-    log().info(L"Scaffold: height locked to Y {} (feet {:.3f} from {})", m_capturedY, footY,
-               source);
+    log().info(L"Scaffold: height locked to Y {} (feet {:.3f} from the hitbox)", m_capturedY, footY);
 }
 
-const wchar_t* Scaffold::readFeet(float& outX, float& outY, float& outZ) const
+bool Scaffold::readFeet(float& outX, float& outY, float& outZ) const
 {
-    const GameData& data = GameData::instance();
-    if (data.playerBoxFeet(outX, outY, outZ)) {
-        return L"hitbox";
+    if (GameData::instance().playerBoxFeet(outX, outY, outZ)) {
+        m_feetMisses = 0;
+        return true;
     }
-
-    const wchar_t* source = L"body eye - 1.62";
-    if (!data.playerFeet(outX, outY, outZ)) {
-        const PlayerView view = data.playerView();
-        outX = view.x;
-        outY = view.y - GameData::kEyeHeight;
-        outZ = view.z;
-        source = L"camera eye - 1.62";
+    if (++m_feetMisses == kFeetMissNotice) {
+        notice::failOnce("Scaffold.hitbox",
+                         L"Scaffold: the hitbox of the player could not be read for " + std::to_wstring(kFeetMissNotice)
+                             + L" frames in a row; no blocks are placed",
+                         "Scaffold is not placing blocks: the hitbox of the player could not be read");
     }
-    if (!m_warnedFeetFallback) {
-        m_warnedFeetFallback = true;
-        log().warn(
-            L"Scaffold: hitbox not readable, using {} (assumes the eye is 1.62 above the feet)",
-            source);
-    }
-    return source;
+    return false;
 }
 
 bool Scaffold::resolveY(float footY, int& outY) const
@@ -183,7 +176,9 @@ void Scaffold::placeAll()
     float footX = 0.0f;
     float footY = 0.0f;
     float footZ = 0.0f;
-    const wchar_t* const source = readFeet(footX, footY, footZ);
+    if (!readFeet(footX, footY, footZ)) {
+        return;
+    }
 
     int planeY = 0;
     if (!resolveY(footY, planeY)) {
@@ -215,8 +210,8 @@ void Scaffold::placeAll()
     m_placing = true;
     for (int i = 0; i < count; ++i) {
         BlockPos target = targets[i];
-        if (hooks::callBuildBlock(gameMode, &target, faceTowardCenter(target, center), 0,
-                                  simTick)) {
+        if (hooks::callBuildBlockWithoutSwing(gameMode, &target, faceTowardCenter(target, center), 0,
+                                              simTick)) {
             ++placed;
         }
     }
@@ -228,9 +223,8 @@ void Scaffold::placeAll()
 
     if (now >= m_nextLog) {
         m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-        log().info(L"Scaffold: {} Y {} ({}) at ({}, {}) {}/{} placed (feet {:.3f} from {})",
-                   patternName(), planeY, heightName(), center.x, center.z, placed, count, footY,
-                   source);
+        log().info(L"Scaffold: {} Y {} ({}) at ({}, {}) {}/{} placed (feet {:.3f} from the hitbox)",
+                   patternName(), planeY, heightName(), center.x, center.z, placed, count, footY);
     }
 }
 
@@ -250,7 +244,6 @@ void Scaffold::onPlayerViewUpdate()
 MenuItem Scaffold::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::choice(
@@ -318,7 +311,7 @@ void Scaffold::onEnabledChanged(bool enabled)
 {
     m_hasLastCenter = false;
     m_warnedNoGameMode = false;
-    m_warnedFeetFallback = false;
+    m_feetMisses = 0;
 
     m_nextLog = Clock::time_point{};
 

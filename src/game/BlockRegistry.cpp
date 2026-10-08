@@ -17,11 +17,11 @@
 #include <intrin.h>
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Strings.h"
 #include "game/ItemIcon.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
-#include "render/BoxMesher.h"
 
 namespace tsukuyomi::blocks {
 
@@ -622,6 +622,7 @@ std::atomic<const std::uint16_t*> g_drawCellsPtr{nullptr};
 std::atomic<int> g_drawReaders{0};
 std::vector<std::vector<std::uint16_t>> g_retiredCells;
 std::vector<std::vector<std::uint8_t>> g_retiredDiff;
+std::vector<std::vector<const void*>> g_retiredPalettes;
 std::atomic<std::size_t> g_drawCellsCount{0};
 std::atomic<const void* const*> g_drawPalettePtr{nullptr};
 std::atomic<std::size_t> g_drawPaletteCount{0};
@@ -638,7 +639,7 @@ std::atomic<std::size_t> g_meshThreadCount{0};
 bool waitForDrawReaders()
 {
     for (int i = 0; i < 2000; ++i) {
-        if (g_drawReaders.load(std::memory_order_acquire) == 0) {
+        if (g_drawReaders.load(std::memory_order_seq_cst) == 0) {
             return true;
         }
         Sleep(0);
@@ -655,6 +656,7 @@ void retireDrawCells()
     if (drained) {
         g_retiredCells.clear();
         g_retiredDiff.clear();
+        g_retiredPalettes.clear();
         g_drawCells.clear();
         g_drawCells2.clear();
         g_diffCells.clear();
@@ -667,8 +669,9 @@ void retireDrawCells()
         g_wantCells2.shrink_to_fit();
         return;
     }
-    log().warn(L"BlockRegistry: the renderer is still reading the marks, so the old table is "
-               L"kept instead of freed");
+    notice::failOnce("BlockRegistry.retireCells",
+                     L"BlockRegistry: the renderer is still reading the marks; the old table is kept",
+                     "Schematica: an old drawing table is retained until its readers finish");
     g_retiredCells.push_back(std::move(g_drawCells));
     g_retiredCells.push_back(std::move(g_drawCells2));
     g_retiredCells.push_back(std::move(g_wantCells));
@@ -679,9 +682,10 @@ void retireDrawCells()
     g_wantCells = {};
     g_wantCells2 = {};
     g_diffCells = {};
-    if (g_retiredCells.size() > 16 && g_drawReaders.load(std::memory_order_acquire) == 0) {
+    if (g_retiredCells.size() > 16 && g_drawReaders.load(std::memory_order_seq_cst) == 0) {
         g_retiredCells.clear();
         g_retiredDiff.clear();
+        g_retiredPalettes.clear();
     }
 }
 
@@ -714,11 +718,11 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
     g_ghostMin[0] = x;  g_ghostMin[1] = y;  g_ghostMin[2] = z;
     g_ghostMax[0] = x + sx;  g_ghostMax[1] = y + sy;  g_ghostMax[2] = z + sz;
 
-    g_drawCellsPtr.store(nullptr, std::memory_order_release);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_release);
-    g_diffCellsPtr.store(nullptr, std::memory_order_release);
-    g_wantCellsPtr.store(nullptr, std::memory_order_release);
-    g_wantCells2Ptr.store(nullptr, std::memory_order_release);
+    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
+    g_diffCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_wantCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_wantCells2Ptr.store(nullptr, std::memory_order_seq_cst);
     g_drawCellsCount.store(0, std::memory_order_relaxed);
     retireDrawCells();
     const std::uint64_t cells = static_cast<std::uint64_t>(sx) * static_cast<std::uint64_t>(sy)
@@ -737,11 +741,11 @@ void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
         g_wantCells.assign(static_cast<std::size_t>(cells), 0);
         g_wantCells2.assign(static_cast<std::size_t>(cells), 0);
         g_drawCellsCount.store(g_drawCells.size(), std::memory_order_relaxed);
-        g_drawCellsPtr.store(g_drawCells.data(), std::memory_order_release);
-        g_drawCells2Ptr.store(g_drawCells2.data(), std::memory_order_release);
-        g_diffCellsPtr.store(g_diffCells.data(), std::memory_order_release);
-        g_wantCellsPtr.store(g_wantCells.data(), std::memory_order_release);
-        g_wantCells2Ptr.store(g_wantCells2.data(), std::memory_order_release);
+        g_drawCellsPtr.store(g_drawCells.data(), std::memory_order_seq_cst);
+        g_drawCells2Ptr.store(g_drawCells2.data(), std::memory_order_seq_cst);
+        g_diffCellsPtr.store(g_diffCells.data(), std::memory_order_seq_cst);
+        g_wantCellsPtr.store(g_wantCells.data(), std::memory_order_seq_cst);
+        g_wantCells2Ptr.store(g_wantCells2.data(), std::memory_order_seq_cst);
     }
 
     const bool valid = sx > 0 && sy > 0 && sz > 0;
@@ -763,11 +767,11 @@ void clearGhostRegion()
     }
     g_lastBoundsAt.store(GetTickCount64(), std::memory_order_release);
 
-    g_drawCellsPtr.store(nullptr, std::memory_order_release);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_release);
-    g_diffCellsPtr.store(nullptr, std::memory_order_release);
-    g_wantCellsPtr.store(nullptr, std::memory_order_release);
-    g_wantCells2Ptr.store(nullptr, std::memory_order_release);
+    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
+    g_diffCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_wantCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_wantCells2Ptr.store(nullptr, std::memory_order_seq_cst);
     g_drawCellsCount.store(0, std::memory_order_relaxed);
     retireDrawCells();
 }
@@ -1147,18 +1151,14 @@ const void* lookupItemByName(const std::string& name)
     return item;
 }
 
-int stackSizeOfItemName(const std::string& name, std::string* gotName)
+int stackSizeOfItemName(const std::string& name)
 {
-    if (gotName != nullptr) {
-        gotName->clear();
-    }
+
     const void* const item = lookupItemByName(name);
     int size = 0;
     if (item != nullptr && memory::isReadable(item, kItemMaxStackAt + 1)) {
         size = *(static_cast<const unsigned char*>(item) + kItemMaxStackAt);
-        if (gotName != nullptr) {
-            readStdString(static_cast<const unsigned char*>(item) + kItemNameAt, *gotName);
-        }
+
     }
     return (size >= 1 && size <= 64) ? size : 0;
 }
@@ -1204,7 +1204,7 @@ bool calibrateStackSizes()
         if (found == table.end()) {
             continue;
         }
-        const int got = stackSizeOfItemName(one.name, nullptr);
+        const int got = stackSizeOfItemName(one.name);
         if (got == 0) {
             continue;
         }
@@ -1225,14 +1225,12 @@ bool calibrateStackSizes()
     }
     const bool ok = (checked >= 3 && small >= 1 && wrong == 0);
     g_stackState.store(ok ? 1 : 2, std::memory_order_release);
-    if (ok) {
-    } else {
-        log().warn(L"BlockRegistry: the stack size cannot be read from the game ({} samples "
-                   L"read / {} not 64 / {} mismatched{}) - falling back to the table",
-                   checked,
-                   small,
-                   wrong,
-                   detail);
+    if (!ok) {
+        notice::failOnce("BlockRegistry.stackSize",
+                         std::format(L"BlockRegistry: the stack size cannot be read from the game ({} samples "
+                                     L"read / {} not 64 / {} mismatched{}); the material list shows no stacks",
+                                     checked, small, wrong, detail),
+                         "The material list cannot show stacks: the stack size could not be read from the game");
     }
     return ok;
 }
@@ -1265,7 +1263,7 @@ std::vector<std::string> registeredItemNames()
     return names;
 }
 
-bool maxStackSizeOf(const char* name, const void* block, int& out)
+bool maxStackSizeOf(const char* name, int& out)
 {
     out = 0;
     if (!calibrateStackSizes()) {
@@ -1273,7 +1271,7 @@ bool maxStackSizeOf(const char* name, const void* block, int& out)
     }
     int size = 0;
     if (name != nullptr && name[0] != 0) {
-        size = stackSizeOfItemName(std::string(name), nullptr);
+        size = stackSizeOfItemName(std::string(name));
     }
     if (size <= 0) {
         return false;
@@ -1313,12 +1311,16 @@ void setGhostPalette(std::vector<const void*> blocks)
 {
     resetRealLayers();
 
-    g_drawPalettePtr.store(nullptr, std::memory_order_release);
+    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
     g_drawPaletteCount.store(0, std::memory_order_relaxed);
-    waitForDrawReaders();
+    if (waitForDrawReaders()) {
+        g_retiredPalettes.clear();
+    } else if (!g_drawPalette.empty()) {
+        g_retiredPalettes.push_back(std::move(g_drawPalette));
+    }
     g_drawPalette = std::move(blocks);
     g_drawPaletteCount.store(g_drawPalette.size(), std::memory_order_relaxed);
-    g_drawPalettePtr.store(g_drawPalette.data(), std::memory_order_release);
+    g_drawPalettePtr.store(g_drawPalette.data(), std::memory_order_seq_cst);
 }
 
 void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
@@ -1340,19 +1342,23 @@ void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size
 
 bool dropGhostCell(std::int32_t x, std::int32_t y, std::int32_t z)
 {
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return false;
-    }
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     bool dropped = false;
-    if (at < g_drawCells.size() && g_drawCells[at] != 0) {
-        g_drawCells[at] = 0;
-        dropped = true;
+    auto* const cells = const_cast<std::uint16_t*>(g_drawCellsPtr.load(std::memory_order_seq_cst));
+    auto* const cells2 = const_cast<std::uint16_t*>(g_drawCells2Ptr.load(std::memory_order_seq_cst));
+    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
+    std::size_t at = 0;
+    if (ghostCellIndex(x, y, z, at) && at < count) {
+        if (cells != nullptr && cells[at] != 0) {
+            cells[at] = 0;
+            dropped = true;
+        }
+        if (cells2 != nullptr && cells2[at] != 0) {
+            cells2[at] = 0;
+            dropped = true;
+        }
     }
-    if (at < g_drawCells2.size() && g_drawCells2[at] != 0) {
-        g_drawCells2[at] = 0;
-        dropped = true;
-    }
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return dropped;
 }
 
@@ -1384,15 +1390,15 @@ bool restoreGhostCellFromWant(std::int32_t x, std::int32_t y, std::int32_t z)
     if (!g_ghostOn.load(std::memory_order_acquire)) {
         return false;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     bool back = false;
     do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_acquire);
-        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_acquire);
+        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
+        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_seq_cst);
         auto* const live =
-            const_cast<std::uint16_t*>(g_drawCellsPtr.load(std::memory_order_acquire));
+            const_cast<std::uint16_t*>(g_drawCellsPtr.load(std::memory_order_seq_cst));
         auto* const live2 =
-            const_cast<std::uint16_t*>(g_drawCells2Ptr.load(std::memory_order_acquire));
+            const_cast<std::uint16_t*>(g_drawCells2Ptr.load(std::memory_order_seq_cst));
         const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
         std::size_t at = 0;
         if (count == 0 || !ghostCellIndex(x, y, z, at) || at >= count) {
@@ -1408,7 +1414,7 @@ bool restoreGhostCellFromWant(std::int32_t x, std::int32_t y, std::int32_t z)
             back = true;
         }
     } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return back;
 }
 
@@ -1419,8 +1425,8 @@ bool setDiffCell(std::int32_t x, std::int32_t y, std::int32_t z, DiffColor color
     if (!g_ghostOn.load(std::memory_order_acquire)) {
         return false;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
-    std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
+    std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     std::size_t at = 0;
     bool changed = false;
@@ -1432,7 +1438,7 @@ bool setDiffCell(std::int32_t x, std::int32_t y, std::int32_t z, DiffColor color
             g_diffCellChanges.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return changed;
 }
 
@@ -1475,9 +1481,9 @@ DiffColor diffCellAt(std::int32_t x, std::int32_t y, std::int32_t z)
     if (!ghostCellIndex(x, y, z, at)) {
         return DiffColor::None;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     DiffColor found = DiffColor::None;
-    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_acquire);
+    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     if (cells != nullptr && count != 0 && at < count) {
         const std::uint8_t raw = cells[at];
@@ -1485,7 +1491,7 @@ DiffColor diffCellAt(std::int32_t x, std::int32_t y, std::int32_t z)
             found = static_cast<DiffColor>(raw);
         }
     }
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return found;
 }
 
@@ -1555,11 +1561,11 @@ bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void
     if (!g_ghostOn.load(std::memory_order_acquire) || real == nullptr) {
         return false;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     bool changed = false;
     do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_acquire);
-        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_acquire);
+        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
+        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_seq_cst);
         const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
         std::size_t at = 0;
         if (want == nullptr || count == 0 || !ghostCellIndex(x, y, z, at) || at >= count) {
@@ -1572,7 +1578,7 @@ bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void
         const void* wantBlock = nullptr;
         if (tag != kWantAirTag) {
             const void* const* const palette =
-                g_drawPalettePtr.load(std::memory_order_acquire);
+                g_drawPalettePtr.load(std::memory_order_seq_cst);
             const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
             if (palette != nullptr && tag - 1u < size) {
                 wantBlock = palette[tag - 1u];
@@ -1587,25 +1593,18 @@ bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void
                                                          tag == kWantAirTag, realExtra,
                                                          realExtraKnown, wantWater)));
     } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return changed;
 }
 
-std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
-                             std::size_t* dropped, const double* eye, int* keptRadius)
+std::size_t collectDiffBoxes(std::vector<DiffBox>& out)
 {
     out.clear();
-    if (dropped != nullptr) {
-        *dropped = 0;
-    }
-    if (keptRadius != nullptr) {
-        *keptRadius = -1;
-    }
     if (!g_ghostOn.load(std::memory_order_acquire)) {
         return 0;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
-    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
+    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     const std::int32_t minX = g_ghostMin[0];
     const std::int32_t minY = g_ghostMin[1];
@@ -1642,76 +1641,13 @@ std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
                 }
             }
         }
-        constexpr std::size_t kRadiusBuckets = 4096;
-        const bool nearest = eye != nullptr && litCount > limit;
-        std::vector<float> offX;
-        std::vector<float> offY;
-        std::vector<float> offZ;
-        std::size_t nearestRadius = 0;
-        boxmesh::RadiusCut cut;
-        if (nearest) {
-            const auto squares = [](std::vector<float>& to, std::size_t n, std::int32_t from,
-                                    double center) {
-                to.resize(n);
-                for (std::size_t i = 0; i < n; ++i) {
-                    const double d =
-                        static_cast<double>(from + static_cast<std::int32_t>(i)) + 0.5 - center;
-                    to[i] = static_cast<float>(d * d);
-                }
-            };
-            squares(offX, sx, minX, eye[0]);
-            squares(offY, sy, minY, eye[1]);
-            squares(offZ, sz, minZ, eye[2]);
-            const float least = *std::min_element(offX.begin(), offX.end())
-                                + *std::min_element(offY.begin(), offY.end())
-                                + *std::min_element(offZ.begin(), offZ.end());
-            nearestRadius = static_cast<std::size_t>(std::sqrt(least));
-            std::vector<std::size_t> histogram(kRadiusBuckets, 0);
-            for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
-                for (std::size_t dy = 0; dy < sy; ++dy) {
-                    const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
-                    const float rowD = offX[dx] + offY[dy];
-                    for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
-                        if (!lit(cells[at]) || !rowShown || showZ[dz] == 0) {
-                            continue;
-                        }
-                        const auto whole = static_cast<std::size_t>(std::sqrt(rowD + offZ[dz]));
-                        const std::size_t bucket = whole > nearestRadius ? whole - nearestRadius : 0;
-                        ++histogram[(std::min)(bucket, kRadiusBuckets - 1)];
-                    }
-                }
-            }
-            cut = boxmesh::radiusCut(histogram, limit);
-        }
-        std::size_t partialLeft = cut.partial;
-        out.reserve((std::min)(litCount, limit));
+        out.reserve(litCount);
         for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
             for (std::size_t dy = 0; dy < sy; ++dy) {
                 const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
-                const float rowD = nearest ? offX[dx] + offY[dy] : 0.0F;
                 for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
                     const std::uint8_t raw = cells[at];
                     if (!lit(raw) || !rowShown || showZ[dz] == 0) {
-                        continue;
-                    }
-                    if (nearest) {
-                        const auto whole = static_cast<std::size_t>(std::sqrt(rowD + offZ[dz]));
-                        std::size_t bucket = whole > nearestRadius ? whole - nearestRadius : 0;
-                        bucket = (std::min)(bucket, kRadiusBuckets - 1);
-                        if (bucket > cut.full || (bucket == cut.full && partialLeft == 0)) {
-                            if (dropped != nullptr) {
-                                ++*dropped;
-                            }
-                            continue;
-                        }
-                        if (bucket == cut.full) {
-                            --partialLeft;
-                        }
-                    }
-                    if (out.size() >= limit) {
-                        if (dropped != nullptr) {
-                            ++*dropped;
-                        }
                         continue;
                     }
                     std::uint8_t covered = 0;
@@ -1747,11 +1683,8 @@ std::size_t collectDiffBoxes(std::vector<DiffBox>& out, std::size_t limit,
                 }
             }
         }
-        if (nearest && keptRadius != nullptr && dropped != nullptr && *dropped != 0) {
-            *keptRadius = static_cast<int>(nearestRadius + cut.full);
-        }
     }
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return out.size();
 }
 
@@ -1760,6 +1693,8 @@ constexpr std::size_t kLegacyCacheSlots = 64;
 struct LegacyCacheSlot {
     std::atomic<const void*> key{nullptr};
     std::atomic<const void*> value{nullptr};
+    std::atomic_flag writing = ATOMIC_FLAG_INIT;
+    std::atomic<std::uint64_t> version{0};
 };
 LegacyCacheSlot g_legacyCache[kLegacyCacheSlots];
 }
@@ -1809,15 +1744,24 @@ const void* legacyOfFast(const void* block)
     }
     const std::size_t at =
         (reinterpret_cast<std::uintptr_t>(block) >> 4) % kLegacyCacheSlots;
-    if (g_legacyCache[at].key.load(std::memory_order_acquire) == block) {
-        return g_legacyCache[at].value.load(std::memory_order_relaxed);
+    auto& slot = g_legacyCache[at];
+    const auto version = slot.version.load(std::memory_order_seq_cst);
+    if ((version & 1) == 0 && slot.key.load(std::memory_order_seq_cst) == block) {
+        const void* const value = slot.value.load(std::memory_order_seq_cst);
+        if (slot.key.load(std::memory_order_seq_cst) == block
+            && slot.version.load(std::memory_order_seq_cst) == version) return value;
     }
     const void* answer = nullptr;
     if (memory::isReadable(block, 0x70)) {
         answer = readPointer(block, 0x68);
     }
-    g_legacyCache[at].value.store(answer, std::memory_order_relaxed);
-    g_legacyCache[at].key.store(block, std::memory_order_release);
+    if (!slot.writing.test_and_set(std::memory_order_acquire)) {
+        slot.version.fetch_add(1, std::memory_order_seq_cst);
+        slot.value.store(answer, std::memory_order_seq_cst);
+        slot.key.store(block, std::memory_order_seq_cst);
+        slot.version.fetch_add(1, std::memory_order_seq_cst);
+        slot.writing.clear(std::memory_order_release);
+    }
     return answer;
 }
 
@@ -1835,9 +1779,9 @@ bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t 
     if (x0 >= x1 || y0 >= y1 || z0 >= z1) {
         return false;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     bool found = false;
-    const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_acquire);
+    const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_seq_cst);
     const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
     if (cells != nullptr && count != 0) {
         for (std::int32_t x = x0; x < x1 && !found; ++x) {
@@ -1855,7 +1799,7 @@ bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t 
             }
         }
     }
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return found;
 }
 
@@ -1890,12 +1834,12 @@ const void* ghostBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, int lay
     if (!layerShows(x, y, z)) {
         return nullptr;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     const void* found = nullptr;
     do {
         const std::uint16_t* const cells =
-            (layer == 1) ? g_drawCells2Ptr.load(std::memory_order_acquire)
-                         : g_drawCellsPtr.load(std::memory_order_acquire);
+            (layer == 1) ? g_drawCells2Ptr.load(std::memory_order_seq_cst)
+                         : g_drawCellsPtr.load(std::memory_order_seq_cst);
         const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
         if (cells == nullptr || count == 0 || at >= count) {
             break;
@@ -1904,14 +1848,14 @@ const void* ghostBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, int lay
         if (tag == 0) {
             break;
         }
-        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_acquire);
+        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_seq_cst);
         const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
         if (palette == nullptr || tag - 1u >= size) {
             break;
         }
         found = palette[tag - 1u];
     } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return found;
 }
 
@@ -1924,10 +1868,10 @@ const void* wantBlockAt(std::int32_t x, std::int32_t y, std::int32_t z)
     if (!ghostCellIndex(x, y, z, at) || !layerShows(x, y, z)) {
         return nullptr;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     const void* found = nullptr;
     do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_acquire);
+        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
         const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
         if (want == nullptr || count == 0 || at >= count) {
             break;
@@ -1936,14 +1880,14 @@ const void* wantBlockAt(std::int32_t x, std::int32_t y, std::int32_t z)
         if (tag == 0 || tag == kWantAirTag) {
             break;
         }
-        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_acquire);
+        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_seq_cst);
         const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
         if (palette == nullptr || tag - 1u >= size) {
             break;
         }
         found = palette[tag - 1u];
     } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return found;
 }
 
@@ -1970,17 +1914,17 @@ bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z)
     if (!ghostCellIndex(x, y, z, at)) {
         return false;
     }
-    g_drawReaders.fetch_add(1, std::memory_order_acquire);
+    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
     bool found = false;
     do {
-        const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_acquire);
+        const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_seq_cst);
         const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
         if (cells == nullptr || count == 0 || at >= count) {
             break;
         }
         found = cells[at] != 0;
     } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_release);
+    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
     return found;
 }
 
@@ -1992,7 +1936,7 @@ void setAirBlock(const void* air)
 void dropWorldBlocks()
 {
     g_ghostOn.store(false, std::memory_order_release);
-    g_drawPalettePtr.store(nullptr, std::memory_order_release);
+    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
     g_drawPaletteCount.store(0, std::memory_order_relaxed);
     g_air.store(nullptr, std::memory_order_release);
     g_worldDropped.store(true, std::memory_order_release);
@@ -2011,9 +1955,9 @@ const void* airBlock()
 void waitUntilIdle()
 {
     g_ghostOn.store(false, std::memory_order_release);
-    g_drawCellsPtr.store(nullptr, std::memory_order_release);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_release);
-    g_drawPalettePtr.store(nullptr, std::memory_order_release);
+    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
+    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
+    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
     g_drawCellsCount.store(0, std::memory_order_relaxed);
     waitForDrawReaders();
     Sleep(50);

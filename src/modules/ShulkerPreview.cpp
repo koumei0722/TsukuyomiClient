@@ -5,7 +5,9 @@
 #include "core/Strings.h"
 #include "game/BlockRegistry.h"
 #include "game/ShulkerFill.h"
+#include "game/ShulkerPreviewLayout.h"
 #include "game/UiProbe.h"
+#include "input/GameButtons.h"
 
 #include <Windows.h>
 
@@ -70,8 +72,13 @@ void ShulkerPreview::onScansReady()
     cui::onScansReady();
     cui::addObserver(this);
     resolveTooltip();
+    m_wheelLeftButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryLeft);
+    m_wheelRightButton = GameButtons::instance().watchButton(gamebuttonlogic::button::inventoryRight);
     if (cui::available()) {
         registerUiDefinitions();
+    }
+    if (miniAvailable()) {
+        cui::addHudObserver(&ShulkerPreview::onHudCreated);
     }
     log().info(L"ShulkerPreview: tooltip {} / full-box icons {}", tooltipAvailable() ? L"ready" : L"NOT usable",
                miniAvailable() ? L"ready" : L"NOT usable");
@@ -80,7 +87,10 @@ void ShulkerPreview::onScansReady()
 void ShulkerPreview::shutdown()
 {
     cui::removeObserver(this);
+    cui::detachPersistentCollectionInt();
     const std::lock_guard<std::mutex> lock(m_stacksLock);
+    m_currentSet = 0;
+    m_slotSets.clear();
     for (ContentSet& set : m_sets) {
         set.id = 0;
         set.key.clear();
@@ -100,12 +110,16 @@ void ShulkerPreview::registerUiDefinitions()
     }
     done = true;
     uiprobe::registerDefExtension("common", "item_renderer", "", miniDefinition());
+    uiprobe::registerDefExtension("hud", "hotbar_hud_item_icon", "", miniDefinition());
+    if (tooltipAvailable()) {
+        uiprobe::registerDefExtension("common", "stack_splitting_overlay", "", spreview::bundleJson());
+        uiprobe::registerDefReplaceControls("common", "highlight_slot_panel", spreview::hoverPanelControlsJson());
+    }
 }
 
 MenuItem ShulkerPreview::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     MenuItem key = menu::keybind(
@@ -115,6 +129,7 @@ MenuItem ShulkerPreview::buildMenu()
             log().info(L"ShulkerPreview: preview key set to {}", m_previewKey.name());
         },
         {});
+    bindPad(key, m_previewKey);
     key.available = [this] { return tooltipAvailable(); };
     key.hidden = writes::blocked("ShulkerPreview:tooltip");
     children.push_back(std::move(key));
@@ -147,15 +162,17 @@ void ShulkerPreview::saveConfig(nlohmann::json& section) const
 bool ShulkerPreview::onSlotButton(std::uint32_t, int, const std::string&, int)
 {
     m_miniCache.clear();
-    if (m_addressKeyed.load()) {
-        forgetSetKeys();
+    {
+        const std::lock_guard<std::mutex> lock(m_stacksLock);
+        m_slotSets.clear();
     }
     return false;
 }
 
 void ShulkerPreview::onScreenTick()
 {
-    m_screenOpen.store(true, std::memory_order_release);
+    ++m_tick;
+    consumeWheel();
     const bool want = wantPreview();
     if (want != m_lastWant) {
         m_lastWant = want;
@@ -165,21 +182,59 @@ void ShulkerPreview::onScreenTick()
 
 void ShulkerPreview::onScreenLost()
 {
-    m_screenOpen.store(false, std::memory_order_release);
+    m_currentBox = {};
+    m_publishedBox = {};
+    m_selectedBox = {};
+    m_publishedSet = 0;
+    m_selectedSet = 0;
+    select(-1);
     m_miniCache.clear();
     freeStacks();
 }
 
 void ShulkerPreview::onScreenCreated(void* ctrl)
 {
+    m_currentBox = {};
+    m_publishedBox = {};
+    m_selectedBox = {};
+    m_publishedSet = 0;
+    m_selectedSet = 0;
+    select(-1);
     m_miniCache.clear();
     m_idAuxCache.clear();
     m_maxStackCache.clear();
+    {
+        const std::lock_guard<std::mutex> lock(m_stacksLock);
+        m_slotSets.clear();
+    }
     if (miniAvailable() && !cui::bindCollectionInt(ctrl, "#tk_sp_mini", &ShulkerPreview::miniIcon, 0)) {
         static bool told = false;
         if (!told) {
             told = true;
             log().warn(L"ShulkerPreview: the full-box icon binding could not be registered");
+        }
+    }
+    if (tooltipAvailable()) {
+        int bound = 0;
+        bound += cui::bindCollectionInt(ctrl, spreview::kBindCurrent, &ShulkerPreview::currentSlot, 0) ? 1 : 0;
+        bound += cui::bindBool(ctrl, spreview::kBindVisible, &ShulkerPreview::gridVisible, 0) ? 1 : 0;
+        bound += cui::bindPersistentText(ctrl, spreview::kBindName, spreview::kTextSlotName) ? 1 : 0;
+        bound += cui::bindBool(ctrl, spreview::kBindNormal, &ShulkerPreview::normalTooltip, 0) ? 1 : 0;
+        for (int i = 0; i < kSlots; ++i) {
+            bound += cui::bindBool(ctrl, spreview::selectedBinding(i).c_str(), &ShulkerPreview::cellSelected,
+                                   static_cast<std::uintptr_t>(i)) ? 1 : 0;
+        }
+        bound += cui::bindBool(ctrl, spreview::kBindHasSelected, &ShulkerPreview::hasSelected, 0) ? 1 : 0;
+        bound += cui::bindPersistentText(ctrl, spreview::kBindSelectedName, spreview::kTextSlotSelectedName) ? 1 : 0;
+        constexpr int kExpected = 2 + 2 + kSlots + 2;
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 3) {
+            if (bound == kExpected) {
+                log().info(L"ShulkerPreview: the tooltip grid bindings were registered on the screen");
+            } else {
+                log().warn(L"ShulkerPreview: only {} of {} tooltip grid bindings were registered",
+                           bound, kExpected);
+            }
         }
     }
 }
@@ -216,7 +271,43 @@ int ShulkerPreview::miniIcon(void* ctrl, const std::string& coll, int index, std
     return self.miniIconOf(cui::screenStackOf(ctrl, coll, index));
 }
 
-int ShulkerPreview::miniIconOf(const void* stack)
+int ShulkerPreview::miniIconHud(void* ctrl, const std::string& coll, int index, std::uintptr_t)
+{
+    ShulkerPreview& self = instance();
+    if (self.m_forgetNames.exchange(false, std::memory_order_acquire)) {
+        self.m_idAuxCache.clear();
+        self.m_maxStackCache.clear();
+    }
+    if (!self.enabled()) {
+        return 0;
+    }
+    const int value = self.miniIconOf(cui::hudStackOf(ctrl, coll, index), false);
+    if (value != 0 && !self.m_loggedHudMini) {
+        self.m_loggedHudMini = true;
+        log().info(L"ShulkerPreview: the HUD cell {} #{} gets the corner icon", toUtf16(coll), index);
+    }
+    return value;
+}
+
+void ShulkerPreview::onHudCreated(void* ctrl)
+{
+    ShulkerPreview& self = instance();
+    if (!self.miniAvailable()) {
+        return;
+    }
+    self.m_forgetNames.store(true, std::memory_order_release);
+    static std::atomic<int> logs{0};
+    const bool bound = cui::bindPersistentCollectionInt(ctrl, "#tk_sp_mini", 0, &ShulkerPreview::miniIconHud, 0);
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        if (bound) {
+            log().info(L"ShulkerPreview: the full-box icon binding was registered on the HUD");
+        } else {
+            log().warn(L"ShulkerPreview: the full-box icon binding could not be registered on the HUD");
+        }
+    }
+}
+
+int ShulkerPreview::miniIconOf(const void* stack, bool useCache)
 {
     if (stack == nullptr || cui::isEmpty(stack)) {
         return 0;
@@ -236,8 +327,10 @@ int ShulkerPreview::miniIconOf(const void* stack)
     }
     const MiniKey key{reinterpret_cast<std::uintptr_t>(root), reinterpret_cast<std::uintptr_t>(first),
                       reinterpret_cast<std::uintptr_t>(last)};
-    if (const auto it = m_miniCache.find(key); it != m_miniCache.end()) {
-        return it->second;
+    if (useCache) {
+        if (const auto it = m_miniCache.find(key); it != m_miniCache.end()) {
+            return it->second;
+        }
     }
     std::vector<cui::NbtItem> items;
     const bool nbtOk = cui::nbtItemsOfTag(root, items);
@@ -263,6 +356,9 @@ int ShulkerPreview::miniIconOf(const void* stack)
             log().info(L"ShulkerPreview: a full shulker box of {} (27 x {}) gets the corner icon",
                        toUtf16(slots.front().name), maxStackOfName(slots.front().name));
         }
+    }
+    if (!useCache) {
+        return value;
     }
     if (m_miniCache.size() >= 256) {
         m_miniCache.clear();

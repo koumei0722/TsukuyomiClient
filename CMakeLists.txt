@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Tsukuyomi
-    VERSION 2.2.2
+    VERSION 2.2.3
     LANGUAGES CXX)
 
 if(NOT MSVC)

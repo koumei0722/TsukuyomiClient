@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -138,24 +137,6 @@ bool cpuThreads(int& out)
     if (system.dwNumberOfProcessors == 0 ||
         system.dwNumberOfProcessors > static_cast<DWORD>(std::numeric_limits<int>::max())) return false;
     out = static_cast<int>(system.dwNumberOfProcessors);
-    return true;
-}
-
-bool parseBaseGhz(const char* brand, float& out)
-{
-    if (!brand) return false;
-    const std::string_view text(brand);
-    const auto at = text.rfind('@');
-    if (at == std::string_view::npos) return false;
-    std::size_t begin = at + 1;
-    while (begin < text.size() && text[begin] == ' ') ++begin;
-    float value = 0.0f;
-    const auto result = std::from_chars(text.data() + begin, text.data() + text.size(), value);
-    if (result.ec != std::errc{} || !std::isfinite(value) || value <= 0.0f) return false;
-    const std::string_view suffix(result.ptr, static_cast<std::size_t>(text.data() + text.size() - result.ptr));
-    if (suffix.size() < 3 || suffix.substr(0, 3) != "GHz") return false;
-    for (const char c : suffix.substr(3)) if (c != ' ') return false;
-    out = value;
     return true;
 }
 
@@ -295,6 +276,18 @@ bool displayInfo(void* hwnd, Display& out)
     std::memcpy(result.driver, g_adapterData.driver, sizeof(result.driver));
     out = result;
     return true;
+}
+
+void closeGpuUtilization()
+{
+    std::lock_guard lock(g_pdhMutex);
+    if (g_query != nullptr) {
+        PdhCloseQuery(g_query);
+        g_query = nullptr;
+    }
+    g_counter = nullptr;
+    g_pdhReady = false;
+    g_pdhAttempted = false;
 }
 
 bool gpuUtilization(int& percent)

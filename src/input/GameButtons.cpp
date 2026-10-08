@@ -1,6 +1,7 @@
 #include "input/GameButtons.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "hooks/Detours.h"
 #include "hooks/HookManager.h"
 #include "memory/Memory.h"
@@ -19,6 +20,7 @@ namespace {
 using ActionNameFn = void* (__fastcall*)(void*, int);
 using FindKeymapFn = void* (__fastcall*)(void*, const void*);
 using BindActionFn = void (__fastcall*)(void*, void*, void*, const void*, int, bool);
+using PadBindFn = void (__fastcall*)(void*, void*, const void*, int);
 using RegisterDownFn = void (__fastcall*)(void*, const void*, const void*, bool);
 using InputUpdateFn = void (__fastcall*)(void*, void*, void*, void*, std::uint64_t);
 using RebuildFn = void (__fastcall*)(void*);
@@ -27,6 +29,7 @@ using MappingFactoryFn = void* (__fastcall*)(void*);
 ActionNameFn g_actionName = nullptr;
 FindKeymapFn g_findKeymap = nullptr;
 BindActionFn g_bindAction = nullptr;
+PadBindFn g_padBind = nullptr;
 RegisterDownFn g_registerDown = nullptr;
 RegisterDownFn g_registerUp = nullptr;
 InputUpdateFn g_inputUpdate = nullptr;
@@ -297,11 +300,23 @@ std::array<int, gamebuttonlogic::kMaxInputRows> g_inputVk{};
 std::array<std::string, gamebuttonlogic::kMaxInputRows> g_inputButtonNames;
 std::array<std::array<char, 16>, gamebuttonlogic::kMaxInputRows> g_inputKeyNames{};
 
+std::array<KeymapRow, gamebuttonlogic::kMaxSlots> g_padRows;
+std::array<int, gamebuttonlogic::kMaxSlots> g_padRowKeys{};
+std::array<std::array<char, 16>, gamebuttonlogic::kMaxSlots> g_padKeyNames{};
+std::array<KeymapRow, gamebuttonlogic::kMaxPadInputRows> g_padInputRows;
+std::array<int, gamebuttonlogic::kMaxPadInputRows> g_padInputKeys{};
+std::array<std::string, gamebuttonlogic::kMaxPadInputRows> g_padInputButtonNames;
+std::array<std::array<char, 16>, gamebuttonlogic::kMaxPadInputRows> g_padInputKeyNames{};
+
 constexpr char kKeyPrefix[] = "key.tk.hk";
 constexpr char kButtonPrefix[] = "button.tk.hk";
 constexpr char kInputKeyPrefix[] = "key.tk.kb";
 constexpr char kInputButtonPrefix[] = "button.tk.kb";
 constexpr char kMarker[] = "button.copy_coordinates";
+constexpr char kPadKeyPrefix[] = "key.tk.hp";
+constexpr char kPadInputKeyPrefix[] = "key.tk.pb";
+constexpr char kPadInputButtonPrefix[] = "button.tk.pb";
+constexpr char kPadMarker[] = "button.chat";
 
 std::string slotName(const char* prefix, int slot)
 {
@@ -496,10 +511,33 @@ void GameButtons::setKeys(int slot, std::vector<int> combo)
     std::copy(combo.begin(), combo.end(), state.combo.begin());
     bool anyChords = false;
     for (int i = 0; i < m_count.load(std::memory_order_relaxed); ++i) {
-        if (m_slots[i].comboCount >= 2) { anyChords = true; break; }
+        if (m_slots[i].comboCount >= 2 || (m_padInstalled.load(std::memory_order_acquire)
+            && m_slots[i].padCount.load(std::memory_order_relaxed) >= 2)) { anyChords = true; break; }
     }
     m_anyChords.store(anyChords, std::memory_order_release);
     state.key.store(combo.size() == 1 ? combo[0] : (combo.empty() ? 0 : -1), std::memory_order_release);
+    state.held.store(false, std::memory_order_release);
+    m_revision.fetch_add(1, std::memory_order_relaxed);
+    m_rowsSeen.store(false, std::memory_order_release);
+    m_chordsSynced.store(false, std::memory_order_release);
+}
+
+void GameButtons::setPadKeys(int slot, std::vector<int> combo)
+{
+    if (slot < 0 || slot >= m_count.load(std::memory_order_acquire)) return;
+    if (combo.size() > gamebuttonlogic::kMaxComboKeys) { fail(L"a controller hotkey has more than 4 buttons"); return; }
+    const std::lock_guard guard(m_attachMutex);
+    Slot& state = m_slots[slot];
+    if (state.padCount.load(std::memory_order_relaxed) == static_cast<int>(combo.size())
+        && std::equal(combo.begin(), combo.end(), state.pad.begin())) return;
+    std::copy(combo.begin(), combo.end(), state.pad.begin());
+    state.padCount.store(static_cast<int>(combo.size()), std::memory_order_release);
+    bool anyChords = false;
+    for (int i = 0; i < m_count.load(std::memory_order_relaxed); ++i) {
+        if (m_slots[i].comboCount >= 2 || (m_padInstalled.load(std::memory_order_acquire)
+            && m_slots[i].padCount.load(std::memory_order_relaxed) >= 2)) { anyChords = true; break; }
+    }
+    m_anyChords.store(anyChords, std::memory_order_release);
     state.held.store(false, std::memory_order_release);
     m_revision.fetch_add(1, std::memory_order_relaxed);
     m_rowsSeen.store(false, std::memory_order_release);
@@ -514,7 +552,8 @@ bool GameButtons::hasChords() const
 bool GameButtons::ready(int slot) const
 {
     return slot >= 0 && slot < m_count.load(std::memory_order_acquire)
-        && !mouseKey(m_slots[slot].key.load(std::memory_order_acquire))
+        && (!mouseKey(m_slots[slot].key.load(std::memory_order_acquire))
+            || (m_padInstalled.load(std::memory_order_acquire) && m_slots[slot].padCount.load(std::memory_order_acquire) > 0))
         && m_installed.load(std::memory_order_acquire)
         && m_revision.load(std::memory_order_acquire) == m_builtRevision.load(std::memory_order_acquire)
         && m_rowsSeen.load(std::memory_order_acquire)
@@ -569,7 +608,12 @@ void GameButtons::onCallback(int packed)
     const int index = gamebuttonlogic::callbackIndex(packed);
     const bool down = kind == gamebuttonlogic::CallbackKind::KeyDown
         || kind == gamebuttonlogic::CallbackKind::ButtonDown
-        || kind == gamebuttonlogic::CallbackKind::InputDown;
+        || kind == gamebuttonlogic::CallbackKind::InputDown
+        || kind == gamebuttonlogic::CallbackKind::PadInputDown;
+    if (kind == gamebuttonlogic::CallbackKind::PadInputDown || kind == gamebuttonlogic::CallbackKind::PadInputUp) {
+        if (index < m_registeredPadInputCount.load(std::memory_order_acquire)) m_padInputHeld[index].store(down, std::memory_order_release);
+        return;
+    }
     if (kind == gamebuttonlogic::CallbackKind::InputDown || kind == gamebuttonlogic::CallbackKind::InputUp) {
         if (index < m_registeredInputCount.load(std::memory_order_acquire)) {
             m_inputHeld[index].store(down, std::memory_order_release);
@@ -609,6 +653,8 @@ void GameButtons::onCallback(int packed)
         }
         return;
     }
+    if (m_padInstalled.load(std::memory_order_acquire) && state.padCount.load(std::memory_order_relaxed) == 1
+        && padChordPartsHeld(state.pad[0])) return;
     if (state.comboCount == 1 && key >= 0 && key < 256) {
         state.modifierAtPress = m_modifierUses[key].load(std::memory_order_acquire);
     } else if (state.comboCount >= 2) {
@@ -622,7 +668,8 @@ void GameButtons::onCallback(int packed)
         log().info(L"GameButtons: button slot {} (key {:#x}, chord {}) pressed", index, key,
                    state.comboCount >= 2);
     }
-    if (mouseKey(key)) return;
+    if (mouseKey(key) && (!m_padInstalled.load(std::memory_order_acquire)
+        || state.padCount.load(std::memory_order_relaxed) == 0)) return;
     state.held.store(true, std::memory_order_release);
     state.lastPressMs.store(GetTickCount64(), std::memory_order_release);
     state.pressSeq.fetch_add(1, std::memory_order_release);
@@ -661,6 +708,28 @@ bool GameButtons::chordPartsHeld(int key) const
     return false;
 }
 
+bool GameButtons::padChordPartsHeld(int pad) const
+{
+    const int count = m_count.load(std::memory_order_acquire);
+    for (int i = 0; i < count; ++i) {
+        const Slot& chord = m_slots[i];
+        const int parts = chord.padCount.load(std::memory_order_relaxed);
+        if (parts < 2) continue;
+        bool contains = false, othersHeld = true;
+        for (int k = 0; k < parts; ++k) {
+            const int part = chord.pad[k];
+            if (part == pad) { contains = true; continue; }
+            bool held = false;
+            for (int j = 0; j < gamebuttonlogic::kMaxPadInputRows; ++j) {
+                if (g_padInputKeys[j] == part) { held = m_padInputHeld[j].load(std::memory_order_acquire); break; }
+            }
+            if (!held) othersHeld = false;
+        }
+        if (contains && othersHeld) return true;
+    }
+    return false;
+}
+
 void GameButtons::onRowAdded()
 {
     static std::atomic<bool> told{false};
@@ -680,9 +749,19 @@ bool GameButtons::syncChordTables(void* client)
 {
     std::vector<gamebuttonlogic::ChordSpec> desired;
     gamebuttonlogic::ChordInputs inputs;
+    gamebuttonlogic::PadChordInputs padInputs;
     {
         const std::lock_guard guard(m_attachMutex);
         const int count = m_count.load(std::memory_order_acquire);
+        if (m_padInstalled.load(std::memory_order_acquire)) {
+            for (int i = 0; i < count; ++i) {
+                const Slot& slot = m_slots[i];
+                const int parts = slot.padCount.load(std::memory_order_relaxed);
+                if (parts >= 2 && !padInputs.add(std::span(slot.pad.data(), parts))) {
+                    fail(L"more than 16 distinct controller chord inputs"); return false;
+                }
+            }
+        }
         for (int i = 0; i < count; ++i) {
             const Slot& slot = m_slots[i];
             if (slot.comboCount < 2) continue;
@@ -701,6 +780,20 @@ bool GameButtons::syncChordTables(void* client)
                 spec.inputs.push_back(std::move(name));
             }
             desired.push_back(std::move(spec));
+        }
+        if (m_padInstalled.load(std::memory_order_acquire)) {
+            for (int i = 0; i < count; ++i) {
+                const Slot& slot = m_slots[i];
+                const int parts = slot.padCount.load(std::memory_order_relaxed);
+                if (parts < 2) continue;
+                gamebuttonlogic::ChordSpec spec{g_buttonNames[i], {}};
+                for (int j = 0; j < parts; ++j) {
+                    auto name = padInputs.buttonName(slot.pad[j]);
+                    if (name.empty()) { fail(L"a controller chord input name is missing"); return false; }
+                    spec.inputs.push_back(std::move(name));
+                }
+                desired.push_back(std::move(spec));
+            }
         }
     }
     void* factory = nullptr;
@@ -768,9 +861,11 @@ void GameButtons::onInputUpdate(void* self)
             m_registeredCount.store(0, std::memory_order_release);
             m_registeredWatchCount.store(0, std::memory_order_release);
             m_registeredInputCount.store(0, std::memory_order_release);
+            m_registeredPadInputCount.store(0, std::memory_order_release);
             for (Slot& state : m_slots) state.held.store(false, std::memory_order_release);
             for (WatchedButton& state : m_watches) state.held.store(false, std::memory_order_release);
             for (auto& held : m_inputHeld) held.store(false, std::memory_order_release);
+            for (auto& held : m_padInputHeld) held.store(false, std::memory_order_release);
         }
         auto registerPair = [this, handler](const std::string& name, int downValue, int upValue) {
             auto add = [this, handler, &name](RegisterDownFn target, int value) {
@@ -815,6 +910,16 @@ void GameButtons::onInputUpdate(void* self)
             }
             m_registeredInputCount.store(i + 1, std::memory_order_release);
         }
+        if (m_padInstalled.load(std::memory_order_acquire)) {
+            for (int i = m_registeredPadInputCount.load(std::memory_order_relaxed); i < gamebuttonlogic::kMaxPadInputRows; ++i) {
+                if (!registerPair(g_padInputButtonNames[i],
+                        gamebuttonlogic::packCallback(gamebuttonlogic::CallbackKind::PadInputDown, i),
+                        gamebuttonlogic::packCallback(gamebuttonlogic::CallbackKind::PadInputUp, i))) {
+                    fail(L"registering the controller chord input handlers faulted"); break;
+                }
+                m_registeredPadInputCount.store(i + 1, std::memory_order_release);
+            }
+        }
         static bool toldRegistered = false;
         if (!toldRegistered && count > 0 && m_registeredCount.load(std::memory_order_acquire) >= count) {
             toldRegistered = true;
@@ -827,10 +932,12 @@ void GameButtons::onInputUpdate(void* self)
         m_registeredCount.store(0, std::memory_order_release);
         m_registeredWatchCount.store(0, std::memory_order_release);
         m_registeredInputCount.store(0, std::memory_order_release);
+        m_registeredPadInputCount.store(0, std::memory_order_release);
         if (changed) {
             for (Slot& state : m_slots) state.held.store(false, std::memory_order_release);
             for (WatchedButton& state : m_watches) state.held.store(false, std::memory_order_release);
             for (auto& held : m_inputHeld) held.store(false, std::memory_order_release);
+            for (auto& held : m_padInputHeld) held.store(false, std::memory_order_release);
         }
     }
 
@@ -841,6 +948,9 @@ void GameButtons::onInputUpdate(void* self)
         const int key = state.key.load(std::memory_order_acquire);
         {
             const std::lock_guard guard(m_attachMutex);
+            const int parts = state.padCount.load(std::memory_order_relaxed);
+            g_padRowKeys[i] = parts > 0 ? state.pad[0] : 0;
+            g_padRows[i].end = g_padRows[i].begin + (parts == 1 ? 1 : 0);
             g_rowKeys[i] = gamebuttonlogic::gameKeyCode(key);
             g_rows[i].end = g_rows[i].begin + (m_slots[i].comboCount == 1 && !mouseKey(key) ? 1 : 0);
         }
@@ -978,6 +1088,11 @@ void GameButtons::install()
         g_rows[i].begin = &g_rowKeys[i];
         g_rows[i].end = &g_rowKeys[i];
         g_rows[i].cap = &g_rowKeys[i] + 1;
+        g_padRows[i].name = slotName(kPadKeyPrefix, i);
+        std::memcpy(g_padKeyNames[i].data(), g_padRows[i].name.c_str(), g_padRows[i].name.size() + 1);
+        g_padRows[i].begin = &g_padRowKeys[i];
+        g_padRows[i].end = &g_padRowKeys[i];
+        g_padRows[i].cap = &g_padRowKeys[i] + 1;
         g_buttonNames[i] = g_outputOverride[i] != nullptr ? std::string(g_outputOverride[i]) : slotName(kButtonPrefix, i);
     }
     for (int i = 0; i < gamebuttonlogic::kMaxInputRows; ++i) {
@@ -987,6 +1102,14 @@ void GameButtons::install()
         g_inputRows[i].end = &g_inputKeys[i];
         g_inputRows[i].cap = &g_inputKeys[i] + 1;
         g_inputButtonNames[i] = slotName(kInputButtonPrefix, i);
+    }
+    for (int i = 0; i < gamebuttonlogic::kMaxPadInputRows; ++i) {
+        g_padInputRows[i].name = slotName(kPadInputKeyPrefix, i);
+        std::memcpy(g_padInputKeyNames[i].data(), g_padInputRows[i].name.c_str(), g_padInputRows[i].name.size() + 1);
+        g_padInputRows[i].begin = &g_padInputKeys[i];
+        g_padInputRows[i].end = &g_padInputKeys[i];
+        g_padInputRows[i].cap = &g_padInputKeys[i] + 1;
+        g_padInputButtonNames[i] = slotName(kPadInputButtonPrefix, i);
     }
     if (!makeCallbackPage(m_callbackPage)) {
         fail(L"the callback page could not be allocated");
@@ -1004,6 +1127,22 @@ void GameButtons::install()
     if (!(action && find && bind && input)) {
         fail(L"a required hook could not be created");
         return;
+    }
+    const bool pad = scan.address(Target::GameButtonPadBind)
+        && hooks.create(scan.address(Target::GameButtonPadBind), &gameButtonPadBind,
+                        reinterpret_cast<void**>(&g_padBind), L"GameButtonPadBind");
+    m_padInstalled.store(pad, std::memory_order_release);
+    if (!pad) notice::failOnce("GameButtonPadBind", L"GameButtons: controller hotkeys are disabled: GameButtonPadBind hook unavailable",
+                              "Controller hotkeys are disabled: GameButtonPadBind hook unavailable");
+    {
+        const std::lock_guard guard(m_attachMutex);
+        bool anyChords = false;
+        for (int i = 0; i < m_count.load(std::memory_order_relaxed); ++i) {
+            if (m_slots[i].comboCount >= 2 || (pad && m_slots[i].padCount.load(std::memory_order_relaxed) >= 2)) {
+                anyChords = true; break;
+            }
+        }
+        m_anyChords.store(anyChords, std::memory_order_release);
     }
     m_installed.store(true, std::memory_order_release);
 }
@@ -1050,11 +1189,18 @@ void* __fastcall gameButtonActionName(void* out, int action)
 {
     const int slot = action - 0x4000;
     const int input = action - 0x4100;
+    const int pad = action - 0x4200;
+    const int padInput = action - 0x4300;
     if (((slot >= 0 && slot < gamebuttonlogic::kMaxSlots)
-        || (input >= 0 && input < gamebuttonlogic::kMaxInputRows)) && out) {
+        || (input >= 0 && input < gamebuttonlogic::kMaxInputRows)
+        || (pad >= 0 && pad < gamebuttonlogic::kMaxSlots)
+        || (padInput >= 0 && padInput < gamebuttonlogic::kMaxPadInputRows)) && out) {
         unsigned char value[32]{};
-        std::memcpy(value, slot >= 0 && slot < gamebuttonlogic::kMaxSlots
-            ? g_keyNames[slot].data() : g_inputKeyNames[input].data(), 11);
+        const char* keyName = slot >= 0 && slot < gamebuttonlogic::kMaxSlots ? g_keyNames[slot].data()
+            : input >= 0 && input < gamebuttonlogic::kMaxInputRows ? g_inputKeyNames[input].data()
+            : pad >= 0 && pad < gamebuttonlogic::kMaxSlots ? g_padKeyNames[pad].data()
+            : g_padInputKeyNames[padInput].data();
+        std::memcpy(value, keyName, 11);
         const std::size_t length = 11;
         const std::size_t capacity = 15;
         std::memcpy(value + 0x10, &length, 8);
@@ -1076,6 +1222,16 @@ void* __fastcall gameButtonFindKeymap(void* layout, const void* name)
     if (input >= 0) {
         g_inputRows[input].name.assign(g_inputKeyNames[input].data());
         return &g_inputRows[input];
+    }
+    const int pad = keySlot(name, kPadKeyPrefix, gamebuttonlogic::kMaxSlots);
+    if (pad >= 0) {
+        g_padRows[pad].name.assign(g_padKeyNames[pad].data());
+        return &g_padRows[pad];
+    }
+    const int padInput = keySlot(name, kPadInputKeyPrefix, gamebuttonlogic::kMaxPadInputRows);
+    if (padInput >= 0) {
+        g_padInputRows[padInput].name.assign(g_padInputKeyNames[padInput].data());
+        return &g_padInputRows[padInput];
     }
     return g_findKeymap ? g_findKeymap(layout, name) : nullptr;
 }
@@ -1119,6 +1275,53 @@ void __fastcall gameButtonBindAction(void* owner, void* table, void* mouse,
         g_bindAction(owner, table, mouse, &buttonName, 0x4100 + i, false);
     }
     if (count != 0) buttons.onRowAdded();
+}
+
+void __fastcall gameButtonPadBind(void* mapping, void* layout, const void* name, int action)
+{
+    if (!g_padBind) return;
+    g_padBind(mapping, layout, name, action);
+    GameButtons& buttons = GameButtons::instance();
+    if (!buttons.m_installed.load(std::memory_order_acquire) || !buttons.m_padInstalled.load(std::memory_order_acquire)
+        || buttons.m_stopping.load(std::memory_order_acquire)
+        || !gameStringEquals(name, kPadMarker, sizeof(kPadMarker) - 1)) return;
+    const int count = buttons.m_count.load(std::memory_order_acquire);
+    gamebuttonlogic::PadChordInputs inputs;
+    std::vector<int> singles;
+    {
+        const std::lock_guard guard(buttons.m_attachMutex);
+        for (int i = 0; i < count; ++i) {
+            const auto& slot = buttons.m_slots[i];
+            const int parts = slot.padCount.load(std::memory_order_relaxed);
+            if (parts >= 2 && !inputs.add(std::span(slot.pad.data(), parts))) {
+                buttons.fail(L"more than 16 distinct controller chord inputs"); return;
+            }
+            if (parts == 1) singles.push_back(i);
+        }
+    }
+    for (int j = 0; j < gamebuttonlogic::kMaxPadInputRows; ++j) {
+        const bool used = j < static_cast<int>(inputs.keys().size());
+        const int key = used ? inputs.keys()[j] : 0;
+        if (g_padInputKeys[j] != key) buttons.m_padInputHeld[j].store(false, std::memory_order_release);
+        g_padInputKeys[j] = key;
+        g_padInputRows[j].end = g_padInputRows[j].begin + (used ? 1 : 0);
+    }
+    int added = 0;
+    for (int i : singles) {
+        std::string copy = g_buttonNames[i];
+        g_padBind(mapping, layout, &copy, 0x4200 + i);
+        ++added;
+    }
+    for (int j = 0; j < static_cast<int>(inputs.keys().size()); ++j) {
+        std::string copy = g_padInputButtonNames[j];
+        g_padBind(mapping, layout, &copy, 0x4300 + j);
+        ++added;
+    }
+    if (added) {
+        buttons.onRowAdded();
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) log().info(L"GameButtons: added {} controller row(s)", added);
+    }
 }
 
 void __fastcall gameButtonInputUpdate(void* self, void* a2, void* a3, void* a4, std::uint64_t a5)

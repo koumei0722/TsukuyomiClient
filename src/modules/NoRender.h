@@ -29,6 +29,7 @@ public:
         Terrain = 0,
         BlockEntities,
         Entities,
+        Items,
         Sky,
         Fog,
         Particles,
@@ -58,8 +59,6 @@ public:
 protected:
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return true; }
-
     enum class OptionSlot {
         Terrain = 0,
         Entities,
@@ -79,6 +78,8 @@ private:
 
     void resolveStages();
 
+    void resolveItems();
+
     void applyStages();
 
     bool m_off[kStageCount] = {};
@@ -86,6 +87,7 @@ private:
     std::vector<Patch> m_patches[kStageCount];
 
     bool m_byOption[kStageCount] = {};
+    static bool isOptionStage(int stage);
 
     int m_found = 0;
 

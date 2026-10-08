@@ -8,6 +8,7 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
 #include "game/LegacyTransaction.h"
@@ -196,7 +197,7 @@ void OffhandSwap::onPlayerViewUpdate()
                                                  std::memory_order_acquire)) {
         return;
     }
-    apply(slot);
+    apply();
 }
 
 void OffhandSwap::servePending()
@@ -320,7 +321,6 @@ void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
     m_netIdFix.offhand = hands.offhand;
     {
         const std::lock_guard<std::mutex> lock(m_offhandLock);
-        m_netIdFix.serial = m_offhand.serial;
         m_offhandWatch = OffhandWatch{};
         m_offhandWatch.armed = true;
     }
@@ -335,9 +335,6 @@ void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
     m_netIdFix.offhandItem = offhandView.item;
     m_netIdFix.holder = hands.holder;
 
-    log().info(L"OffhandSwap: waiting for the server ({}, slot {}, net ids {} / {}, packet {})",
-               (m_netIdFix.hand != nullptr) ? L"lining up" : L"gate only", slot,
-               m_netIdFix.handValue, m_netIdFix.offhandValue, m_netIdFix.serial);
 }
 
 OffhandSwap::OffhandArrival OffhandSwap::latestOffhand() const
@@ -584,11 +581,9 @@ int OffhandSwap::swapWithOffhand(const Hands* hands, int count, int slot)
     return applied;
 }
 
-bool OffhandSwap::apply(int slot)
+bool OffhandSwap::apply()
 {
-    if (slot != kHeldSlot && (slot < 0 || slot >= kSlotCount)) {
-        return false;
-    }
+    constexpr int slot = kHeldSlot;
 
     Hands hands[2];
     int count = 0;
@@ -662,10 +657,26 @@ bool OffhandSwap::apply(int slot)
 
             beginNetIdFix(hands[0], firstSlot);
 
-            log().success(L"OffhandSwap: swapped slot {} with the offhand through the "
-                          L"legacy path ({} target{})",
-                          firstSlot, applied, (applied == 1) ? L"" : L"s");
+            static int logs1 = 0;
+            if (logs1 < 200) {
+                ++logs1;
+                log().success(L"OffhandSwap: swapped slot {} with the offhand through the "
+                              L"legacy path ({} target{})",
+                              firstSlot, applied, (applied == 1) ? L"" : L"s");
+            }
             return true;
+        }
+
+        if (!useRequestPath) {
+            if (!LegacyTransaction::instance().available()) {
+                notice::failOnce("OffhandSwap.legacy",
+                                 L"OffhandSwap: the legacy inventory path is unavailable, so moving items into the "
+                                 L"offhand on a server is off",
+                                 "OffhandSwap cannot move items into the offhand on this server: the legacy "
+                                 "inventory path is unavailable");
+            }
+            log().warn(L"OffhandSwap: the legacy swap for slot {} could not be sent; nothing changed", firstSlot);
+            return false;
         }
 
         const ItemStackRequest::SlotRef hand =
@@ -687,11 +698,9 @@ bool OffhandSwap::apply(int slot)
         m_pending = Pending{};
         m_pending.active = true;
         m_pending.requestId = ItemStackRequest::instance().lastRequestId();
-        m_pending.count = count;
         m_pending.selected = firstSlot;
         for (int i = 0; i < count; ++i) {
             m_pending.hand[i] = hands[i].slots + kSlotStride * targetSlot(hands[i], slot);
-            m_pending.offhand[i] = hands[i].offhand;
         }
         m_pending.giveUpAtMs = GetTickCount64() + kResponseWaitMs;
         if (StackView placed; count > 0 && readStack(m_pending.hand[0], placed)) {
@@ -708,8 +717,12 @@ bool OffhandSwap::apply(int slot)
             return false;
         }
 
-        log().success(L"OffhandSwap: swapped slot {} with the offhand ({} target{})", firstSlot,
-                      applied, (applied == 1) ? L"" : L"s");
+        static int logs2 = 0;
+        if (logs2 < 200) {
+            ++logs2;
+            log().success(L"OffhandSwap: swapped slot {} with the offhand ({} target{})", firstSlot,
+                          applied, (applied == 1) ? L"" : L"s");
+        }
         return true;
     }
 
@@ -720,15 +733,18 @@ bool OffhandSwap::apply(int slot)
         return false;
     }
 
-    log().success(L"OffhandSwap: swapped slot {} with the offhand ({} targets)",
-                  targetSlot(hands[0], slot), applied);
+    static int logs3 = 0;
+    if (logs3 < 200) {
+        ++logs3;
+        log().success(L"OffhandSwap: swapped slot {} with the offhand ({} targets)",
+                      targetSlot(hands[0], slot), applied);
+    }
     return true;
 }
 
 MenuItem OffhandSwap::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::keybind(
@@ -738,6 +754,7 @@ MenuItem OffhandSwap::buildMenu()
             log().info(L"OffhandSwap: swap key set to {}", m_swapKey.name());
         },
         defaultSwapKeys()));
+    bindPad(children.back(), m_swapKey);
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };

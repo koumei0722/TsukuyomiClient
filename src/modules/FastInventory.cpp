@@ -5,13 +5,7 @@
 #include "hooks/Detours.h"
 #include "memory/Scanner.h"
 
-#include <Windows.h>
-
 namespace tsukuyomi {
-
-namespace {
-
-}
 
 FastInventory& FastInventory::instance()
 {

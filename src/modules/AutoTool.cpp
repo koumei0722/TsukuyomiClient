@@ -5,8 +5,8 @@
 #include "config/WriteSwitches.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "game/GameData.h"
-#include "game/HolderTable.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
 #include "memory/Memory.h"
@@ -23,6 +23,10 @@
 namespace tsukuyomi {
 
 namespace {
+
+constexpr int kSlotCount = 9;
+constexpr ptrdiff_t kSelectedSlotOffset = 0x10;
+constexpr ptrdiff_t kSlotStride = 0x98;
 
 int accessViolationFilter(unsigned long code)
 {
@@ -61,12 +65,11 @@ bool readByteGuarded(const void* address, unsigned char& value)
     }
 }
 
-bool probeSlotSpeeds(void** itemSlot, std::byte* slotZero, void* savedItem, ptrdiff_t stride,
-                     int slotCount, void* rcx, void* rdx, void* r8, void* r9, float* speeds)
+bool probeSlotSpeeds(void** itemSlot, std::byte* slotZero, void* savedItem, void* rcx, void* rdx, void* r8, void* r9, float* speeds)
 {
     __try {
-        for (int slot = 0; slot < slotCount; ++slot) {
-            *itemSlot = slotZero + stride * slot;
+        for (int slot = 0; slot < kSlotCount; ++slot) {
+            *itemSlot = slotZero + kSlotStride * slot;
             speeds[slot] = hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
         }
         *itemSlot = savedItem;
@@ -88,12 +91,11 @@ static_assert(sizeof(DamageParams) == 8);
 
 using DamageCalcFn = float(__fastcall*)(void* attacker, void* target, const DamageParams* params);
 
-bool probeSlotDamages(void* calc, int* selected, int current, void* attacker, void* target, int slotCount,
-                      float* damages)
+bool probeSlotDamages(void* calc, int* selected, int current, void* attacker, void* target, float* damages)
 {
     const DamageParams params;
     __try {
-        for (int slot = 0; slot < slotCount; ++slot) {
+        for (int slot = 0; slot < kSlotCount; ++slot) {
             *selected = slot;
             damages[slot] = reinterpret_cast<DamageCalcFn>(calc)(attacker, target, &params);
         }
@@ -161,17 +163,17 @@ const ModuleRange& mainModule()
     return range;
 }
 
-bool readSlotValue(void* holder, ptrdiff_t offset, int slotCount, int& slot)
+bool readSlotValue(void* holder, int& slot)
 {
     if (holder == nullptr) {
         return false;
     }
-    const void* const field = static_cast<const std::byte*>(holder) + offset;
+    const void* const field = static_cast<const std::byte*>(holder) + kSelectedSlotOffset;
     int value = -1;
     if (!readIntGuarded(field, value)) {
         return false;
     }
-    if (value < 0 || value >= slotCount) {
+    if (value < 0 || value >= kSlotCount) {
         return false;
     }
     slot = value;
@@ -180,7 +182,7 @@ bool readSlotValue(void* holder, ptrdiff_t offset, int slotCount, int& slot)
 
 }
 
-bool AutoTool::looksLikeSlotArray(const std::byte* slotZero, ptrdiff_t stride, int slotCount, bool* faulted)
+bool AutoTool::looksLikeSlotArray(const std::byte* slotZero, bool* faulted)
 {
     if (faulted != nullptr) {
         *faulted = false;
@@ -202,9 +204,9 @@ bool AutoTool::looksLikeSlotArray(const std::byte* slotZero, ptrdiff_t stride, i
     if (!mainModule().contains(first)) {
         return false;
     }
-    for (int slot = 1; slot < slotCount; ++slot) {
+    for (int slot = 1; slot < kSlotCount; ++slot) {
         void* value = nullptr;
-        if (!readPointerGuarded(slotZero + stride * slot, value)) {
+        if (!readPointerGuarded(slotZero + kSlotStride * slot, value)) {
             if (faulted != nullptr) {
                 *faulted = true;
             }
@@ -371,7 +373,7 @@ bool AutoTool::holderIsLive(void* holder, int* side) const
         *side = 0;
     }
     if (!canTellLive()) {
-        return true;
+        return false;
     }
     const void* const localVtable = m_attack.localPlayerVtable;
     const std::ptrdiff_t inventory = m_attack.inventory;
@@ -421,14 +423,14 @@ bool AutoTool::resolveSlots(void* holder, std::byte*& slots, bool* faulted)
         return false;
     }
     auto* const array = static_cast<std::byte*>(head);
-    if (!looksLikeSlotArray(array, kSlotStride, kSlotCount, &bad)) {
+    if (!looksLikeSlotArray(array, &bad)) {
         return false;
     }
     slots = array;
     return true;
 }
 
-bool AutoTool::findOwner(void* item, Owner& out, const void* queryPlayer)
+bool AutoTool::findOwner(void* item, Owner& out)
 {
     if (item == nullptr) {
         return false;
@@ -483,42 +485,16 @@ bool AutoTool::findOwner(void* item, Owner& out, const void* queryPlayer)
         }
         return true;
     }
-    if (anyResolved) {
+    if (anyResolved || count == 0) {
+        m_unresolvedStreak.store(0, std::memory_order_relaxed);
         return false;
     }
-
-    for (std::size_t i = 0; i < count; ++i) {
-        if (faultedAt[i]) {
-            continue;
-        }
-        if (canTellLive() && (queryPlayer == nullptr || playerOfHolder(candidates[i]) != queryPlayer)) {
-            continue;
-        }
-        int slot = -1;
-        if (!readSlotValue(candidates[i], kSelectedSlotOffset, kSlotCount, slot)) {
-            continue;
-        }
-        auto* const head = const_cast<std::byte*>(itemAt) - kSlotStride * slot;
-        if (!memory::isReadable(head - kSlotStride,
-                                static_cast<size_t>(kSlotStride) * (kSlotCount + 1))
-            || !looksLikeSlotArray(head, kSlotStride, kSlotCount)) {
-            continue;
-        }
-        void* before = nullptr;
-        void* first = nullptr;
-        if (!readPointerGuarded(head - kSlotStride, before) || !readPointerGuarded(head, first)
-            || before == first) {
-            continue;
-        }
-        out.holder = candidates[i];
-        out.slots = head;
-        out.slot = slot;
-        if (!m_fallbackLogged.exchange(true, std::memory_order_relaxed)) {
-            log().warn(L"AutoTool: could not follow the inventory of any slot holder; using the "
-                       L"selected slot number instead (another player's hotbar can be mistaken "
-                       L"for yours on a server)");
-        }
-        return true;
+    if (m_unresolvedStreak.fetch_add(1, std::memory_order_relaxed) + 1 == kUnresolvedNotice) {
+        notice::failOnce("AutoTool.owner",
+                         L"AutoTool: could not follow the inventory of any slot holder (" + std::to_wstring(count)
+                             + L" candidate(s), " + std::to_wstring(kUnresolvedNotice)
+                             + L" queries in a row); tools are not switched",
+                         "AutoTool is not switching tools: the hotbar of the player could not be read");
     }
     return false;
 }
@@ -567,15 +543,12 @@ bool AutoTool::sameHotbar(const std::byte* a, const std::byte* b)
 
 void* AutoTool::findTwin(const Owner& owner)
 {
-    const bool typed = canTellLive();
     int wanted = 0;
-    if (typed) {
-        int ownerSide = 0;
-        if (!holderIsLive(owner.holder, &ownerSide) || ownerSide == 0) {
-            return nullptr;
-        }
-        wanted = ownerSide == 1 ? 2 : 1;
+    int ownerSide = 0;
+    if (!holderIsLive(owner.holder, &ownerSide) || ownerSide == 0) {
+        return nullptr;
     }
+    wanted = ownerSide == 1 ? 2 : 1;
 
     void* candidates[kHolderSlots + 1] = {};
     std::size_t count = snapshotHolders(candidates, kHolderSlots);
@@ -591,7 +564,7 @@ void* AutoTool::findTwin(const Owner& owner)
         int slot = -1;
         std::byte* slots = nullptr;
         bool faulted = false;
-        if (!readSlotValue(other, kSelectedSlotOffset, kSlotCount, slot) || slot != owner.slot) {
+        if (!readSlotValue(other, slot) || slot != owner.slot) {
             continue;
         }
         if (!resolveSlots(other, slots, &faulted)) {
@@ -603,12 +576,11 @@ void* AutoTool::findTwin(const Owner& owner)
         if (slots == owner.slots) {
             continue;
         }
-        if (typed) {
-            int side = 0;
-            if (!holderIsLive(other, &side) || side != wanted) {
-                continue;
-            }
+        int side = 0;
+        if (!holderIsLive(other, &side) || side != wanted) {
+            continue;
         }
+
         if (sameHotbar(owner.slots, slots)) {
             return other;
         }
@@ -631,7 +603,6 @@ bool AutoTool::available() const
 MenuItem AutoTool::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     {
@@ -736,13 +707,13 @@ bool AutoTool::onAttack(void* gameMode, void* target, bool direct, const void* h
     }
     int current = -1;
     unsigned char containerId = 0xFF;
-    if (!readSlotValue(inventory, kSelectedSlotOffset, kSlotCount, current)
+    if (!readSlotValue(inventory, current)
         || !readByteGuarded(inv + 0xB0, containerId) || containerId != 0) {
         return hooks::callAttackCore(gameMode, target, direct, hitPos);
     }
     float damages[kSlotCount] = {};
     if (!probeSlotDamages(m_attack.damageCalc, reinterpret_cast<int*>(inv + kSelectedSlotOffset), current, player,
-                          target, kSlotCount, damages)) {
+                          target, damages)) {
         static std::atomic<int> told{0};
         if (told.fetch_add(1, std::memory_order_relaxed) < 3) {
             log().warn(L"AutoTool: computing the attack damage faulted; attacking without switching");
@@ -824,7 +795,7 @@ bool AutoTool::onSendTransaction(void* player, void** transaction)
     int slot = -1;
     void* inventory = nullptr;
     if (!readPointerGuarded(static_cast<std::byte*>(player) + m_attack.inventory, inventory) || inventory == nullptr
-        || !readSlotValue(inventory, kSelectedSlotOffset, kSlotCount, slot)) {
+        || !readSlotValue(inventory, slot)) {
         return false;
     }
     Held& held = m_held[m_heldCount++];
@@ -931,7 +902,7 @@ bool AutoTool::applySlot(void* owner, void* twin, int slot)
             continue;
         }
         int current = -1;
-        if (!readSlotValue(holder, kSelectedSlotOffset, kSlotCount, current)) {
+        if (!readSlotValue(holder, current)) {
             forgetHolder(holder);
             continue;
         }
@@ -976,7 +947,11 @@ void AutoTool::restoreSlot()
         }
     }
     if (holders > 0) {
-        log().info(L"AutoTool: restored slot {} ({} holder(s))", slot + 1, holders);
+        static int logs1 = 0;
+        if (logs1 < 200) {
+            ++logs1;
+            log().info(L"AutoTool: restored slot {} ({} holder(s))", slot + 1, holders);
+        }
     }
 }
 
@@ -1007,6 +982,13 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
     if (!enabled() || rcx == nullptr) {
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
+    if (!canTellLive()) {
+        notice::failOnce("AutoTool.types",
+                         L"AutoTool: the LocalPlayer / ServerPlayer types or the inventory field were not found; "
+                         L"tools are not switched",
+                         "AutoTool is not switching tools: the player types could not be found");
+        return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
+    }
     if (speedQueryIsForeign(rcx)) {
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
@@ -1019,7 +1001,7 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
     }
 
     Owner owner;
-    if (!findOwner(savedItem, owner, contextPlayer(rcx))) {
+    if (!findOwner(savedItem, owner)) {
         return hooks::callGetDestroySpeed(rcx, rdx, r8, r9);
     }
     const int currentSlot = owner.slot;
@@ -1027,7 +1009,7 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
     m_lastSpeedQuery.store(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
 
     float speeds[kSlotCount] = {};
-    if (!probeSlotSpeeds(itemSlot, owner.slots, savedItem, kSlotStride, kSlotCount, rcx, rdx, r8,
+    if (!probeSlotSpeeds(itemSlot, owner.slots, savedItem, rcx, rdx, r8,
                          r9, speeds)) {
         forgetHolder(owner.holder);
         log().warn(L"AutoTool: probing the hotbar faulted inside the game; "
@@ -1088,9 +1070,13 @@ float AutoTool::onGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
             return speeds[currentSlot];
         }
         if (fromSlot >= 0) {
-            log().info(L"AutoTool: slot {} -> {} (speed {:.1f} -> {:.1f}{})", fromSlot + 1,
-                       bestSlot + 1, speeds[currentSlot], best,
-                       twin != nullptr ? L", server-side copy too" : L"");
+            static int logs2 = 0;
+            if (logs2 < 200) {
+                ++logs2;
+                log().info(L"AutoTool: slot {} -> {} (speed {:.1f} -> {:.1f}{})", fromSlot + 1,
+                           bestSlot + 1, speeds[currentSlot], best,
+                           twin != nullptr ? L", server-side copy too" : L"");
+            }
         }
         applySlot(owner.holder, twin, bestSlot);
     }
@@ -1120,6 +1106,18 @@ void AutoTool::onUpdate()
 
 void AutoTool::onPlayerViewUpdate()
 {
+    if (const int stage = m_unloadStage.load(std::memory_order_acquire); stage != 0) {
+        int expected = 1;
+        if (m_unloadStage.compare_exchange_strong(expected, 4, std::memory_order_acq_rel)) {
+            if (m_heldCount > 0) {
+                flushHeld(false);
+            }
+            m_attackOwner.store(nullptr, std::memory_order_release);
+            restoreSlot();
+            m_unloadStage.store(2, std::memory_order_release);
+        }
+        return;
+    }
     m_ownClient.store(enabled() ? HandRestock::instance().ownClientHolder() : nullptr, std::memory_order_release);
 
     if (m_heldCount > 0) {
@@ -1158,6 +1156,18 @@ void AutoTool::onEnabledChanged(bool enabled)
 
 void AutoTool::shutdown()
 {
+    m_unloadStage.store(1, std::memory_order_release);
+    for (int waited = 0; waited < 1000 && m_unloadStage.load(std::memory_order_acquire) != 2; ++waited) {
+        Sleep(1);
+    }
+    int expected = 1;
+    if (!m_unloadStage.compare_exchange_strong(expected, 3, std::memory_order_acq_rel)) {
+        while (m_unloadStage.load(std::memory_order_acquire) != 2) {
+            Sleep(1);
+        }
+        log().info(L"AutoTool: the slot and held attacks were settled on the game thread at unload");
+        return;
+    }
     restoreSlot();
     if (m_heldCount > 0) {
         log().info(L"AutoTool: {} held attack(s) were discarded at unload", m_heldCount);

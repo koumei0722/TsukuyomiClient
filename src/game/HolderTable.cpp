@@ -44,12 +44,6 @@ void HolderTable::forget(void* holder)
     }
 }
 
-void HolderTable::clear()
-{
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    m_entries.fill(Entry{});
-}
-
 std::size_t HolderTable::snapshot(void** out, std::size_t capacity) const
 {
     std::array<Entry, kCapacity> copy{};
@@ -65,13 +59,6 @@ std::size_t HolderTable::snapshot(void** out, std::size_t capacity) const
         }
     }
     return count;
-}
-
-std::size_t HolderTable::size() const
-{
-    const std::lock_guard<std::mutex> lock(m_mutex);
-    return static_cast<std::size_t>(
-        std::count_if(m_entries.begin(), m_entries.end(), [](const Entry& e) { return e.holder != nullptr; }));
 }
 
 NetIdMatch compareNetIds(const std::int32_t* a, const std::int32_t* b, std::size_t count)

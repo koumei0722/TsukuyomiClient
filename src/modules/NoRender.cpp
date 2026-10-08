@@ -4,6 +4,7 @@
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
@@ -38,6 +39,9 @@ constexpr StageDef kStages[] = {
     {NoRender::Stage::Entities, L"Entity", "entity",
      {"Level renderer camera - Render entities",
       "Level renderer camera - Render entity effects", nullptr, nullptr, nullptr, nullptr}},
+
+    {NoRender::Stage::Items, L"Item", "item",
+     {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}},
     {NoRender::Stage::Sky, L"Sky", "sky",
      {"Level renderer camera - Render sky", nullptr, nullptr, nullptr, nullptr, nullptr}},
     {NoRender::Stage::Fog, L"Fog", "fog",
@@ -112,7 +116,7 @@ bool functionRange(std::byte* inside, std::byte*& begin, std::byte*& end)
     return begin < end;
 }
 
-bool directCall(const std::byte* at, std::byte*& target, std::byte*& outBegin)
+bool directCall(const std::byte* at, std::byte*& target)
 {
     if (static_cast<unsigned char>(*at) != 0xE8) {
         return false;
@@ -124,7 +128,6 @@ bool directCall(const std::byte* at, std::byte*& target, std::byte*& outBegin)
         return false;
     }
     target = t;
-    outBegin = begin;
     return true;
 }
 
@@ -214,6 +217,21 @@ bool NoRender::available() const
     return m_found > 0;
 }
 
+bool NoRender::isOptionStage(int stage)
+{
+    switch (static_cast<Stage>(stage)) {
+    case Stage::Terrain:
+    case Stage::Entities:
+    case Stage::BlockEntities:
+    case Stage::Particles:
+    case Stage::Sky:
+    case Stage::Weather:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void NoRender::resolveOptions()
 {
 
@@ -232,9 +250,12 @@ void NoRender::resolveOptions()
     }
     std::byte* begin = nullptr;
     std::byte* end = nullptr;
+
     if (!functionRange(anchor, begin, end)) {
-        begin = anchor;
-        end = anchor + 0x6000;
+        notice::failOnce("NoRender.range",
+                         L"NoRender: could not get the bounds of the stage list function from .pdata; NoRender is off",
+                         "NoRender is off: the render stage function could not be located");
+        return;
     }
 
     constexpr std::size_t kMaxHits = 24;
@@ -278,13 +299,16 @@ void NoRender::resolveOptions()
         }
     }
     if (first == kMaxHits) {
-        log().warn(L"NoRender: the option lookup sequence was not found ({} candidates); only "
-                   L"the stage-call patch will be used",
-                   count);
+
+        notice::failOnce("NoRender.options",
+                         std::format(L"NoRender: the option lookup sequence was not found ({} candidates); Terrain, "
+                                     L"Entities, Block entities, Particles, Sky and Weather are off",
+                                     count),
+                         "NoRender cannot hide terrain, entities, block entities, particles, sky or weather: the "
+                         "render options were not found");
         return;
     }
 
-    int made = 0;
     for (std::size_t k = 0; k < kOptionCount; ++k) {
         std::byte* const callSite = hits[first + k].at;
 
@@ -300,25 +324,32 @@ void NoRender::resolveOptions()
             }
         }
         if (read == nullptr) {
-            log().warn(L"NoRender: no read site found for option {:#x}",
-                       hits[first + k].id);
+            notice::failOnce("NoRender.optionRead",
+                             std::format(L"NoRender: no read site found for option {:#x}; that item is off",
+                                         hits[first + k].id),
+                             "Some NoRender items are off: a render option could not be patched");
             continue;
         }
         const std::size_t stage = static_cast<std::size_t>(kOptionStages[k]);
-        Patch patch(read, patched, patchName(stage).c_str());
+
+        std::size_t oneSize = 0;
+        std::vector<std::byte> one;
+        Patch patch = memory::makeForceTrueInstruction(read, oneSize, one)
+                          ? makeAtomicPatch(read, std::move(one), patchName(stage).c_str())
+                          : Patch(read, patched, patchName(stage).c_str());
         if (!patch.valid()) {
             continue;
         }
         m_patches[stage].push_back(std::move(patch));
         m_byOption[stage] = true;
         ++m_found;
-        ++made;
     }
 
     if (std::byte* const stage = Scanner::instance().address(Target::NameTagStage);
         stage != nullptr) {
         const std::size_t at = static_cast<std::size_t>(Stage::NameTags);
-        Patch patch(stage, std::vector<std::byte>{std::byte{0xC3}}, patchName(at).c_str());
+
+        Patch patch = makeAtomicPatch(stage, std::vector<std::byte>{std::byte{0xC3}}, patchName(at).c_str());
         if (patch.valid()) {
             m_patches[at].push_back(std::move(patch));
             ++m_found;
@@ -370,7 +401,7 @@ void NoRender::resolveOptions()
     if (std::byte* const outline = Scanner::instance().address(Target::BlockOutlineDraw);
         outline != nullptr) {
         const std::size_t at = static_cast<std::size_t>(Stage::Cursor);
-        Patch patch(outline, std::vector<std::byte>{std::byte{0xC3}}, patchName(at).c_str());
+        Patch patch = makeAtomicPatch(outline, std::vector<std::byte>{std::byte{0xC3}}, patchName(at).c_str());
         if (patch.valid()) {
             m_patches[at].push_back(std::move(patch));
             ++m_found;
@@ -378,6 +409,24 @@ void NoRender::resolveOptions()
         m_byOption[at] = true;
     } else {
         log().warn(L"NoRender: the block outline draw function was not found");
+    }
+}
+
+void NoRender::resolveItems()
+{
+    if (std::byte* const item = Scanner::instance().address(Target::ItemActorRender); item != nullptr) {
+        const std::size_t at = static_cast<std::size_t>(Stage::Items);
+        if (static_cast<unsigned char>(item[0]) == 0x55) {
+            Patch patch = makeAtomicPatch(item, std::vector<std::byte>{std::byte{0xC3}}, patchName(at).c_str());
+            if (patch.valid()) {
+                m_patches[at].push_back(std::move(patch));
+                ++m_found;
+            }
+        } else {
+            log().warn(L"NoRender: the dropped item renderer does not start with push rbp, so it is left alone");
+        }
+    } else {
+        log().warn(L"NoRender: the dropped item renderer was not found");
     }
 }
 
@@ -392,13 +441,9 @@ void NoRender::resolveStages()
 
     std::byte* begin = nullptr;
     std::byte* end = nullptr;
-    if (!functionRange(anchor, begin, end)) {
 
-        begin = anchor;
-        end = anchor + 0x6000;
-        log().warn(L"NoRender: could not get the function bounds from .pdata; scanning {:#x} "
-                   L"bytes from the start",
-                   static_cast<std::size_t>(end - begin));
+    if (!functionRange(anchor, begin, end)) {
+        return;
     }
 
     std::byte* zoneBegin = nullptr;
@@ -432,6 +477,10 @@ void NoRender::resolveStages()
             continue;
         }
 
+        if (!m_byOption[stageIndex] && isOptionStage(stageIndex)) {
+            continue;
+        }
+
         std::byte* main = nullptr;
         for (std::byte* scan = at; scan + 5 < at + kColdPathSpan && scan + 5 < end; ++scan) {
             if (static_cast<unsigned char>(*scan) == 0xE9) {
@@ -450,8 +499,7 @@ void NoRender::resolveStages()
         int calls = 0;
         for (std::byte* scan = main; scan + 6 < main + kMainSpan && scan + 6 < end;) {
             std::byte* target = nullptr;
-            std::byte* targetBegin = nullptr;
-            if (directCall(scan, target, targetBegin)) {
+            if (directCall(scan, target)) {
                 ++calls;
                 if (calls == 1) {
                     if (zoneBegin == nullptr) {
@@ -499,7 +547,7 @@ void NoRender::resolveStages()
             continue;
         }
 
-        if (Patch patch = makeNopPatch(drawCall, drawSize, patchName(stageIndex).c_str()); patch.valid()) {
+        if (Patch patch = makeSkipPatch(drawCall, drawSize, patchName(stageIndex).c_str()); patch.valid()) {
             m_patches[stageIndex].push_back(std::move(patch));
             ++m_found;
         } else {
@@ -531,16 +579,12 @@ void NoRender::resolveStages()
             break;
         }
 
-        int more = 0;
-
         for (std::byte* scan = drawCall + 5; scan + 5 <= stop;) {
             std::byte* target = nullptr;
-            std::byte* targetBegin = nullptr;
-            if (directCall(scan, target, targetBegin) && target == callee) {
+            if (directCall(scan, target) && target == callee) {
                 if (!takesOutParam(scan, 5) && !nearAssert(scan, 5)) {
-                    if (Patch patch = makeNopPatch(scan, 5, patchName(stageIndex).c_str()); patch.valid()) {
+                    if (Patch patch = makeSkipPatch(scan, 5, patchName(stageIndex).c_str()); patch.valid()) {
                         m_patches[stageIndex].push_back(std::move(patch));
-                        ++more;
                     }
                 }
                 scan += 5;
@@ -561,6 +605,7 @@ void NoRender::onScansReady()
 
     resolveOptions();
     resolveStages();
+    resolveItems();
     if (!available()) {
         return;
     }
@@ -570,13 +615,18 @@ void NoRender::onScansReady()
 
 void NoRender::applyStages()
 {
+
     const bool on = enabled();
+    std::vector<Patch*> apply;
+    std::vector<Patch*> remove;
     for (std::size_t i = 0; i < kStageCount; ++i) {
         const bool want = on && m_off[i] && !m_stageBlocked[i];
         for (Patch& patch : m_patches[i]) {
-            patch.setEnabled(want);
+            (want ? apply : remove).push_back(&patch);
         }
     }
+    Patch::setAll(remove, false);
+    Patch::setAll(apply, true);
 }
 
 void NoRender::onEnabledChanged(bool )
@@ -597,7 +647,6 @@ void NoRender::shutdown()
 MenuItem NoRender::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
 

@@ -15,20 +15,17 @@ namespace tsukuyomi {
 namespace {
 
 struct EffectDef {
-    AntiEffect::Effect effect;
     std::int32_t id;
     const wchar_t* label;
     const char* key;
 };
 
 constexpr EffectDef kEffects[] = {
-    {AntiEffect::Effect::Darkness, AntiEffect::kDarknessEffectId, L"Darkness", "darkness"},
-    {AntiEffect::Effect::Blindness, AntiEffect::kBlindnessEffectId, L"Blindness", "blindness"},
-    {AntiEffect::Effect::Nausea, AntiEffect::kNauseaEffectId, L"Nausea", "nausea"},
+    {AntiEffect::kDarknessEffectId, L"Darkness", "darkness"},
+    {AntiEffect::kBlindnessEffectId, L"Blindness", "blindness"},
+    {AntiEffect::kNauseaEffectId, L"Nausea", "nausea"},
 };
 static_assert(sizeof(kEffects) / sizeof(kEffects[0]) == AntiEffect::kEffectCount);
-
-constexpr const char* kOldSection = "AntiDarkness";
 
 }
 
@@ -79,7 +76,6 @@ void* AntiEffect::onGetEffect(int effectId, void* original)
 MenuItem AntiEffect::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     for (std::size_t i = 0; i < kEffectCount; ++i) {
@@ -99,15 +95,7 @@ MenuItem AntiEffect::buildMenu()
 
 void AntiEffect::loadConfig(const nlohmann::json& section)
 {
-
-    const bool fresh = !section.contains("enabled") && !section.contains("keys");
-    const nlohmann::json& old = Config::instance().section(kOldSection);
-    if (fresh && (old.contains("enabled") || old.contains("keys"))) {
-        Module::loadConfig(old);
-        log().info(L"AntiEffect: took over the settings of AntiDarkness");
-    } else {
-        Module::loadConfig(section);
-    }
+    Module::loadConfig(section);
     for (std::size_t i = 0; i < kEffectCount; ++i) {
         m_hide[i].store(Config::getBool(section, kEffects[i].key, true), std::memory_order_relaxed);
     }
@@ -119,8 +107,6 @@ void AntiEffect::saveConfig(nlohmann::json& section) const
     for (std::size_t i = 0; i < kEffectCount; ++i) {
         section[kEffects[i].key] = m_hide[i].load(std::memory_order_relaxed);
     }
-
-    Config::instance().eraseSection(kOldSection);
 }
 
 }

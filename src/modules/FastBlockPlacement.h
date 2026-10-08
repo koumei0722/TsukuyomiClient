@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <vector>
 
@@ -32,8 +33,6 @@ public:
 protected:
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return true; }
-
 private:
     FastBlockPlacement() = default;
 
@@ -48,6 +47,10 @@ private:
     const wchar_t* axisName() const;
 
     void placeRange();
+    void applyReset();
+    std::atomic<bool> m_resetRequested{false};
+
+    bool handReady(void* gameMode);
 
     static BlockPos shiftByFace(BlockPos pos, unsigned char face);
 
@@ -86,6 +89,7 @@ private:
     bool m_placing = false;
 
     bool m_manualDone = false;
+    bool m_seenEmptyHand = false;
 
     std::vector<BlockPos> m_placed;
 

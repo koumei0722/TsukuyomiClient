@@ -344,17 +344,38 @@ void __fastcall selected(void* self, int idx)
     }
 }
 
-bool pushRaw(void* ci)
+struct alignas(8) WheelStackRef {
+    void* alive;
+    void* counts;
+    void* stack;
+};
+
+bool releaseStackRef(void* counts)
 {
     __try {
+        auto* const c = static_cast<std::uint8_t*>(counts);
+        void* const* cvt = *reinterpret_cast<void* const* const*>(c);
+        if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 8)) == 0) {
+            reinterpret_cast<CountsReleaseFn>(cvt[0])(c);
+            if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 0xc)) == 0) {
+                reinterpret_cast<CountsReleaseFn>(cvt[1])(c);
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool pushRaw(void* ci)
+{
+    WheelStackRef ref{};
+    volatile bool got = false;
+    volatile bool ok = false;
+    __try {
         void* const* vt = *static_cast<void* const* const*>(ci);
-        struct alignas(8) StackRef {
-            void* alive;
-            void* counts;
-            void* stack;
-        } ref{};
         reinterpret_cast<GetStackFn>(vt[g_stackSlot / 8])(ci, &ref);
-        bool ok = false;
+        got = true;
         if (ref.alive != nullptr && *static_cast<const volatile std::uint8_t*>(ref.alive) == 1 && ref.stack != nullptr) {
             void* const factory = reinterpret_cast<GetFactoryFn>(vt[g_factorySlot / 8])(ci);
             alignas(16) unsigned char scene[16]{};
@@ -363,20 +384,13 @@ bool pushRaw(void* ci)
             reinterpret_cast<PushSceneFn>(svt[g_pushSlot / 8])(ref.stack, scene, 0);
             ok = true;
         }
-        if (ref.counts != nullptr) {
-            auto* const c = static_cast<std::uint8_t*>(ref.counts);
-            void* const* cvt = *reinterpret_cast<void* const* const*>(c);
-            if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 8)) == 0) {
-                reinterpret_cast<CountsReleaseFn>(cvt[0])(c);
-                if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 0xc)) == 0) {
-                    reinterpret_cast<CountsReleaseFn>(cvt[1])(c);
-                }
-            }
-        }
-        return ok;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
+        ok = false;
     }
+    if (got && ref.counts != nullptr) {
+        releaseStackRef(ref.counts);
+    }
+    return ok;
 }
 
 std::int32_t slotAt(const std::byte* at)

@@ -10,6 +10,7 @@ namespace tsukuyomi {
 
 class ItemStackRequest {
 public:
+    static constexpr std::ptrdiff_t kRequestIdOffset = 0x08;
     static ItemStackRequest& instance();
 
     void onScansReady();
@@ -43,8 +44,6 @@ public:
 
     static constexpr int kResultSuccess = 0;
 
-    void forget();
-
     void noteInventoryContent(int containerId)
     {
         if (containerId == 0) {
@@ -73,9 +72,8 @@ public:
     static constexpr std::size_t kOpenShellBytes = 0x18;
     static constexpr int kContainerTypeInventory = -1;
 
-    void rememberContainerOpenResult(const void* result);
-
     void onFrame();
+    void waitPendingClose(unsigned long long maxMs);
 
     bool suppressingInputReset() const;
 
@@ -160,8 +158,6 @@ private:
     static constexpr std::ptrdiff_t kValidFlagOffset = 0x09;
     static constexpr std::ptrdiff_t kPendingOffset = 0x60;
 
-    static constexpr std::ptrdiff_t kRequestIdOffset = 0x08;
-
     static constexpr std::size_t kResponseEntrySize = 0x30;
     static constexpr std::ptrdiff_t kResponseResultOffset = 0x00;
     static constexpr std::ptrdiff_t kResponseRequestIdOffset = 0x10;
@@ -221,13 +217,8 @@ private:
     std::atomic<void*> m_closeVtable{nullptr};
     std::byte m_packetHead[0x30]{};
     std::atomic<bool> m_hasPacketHead{false};
-    std::atomic<bool> m_closeSynthetic{false};
-    std::atomic<bool> m_loggedRealClose{false};
 
-    static constexpr std::size_t kOpenResultSize = 0x48;
     static constexpr std::ptrdiff_t kOpenResultTagOffset = 0x40;
-
-    std::atomic<bool> m_loggedOpenResult{false};
 
     std::atomic<unsigned long long> m_pendingCloseAtMs{0};
 

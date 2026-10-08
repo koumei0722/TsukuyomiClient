@@ -51,7 +51,7 @@ Listener* g_observers[kMaxObservers] = {};
 constexpr std::ptrdiff_t kStackItemOffset = 0x08;
 constexpr std::ptrdiff_t kStackAuxOffset = 0x20;
 constexpr std::ptrdiff_t kStackCountOffset = 0x22;
-constexpr std::ptrdiff_t kStackValidOffset = 0x23;
+constexpr std::ptrdiff_t kStackNetTagOffset = 0x90;
 constexpr std::ptrdiff_t kItemNameOffset = 0x128;
 
 constexpr int kMaxCollection = 64;
@@ -97,6 +97,9 @@ using CompoundGetFn = const void*(__fastcall*)(const void* tag, const std::strin
 StorageInfoFn g_storageInfo = nullptr;
 CompoundGetFn g_compoundGet = nullptr;
 std::ptrdiff_t g_stackUserDataOffset = -1;
+using TagHashFn = std::uint64_t(__fastcall*)(const void* tag);
+TagHashFn g_tagHash = nullptr;
+constexpr std::size_t kTagHashSlot = 0x50 / 8;
 std::ptrdiff_t g_itemCategoryOffset = -1;
 
 bool callStorageInfoGuarded(void* out, const void* stack, void* mc, bool& faulted)
@@ -107,6 +110,20 @@ bool callStorageInfoGuarded(void* out, const void* stack, void* mc, bool& faulte
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         faulted = true;
+        return false;
+    }
+}
+
+bool callTagHashGuarded(const void* tag, std::uint64_t& out)
+{
+    __try {
+        void* const* const vt = *static_cast<void* const* const*>(tag);
+        if (vt == nullptr || vt[kTagHashSlot] != reinterpret_cast<void*>(g_tagHash)) {
+            return false;
+        }
+        out = g_tagHash(tag);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 }
@@ -206,25 +223,13 @@ bool readStdStringGuarded(const void* at, char* out, size_t outSize)
     }
 }
 
-struct SlotKey {
-    std::string coll;
-    int index = -1;
-    bool operator<(const SlotKey& o) const
-    {
-        return (coll != o.coll) ? coll < o.coll : index < o.index;
-    }
-};
-
 struct ScreenState {
     void* sm = nullptr;
     void* ctrl = nullptr;
     void* mc = nullptr;
     std::uintptr_t kind = 0;
-    ULONGLONG aliveMs = 0;
-    bool aliveNow = false;
     const void* emptyItem = nullptr;
     std::unordered_map<std::string, int> sizes;
-    std::map<SlotKey, POINT> positions;
 };
 ScreenState g_screen;
 
@@ -241,7 +246,6 @@ const std::string& intern(const std::string& s)
 std::string g_hoverColl;
 int g_hoverIndex = -1;
 POINT g_hoverCursor{};
-ULONGLONG g_hoverMs = 0;
 int g_pitch = 0;
 std::string g_lastPitchColl;
 int g_lastPitchIndex = -1;
@@ -255,7 +259,6 @@ struct PendingPress {
     int index = -1;
 };
 PendingPress g_pending;
-Stats g_stats;
 
 std::atomic<bool> g_loggedScreen{false};
 std::atomic<int> g_faultLogs{0};
@@ -274,7 +277,6 @@ void forgetScreen()
     g_pending = PendingPress{};
     g_hoverColl.clear();
     g_hoverIndex = -1;
-    g_hoverMs = 0;
     g_lastPitchColl.clear();
     g_lastPitchIndex = -1;
     if (had && g_listener != nullptr) {
@@ -340,6 +342,47 @@ bool __fastcall invokeTrue(GameCallable*)
 {
     return true;
 }
+float __fastcall invokeFloat(GameCallable* self)
+{
+    const BindSlot* s = slotOf(self);
+    return (s != nullptr && s->fn != 0) ? reinterpret_cast<FloatGetter>(s->fn)(s->arg) : 0.0f;
+}
+void* __fastcall invokeLongText(void* ret, GameCallable* self)
+{
+    std::string text;
+    const BindSlot* s = slotOf(self);
+    if (s != nullptr && s->fn != 0) {
+        reinterpret_cast<LongTextGetter>(s->fn)(s->arg, text);
+    }
+    constexpr std::size_t kMaxLength = 0x400;
+    if (text.size() > kMaxLength) {
+        text.resize(kMaxLength);
+    }
+    auto* const out = static_cast<unsigned char*>(ret);
+    std::memset(out, 0, 0x20);
+    std::uint64_t length = text.size();
+    void* buf = nullptr;
+    if (length > 15) {
+        buf = hooks::callGameAllocate(static_cast<std::size_t>(length) + 1);
+        if (buf == nullptr) {
+            length = 15;
+        }
+    }
+    if (buf != nullptr) {
+        std::memcpy(buf, text.data(), static_cast<std::size_t>(length));
+        static_cast<char*>(buf)[length] = '\0';
+        const auto ptr = reinterpret_cast<std::uintptr_t>(buf);
+        std::memcpy(out, &ptr, sizeof(ptr));
+        std::memcpy(out + 0x10, &length, sizeof(length));
+        std::memcpy(out + 0x18, &length, sizeof(length));
+    } else {
+        std::memcpy(out, text.data(), static_cast<std::size_t>(length));
+        const std::uint64_t capacity = 15;
+        std::memcpy(out + 0x10, &length, sizeof(length));
+        std::memcpy(out + 0x18, &capacity, sizeof(capacity));
+    }
+    return ret;
+}
 int __fastcall invokeCollInt(GameCallable* self, const std::string* coll, const int* index)
 {
     if (self == nullptr || coll == nullptr || index == nullptr || self->spare[0] == 0) {
@@ -366,6 +409,8 @@ const CallableOps kBoolOps{callableMove, callableDestroy, reinterpret_cast<const
 const CallableOps kIntOps{callableMove, callableDestroy, reinterpret_cast<const void*>(&invokeInt)};
 const CallableOps kTextOps{callableMove, callableDestroy, reinterpret_cast<const void*>(&invokeText)};
 const CallableOps kTrueOps{callableMove, callableDestroy, reinterpret_cast<const void*>(&invokeTrue)};
+const CallableOps kFloatOps{callableMove, callableDestroy, reinterpret_cast<const void*>(&invokeFloat)};
+const CallableOps kLongTextOps{callableMove, callableDestroy, reinterpret_cast<const void*>(&invokeLongText)};
 const CallableOps kButtonOps{callableMove, callableDestroy,
                              reinterpret_cast<const void*>(&invokeButton)};
 const CallableOps kCollIntOps{&moveCollection, callableDestroy,
@@ -381,7 +426,7 @@ BindRegFn g_bindInt = nullptr;
 BindRegFn g_bindText = nullptr;
 BindRegFn g_bindCollInt = nullptr;
 BindRegFn g_bindFloat = nullptr;
-constexpr int kMaxHudObservers = 4;
+constexpr int kMaxHudObservers = 8;
 std::atomic<HudCreatedFn> g_hudObservers[kMaxHudObservers]{};
 std::atomic<int> g_hudObserverCount{0};
 ClickRegFn g_regClick = nullptr;
@@ -636,7 +681,6 @@ void adoptController(void* ctrl)
     g_screen.ctrl = ctrl;
     g_screen.mc = mc;
     g_screen.kind = reinterpret_cast<std::uintptr_t>(vt);
-    g_screen.aliveMs = GetTickCount64();
     static const std::string kNone = "tk_none_collection";
     bool faulted = false;
     g_screen.emptyItem = callGetItemGuarded(mc, &kNone, 0, faulted);
@@ -736,6 +780,7 @@ void onScansReady()
     }
     g_storageInfo = scanner.addressAs<StorageInfoFn>(Target::ItemStorageInfo);
     g_compoundGet = scanner.addressAs<CompoundGetFn>(Target::CompoundTagGet);
+    g_tagHash = scanner.addressAs<TagHashFn>(Target::CompoundTagHash);
     if (const std::byte* fn = reinterpret_cast<const std::byte*>(g_storageInfo);
         fn != nullptr && memory::isReadable(fn, 0x200)) {
         for (std::size_t k = 0; k + 9 <= 0x200; ++k) {
@@ -761,10 +806,10 @@ void onScansReady()
               && g_matches != nullptr && g_matchFlags != nullptr && offsetsOk
               && scanner.found(Target::ContainerSmHandle);
     if (g_ready) {
-        log().info(L"ContainerUi: ready (state machine +{:#x}, manager +{:#x}; storage {} nbt {} +{:#x}; "
+        log().info(L"ContainerUi: ready (state machine +{:#x}, manager +{:#x}; storage {} nbt {} +{:#x} hash {}; "
                    L"item category +{:#x})",
                    g_smOffset, g_mcOffset, g_storageInfo != nullptr, g_compoundGet != nullptr,
-                   g_stackUserDataOffset, g_itemCategoryOffset);
+                   g_stackUserDataOffset, g_tagHash != nullptr, g_itemCategoryOffset);
     } else {
         log().warn(L"ContainerUi: not usable (getItem {} isNull {} max {} match {} flags {} "
                    L"sm +{:#x} mc +{:#x})",
@@ -796,17 +841,13 @@ bool onSmHandle(void* sm, std::uint32_t id, int state, const void* coll, int ind
     if (g_screen.sm != sm) {
         return false;
     }
-    ++g_stats.smEvents;
     const std::string collName(name);
     if (id == button::kHover && state == kStateHeld && index >= 0 && !collName.empty()) {
-        ++g_stats.hoverEvents;
         POINT cursor{};
         GetCursorPos(&cursor);
         g_hoverColl = collName;
         g_hoverIndex = index;
         g_hoverCursor = cursor;
-        g_hoverMs = GetTickCount64();
-        g_screen.positions[SlotKey{collName, index}] = cursor;
         updatePitch(collName, index, cursor);
     }
     for (Listener* const one : g_observers) {
@@ -832,7 +873,6 @@ bool onSmHandle(void* sm, std::uint32_t id, int state, const void* coll, int ind
 
 std::uint32_t onScreenTickHook(void* ctrl)
 {
-    ++g_stats.tickCalls;
     if (!g_ready || ctrl == nullptr) {
         return 0;
     }
@@ -842,9 +882,6 @@ std::uint32_t onScreenTickHook(void* ctrl)
     if (ctrl != g_screen.ctrl) {
         return 0;
     }
-    g_screen.aliveMs = GetTickCount64();
-    g_screen.aliveNow = true;
-    ++g_stats.ticks;
     if (g_listener != nullptr) {
         g_listener->onScreenTick();
     }
@@ -853,7 +890,6 @@ std::uint32_t onScreenTickHook(void* ctrl)
             one->onScreenTick();
         }
     }
-    g_screen.aliveNow = false;
     const bool refresh = g_refresh;
     g_refresh = false;
     return refresh ? 1u : 0u;
@@ -951,7 +987,11 @@ void* hudContainerManager(void* ctrl)
 void addHudObserver(HudCreatedFn fn)
 {
     const int n = g_hudObserverCount.load(std::memory_order_acquire);
-    if (fn == nullptr || n >= kMaxHudObservers) {
+    if (fn == nullptr) {
+        return;
+    }
+    if (n >= kMaxHudObservers) {
+        log().warn(L"ContainerUi: too many HUD observers (max {}); one module gets no HUD bindings", kMaxHudObservers);
         return;
     }
     for (int i = 0; i < n; ++i) {
@@ -1048,14 +1088,24 @@ struct PersistentCode {
     std::uint8_t destroy[4];
     std::uint8_t textTramp[8];
     std::uint8_t emptyText[32];
+    std::uint8_t collTramp[8];
+    std::uint8_t returnZero[4];
     alignas(8) const void* boolOps[3];
     const void* floatOps[3];
     const void* trueOps[3];
     const void* textOps[3];
+    const void* collOps[3];
+};
+struct CollSlot {
+    void* fn;
+    void* ctrl;
+    std::uintptr_t getter;
+    std::uintptr_t arg;
 };
 struct PersistentValues {
     std::uint8_t bools[kPersistentSlots];
     float floats[kPersistentSlots];
+    CollSlot colls[kPersistentCollSlots];
 };
 struct TextSlot {
     void* fn;
@@ -1066,13 +1116,14 @@ static_assert(sizeof(TextSlot) == kPersistentTextBytes);
 struct PersistentText {
     TextSlot slots[kPersistentTextSlots];
 };
-static_assert(sizeof(PersistentText) <= 4096 * 3);
+static_assert(sizeof(PersistentText) == kPersistentTextSlots * kPersistentTextBytes);
 
 PersistentCode* g_persistCode = nullptr;
 PersistentValues* g_persistValues = nullptr;
 PersistentText* g_persistText = nullptr;
 std::once_flag g_persistOnce;
 std::atomic<int> g_textInside{0};
+std::atomic<int> g_collInside{0};
 
 void makePersistent()
 {
@@ -1080,8 +1131,9 @@ void makePersistent()
     GetSystemInfo(&info);
     const SIZE_T page = info.dwPageSize;
     static_assert(sizeof(PersistentCode) < 4096 && sizeof(PersistentValues) < 4096);
+    const SIZE_T textPages = (sizeof(PersistentText) + page - 1) / page;
     auto* const base = static_cast<std::uint8_t*>(
-        VirtualAlloc(nullptr, page * 5, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        VirtualAlloc(nullptr, page * (2 + textPages), MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     if (base == nullptr) {
         log().warn(L"ContainerUi: could not allocate the persistent bindings (error {})", GetLastError());
         return;
@@ -1103,6 +1155,13 @@ void makePersistent()
     std::memcpy(code->destroy, kRet, sizeof(kRet));
     std::memcpy(code->textTramp, kTextTramp, sizeof(kTextTramp));
     std::memcpy(code->emptyText, kEmptyText, sizeof(kEmptyText));
+    constexpr std::uint8_t kCollTramp[] = {0x48, 0x8B, 0x41, 0x08, 0xFF, 0x20};
+    constexpr std::uint8_t kReturnZero[] = {0x31, 0xC0, 0xC3};
+    std::memcpy(code->collTramp, kCollTramp, sizeof(kCollTramp));
+    std::memcpy(code->returnZero, kReturnZero, sizeof(kReturnZero));
+    code->collOps[0] = code->move;
+    code->collOps[1] = code->destroy;
+    code->collOps[2] = code->collTramp;
     code->boolOps[0] = code->move;
     code->boolOps[1] = code->destroy;
     code->boolOps[2] = code->boolRead;
@@ -1123,6 +1182,9 @@ void makePersistent()
     }
     FlushInstructionCache(GetCurrentProcess(), base, page);
     g_persistValues = reinterpret_cast<PersistentValues*>(base + page);
+    for (CollSlot& slot : g_persistValues->colls) {
+        slot.fn = code->returnZero;
+    }
     auto* const text = reinterpret_cast<PersistentText*>(base + page * 2);
     for (int i = 0; i < kPersistentTextSlots; ++i) {
         text->slots[i].fn = code->emptyText;
@@ -1209,6 +1271,20 @@ void* __fastcall invokePersistentText(void* ret, GameCallable* self)
     return ret;
 }
 
+int __fastcall invokePersistentCollInt(GameCallable* self, const std::string* coll, const int* index)
+{
+    g_collInside.fetch_add(1, std::memory_order_acquire);
+    int value = 0;
+    if (self != nullptr && self->capture != nullptr && coll != nullptr && index != nullptr) {
+        const auto* const slot = static_cast<const CollSlot*>(self->capture);
+        if (slot->getter != 0) {
+            value = reinterpret_cast<CollIntGetter>(slot->getter)(slot->ctrl, *coll, *index, slot->arg);
+        }
+    }
+    g_collInside.fetch_sub(1, std::memory_order_release);
+    return value;
+}
+
 }
 
 volatile std::uint8_t* persistentBool(int slot)
@@ -1265,6 +1341,19 @@ bool bindPersistentText(void* ctrl, const char* name, int slot)
     return bindPersistent(g_bindText, g_persistCode->textOps, ctrl, name, s);
 }
 
+static void waitPersistentCallers(const std::atomic<int>& inside, const wchar_t* what)
+{
+    Sleep(20);
+    for (int waited = 0; waited < 2000 && inside.load(std::memory_order_acquire) != 0; ++waited) {
+        Sleep(1);
+    }
+    if (inside.load(std::memory_order_acquire) != 0) {
+        log().warn(L"ContainerUi: a persistent {} getter is still running after 2 s", what);
+        return;
+    }
+    Sleep(5);
+}
+
 void detachPersistentText()
 {
     if (g_persistText == nullptr || g_persistCode == nullptr) {
@@ -1275,17 +1364,166 @@ void detachPersistentText()
         g_persistText->slots[i].length = 0;
         g_persistText->slots[i].text[0] = '\0';
     }
-    for (int waited = 0; waited < 200 && g_textInside.load(std::memory_order_acquire) != 0; ++waited) {
-        Sleep(1);
+    waitPersistentCallers(g_textInside, L"text");
+}
+
+namespace {
+std::atomic<std::uint32_t> g_hudForward[kPersistentCollSlots]{};
+std::atomic<const void*> g_hudResolver{nullptr};
+std::atomic<bool> g_hudResolverChecked{false};
+constexpr std::size_t kHudResolverSlot = 19;
+
+bool functionRange(const void* pc, const std::byte*& begin, const std::byte*& end)
+{
+    DWORD64 imageBase = 0;
+    PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(pc), &imageBase, nullptr);
+    for (int depth = 0; fn != nullptr && depth < 8; ++depth) {
+        const auto* const info = reinterpret_cast<const std::uint8_t*>(imageBase + fn->UnwindData);
+        if (!memory::isReadable(info, 4)) {
+            return false;
+        }
+        constexpr std::uint8_t kChainInfo = 0x4;
+        if (((info[0] >> 3) & kChainInfo) == 0) {
+            begin = reinterpret_cast<const std::byte*>(imageBase + fn->BeginAddress);
+            end = reinterpret_cast<const std::byte*>(imageBase + fn->EndAddress);
+            return true;
+        }
+        const std::size_t codes = (static_cast<std::size_t>(info[2]) + 1) & ~static_cast<std::size_t>(1);
+        fn = reinterpret_cast<PRUNTIME_FUNCTION>(const_cast<std::uint8_t*>(info + 4 + codes * 2));
     }
-    if (g_textInside.load(std::memory_order_acquire) != 0) {
-        log().warn(L"ContainerUi: a persistent text getter is still running after 200 ms");
+    return false;
+}
+}
+
+bool locateHudCollectionResolver(const void* site, void*& resolver, void*& base)
+{
+    resolver = nullptr;
+    base = nullptr;
+    const std::byte* begin = nullptr;
+    const std::byte* end = nullptr;
+    if (site == nullptr || !functionRange(site, begin, end) || end <= begin
+        || !memory::isReadable(begin, static_cast<std::size_t>(end - begin))) {
+        log().warn(L"ContainerUi: the HUD collection resolver could not be located (no .pdata entry)");
+        return false;
     }
+    const std::byte* found = nullptr;
+    int count = 0;
+    for (const std::byte* p = begin; p + 6 <= end; ++p) {
+        if (p[0] != std::byte{0x5D} || p[1] != std::byte{0xE9}) {
+            continue;
+        }
+        std::int32_t rel = 0;
+        std::memcpy(&rel, p + 2, sizeof(rel));
+        const std::byte* const target = p + 6 + rel;
+        if (target >= begin && target < end) {
+            continue;
+        }
+        const std::byte* tb = nullptr;
+        const std::byte* te = nullptr;
+        if (!memory::inGameModule(target) || !functionRange(target, tb, te) || tb != target) {
+            continue;
+        }
+        found = target;
+        ++count;
+    }
+    const auto module = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    if (count != 1) {
+        log().warn(L"ContainerUi: the HUD collection resolver (RVA {:#x}) has {} tail jumps to a base; not used",
+                   reinterpret_cast<std::uintptr_t>(begin) - module, count);
+        return false;
+    }
+    resolver = const_cast<std::byte*>(begin);
+    base = const_cast<std::byte*>(found);
+    g_hudResolver.store(begin, std::memory_order_release);
+    log().info(L"ContainerUi: HUD collection resolver at RVA {:#x}, base at RVA {:#x}",
+               reinterpret_cast<std::uintptr_t>(begin) - module, reinterpret_cast<std::uintptr_t>(found) - module);
+    return true;
+}
+
+bool hudForwardsToBase(std::uint32_t nameHash)
+{
+    if (nameHash == 0) {
+        return false;
+    }
+    for (const auto& one : g_hudForward) {
+        if (one.load(std::memory_order_relaxed) == nameHash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool bindPersistentCollectionInt(void* ctrl, const char* name, int slot, CollIntGetter fn, std::uintptr_t arg)
+{
+    if (slot < 0 || slot >= kPersistentCollSlots || fn == nullptr || name == nullptr || ctrl == nullptr
+        || g_bindCollInt == nullptr || !persistentReady()) {
+        return false;
+    }
+    if (const void* const resolver = g_hudResolver.load(std::memory_order_acquire);
+        resolver != nullptr && !g_hudResolverChecked.exchange(true)) {
+        void* vt = nullptr;
+        void* slotFn = nullptr;
+        if (readPointer(ctrl, vt) && vt != nullptr
+            && readPointer(static_cast<std::byte*>(vt) + kHudResolverSlot * sizeof(void*), slotFn)
+            && slotFn == resolver) {
+            log().info(L"ContainerUi: the HUD vtable slot {} is the hooked collection resolver", kHudResolverSlot);
+        } else {
+            log().warn(L"ContainerUi: the HUD vtable slot {} is not the hooked collection resolver; "
+                       L"values in hotbar_items stay unanswered", kHudResolverSlot);
+        }
+    }
+    g_hudForward[slot].store(buttonId(name), std::memory_order_relaxed);
+    CollSlot& s = g_persistValues->colls[slot];
+    s.ctrl = ctrl;
+    s.getter = reinterpret_cast<std::uintptr_t>(fn);
+    s.arg = arg;
+    InterlockedExchangePointer(&s.fn, reinterpret_cast<void*>(&invokePersistentCollInt));
+    return bindPersistent(g_bindCollInt, g_persistCode->collOps, ctrl, name, &s);
+}
+
+void detachPersistentCollectionInt()
+{
+    if (g_persistValues == nullptr || g_persistCode == nullptr) {
+        return;
+    }
+    for (CollSlot& s : g_persistValues->colls) {
+        InterlockedExchangePointer(&s.fn, g_persistCode->returnZero);
+    }
+    waitPersistentCallers(g_collInside, L"collection");
+}
+
+const void* hudStackOf(void* ctrl, const std::string& coll, int index)
+{
+    if (g_getItem == nullptr || index < 0) {
+        return nullptr;
+    }
+    void* const mc = hudContainerManager(ctrl);
+    if (mc == nullptr) {
+        return nullptr;
+    }
+    bool faulted = false;
+    const void* one = callGetItemGuarded(mc, &coll, index, faulted);
+    if (faulted) {
+        noteFault(L"HUD getItem (collection value)");
+        return nullptr;
+    }
+    return one;
 }
 bool bindText(void* ctrl, const char* name, TextGetter fn, std::uintptr_t arg)
 {
     return bindWith(g_bindText, kTextOps, "t", ctrl, name, reinterpret_cast<std::uintptr_t>(fn),
                     arg);
+}
+
+bool bindLongText(void* ctrl, const char* name, LongTextGetter fn, std::uintptr_t arg)
+{
+    return bindWith(g_bindText, kLongTextOps, "T", ctrl, name, reinterpret_cast<std::uintptr_t>(fn), arg);
+}
+
+bool bindFloat(void* ctrl, const char* name, FloatGetter fn, std::uintptr_t arg)
+{
+    return floatBindingsAvailable()
+           && bindWith(g_bindFloat, kFloatOps, "f", ctrl, name, reinterpret_cast<std::uintptr_t>(fn), arg);
 }
 
 bool onButtonPressed(void* ctrl, const char* buttonName, ButtonHandler fn, std::uintptr_t arg)
@@ -1478,11 +1716,6 @@ void onScreenDestroyed(void* ctrl)
     }
 }
 
-Stats stats()
-{
-    return g_stats;
-}
-
 bool hasScreen()
 {
     return g_ready && g_screen.ctrl != nullptr && g_screen.mc != nullptr;
@@ -1491,11 +1724,6 @@ bool hasScreen()
 void* screenController()
 {
     return hasScreen() ? g_screen.ctrl : nullptr;
-}
-
-std::uintptr_t screenKind()
-{
-    return hasScreen() ? g_screen.kind : 0;
 }
 
 int collectionSize(const std::string& coll)
@@ -1628,7 +1856,15 @@ bool sameItem(const void* a, const void* b)
     if (!same) {
         return false;
     }
-    return auxOf(a) == auxOf(b);
+    if (auxOf(a) != auxOf(b)) {
+        return false;
+    }
+    auto hasContents = [](const void* stack) {
+        int used = 0;
+        int total = 0;
+        return nbtContents(stack, used, total) && used > 0;
+    };
+    return hasContents(a) == hasContents(b);
 }
 
 std::uintptr_t itemKey(const void* stack)
@@ -1662,6 +1898,18 @@ std::string itemName(const void* stack)
     return name;
 }
 
+int netTagOf(const void* stack)
+{
+    if (isEmpty(stack)) {
+        return -1;
+    }
+    std::uint8_t tag = 0;
+    if (!readByteGuarded(static_cast<const std::byte*>(stack) + kStackNetTagOffset, tag)) {
+        return -1;
+    }
+    return tag;
+}
+
 int auxOf(const void* stack)
 {
     if (stack == nullptr) {
@@ -1670,127 +1918,6 @@ int auxOf(const void* stack)
     std::uint16_t aux = 0;
     readWordGuarded(static_cast<const std::byte*>(stack) + kStackAuxOffset, aux);
     return static_cast<std::int16_t>(aux);
-}
-
-namespace {
-
-using RarityFn = int(__fastcall*)(const void* item);
-std::atomic<int> g_raritySlot{-2};
-
-int callRarityGuarded(RarityFn fn, const void* item, bool& faulted)
-{
-    faulted = false;
-    __try {
-        return fn(item);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        faulted = true;
-        return -1;
-    }
-}
-
-bool readInt32Guarded(const void* at, std::int32_t& out)
-{
-    if (!memory::isReadable(at, 4)) {
-        return false;
-    }
-    std::memcpy(&out, at, 4);
-    return true;
-}
-
-int findRaritySlot()
-{
-    struct Known {
-        const char* name;
-        int rarity;
-    };
-    static const Known kKnown[] = {
-        {"minecraft:dirt", 0},        {"minecraft:experience_bottle", 1}, {"minecraft:totem_of_undying", 1},
-        {"minecraft:mace", 3},        {"minecraft:heavy_core", 3},        {"minecraft:elytra", 3},
-        {"minecraft:dragon_egg", 3},
-    };
-    std::vector<std::pair<const void*, int>> items;
-    for (const Known& k : kKnown) {
-        if (const void* item = blocks::itemByName(k.name)) {
-            items.emplace_back(item, k.rarity);
-        }
-    }
-    if (items.size() < 4 || items.front().second != 0) {
-        return -1;
-    }
-    void* vt = nullptr;
-    if (!readPointer(items.front().first, vt) || vt == nullptr || !memory::inGameModule(vt)) {
-        return -1;
-    }
-    constexpr int kMaxSlot = 160;
-    for (int slot = 0; slot < kMaxSlot; ++slot) {
-        void* fn = nullptr;
-        if (!readPointer(static_cast<const std::byte*>(vt) + slot * 8, fn) || fn == nullptr
-            || !memory::inGameModule(fn)) {
-            break;
-        }
-        const auto* b = static_cast<const std::uint8_t*>(fn);
-        if (!memory::isReadable(b, 7) || b[0] != 0x8B || b[1] != 0x81 || b[6] != 0xC3) {
-            continue;
-        }
-        std::int32_t disp = 0;
-        std::memcpy(&disp, b + 2, 4);
-        if (disp <= 0 || disp > 0x2000) {
-            continue;
-        }
-        bool all = true;
-        for (const auto& [item, want] : items) {
-            std::int32_t v = -1;
-            if (!readInt32Guarded(static_cast<const std::byte*>(item) + disp, v) || v != want) {
-                all = false;
-                break;
-            }
-        }
-        if (all) {
-            log().info(L"ContainerUi: item rarity = vtable slot {} (+{:#x}), field +{:#x}", slot, slot * 8, disp);
-            return slot;
-        }
-    }
-    log().warn(L"ContainerUi: item rarity getter not found; sorting by rarity falls back to names");
-    return -1;
-}
-
-}
-
-int itemRarityOf(const void* item)
-{
-    if (item == nullptr) {
-        return -1;
-    }
-    int slot = g_raritySlot.load();
-    if (slot == -2) {
-        slot = findRaritySlot();
-        if (slot >= 0 || blocks::itemByName("minecraft:dirt") != nullptr) {
-            g_raritySlot.store(slot);
-        }
-    }
-    if (slot < 0) {
-        return -1;
-    }
-    void* vt = nullptr;
-    void* fn = nullptr;
-    if (!readPointer(item, vt) || vt == nullptr || !memory::inGameModule(vt)
-        || !readPointer(static_cast<const std::byte*>(vt) + slot * 8, fn) || fn == nullptr
-        || !memory::inGameModule(fn)) {
-        return -1;
-    }
-    bool faulted = false;
-    const int r = callRarityGuarded(reinterpret_cast<RarityFn>(fn), item, faulted);
-    if (faulted) {
-        noteFault(L"item rarity");
-        return -1;
-    }
-    return (r >= 0 && r <= 16) ? r : -1;
-}
-
-int rarityOf(const void* stack)
-{
-    const std::uintptr_t item = itemKey(stack);
-    return item != 0 ? itemRarityOf(reinterpret_cast<const void*>(item)) : -1;
 }
 
 int creativeCategoryOf(const void* stack)
@@ -1802,10 +1929,6 @@ int creativeCategoryOf(const void* stack)
     std::uint8_t value = 0xFF;
     if (item == 0 || !readByteGuarded(reinterpret_cast<const std::byte*>(item) + g_itemCategoryOffset, value)) {
         return -1;
-    }
-    static std::atomic<int> said{0};
-    if (said.fetch_add(1) < 12) {
-        log().info(L"ContainerUi: creative category {} = {}", toUtf16(itemName(stack)), value);
     }
     return value <= 6 ? value : -1;
 }
@@ -1827,14 +1950,8 @@ bool storageFill(const void* stack, int& current, int& capacity)
     if (out[0x0c] == std::byte{0}) {
         return false;
     }
-    std::int32_t head = 0;
-    std::memcpy(&head, out + 0x00, 4);
     std::memcpy(&current, out + 0x04, 4);
     std::memcpy(&capacity, out + 0x08, 4);
-    static std::atomic<int> said{0};
-    if (said.fetch_add(1) < 3) {
-        log().info(L"ContainerUi: storage info {} / {} / {}", head, current, capacity);
-    }
     return current >= 0;
 }
 
@@ -1923,6 +2040,22 @@ const void* userDataOf(const void* stack)
         return nullptr;
     }
     return root;
+}
+
+bool tagHashOf(const void* stack, std::uint64_t& out)
+{
+    out = 0;
+    if (isEmpty(stack)) {
+        return true;
+    }
+    if (g_stackUserDataOffset < 0) {
+        return false;
+    }
+    const void* const root = userDataOf(stack);
+    if (root == nullptr) {
+        return true;
+    }
+    return g_tagHash != nullptr && callTagHashGuarded(root, out);
 }
 
 std::string enchantKey(const void* stack)
@@ -2115,42 +2248,6 @@ bool nbtItemsOfTag(const void* root, std::vector<NbtItem>& out)
     return true;
 }
 
-int screenCollectionSize(const std::string& coll)
-{
-    if (!hasScreen() || g_screenGetItem == nullptr) {
-        return 0;
-    }
-    const std::string& name = intern(coll);
-    bool faulted = false;
-    const void* none = callScreenGetItemGuarded(reinterpret_cast<const void*>(g_screenGetItem), g_screen.ctrl,
-                                                &name, 1 << 20, faulted);
-    if (faulted || none == nullptr) {
-        return 0;
-    }
-    constexpr int kMaxScreenCollection = 4096;
-    int size = 0;
-    for (; size < kMaxScreenCollection; ++size) {
-        const void* one = callScreenGetItemGuarded(reinterpret_cast<const void*>(g_screenGetItem), g_screen.ctrl,
-                                                   &name, size, faulted);
-        if (faulted || one == nullptr || one == none) {
-            break;
-        }
-    }
-    return faulted ? 0 : size;
-}
-
-const void* screenStackAt(const std::string& coll, int index)
-{
-    if (!hasScreen() || g_screenGetItem == nullptr || index < 0) {
-        return nullptr;
-    }
-    const std::string& name = intern(coll);
-    bool faulted = false;
-    const void* one = callScreenGetItemGuarded(reinterpret_cast<const void*>(g_screenGetItem), g_screen.ctrl,
-                                               &name, index, faulted);
-    return faulted ? nullptr : one;
-}
-
 namespace {
 
 bool sendButton(std::uint32_t id, const std::string* coll, int index)
@@ -2214,11 +2311,6 @@ bool click(const std::string& coll, int index, Click kind)
     return sendButton(id, &intern(coll), index);
 }
 
-bool press(std::uint32_t id, const std::string& coll, int index)
-{
-    return sendButton(id, &intern(coll), index);
-}
-
 bool dropCursor(bool all)
 {
     static const std::string kEmpty;
@@ -2249,29 +2341,6 @@ bool lastHovered(std::string& coll, int& index)
 int slotPitchPixels()
 {
     return g_pitch;
-}
-
-bool slotScreenPos(const std::string& coll, int index, int& x, int& y)
-{
-    auto it = g_screen.positions.find(SlotKey{coll, index});
-    if (it != g_screen.positions.end()) {
-        x = it->second.x;
-        y = it->second.y;
-        return true;
-    }
-    if (g_pitch <= 0) {
-        return false;
-    }
-    for (const auto& [key, pos] : g_screen.positions) {
-        if (key.coll != coll) {
-            continue;
-        }
-        const int cols = 9;
-        x = pos.x + (index % cols - key.index % cols) * g_pitch;
-        y = pos.y + (index / cols - key.index / cols) * g_pitch;
-        return true;
-    }
-    return false;
 }
 
 }

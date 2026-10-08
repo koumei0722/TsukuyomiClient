@@ -11,7 +11,6 @@ inline constexpr std::size_t kNodeWords = 4;
 inline constexpr std::size_t kRecordBytes = 16;
 
 inline constexpr std::uintptr_t kTagString = 4;
-inline constexpr std::uintptr_t kTagArray = 6;
 inline constexpr std::uintptr_t kTagObject = 7;
 
 #pragma pack(push, 8)
@@ -59,6 +58,7 @@ public:
     std::size_t usedNodes() const { return m_nodeAt; }
     std::size_t usedWords() const { return m_wordAt; }
     std::size_t usedText() const { return m_textAt; }
+    std::size_t usedRecords() const { return m_recordAt; }
 
     std::size_t capacityNodes() const { return m_nodeCap; }
     std::size_t capacityWords() const { return m_wordCap; }

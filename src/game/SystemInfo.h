@@ -7,8 +7,6 @@ namespace tsukuyomi::sysinfo {
 
 bool cpuName(char* out, std::size_t cap);
 bool cpuThreads(int& out);
-bool parseBaseGhz(const char* brand, float& out);
-
 struct Memory {
     std::uint64_t privateBytes;
     std::uint64_t workingSet;
@@ -29,5 +27,6 @@ bool displayInfo(void* hwnd, Display& out);
 void* mainWindow();
 
 bool gpuUtilization(int& percent);
+void closeGpuUtilization();
 
 }

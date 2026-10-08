@@ -28,6 +28,7 @@ tsukuyomiCameraTrampolineEntry proc
     sub rsp, 20h
     mov rcx, rdi
     mov rdx, rbx
+    lea r8, [rbp + 8]
     call tsukuyomiCameraHook
     add rsp, 20h
 
@@ -102,7 +103,7 @@ tsukuyomiPlayerViewTrampolineEntry proc
     jmp qword ptr [tsukuyomiPlayerViewTrampoline]
 tsukuyomiPlayerViewTrampolineEntry endp
 
-extern tsukuyomiShouldBlockPacket : proc
+extern tsukuyomiOnPacketSend : proc
 extern tsukuyomiPacketSendTrampoline : qword
 
 tsukuyomiPacketSendTrampolineEntry proc
@@ -127,7 +128,7 @@ tsukuyomiPacketSendTrampolineEntry proc
 
     sub rsp, 20h
     mov rcx, rdx
-    call tsukuyomiShouldBlockPacket
+    call tsukuyomiOnPacketSend
     add rsp, 20h
 
     movdqu xmm0, [rsp + 00h]
@@ -148,14 +149,8 @@ tsukuyomiPacketSendTrampolineEntry proc
     mov rsp, rbp
     pop rbp
 
-    test al, al
-    jnz packetBlocked
-
     jmp qword ptr [tsukuyomiPacketSendTrampoline]
 
-packetBlocked:
-    xor eax, eax
-    ret
 tsukuyomiPacketSendTrampolineEntry endp
 
 end

@@ -1,5 +1,6 @@
 #include "game/ChatCommand.h"
 
+#include <optional>
 #include <Windows.h>
 
 #include <algorithm>
@@ -9,21 +10,36 @@
 #include <utility>
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Strings.h"
 #include "game/ChatCommandParse.h"
 #include "game/ClientChat.h"
+#include "game/CommandSyntax.h"
 
 namespace tsukuyomi::chatcommand {
 namespace {
 struct Command {
     std::vector<std::string> names;
     std::string usage;
-    Handler handler;
+    RawHandler handler;
     SuggestionFilter filter;
+    bool handlesNoArgs = false;
 };
 std::vector<Command> g_commands;
+std::mutex g_commandsMutex;
+
+std::optional<Command> findCommand(const std::string& name)
+{
+    std::lock_guard lock(g_commandsMutex);
+    const auto found = std::find_if(g_commands.begin(), g_commands.end(), [&](const Command& entry) {
+        return std::find(entry.names.begin(), entry.names.end(), name) != entry.names.end();
+    });
+    if (found == g_commands.end()) return std::nullopt;
+    return *found;
+}
 std::mutex g_queueMutex;
 std::vector<std::string> g_queue;
+std::vector<std::string> g_notices;
 bool g_overflowLogged = false;
 int g_loggedCommands = 0;
 int g_loggedReplies = 0;
@@ -31,6 +47,7 @@ std::atomic<bool> g_completingTk{false};
 std::mutex g_completionMutex;
 std::vector<std::string> g_completionWords;
 std::size_t g_completionArgument = 0;
+std::vector<std::string> g_shownSuggestions;
 
 bool copyGuarded(const void* args, char* dst, std::size_t length)
 {
@@ -62,9 +79,10 @@ bool lengthGuarded(const void* args, std::size_t& length)
     }
 }
 
-void reply(const std::string& line)
+void reply(const std::string& line, bool error = false)
 {
-    const std::string text = "\xC2\xA7" "b[Tsukuyomi]" "\xC2\xA7" "r " + line;
+    const std::string text = error ? "\xC2\xA7" "c" + line
+                                   : "\xC2\xA7" "b[Tsukuyomi]" "\xC2\xA7" "r " + line;
     if (!clientchat::printLocal(text) && g_loggedReplies < 200) {
         ++g_loggedReplies;
         log().info(L"ChatCommands: {}", toUtf16(text));
@@ -75,7 +93,16 @@ void reply(const std::string& line)
 void registerModuleCommand(std::vector<std::string> names, std::string usage, Handler handler,
                            SuggestionFilter filter)
 {
-    g_commands.push_back({std::move(names), std::move(usage), std::move(handler), std::move(filter)});
+    registerRawCommand(std::move(names), std::move(usage),
+        [handler = std::move(handler)](const auto& args, const auto&) { return handler(args); },
+        std::move(filter));
+}
+
+void registerRawCommand(std::vector<std::string> names, std::string usage, RawHandler handler,
+                        SuggestionFilter filter, bool handlesNoArgs)
+{
+    std::lock_guard lock(g_commandsMutex);
+    g_commands.push_back({std::move(names), std::move(usage), std::move(handler), std::move(filter), handlesNoArgs});
 }
 
 bool intercept(const void* args, std::int32_t* out)
@@ -85,6 +112,18 @@ bool intercept(const void* args, std::int32_t* out)
     if (!lengthGuarded(args, length)) return false;
     std::string text(length, '\0');
     if (!copyGuarded(args, text.data(), length) || !isTsukuyomiCommand(text)) return false;
+    {
+        std::string message;
+        const auto checked = commandsyntax::check(text, message);
+        if (checked == commandsyntax::Result::SyntaxError) {
+            clientchat::printLocal("\xC2\xA7" "c" + message);
+            if (out != nullptr) *out = 0;
+            return true;
+        }
+        if (checked == commandsyntax::Result::Unavailable)
+            notice::failOnce("ChatCommand.syntax", L"ChatCommand: /tk syntax checking is unavailable",
+                             "Syntax checking for /tk is unavailable");
+    }
     {
         std::lock_guard lock(g_queueMutex);
         if (g_queue.size() < 16) g_queue.push_back(std::move(text));
@@ -108,6 +147,10 @@ void noteCompletionText(const void* text)
              && copy.find(' ', copy.find_first_not_of(' ')) != std::string::npos;
         if (tk) copyText = std::move(copy);
     }
+    {
+        std::lock_guard lock(g_completionMutex);
+        g_shownSuggestions.clear();
+    }
     if (tk) {
         std::lock_guard lock(g_completionMutex);
         g_completionWords = words(copyText);
@@ -126,12 +169,13 @@ bool allowTsukuyomiSuggestion(const void* suggestion)
     if (!copyGuarded(suggestion, text.data(), length)) return true;
     if (text.starts_with("minecraft:")) return false;
     std::lock_guard lock(g_completionMutex);
-    if (g_completionWords.size() < 2) return true;
-    const auto found = std::find_if(g_commands.begin(), g_commands.end(), [](const Command& entry) {
-        return std::find(entry.names.begin(), entry.names.end(), g_completionWords[1]) != entry.names.end();
-    });
-    if (found == g_commands.end() || !found->filter) return true;
-    return found->filter(g_completionWords, g_completionArgument, text);
+    if (g_completionWords.size() >= 2) {
+        const std::optional<Command> found = findCommand(g_completionWords[1]);
+        if (found && found->filter && !found->filter(g_completionWords, g_completionArgument, text)) return false;
+    }
+    if (std::find(g_shownSuggestions.begin(), g_shownSuggestions.end(), text) != g_shownSuggestions.end()) return false;
+    g_shownSuggestions.push_back(std::move(text));
+    return true;
 }
 
 bool completingTsukuyomiArguments()
@@ -139,34 +183,53 @@ bool completingTsukuyomiArguments()
     return g_completingTk.load(std::memory_order_relaxed);
 }
 
+void postNotice(std::string line)
+{
+    std::lock_guard lock(g_queueMutex);
+    if (g_notices.size() < 8) g_notices.push_back(std::move(line));
+}
+
 void pump()
 {
     std::vector<std::string> queued;
+    std::vector<std::string> notices;
     {
         std::lock_guard lock(g_queueMutex);
         queued.swap(g_queue);
+        notices.swap(g_notices);
     }
+    for (const auto& line : notices) reply(line);
     for (const auto& command : queued) {
         if (g_loggedCommands < 200) {
             ++g_loggedCommands;
             log().info(L"ChatCommands: received {}", toUtf16(command));
         }
         const auto tokens = words(command);
-        if (tokens.size() == 1 || tokens[1] == "help") {
-            reply("/tk help");
-            for (std::size_t i = 0; i < g_commands.size() && i < 11; ++i) reply(g_commands[i].usage);
+        if (tokens.size() > 2 && tokens[1] == "help") {
+            reply("Usage: /tk [help]", true);
             continue;
         }
-        auto found = std::find_if(g_commands.begin(), g_commands.end(), [&](const Command& entry) {
-            return std::find(entry.names.begin(), entry.names.end(), tokens[1]) != entry.names.end();
-        });
-        if (found == g_commands.end()) {
-            reply("Unknown command: " + command + " (try /tk help)");
+        if (tokens.size() == 1 || tokens[1] == "help") {
+            reply("/tk help");
+            std::vector<std::string> usages;
+            {
+                std::lock_guard lock(g_commandsMutex);
+                for (std::size_t i = 0; i < g_commands.size() && i < 11; ++i) usages.push_back(g_commands[i].usage);
+            }
+            for (const auto& usage : usages) reply(usage);
+            continue;
+        }
+        const std::optional<Command> found = findCommand(tokens[1]);
+        if (!found) {
+            reply("Unknown command: " + command + " (try /tk help)", true);
             continue;
         }
         const std::vector<std::string> args(tokens.begin() + 2, tokens.end());
-        const auto lines = args.empty() ? std::vector<std::string>{found->usage} : found->handler(args);
-        for (std::size_t i = 0; i < lines.size() && i < 12; ++i) reply(lines[i]);
+        const auto rawTokens = rawWords(command);
+        const std::vector<std::string> rawArgs(rawTokens.begin() + 2, rawTokens.end());
+        const auto response = args.empty() && !found->handlesNoArgs ? Reply{{found->usage}, true}
+                                                                  : found->handler(args, rawArgs);
+        for (std::size_t i = 0; i < response.lines.size() && i < 24; ++i) reply(response.lines[i], response.error);
     }
 }
 }

@@ -1,6 +1,7 @@
 #include "config/WriteSwitches.h"
 
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
 
@@ -144,11 +145,6 @@ bool blocked(std::string_view feature)
     return !g_off.empty() && blockedBy(feature, g_off);
 }
 
-std::vector<std::string> disabledNames()
-{
-    return g_off;
-}
-
 void noteUnknown(std::string_view name)
 {
     const std::string key(name);
@@ -169,8 +165,10 @@ void finishStartup()
 {
     const std::filesystem::path path = paths::hooksFile();
     if (g_fileBroken) {
-        log().warn(L"hooks.json could not be read; every hook and patch stays on (fix or delete {})",
-                   path.wstring());
+        notice::failOnce("WriteSwitches.unreadable",
+                         L"hooks.json could not be read; every hook and patch stays on (fix or delete "
+                             + path.wstring() + L")",
+                         "hooks.json could not be read: every hook and patch is on");
         return;
     }
     std::vector<std::pair<std::string, bool>> known;
@@ -208,16 +206,12 @@ void finishStartup()
         log().info(L"hooks.json: every hook and patch is on");
     }
     for (const std::string& name : g_invalid) {
-        log().warn(L"hooks.json: \"{}\" is not true/false; it stays on (write true or false)", toUtf16(name));
+        log().warn(L"hooks.json: \"{}\" is not true/false; it is reset to true", toUtf16(name));
     }
-    if (g_fileExisted && !missing && retired == 0) {
+    if (g_fileExisted && !missing && retired == 0 && g_invalid.empty()) {
         return;
     }
-    if (!g_invalid.empty()) {
-        log().warn(L"hooks.json is not updated with the missing names until the values above are fixed");
-        return;
-    }
-    const std::string text = render(known, {}, {});
+    const std::string text = render(known);
     const HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
                                     nullptr);
     if (file == INVALID_HANDLE_VALUE) {
@@ -228,11 +222,14 @@ void finishStartup()
     const bool ok = WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &wrote, nullptr) != 0
                     && wrote == text.size();
     CloseHandle(file);
+    if (!ok) {
+        log().warn(L"hooks.json could not be fully written ({})", path.wstring());
+        return;
+    }
     log().info(L"hooks.json {} ({} names)", g_fileExisted ? L"was updated" : L"was created", table().size());
     if (retired != 0) {
         log().info(L"hooks.json: dropped {} name(s) that are no longer used", retired);
     }
-    (void)ok;
 }
 
 }

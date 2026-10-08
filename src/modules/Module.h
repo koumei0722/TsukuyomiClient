@@ -1,6 +1,10 @@
 #pragma once
 
+#include <atomic>
 #include <nlohmann/json.hpp>
+
+#include <utility>
+#include <vector>
 
 #include "input/Hotkey.h"
 #include "ui/Menu.h"
@@ -18,9 +22,15 @@ public:
 
     virtual bool available() const { return true; }
 
-    bool enabled() const { return m_enabled && !m_writeBlocked; }
+    bool enabled() const
+    {
+        return m_enabled.load(std::memory_order_acquire) && !m_writeBlocked
+               && (m_parent == nullptr || m_parent->enabled());
+    }
+    bool ownEnabled() const { return m_enabled.load(std::memory_order_acquire); }
     void setEnabled(bool value);
-    void toggle() { setEnabled(!m_enabled); }
+    void toggle() { setEnabled(!m_enabled.load(std::memory_order_acquire)); }
+    void toggleByKey();
 
     virtual bool writeBlocked() const;
     virtual void applyWriteBlock();
@@ -39,6 +49,9 @@ public:
 
     const Hotkey& toggleKey() const { return m_toggleKey; }
 
+    void setParent(Module* parent) { m_parent = parent; }
+    void parentEnabledChanged();
+
 protected:
     Module() = default;
 
@@ -48,14 +61,13 @@ protected:
 
     virtual bool persistEnabled() const { return true; }
 
-    virtual bool handlesToggleKey() const { return false; }
-
     MenuItem enabledItem();
     MenuItem toggleKeyItem();
 
 private:
-    bool m_enabled = false;
+    std::atomic<bool> m_enabled{false};
     bool m_writeBlocked = false;
+    Module* m_parent = nullptr;
 
     Hotkey m_toggleKey;
 };

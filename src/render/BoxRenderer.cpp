@@ -1,8 +1,7 @@
 #include "render/BoxRenderer.h"
-#include "render/WorldMesh.h"
 
 #include "core/Logger.h"
-#include "core/Paths.h"
+#include "core/Notice.h"
 #include "memory/Memory.h"
 
 #include <Windows.h>
@@ -10,7 +9,6 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
-#include <filesystem>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -24,8 +22,9 @@ constexpr std::ptrdiff_t kCameraX = 0x40;
 constexpr std::ptrdiff_t kCameraY = 0x44;
 constexpr std::ptrdiff_t kCameraZ = 0x48;
 
-constexpr std::ptrdiff_t kSearchFrom = -0x1000;
-constexpr std::ptrdiff_t kSearchTo = 0x400;
+constexpr std::ptrdiff_t kSourceProj = 0x9c;
+constexpr std::ptrdiff_t kSourceView = kSourceProj + 0x40;
+constexpr unsigned long long kCameraBadNoticeMs = 10000;
 
 bool finiteFloat(float v)
 {
@@ -44,7 +43,7 @@ bool looksLikeProjection(const float* m)
             return false;
         }
     }
-    if (!(m[0] > 0.05F && m[0] < 10.0F) || !(m[5] > 0.05F && m[5] < 10.0F)) {
+    if (!(m[0] > 0.05F && m[0] < 200.0F) || !(m[5] > 0.05F && m[5] < 200.0F)) {
         return false;
     }
     const int zeros[] = {1, 2, 3, 4, 6, 7, 8, 9, 12, 13, 15};
@@ -91,9 +90,6 @@ bool looksLikeView(const float* m)
     return true;
 }
 
-std::atomic<std::ptrdiff_t> g_projAt{0};
-std::atomic<bool> g_projFound{false};
-
 struct Snapshot {
     float eye[3] = {0.0F, 0.0F, 0.0F};
     float vp[16] = {};
@@ -101,11 +97,8 @@ struct Snapshot {
 };
 std::mutex g_camLock;
 Snapshot g_cam;
-constexpr std::ptrdiff_t kPerspectiveStride = 0x120;
-std::atomic<int> g_perspective{0};
-std::atomic<unsigned long long> g_perspectiveAt{0};
-constexpr unsigned long long kPerspectiveStaleMs = 1000;
-std::atomic<unsigned> g_perspectiveViewMissing{0};
+std::atomic<unsigned long long> g_cameraBadSince{0};
+std::atomic<std::uintptr_t> g_cameraBadSource{0};
 
 std::mutex g_boxLock;
 std::shared_ptr<const std::vector<blocks::DiffBox>> g_boxes;
@@ -142,89 +135,54 @@ void multiply(const float* a, const float* b, float* out)
 
 }
 
-void noteCamera(void* cameraBase)
+void noteCamera(void* cameraBase, void* source)
 {
-    if (cameraBase == nullptr) {
+    if (cameraBase == nullptr || source == nullptr) {
         return;
     }
     auto* const base = static_cast<std::byte*>(cameraBase);
 
-    std::ptrdiff_t at = g_projAt.load(std::memory_order_relaxed);
-    float proj[16];
-    float view[16];
-    bool ok = false;
-    std::byte savedMatrices[0x80];
-    if (g_projFound.load(std::memory_order_acquire)
-        && memory::copyGuarded(base + at, savedMatrices, sizeof(savedMatrices))) {
-        std::memcpy(proj, savedMatrices, sizeof(proj));
-        std::memcpy(view, savedMatrices + 0x40, sizeof(view));
+    float proj[16]{};
+    float view[16]{};
+    std::byte matrices[0x80];
+    static_assert(kSourceView == kSourceProj + static_cast<std::ptrdiff_t>(sizeof(proj)));
+    bool ok = memory::copyGuarded(static_cast<std::byte*>(source) + kSourceProj, matrices, sizeof(matrices));
+    if (ok) {
+        std::memcpy(proj, matrices, sizeof(proj));
+        std::memcpy(view, matrices + sizeof(proj), sizeof(view));
         ok = looksLikeProjection(proj) && looksLikeView(view);
-    }
-    if (!ok) {
-        g_projFound.store(false, std::memory_order_release);
-        constexpr std::ptrdiff_t kStep = 0x200;
-        for (std::ptrdiff_t block = kSearchFrom; block < kSearchTo && !ok; block += kStep) {
-            const auto span = static_cast<std::size_t>(kStep + 0x80);
-            if (!memory::isReadable(base + block, span)) {
-                continue;
-            }
-            for (std::ptrdiff_t off = block; off < block + kStep; off += 4) {
-                if (off + 0x80 > kSearchTo) {
-                    break;
-                }
-                std::memcpy(proj, base + off, sizeof(proj));
-                if (!looksLikeProjection(proj)) {
-                    continue;
-                }
-                std::memcpy(view, base + off + 0x40, sizeof(view));
-                if (!looksLikeView(view)) {
-                    continue;
-                }
-                at = off;
-                ok = true;
-                g_projAt.store(off, std::memory_order_relaxed);
-                g_projFound.store(true, std::memory_order_release);
-                break;
-            }
-        }
-        if (!ok) {
-            static std::atomic<unsigned> told{0};
-            if (told.fetch_add(1, std::memory_order_relaxed) < 3) {
-                log().warn(L"BoxRenderer: the projection matrix was not found (camera {:#x})",
-                           reinterpret_cast<std::uintptr_t>(base));
-            }
-        }
-    }
-    if (!ok) {
-        std::lock_guard<std::mutex> guard(g_camLock);
-        g_cam.valid = false;
-        return;
     }
 
     float eye[3];
     static_assert(kCameraY == kCameraX + sizeof(float) && kCameraZ == kCameraY + sizeof(float));
-    if (!memory::copyGuarded(base + kCameraX, eye, sizeof(eye))
-        || !finiteFloat(eye[0]) || !finiteFloat(eye[1]) || !finiteFloat(eye[2])) {
+    if (ok
+        && (!memory::copyGuarded(base + kCameraX, eye, sizeof(eye)) || !finiteFloat(eye[0]) || !finiteFloat(eye[1])
+            || !finiteFloat(eye[2]))) {
+        ok = false;
+    }
+
+    if (!ok) {
+        const unsigned long long now = GetTickCount64();
+        const unsigned long long since = g_cameraBadSince.load(std::memory_order_relaxed);
+        const auto sourceAt = reinterpret_cast<std::uintptr_t>(source);
+        const bool sameSource = g_cameraBadSource.exchange(sourceAt, std::memory_order_relaxed) == sourceAt;
+        if (since == 0 || !sameSource) {
+            g_cameraBadSince.store(now, std::memory_order_relaxed);
+        } else if (now - since >= kCameraBadNoticeMs) {
+            notice::failOnce("BoxRenderer.camera",
+                             std::format(L"BoxRenderer: the camera matrices could not be read for {} ms (camera {:#x}, "
+                                         L"source {:#x} +{:#x}); boxes are not drawn",
+                                         now - since, reinterpret_cast<std::uintptr_t>(base),
+                                         reinterpret_cast<std::uintptr_t>(source),
+                                         static_cast<std::uintptr_t>(kSourceProj)),
+                             "Boxes are not drawn: the camera could not be read");
+        }
         std::lock_guard<std::mutex> guard(g_camLock);
         g_cam.valid = false;
         return;
     }
+    g_cameraBadSince.store(0, std::memory_order_relaxed);
 
-    const unsigned long long perspectiveAt = g_perspectiveAt.load(std::memory_order_acquire);
-    const int perspective = g_perspective.load(std::memory_order_relaxed);
-    if (perspectiveAt != 0 && GetTickCount64() - perspectiveAt < kPerspectiveStaleMs
-        && (perspective == 1 || perspective == 2)) {
-        float other[16];
-        if (memory::copyGuarded(base + at + 0x40 + perspective * kPerspectiveStride, other, sizeof(other))
-            && looksLikeView(other)) {
-            std::memcpy(view, other, sizeof(view));
-        } else if (g_perspectiveViewMissing.fetch_add(1, std::memory_order_relaxed) == 0) {
-            log().warn(L"BoxRenderer: the view matrix for perspective {} was not found (camera {:#x}, +{:#x}); "
-                       L"using the first person one",
-                       perspective, reinterpret_cast<std::uintptr_t>(base),
-                       static_cast<std::uintptr_t>(at + 0x40 + perspective * kPerspectiveStride));
-        }
-    }
     Snapshot snap;
     snap.eye[0] = eye[0];
     snap.eye[1] = eye[1];
@@ -266,12 +224,6 @@ bool cameraSnapshot(float eye[3], float vp[16])
     return true;
 }
 
-void noteViewPerspective(int perspective)
-{
-    g_perspective.store(perspective, std::memory_order_relaxed);
-    g_perspectiveAt.store(GetTickCount64(), std::memory_order_release);
-}
-
 std::shared_ptr<const std::vector<blocks::DiffBox>> boxSnapshot()
 {
     std::lock_guard<std::mutex> guard(g_boxLock);
@@ -296,15 +248,6 @@ constexpr Rgb kColors[4] = {
     {1.00F, 0.25F, 0.25F},
     {1.00F, 0.60F, 0.10F},
     {1.00F, 0.40F, 0.80F},
-};
-
-constexpr int kFaces[6][4] = {
-    {0, 1, 3, 2},
-    {4, 6, 7, 5},
-    {0, 4, 5, 1},
-    {2, 3, 7, 6},
-    {0, 2, 6, 4},
-    {1, 5, 7, 3},
 };
 
 }

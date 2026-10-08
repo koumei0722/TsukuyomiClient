@@ -36,12 +36,10 @@ protected:
     void onUpdate() override;
     void onEnabledChanged(bool enabled) override;
 
-    bool persistEnabled() const override { return true; }
-
 private:
     Zoom() = default;
 
-    static constexpr std::ptrdiff_t kFovOffsets[] = {0x50, 0x170};
+    static constexpr std::ptrdiff_t kFovOffset = 0x50;
 
     static constexpr float kFovMin = 0.1f;
     static constexpr float kFovMax = 3.2f;
@@ -59,9 +57,11 @@ private:
     bool m_baseFovReady = false;
 
     std::atomic<bool> m_restoreFov{false};
+    std::atomic<bool> m_applyFov{false};
+    std::atomic<bool> m_restoredForUnload{false};
 
     static constexpr float kMinFactor = 1.25f;
-    static constexpr float kMaxFactor = 10.0f;
+    static constexpr float kMaxFactor = 30.0f;
     static constexpr float kDefaultFactor = 4.0f;
 
     static constexpr float kFactorStep = 0.5f;
@@ -69,6 +69,8 @@ private:
     Hotkey m_zoomKey;
 
     float m_factor = kDefaultFactor;
+
+    std::atomic<float> m_activeFactor{kDefaultFactor};
 
     std::atomic<bool> m_zooming{false};
 

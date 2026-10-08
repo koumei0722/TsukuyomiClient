@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "game/HolderTable.h"
+#include "game/ChatCommand.h"
 #include "game/ItemStackOps.h"
 #include "modules/Module.h"
 
@@ -24,6 +25,7 @@ public:
     bool available() const override;
 
     void onScansReady() override;
+    MenuItem buildMenu() override;
     void loadConfig(const nlohmann::json& section) override;
     void saveConfig(nlohmann::json& section) const override;
 
@@ -37,8 +39,6 @@ public:
 
 protected:
     void onEnabledChanged(bool enabled) override;
-
-    bool persistEnabled() const override { return true; }
 
 private:
     HandRestock() = default;
@@ -83,7 +83,7 @@ private:
         Inventory server;
         bool haveServer = false;
     };
-    bool resolveOwn(Own& out, bool wantServer, bool forOthers = false) const;
+    bool resolveOwn(Own& out, bool wantServer) const;
 
     bool resolveClient(Inventory& out) const;
 
@@ -109,7 +109,11 @@ private:
 
     int findSource(const Inventory& inventory, const SlotView& wanted, int keepSlot) const;
 
-    int applyRefill(Spot spot, int destSlot, int sourceSlot);
+    int applyRefill(Spot spot, int destSlot, int sourceSlot, bool durabilitySwap = false);
+
+    void checkDurability(const Inventory& inventory);
+    bool durabilityOf(const std::byte* stack, int& max, int& damage) const;
+    int findDurabilitySource(const Inventory& inventory, void* item, int keepSlot, int threshold) const;
 
     bool predictRefill(const Inventory& inventory, Spot spot, int destSlot, int sourceSlot);
 
@@ -182,17 +186,17 @@ private:
         void* container = nullptr;
         int slot = -1;
         void* item = nullptr;
-        void* block = nullptr;
         std::uint16_t aux = 0;
         std::uint8_t count = 0;
 
         int total = 0;
         std::string name;
     };
+    std::atomic<bool> m_resetRequested{false};
     HandState m_last[kSpotCount];
     mutable std::mutex m_excludedMutex;
     std::set<std::string> m_excluded;
-    std::vector<std::string> restockCommand(const std::vector<std::string>& args);
+    chatcommand::Reply restockCommand(const std::vector<std::string>& args);
     std::string mainHandItemName() const;
     Clock::time_point m_nextRefillAt[kSpotCount]{};
 
@@ -205,7 +209,6 @@ private:
         int destSlot = -1;
         void* container = nullptr;
         void* item = nullptr;
-        void* block = nullptr;
         std::uint16_t aux = 0;
 
         int totalBefore = 0;
@@ -235,6 +238,11 @@ private:
         std::uint32_t contentSerialAtSend = 0;
         void* predItem = nullptr;
         std::uint8_t predCount = 0;
+        bool durabilitySwap = false;
+        void* predSourceItem = nullptr;
+        std::uint8_t predSourceCount = 0;
+        std::int32_t predDestNet = 0;
+        std::int32_t predSourceNet = 0;
     };
     Outstanding m_outstanding;
 
@@ -248,6 +256,20 @@ private:
     static constexpr int kContentSettleMs = 1500;
     static constexpr int kResultFailedToValidateSrcSlot = 49;
     static constexpr int kResultFailedToValidateDstSlot = 50;
+
+    static constexpr int kDefaultDurabilityThreshold = 10;
+    static constexpr int kMinDurabilityThreshold = 1;
+    static constexpr int kMaxDurabilityThreshold = 100;
+    std::atomic<bool> m_swapLowDurability{false};
+    std::atomic<int> m_durabilityThreshold{kDefaultDurabilityThreshold};
+    std::int32_t m_maxDamageSlot = 0;
+    void* m_damageValue = nullptr;
+    static constexpr int kDurabilityCooldownMs = 500;
+    static constexpr int kDurabilityRefusedMs = 2000;
+    Clock::time_point m_nextDurabilityAt[kSpotCount]{};
+    void* m_noReplacementItem[kSpotCount]{};
+    bool m_warnedNoSwapAction = false;
+    bool m_warnedNoDurability = false;
 
     bool m_warnedNoRequest = false;
     bool m_warnedNoPredict = false;

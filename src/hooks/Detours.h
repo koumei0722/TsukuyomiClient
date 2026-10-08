@@ -9,8 +9,6 @@ namespace tsukuyomi::hooks {
 
 void installAll();
 
-void refreshHookGroups();
-
 void freezeHookGroups();
 
 bool installLate();
@@ -22,6 +20,8 @@ bool callSendComplexTx(void* player, void** transaction);
 bool attackHooksInstalled();
 bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra,
                     bool simTick);
+bool callBuildBlockWithoutSwing(void* gameMode, void* blockPos, unsigned char face,
+                                unsigned char extra, bool simTick);
 
 bool callGameModeContinueDestroyBlock(void* gameMode, const void* pos, std::uint8_t face,
                                       const void* playerPos, bool* out);
@@ -47,13 +47,14 @@ void* gameClientInstance();
 
 bool callOpenHowToPlayScreen();
 
-bool popTopScreen();
-
 bool offstackScreenHeld();
 bool tickOffstackScreen();
 void releaseOffstackScreen(const wchar_t* why);
 
 void* callGameAllocate(size_t size);
+
+bool translate(void* out, const char* key);
+bool translateWith(void* out, const void* key, const void* params);
 
 void* callSettingsFindComponent(void* registry, const void* idView);
 
@@ -77,14 +78,11 @@ std::uint64_t requestChunkRebuilds(const std::vector<std::array<std::int32_t, 3>
 void clearChunkRebuilds();
 bool chunkHasGeometryNow(std::int32_t cx, std::int32_t cy, std::int32_t cz);
 bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
-                            std::uint32_t& tries, std::uint64_t* startSeq = nullptr,
-                            std::uint32_t* stacked = nullptr);
+                            std::uint32_t& tries, std::uint64_t* startSeq = nullptr);
 std::uint64_t nextBuildSeq();
 void clearChunkBoxTries();
 
 void armStorageHooks(void* subChunk, int baseX, int baseY, int baseZ);
-
-void armStorageFromSubChunk(void* subChunk);
 
 void armPendingStoragePreds();
 

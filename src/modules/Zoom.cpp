@@ -2,21 +2,13 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
-#include "core/Paths.h"
 #include "input/Foreground.h"
 #include "input/GameButtons.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 
-#include <TlHelp32.h>
-
 #include <algorithm>
 #include <cmath>
-#include <filesystem>
-#include <system_error>
-#include <cstring>
-#include <format>
-#include <string>
 
 namespace tsukuyomi {
 
@@ -38,10 +30,8 @@ void Zoom::onScansReady()
 
     if (std::byte* const base = Scanner::instance().address(Target::CameraUpdate);
         base != nullptr) {
-        const auto* const b = reinterpret_cast<const unsigned char*>(base + kWriteFov);
-        if (memory::isReadable(base + kWriteFov, kWriteFovSize) && b[0] == 0xF3 && b[1] == 0x0F
-            && b[2] == 0x11) {
-            m_patchFov = makeNopPatch(base + kWriteFov, kWriteFovSize, "Zoom.Fov");
+        if (movssStoreLength(base + kWriteFov) == kWriteFovSize) {
+            m_patchFov = makeSkipPatch(base + kWriteFov, kWriteFovSize, "Zoom.Fov");
         } else {
             log().warn(L"Zoom: the fov write is not a movss, so it is left alone (zoom may not "
                        L"work)");
@@ -50,10 +40,8 @@ void Zoom::onScansReady()
 
     if (std::byte* const base = Scanner::instance().address(Target::CameraFovStore);
         base != nullptr) {
-        const auto* const b = reinterpret_cast<const unsigned char*>(base + kWriteFov2);
-        if (memory::isReadable(base + kWriteFov2, kWriteFov2Size) && b[0] == 0xF3 && b[1] == 0x41
-            && b[2] == 0x0F && b[3] == 0x11) {
-            m_patchFov2 = makeNopPatch(base + kWriteFov2, kWriteFov2Size, "Zoom.Fov");
+        if (movssStoreLength(base + kWriteFov2) == kWriteFov2Size) {
+            m_patchFov2 = makeSkipPatch(base + kWriteFov2, kWriteFov2Size, "Zoom.Fov");
         } else {
             log().warn(L"Zoom: the second fov write is not a movss, so it is left alone");
         }
@@ -75,6 +63,9 @@ void Zoom::onUpdate()
 {
     const bool down = !m_zoomKey.empty() && enabled() && available() && m_zoomKey.isDown()
                       && input::isInGameplay();
+    if (down && !m_zooming.load(std::memory_order_acquire)) {
+        m_activeFactor.store(std::clamp(m_factor, kMinFactor, kMaxFactor), std::memory_order_release);
+    }
     const bool was = m_zooming.exchange(down, std::memory_order_acq_rel);
     const auto& buttons = GameButtons::instance();
     const std::uint64_t left = buttons.buttonPressSeq(m_wheelLeftButton);
@@ -85,21 +76,21 @@ void Zoom::onUpdate()
     m_wheelRightSeen = right;
     if (down != was) {
         if (down) {
-            m_baseFovReady = false;
-            m_patchFov.apply();
-            m_patchFov2.apply();
+            m_applyFov.store(true, std::memory_order_release);
         } else {
             m_restoreFov.store(true, std::memory_order_release);
         }
-        log().info(L"Zoom: {} (factor {:.2f})", down ? L"started" : L"stopped", m_factor);
+        log().info(L"Zoom: {} (factor {:.2f})", down ? L"started" : L"stopped",
+                   m_activeFactor.load(std::memory_order_acquire));
     }
 
     if (wheel != 0) {
-        const float before = m_factor;
-        m_factor = std::clamp(m_factor + kFactorStep * static_cast<float>(wheel), kMinFactor,
-                              kMaxFactor);
-        if (m_factor != before) {
-            log().info(L"Zoom: factor {:.2f} -> {:.2f}", before, m_factor);
+        const float before = m_activeFactor.load(std::memory_order_acquire);
+        const float after = std::clamp(before + kFactorStep * static_cast<float>(wheel), kMinFactor,
+                                       kMaxFactor);
+        if (after != before) {
+            m_activeFactor.store(after, std::memory_order_release);
+            log().info(L"Zoom: factor {:.2f} -> {:.2f}", before, after);
         }
     }
 }
@@ -107,11 +98,14 @@ void Zoom::onUpdate()
 void Zoom::onEnabledChanged(bool enabled)
 {
     if (!enabled) {
-        m_zooming.store(false, std::memory_order_release);
+        if (m_zooming.exchange(false, std::memory_order_acq_rel)) {
+            m_restoreFov.store(true, std::memory_order_release);
+            log().info(L"Zoom: stopped (module switched off)");
+        }
     }
 }
 
-static bool looksLikeCamera(const std::byte* at, std::ptrdiff_t fovOffset)
+static bool looksLikeCamera(const std::byte* at, std::ptrdiff_t fovOffset, bool anyFov)
 {
     float v[4]{};
     if (!memory::copyGuarded(at + fovOffset - 4, v, sizeof(v))) {
@@ -122,7 +116,7 @@ static bool looksLikeCamera(const std::byte* at, std::ptrdiff_t fovOffset)
     const float nearPlane = v[2];
     const float farPlane = v[3];
     return std::isfinite(aspect) && aspect > 0.2f && aspect < 8.0f
-           && std::isfinite(fov) && fov > 0.05f && fov < 3.2f
+           && std::isfinite(fov) && fov > (anyFov ? 0.0f : 0.05f) && fov < 3.2f
            && std::isfinite(nearPlane) && nearPlane > 0.0f && nearPlane < 10.0f
            && std::isfinite(farPlane) && farPlane > 16.0f && farPlane < 1.0e7f;
 }
@@ -135,18 +129,26 @@ void Zoom::onCameraWrite(void* cameraBase, void* source)
 
     auto* const base = static_cast<std::byte*>(cameraBase);
 
+    const bool applyWanted = m_applyFov.exchange(false, std::memory_order_acq_rel);
     if (m_restoreFov.exchange(false, std::memory_order_acq_rel)) {
         m_baseFovReady = false;
-        m_patchFov.restore();
-        m_patchFov2.restore();
+        Patch* const patches[] = {&m_patchFov, &m_patchFov2};
+        Patch::setAll(patches, false);
+        m_restoredForUnload.store(true, std::memory_order_release);
         return;
+    }
+    if (applyWanted && zooming()) {
+        m_baseFovReady = false;
+        Patch* const patches[] = {&m_patchFov, &m_patchFov2};
+        Patch::setAll(patches, true);
     }
 
     if (!zooming()) {
         return;
     }
 
-    const float factor = std::clamp(m_factor, kMinFactor, kMaxFactor);
+    const float factor =
+        std::clamp(m_activeFactor.load(std::memory_order_acquire), kMinFactor, kMaxFactor);
     int wrote = 0;
     std::byte* const targets[] = {static_cast<std::byte*>(source), base};
     bool captured = false;
@@ -155,31 +157,30 @@ void Zoom::onCameraWrite(void* cameraBase, void* source)
         if (target == nullptr) {
             continue;
         }
-        if (!looksLikeCamera(target, kFovOffsets[0])) {
+        const bool haveBase = m_baseFovReady && std::isfinite(m_baseFov[slot])
+                              && m_baseFov[slot] >= kFovMin && m_baseFov[slot] <= kFovMax;
+        if (!looksLikeCamera(target, kFovOffset, haveBase)) {
             continue;
         }
         float current = 0.0f;
-        if (!memory::copyGuarded(target + kFovOffsets[0], &current, sizeof(current))) {
+        if (!memory::copyGuarded(target + kFovOffset, &current, sizeof(current))) {
             continue;
         }
-        if (!std::isfinite(current) || current < kFovMin || current > kFovMax) {
+        if (!haveBase
+            && (!std::isfinite(current) || current < kFovMin || current > kFovMax)) {
             continue;
         }
         if (!m_baseFovReady) {
             m_baseFov[slot] = current;
             captured = true;
         }
-        const float original =
-            (std::isfinite(m_baseFov[slot]) && m_baseFov[slot] >= kFovMin
-             && m_baseFov[slot] <= kFovMax)
-                ? m_baseFov[slot]
-                : current;
+        const float original = haveBase ? m_baseFov[slot] : current;
 
         const float shrunk = 2.0f * std::atan(std::tan(original * 0.5f) / factor);
         if (!std::isfinite(shrunk) || shrunk <= 0.0f) {
             continue;
         }
-        if (!memory::writeGuarded(target + kFovOffsets[0], &shrunk, sizeof(shrunk))) {
+        if (!memory::writeGuarded(target + kFovOffset, &shrunk, sizeof(shrunk))) {
             continue;
         }
         ++wrote;
@@ -192,7 +193,6 @@ void Zoom::onCameraWrite(void* cameraBase, void* source)
 MenuItem Zoom::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::keybind(
@@ -202,6 +202,7 @@ MenuItem Zoom::buildMenu()
             log().info(L"Zoom: zoom key set to {}", m_zoomKey.name());
         },
         {}));
+    bindPad(children.back(), m_zoomKey);
     children.push_back(menu::number(
         L"Factor", [this] { return m_factor; },
         [this](float value) { m_factor = std::clamp(value, kMinFactor, kMaxFactor); }, false,
@@ -242,6 +243,15 @@ void Zoom::shutdown()
 {
     m_zooming.store(false, std::memory_order_release);
 
+    m_applyFov.store(false, std::memory_order_release);
+    if (m_patchFov.applied() || m_patchFov2.applied()) {
+        m_restoredForUnload.store(false, std::memory_order_release);
+        m_restoreFov.store(true, std::memory_order_release);
+        for (int waited = 0; waited < 500 && !m_restoredForUnload.load(std::memory_order_acquire); ++waited) {
+            Sleep(1);
+        }
+    }
+    m_restoreFov.store(false, std::memory_order_release);
     m_patchFov.restore();
     m_patchFov2.restore();
 }

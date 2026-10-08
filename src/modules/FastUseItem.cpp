@@ -74,7 +74,6 @@ bool FastUseItem::available() const
 MenuItem FastUseItem::buildMenu()
 {
     std::vector<MenuItem> children;
-    children.push_back(menu::back());
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::toggle(L"Sneak only", [this] { return m_sneakOnly; },
@@ -113,8 +112,6 @@ void FastUseItem::saveConfig(nlohmann::json& section) const
     Module::saveConfig(section);
     section["sneakOnly"] = m_sneakOnly;
 
-    section.erase("uses");
-    section.erase("intervalMs");
 }
 
 bool FastUseItem::shouldRepeat(void* gameMode) const

@@ -13,8 +13,6 @@ struct Slot {
     int count = 0;
 };
 
-inline constexpr int kShulkerSlots = 27;
-
 int uniformFull(const std::vector<Slot>& items, int slots,
                 const std::function<int(const std::string& name)>& maxOf);
 

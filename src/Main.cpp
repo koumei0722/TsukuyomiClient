@@ -11,7 +11,7 @@ namespace {
 DWORD WINAPI bootstrap(LPVOID parameter)
 {
     HMODULE self = static_cast<HMODULE>(parameter);
-    tsukuyomi::Client::instance().run(self);
+    tsukuyomi::Client::instance().run();
 
     tsukuyomi::oreui::removeEarlyFileHook();
 

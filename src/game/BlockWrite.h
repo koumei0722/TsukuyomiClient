@@ -21,9 +21,6 @@ std::uint64_t regionGeneration();
 
 bool regionIsAlive(void* region);
 
-inline constexpr std::size_t kFindWhyCount = 12;
-void findSubChunkStats(std::size_t out[kFindWhyCount]);
-
 bool lastFindWasMissingChunk();
 bool lastFindWasOutsideWorld();
 
@@ -42,8 +39,6 @@ const void* readWorldAt(int x, int y, int z);
 bool readWorldExtraAt(int x, int y, int z, const void*& out);
 
 std::size_t knownSubChunkCount();
-
-void* subChunkAt(int baseX, int baseY, int baseZ);
 
 void noteSubChunkAt(int baseX, int baseY, int baseZ, void* subChunk);
 

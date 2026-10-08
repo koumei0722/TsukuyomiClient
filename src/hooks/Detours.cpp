@@ -3,9 +3,8 @@
 #include "config/WriteSwitches.h"
 
 #include "core/FreezeWatch.h"
-#include "core/DiagFlags.h"
 #include "core/Logger.h"
-#include "core/Perf.h"
+#include "core/Notice.h"
 #include "game/BlockRegistry.h"
 #include "game/BlockWrite.h"
 #include "game/ChatCommand.h"
@@ -15,17 +14,16 @@
 #include "game/FmodStats.h"
 #include "game/TradeUi.h"
 #include "game/GameData.h"
-#include "game/GameVersion.h"
 #include "game/UiSound.h"
 #include "game/InventoryScreen.h"
 #include "game/ItemStackRequest.h"
 #include "game/UiProbe.h"
 #include "input/GameButtons.h"
 #include "hooks/HookManager.h"
-#include "hooks/HookCount.h"
 #include "input/GameInput.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
+#include "modules/ModuleManager.h"
 #include "modules/DebugScreen.h"
 #include "modules/DebugKeys.h"
 #include "game/GameModeState.h"
@@ -39,19 +37,24 @@
 #include "modules/FastUseItem.h"
 #include "modules/FlySpeed.h"
 #include "modules/HandRestock.h"
-#include "modules/InventoryHUD.h"
+#include "modules/OffhandSlot.h"
+#include "modules/PlayerList.h"
+#include "modules/DeathLogger.h"
+#include "modules/AppleSkin.h"
+#include "modules/EffectTimer.h"
+#include "modules/ArmorHUD.h"
 #include "modules/OffhandSwap.h"
 #include "modules/FastInventory.h"
 #include "modules/ItemScroller.h"
 #include "modules/FreeCamera.h"
 #include "modules/Fullbright.h"
 #include "modules/NoRender.h"
+#include "modules/ToggleSneakSprint.h"
 #include "modules/Zoom.h"
 #include "modules/Scaffold.h"
 #include "modules/Schematica.h"
 #include "modules/ShulkerPreview.h"
 #include "render/BoxRenderer.h"
-#include "render/FrameTrace.h"
 #include "render/Overlay.h"
 #include "render/WorldMesh.h"
 
@@ -75,12 +78,15 @@
 
 namespace tsukuyomi {
 
+namespace hooks {
+static void refreshHookGroups();
+}
+
 using SendCommandFn = void(__fastcall*)(void*, std::int32_t*, const void*, std::int32_t);
 SendCommandFn g_sendCommandRequest = nullptr;
 availablecommands::LoadPacketFn g_commandRegistryLoadPacket = nullptr;
 void __fastcall detourCommandRegistryLoadPacket(void* registry, const void* packet)
 {
-    TSUKUYOMI_HOOK_COUNT("CommandRegistryLoadPacket");
     availablecommands::loadWithTk(g_commandRegistryLoadPacket, registry, packet);
 }
 using CommandAutoCompleteFn = void*(__fastcall*)(void* registry, void* out, const void* origin, const void* text,
@@ -92,14 +98,13 @@ CommandAutoCompleteFilterFn g_commandAutoCompleteFilter = nullptr;
 void* __fastcall detourCommandAutoComplete(void* registry, void* out, const void* origin, const void* text,
                                            std::uint32_t cursor)
 {
-    TSUKUYOMI_HOOK_COUNT("CommandAutoComplete");
+    availablecommands::ensureTk(g_commandRegistryLoadPacket, registry);
     chatcommand::noteCompletionText(text);
     return g_commandAutoComplete(registry, out, origin, text, cursor);
 }
 bool __fastcall detourCommandAutoCompleteFilter(void* registry, const void* suggestion, const void* originFlag,
                                                 bool cheatsEnabled, bool playerFlag)
 {
-    TSUKUYOMI_HOOK_COUNT("CommandAutoCompleteFilter");
     const bool keep = g_commandAutoCompleteFilter(registry, suggestion, originFlag, cheatsEnabled, playerFlag);
     if (!chatcommand::completingTsukuyomiArguments()) {
         return keep;
@@ -110,7 +115,6 @@ bool __fastcall detourCommandAutoCompleteFilter(void* registry, const void* sugg
 void __fastcall detourSendCommandRequest(void* sender, std::int32_t* out,
                                          const void* command, std::int32_t flags)
 {
-    TSUKUYOMI_HOOK_COUNT("SendCommandRequest");
     if (chatcommand::intercept(command, out)) return;
     if (g_sendCommandRequest != nullptr) g_sendCommandRequest(sender, out, command, flags);
 }
@@ -126,13 +130,12 @@ void* tsukuyomiPlayerViewTrampoline = nullptr;
 void tsukuyomiPacketSendTrampolineEntry();
 void* tsukuyomiPacketSendTrampoline = nullptr;
 
-void tsukuyomiCameraHook(void* cameraBase, void* source)
+void tsukuyomiCameraHook(void* cameraBase, void* source, void* frame)
 {
-    TSUKUYOMI_HOOK_COUNT("CameraUpdate");
-    FreeCamera::instance().onCameraWrite(cameraBase);
+    FreeCamera::instance().onCameraWrite(cameraBase, frame);
 
     Zoom::instance().onCameraWrite(cameraBase, source);
-    boxes::noteCamera(cameraBase);
+    boxes::noteCamera(cameraBase, source);
 }
 
 using ViewVectorFn = void*(__fastcall*)(void* actor, float* out, float partial);
@@ -140,20 +143,39 @@ ViewVectorFn g_viewVector = nullptr;
 
 void* __fastcall detourViewVector(void* actor, float* out, float partial)
 {
-    TSUKUYOMI_HOOK_COUNT("ViewVector");
     void* const result = (g_viewVector != nullptr) ? g_viewVector(actor, out, partial) : nullptr;
-    if (!FreeCamera::instance().enabled() && !GameData::instance().hasLivePlayer()) {
+    if (!FreeCamera::instance().active() && !GameData::instance().hasLivePlayer()) {
         GameData::instance().adoptPlayerFromEntity(actor);
     }
-    if (FreeCamera::instance().enabled() && GameData::instance().isPlayerEntity(actor)) {
+    if (FreeCamera::instance().freezesAim() && GameData::instance().isPlayerEntity(actor)) {
         FreeCamera::instance().freezeViewVector(out);
     }
     return result;
 }
 
+namespace {
+constexpr unsigned kAdoptAfter = 32;
+void* g_viewLeader = nullptr;
+unsigned g_viewMisses = 0;
+
+bool isLeadingView(void* viewBase)
+{
+    if (viewBase != g_viewLeader) {
+        if (++g_viewMisses <= kAdoptAfter) {
+            return false;
+        }
+        g_viewLeader = viewBase;
+    }
+    g_viewMisses = 0;
+    return true;
+}
+}
+
 void tsukuyomiPlayerViewHook(void* viewBase)
 {
-    TSUKUYOMI_HOOK_COUNT("PlayerView");
+    if (!isLeadingView(viewBase)) {
+        return;
+    }
     const freezewatch::Scope freezeScope{"PlayerView (game thread)"};
     hooks::refreshHookGroups();
 
@@ -199,11 +221,13 @@ void tsukuyomiPlayerViewHook(void* viewBase)
     GameModeState::instance().onPlayerView(GetTickCount64());
 
     UiSound::instance().pump();
+    ModuleManager::instance().pumpToggleNotices();
 
     ItemStackRequest::instance().onFrame();
 
     chatcommand::pump();
     GameButtons::instance().pumpNotice();
+    notice::pump();
     HandRestock::instance().onPlayerViewUpdate();
 
     OffhandSwap::instance().onPlayerViewUpdate();
@@ -213,14 +237,18 @@ void tsukuyomiPlayerViewHook(void* viewBase)
     Schematica::instance().onPlayerViewUpdate();
 
     DebugScreen::instance().onPlayerViewUpdate();
+    PlayerList::instance().onPlayerViewUpdate();
+    DeathLogger::instance().onPlayerViewUpdate();
+    AppleSkin::instance().onPlayerViewUpdate();
     DebugKeys::instance().onPlayerViewUpdate();
+    ArmorHUD::instance().onPlayerViewUpdate();
 
     uiprobe::pumpMenuSelection();
 
     uiprobe::pumpControlsKeybind();
 }
 
-bool zeroAuthInputMove(void* packet)
+void zeroAuthInputMove(void* packet)
 {
     constexpr std::size_t kMoveAt = 0x080;
     constexpr std::size_t kFlagsAt = 0x014;
@@ -231,20 +259,17 @@ bool zeroAuthInputMove(void* packet)
     constexpr std::uint32_t kZeroFlags = 0;
     memory::writeGuarded(base + 0x088, &kZeroFlags, sizeof(kZeroFlags));
     memory::writeGuarded(base + kFlagsAt, &kZeroFlags, sizeof(kZeroFlags));
-    return true;
 }
 
-unsigned char tsukuyomiShouldBlockPacket(void* packet)
+void tsukuyomiOnPacketSend(void* packet)
 {
-    TSUKUYOMI_HOOK_COUNT("PacketSend");
-    if (FreeCamera::instance().enabled()
+    if (FreeCamera::instance().active()
         && ItemStackRequest::packetId(packet) == 0x90) {
         zeroAuthInputMove(packet);
     }
 
     ItemStackRequest::instance().observePacket(packet);
 
-    return 0u;
 }
 
 }
@@ -253,10 +278,10 @@ unsigned char tsukuyomiShouldBlockPacket(void* packet)
 
 namespace tsukuyomi::hooks {
 
-std::atomic<bool> g_countHotPaths{false};
+static void armStorageFromSubChunk(void* subChunk);
 
 void noteChunkBuiltForRebuilds(const void* rec, std::uint64_t buildSeq);
-void noteChunkBoxTries(const void* rec, std::uint32_t tries, std::uint32_t stacked,
+void noteChunkBoxTries(const void* rec, std::uint32_t tries,
                        std::uint64_t buildSeq);
 
 namespace {
@@ -264,7 +289,10 @@ namespace {
 using GetDestroySpeedFn = float(__fastcall*)(void*, void*, void*, void*);
 using SetSelectedSlotFn = void(__fastcall*)(void*, void*, void*, void*);
 using BuildBlockFn = bool(__fastcall*)(void*, void*, unsigned char, unsigned char, bool);
+using MobSwingFn = bool(__fastcall*)(void*, unsigned char, unsigned char);
 using AbilitiesAccessFn = bool(__fastcall*)(void*, void*, void*, void*);
+using PoseDecisionFn = void(__fastcall*)(void*, void*, void*, void*, void*, std::uint64_t*, void*, void*,
+                                          void*, void*);
 
 using UseItemFn = int(__fastcall*)(void*, void*, int);
 
@@ -311,12 +339,15 @@ using UiEventDispatchFn = int(__fastcall*)(void*, const void*, void*, void*);
 GetDestroySpeedFn g_getDestroySpeed = nullptr;
 SetSelectedSlotFn g_setSelectedSlot = nullptr;
 BuildBlockFn g_buildBlock = nullptr;
+MobSwingFn g_mobSwing = nullptr;
+thread_local bool t_suppressSwing = false;
 using GameModeContinueDestroyBlockFn = bool(__fastcall*)(void*, const void*, std::uint8_t,
                                                           const void*, bool*);
 using GameModeDestroyBlockFn = bool(__fastcall*)(void*, const void*, std::uint8_t);
 GameModeContinueDestroyBlockFn g_gameModeContinueDestroyBlock = nullptr;
 GameModeDestroyBlockFn g_gameModeDestroyBlock = nullptr;
 AbilitiesAccessFn g_abilitiesAccess = nullptr;
+PoseDecisionFn g_poseDecision = nullptr;
 UseItemFn g_useItem = nullptr;
 UseItemTransactionFn g_useItemTransaction = nullptr;
 SetGameModeFn g_setGameMode = nullptr;
@@ -360,6 +391,10 @@ using LevelChunkTickFn = std::uintptr_t(__fastcall*)(void*, void*, void*, void*)
 LevelChunkTickFn g_levelChunkTick = nullptr;
 using ContainerGetItemFn = const void*(__fastcall*)(void*, const void*, int);
 ContainerGetItemFn g_containerGetItem = nullptr;
+using HudCollResolveFn = bool(__fastcall*)(void*, void*, std::uintptr_t, std::uintptr_t, void*, std::uintptr_t, void*,
+                                           void*);
+HudCollResolveFn g_hudCollResolve = nullptr;
+HudCollResolveFn g_hudCollBase = nullptr;
 using TradeInvokeFn = int(__fastcall*)(void*, void* const*);
 TradeInvokeFn g_tradeHoverInvoke = nullptr;
 TradeInvokeFn g_tradeSecondaryInvoke = nullptr;
@@ -394,12 +429,16 @@ using LegacyParticleRenderFn = void*(__fastcall*)(void* engine, void* out, void*
 LegacyParticleRenderFn g_legacyParticleRender = nullptr;
 using FmodSystemUpdateFn = int(__fastcall*)(void* system);
 FmodSystemUpdateFn g_fmodSystemUpdate = nullptr;
-using ShulkerContentsTextFn = void*(__fastcall*)(void* out, const void* tag);
-ShulkerContentsTextFn g_shulkerContentsText = nullptr;
 using ItemHoverTextBuildFn = void*(__fastcall*)(const void* stack, void* out, void* level, bool flag);
 ItemHoverTextBuildFn g_itemHoverTextBuild = nullptr;
 using HoverRendererRenderFn = void(__fastcall*)(void* self, void* ctx, void* client, void* owner, int pass);
 HoverRendererRenderFn g_hoverRendererRender = nullptr;
+HoverRendererRenderFn g_mobEffectsRendererRender = nullptr;
+using MobEffectsLayoutFn = void(__fastcall*)(void* layout);
+MobEffectsLayoutFn g_mobEffectsLayout = nullptr;
+using HudRendererUpdateFn = std::uintptr_t(__fastcall*)(void* self, void* a, void* b, void* c);
+HudRendererUpdateFn g_hungerRendererUpdate = nullptr;
+HudRendererUpdateFn g_heartRendererUpdate = nullptr;
 using AttackCoreFn = bool(__fastcall*)(void* gameMode, void* target, bool direct, const void* hitPos);
 AttackCoreFn g_attackCore = nullptr;
 using SendComplexTxFn = void(__fastcall*)(void* player, void** transaction);
@@ -409,6 +448,8 @@ std::uintptr_t g_legacyParticleSubmitEnd = 0;
 OreKeyRowsBuildFn g_oreKeyRowsBuild = nullptr;
 I18nGetFn g_i18nGet = nullptr;
 void* g_i18nSelf = nullptr;
+using I18nGetWithParamsFn = void*(__fastcall*)(void*, void*, const void*, const void*, const void*);
+I18nGetWithParamsFn g_i18nGetWithParams = nullptr;
 
 float __fastcall detourGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
 {
@@ -417,7 +458,6 @@ float __fastcall detourGetDestroySpeed(void* rcx, void* rdx, void* r8, void* r9)
 
 void __fastcall detourSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("SetSelectedSlot");
     const void* const returnAddress = _ReturnAddress();
 
     if (Zoom::instance().suppressHotbar(returnAddress)) {
@@ -431,7 +471,6 @@ void __fastcall detourSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
 
 void __fastcall detourHandleItemStackResponse(void* rcx, void* rdx, void* r8, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("HandleItemStackResponse");
     ItemStackRequest::instance().onResponse(rdx);
 
     if (g_handleItemStackResponse != nullptr) {
@@ -442,22 +481,27 @@ void __fastcall detourHandleItemStackResponse(void* rcx, void* rdx, void* r8, vo
 bool __fastcall detourBuildBlock(void* gameMode, void* blockPos, unsigned char face,
                                  unsigned char extra, bool simTick)
 {
-    TSUKUYOMI_HOOK_COUNT("buildBlock");
     GameData::instance().setGameMode(gameMode);
 
     return FastBlockPlacement::instance().onBuildBlock(gameMode, blockPos, face, extra, simTick);
 }
 
+bool __fastcall detourMobSwing(void* mob, unsigned char source, unsigned char r8)
+{
+    if (t_suppressSwing) {
+        return false;
+    }
+    return g_mobSwing != nullptr ? g_mobSwing(mob, source, r8) : false;
+}
+
 bool __fastcall detourGameModeContinueDestroyBlock(void* gameMode, const void* pos,
                                                    std::uint8_t face, const void* playerPos, bool* out)
 {
-    TSUKUYOMI_HOOK_COUNT("GameModeContinueDestroyBlock");
     return FastBlockBreak::instance().onContinueDestroyBlock(gameMode, pos, face, playerPos, out);
 }
 
 bool __fastcall detourGameModeDestroyBlock(void* gameMode, const void* pos, std::uint8_t face)
 {
-    TSUKUYOMI_HOOK_COUNT("GameModeDestroyBlock");
     return FastBlockBreak::instance().onDestroyBlock(gameMode, pos, face);
 }
 
@@ -468,15 +512,25 @@ bool __fastcall detourAbilitiesAccess(void* rcx, void* rdx, void* r8, void* r9)
     return g_abilitiesAccess != nullptr ? g_abilitiesAccess(rcx, rdx, r8, r9) : false;
 }
 
+void __fastcall detourPoseDecision(void* a1, void* input, void* gameType, void* room, void* flags,
+                                   std::uint64_t* actions, void* a7, void* a8, void* a9, void* a10)
+{
+    const bool lent = CreativeNoClip::instance().beforePoseDecision(room);
+    if (g_poseDecision != nullptr) {
+        g_poseDecision(a1, input, gameType, room, flags, actions, a7, a8, a9, a10);
+    }
+    if (lent) {
+        CreativeNoClip::instance().afterPoseDecision(room);
+    }
+}
+
 int __fastcall detourUseItem(void* gameMode, void* itemStack, int extra)
 {
-    TSUKUYOMI_HOOK_COUNT("useItem");
     return FastUseItem::instance().onUseItem(gameMode, itemStack, extra);
 }
 
 int __fastcall detourUseItemTransaction(void* gameMode, void* itemStack, int extra)
 {
-    TSUKUYOMI_HOOK_COUNT("useItemTransaction");
     return FastUseItem::instance().onUseItemTransaction(gameMode, itemStack, extra);
 }
 
@@ -679,14 +733,14 @@ bool takePendingStorageVtable(void** out)
     const std::size_t write = std::min(g_pendingWrite.load(std::memory_order_acquire),
                                        kPendingVtableMax);
     std::size_t read = g_pendingRead.load(std::memory_order_relaxed);
-    while (read < write) {
+    if (read < write) {
         void* const one = g_pendingVtable[read].load(std::memory_order_acquire);
-        g_pendingRead.store(read + 1, std::memory_order_relaxed);
-        if (one != nullptr) {
-            *out = one;
-            return true;
+        if (one == nullptr) {
+            return false;
         }
-        read = g_pendingRead.load(std::memory_order_relaxed);
+        g_pendingRead.store(read + 1, std::memory_order_relaxed);
+        *out = one;
+        return true;
     }
     return false;
 }
@@ -820,7 +874,6 @@ ChunkCoordinatorFrameFn g_chunkCoordinatorFrame = nullptr;
 
 void __fastcall detourChunkCoordinatorFrame(void* self)
 {
-    TSUKUYOMI_HOOK_COUNT("ChunkCoordinatorFrame");
     if (self != nullptr) {
         g_visCoordinator.store(self, std::memory_order_relaxed);
     }
@@ -1083,7 +1136,6 @@ bool readSeat(const HitSeat& seat, unsigned char* out)
 
 void* __fastcall detourHitAssign(void* dst, const void* src)
 {
-    TSUKUYOMI_HOOK_COUNT("HitResultAssign");
     void* const site = _ReturnAddress();
     void* const out = g_hitAssign != nullptr ? g_hitAssign(dst, src) : dst;
     if (dst == nullptr) {
@@ -1092,8 +1144,13 @@ void* __fastcall detourHitAssign(void* dst, const void* src)
     auto* const p = static_cast<unsigned char*>(dst);
     std::int32_t cell[3] = {0, 0, 0};
     std::memcpy(cell, p + kHitBlockPos, sizeof(cell));
+    constexpr std::size_t kHitKindAt = 0x18;
+    constexpr std::int32_t kHitKindBlockValue = 0;
+    constexpr std::int32_t kHitKindNothing = 3;
+    std::int32_t kind = -1;
+    std::memcpy(&kind, p + kHitKindAt, sizeof(kind));
 
-    if (cell[0] == 0 && cell[1] == 0 && cell[2] == 0) {
+    if (kind == kHitKindNothing) {
         if (!g_hitBlankReady.load(std::memory_order_relaxed)) {
             std::memcpy(g_hitBlank, p, kHitSize);
             g_hitBlankReady.store(true, std::memory_order_release);
@@ -1101,7 +1158,7 @@ void* __fastcall detourHitAssign(void* dst, const void* src)
         publishHit(site, dst, p);
         return out;
     }
-    if (!blocks::ghostOn() || !g_hitBlankReady.load(std::memory_order_acquire)
+    if (kind != kHitKindBlockValue || !blocks::ghostOn() || !g_hitBlankReady.load(std::memory_order_acquire)
         || !blocks::ghostCell(cell[0], cell[1], cell[2])) {
         publishHit(site, dst, p);
         return out;
@@ -1117,7 +1174,6 @@ HitMoveAssignFn g_hitMoveAssign = nullptr;
 
 void* __fastcall detourHitMoveAssign(void* dst, void* src)
 {
-    TSUKUYOMI_HOOK_COUNT("HitResultMoveAssign");
     void* const out = g_hitMoveAssign != nullptr ? g_hitMoveAssign(dst, src) : dst;
     if (dst == nullptr) {
         return out;
@@ -1166,7 +1222,6 @@ bool __fastcall detourBlockSourceSetBlock(void* region, const void* pos, const v
                                           unsigned int mode, unsigned int updateFlags,
                                           void* actor)
 {
-    TSUKUYOMI_HOOK_COUNT("BlockSourceSetBlock");
     blockwrite::noteRegion(region, mode, updateFlags, actor);
 
     blockwrite::noteWritePos(static_cast<const int*>(pos));
@@ -1197,7 +1252,6 @@ using BlockDrawFn = void(__fastcall*)(void*, void*, void*, void*, void*);
 BlockDrawFn g_blockTessellate = nullptr;
 
 thread_local std::uint32_t t_buildBoxTries = 0;
-thread_local std::uint32_t t_buildBoxStacked = 0;
 
 inline std::uintptr_t realLayerByte(void* real)
 {
@@ -1301,9 +1355,7 @@ void* __fastcall detourChunkMeshBuild(void* ctx, void* rec, void* a3, void* a4, 
                                       void* a6)
 {
     announceMeshThreadOnce();
-    const long long perfBegan = perf::now();
     t_buildBoxTries = 0;
-    t_buildBoxStacked = 0;
     const std::uint64_t buildSeq = nextBuildSeq();
     void* ret = nullptr;
     {
@@ -1311,8 +1363,7 @@ void* __fastcall detourChunkMeshBuild(void* ctx, void* rec, void* a3, void* a4, 
         ret = g_chunkMeshBuild != nullptr ? g_chunkMeshBuild(ctx, rec, a3, a4, a5, a6)
                                           : nullptr;
     }
-    perf::add(perf::Slot::ChunkBuild, perfBegan);
-    noteChunkBoxTries(rec, t_buildBoxTries, t_buildBoxStacked, buildSeq);
+    noteChunkBoxTries(rec, t_buildBoxTries, buildSeq);
     noteChunkBuiltForRebuilds(rec, buildSeq);
     return ret;
 }
@@ -1502,7 +1553,6 @@ void __fastcall detourBlockTessellate(void* self, void* a, void* graphics, void*
 
 void __fastcall detourSetGameMode(void* self, int mode, int extra)
 {
-    TSUKUYOMI_HOOK_COUNT("SetGameMode");
     GameModeState::instance().onSetGameMode(mode, GetTickCount64());
     PlayerContext::instance().onEntityContext(self);
 
@@ -1513,7 +1563,6 @@ void __fastcall detourSetGameMode(void* self, int mode, int extra)
 
 void __fastcall detourNotifyInventoryOpen(void* client, int which)
 {
-    TSUKUYOMI_HOOK_COUNT("NotifyInventoryOpen");
     ItemStackRequest::instance().onNotifyInventoryOpen(client);
 
     if (g_notifyInventoryOpen != nullptr) {
@@ -1541,9 +1590,9 @@ void noteSneakInput(void* out)
 
 void* __fastcall detourInputGather(void* a1, void* out, void* a3, void* a4)
 {
-    TSUKUYOMI_HOOK_COUNT("InputGather");
-    noteSneakInput(out);
     FreeCamera::instance().onInputGatherBefore(out);
+    ToggleSneakSprint::instance().onInputGatherBefore(out, _ReturnAddress());
+    noteSneakInput(out);
 
     void* const result = (g_inputGather != nullptr) ? g_inputGather(a1, out, a3, a4) : nullptr;
 
@@ -1553,7 +1602,6 @@ void* __fastcall detourInputGather(void* a1, void* out, void* a3, void* a4)
 
 void* __fastcall detourMoveIntent(void* out, void* input, void* a3, void* a4, std::uint64_t a5, void* a6)
 {
-    TSUKUYOMI_HOOK_COUNT("MoveIntentFromInput");
     void* const result = (g_moveIntent != nullptr) ? g_moveIntent(out, input, a3, a4, a5, a6) : nullptr;
     FreeCamera::instance().onMoveIntent(out, input);
     return result;
@@ -1561,7 +1609,6 @@ void* __fastcall detourMoveIntent(void* out, void* input, void* a3, void* a4, st
 
 void* __fastcall detourMoveInputHandler(void* client, void* a2, void* a3, void* a4)
 {
-    TSUKUYOMI_HOOK_COUNT("MoveInputHandler");
     if (client != nullptr) {
         g_clientInstance.store(client, std::memory_order_relaxed);
     }
@@ -1588,7 +1635,6 @@ void* __fastcall detourGetActorEffect(void* context, int effectId)
 void __fastcall detourContainerOpenHandle(void* packet, void* result, void* callback,
                                           void* network)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerOpenHandle");
     if (g_containerOpenHandle == nullptr) {
         return;
     }
@@ -1596,7 +1642,6 @@ void __fastcall detourContainerOpenHandle(void* packet, void* result, void* call
     std::byte shell[ItemStackRequest::kOpenShellBytes];
     const bool watching = requests.suppressionPending() && requests.captureOpenShell(packet, shell);
     g_containerOpenHandle(packet, result, callback, network);
-    requests.rememberContainerOpenResult(result);
     if (watching) {
         requests.takeInventoryOpen(packet, result, shell);
     }
@@ -1604,7 +1649,6 @@ void __fastcall detourContainerOpenHandle(void* packet, void* result, void* call
 
 void* __fastcall detourInventoryContentRead(void* packet, void* out, void* stream, void* network)
 {
-    TSUKUYOMI_HOOK_COUNT("InventoryContentRead");
     if (g_inventoryContentRead == nullptr) {
         return out;
     }
@@ -1615,7 +1659,6 @@ void* __fastcall detourInventoryContentRead(void* packet, void* out, void* strea
 
 void* __fastcall detourInventoryHoveredSlot(void* controller, void* out)
 {
-    TSUKUYOMI_HOOK_COUNT("InventoryHoveredSlot");
     InventoryScreen::instance().onController();
 
     return g_inventoryHoveredSlot != nullptr ? g_inventoryHoveredSlot(controller, out) : out;
@@ -1623,12 +1666,11 @@ void* __fastcall detourInventoryHoveredSlot(void* controller, void* out)
 
 void* __fastcall detourUiDefLookup(void* self, const void* space, const void* name)
 {
-    TSUKUYOMI_HOOK_COUNT("UiDefLookup");
     void* const value = (g_uiDefLookup != nullptr) ? g_uiDefLookup(self, space, name) : nullptr;
     if (void* const extended = uiprobe::extendDefinition(self, space, name, value)) {
         return extended;
     }
-    if (void* const swapped = uiprobe::substitute(self, space, name)) {
+    if (void* const swapped = uiprobe::substituteOwnPage(self, space, name)) {
         return swapped;
     }
     return value;
@@ -1636,7 +1678,6 @@ void* __fastcall detourUiDefLookup(void* self, const void* space, const void* na
 
 void* __fastcall detourFogSettingsFetch(void* self, void* out, void* src, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("FogSettingsFetch");
     void* const result =
         (g_fogSettingsFetch != nullptr) ? g_fogSettingsFetch(self, out, src, r9) : nullptr;
     if (out != nullptr && NoRender::instance().fogSuppressed()) {
@@ -1653,40 +1694,60 @@ void* __fastcall detourFogSettingsFetch(void* self, void* out, void* src, void* 
     return result;
 }
 
-void* __fastcall detourShulkerContentsText(void* out, const void* tag)
-{
-    TSUKUYOMI_HOOK_COUNT("ShulkerContentsText");
-    void* const result = (g_shulkerContentsText != nullptr) ? g_shulkerContentsText(out, tag) : out;
-    ShulkerPreview::instance().onContentsText(out, tag, _ReturnAddress());
-    return result;
-}
-
 void* __fastcall detourItemHoverTextBuild(const void* stack, void* out, void* level, bool flag)
 {
-    TSUKUYOMI_HOOK_COUNT("ItemHoverTextBuild");
     void* const result = (g_itemHoverTextBuild != nullptr) ? g_itemHoverTextBuild(stack, out, level, flag) : out;
     DebugKeys::instance().onItemHoverText(stack, out);
+    AppleSkin::instance().onItemHoverText(stack, out);
     return result;
 }
 
 void __fastcall detourHoverRendererRender(void* self, void* ctx, void* client, void* owner, int pass)
 {
-    TSUKUYOMI_HOOK_COUNT("HoverRendererRender");
     if (g_hoverRendererRender != nullptr) {
         g_hoverRendererRender(self, ctx, client, owner, pass);
     }
-    ShulkerPreview::instance().onHoverRender(self, ctx, client, owner);
+    AppleSkin::instance().onHoverRender(self, ctx, client, owner);
+}
+
+void __fastcall detourMobEffectsRendererRender(void* self, void* ctx, void* client, void* owner, int pass)
+{
+    if (g_mobEffectsRendererRender != nullptr) {
+        g_mobEffectsRendererRender(self, ctx, client, owner, pass);
+    }
+    EffectTimer::instance().onRendered(client, owner);
+}
+
+void __fastcall detourMobEffectsLayout(void* layout)
+{
+    EffectTimer::instance().beforeLayout(layout);
+    if (g_mobEffectsLayout != nullptr) {
+        g_mobEffectsLayout(layout);
+    }
+    EffectTimer::instance().afterLayout(layout);
+}
+
+std::uintptr_t __fastcall detourHungerRendererUpdate(void* self, void* a, void* b, void* c)
+{
+    const std::uintptr_t result = (g_hungerRendererUpdate != nullptr) ? g_hungerRendererUpdate(self, a, b, c) : 0;
+    AppleSkin::instance().onHungerRendererUpdate(self);
+    return result;
+}
+
+std::uintptr_t __fastcall detourHeartRendererUpdate(void* self, void* a, void* b, void* c)
+{
+    const std::uintptr_t result = (g_heartRendererUpdate != nullptr) ? g_heartRendererUpdate(self, a, b, c) : 0;
+    AppleSkin::instance().onHeartRendererUpdate(self);
+    return result;
 }
 
 bool __fastcall detourAttackCore(void* gameMode, void* target, bool direct, const void* hitPos)
 {
-    TSUKUYOMI_HOOK_COUNT("AttackCore");
     return AutoTool::instance().onAttack(gameMode, target, direct, hitPos);
 }
 
 void __fastcall detourSendComplexTx(void* player, void** transaction)
 {
-    TSUKUYOMI_HOOK_COUNT("SendComplexTransaction");
     if (AutoTool::instance().onSendTransaction(player, transaction)) {
         return;
     }
@@ -1697,7 +1758,6 @@ void __fastcall detourSendComplexTx(void* player, void** transaction)
 
 void __fastcall detourLegacyParticleInsert(void* frameBuilder, void* description)
 {
-    TSUKUYOMI_HOOK_COUNT("LegacyParticleInsert");
     if (NoRender::instance().particlesSuppressed()) {
         const auto back = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
         if (back >= g_legacyParticleSubmitBegin && back < g_legacyParticleSubmitEnd) {
@@ -1822,8 +1882,7 @@ std::byte* resolveLegacyParticleInsert()
 
 void* __fastcall detourOreKeyRowsBuild(void* out, void* rdx, void* r8)
 {
-    TSUKUYOMI_HOOK_COUNT("OreKeyRowsBuild");
-    uiprobe::substituteKeyRows(rdx, true);
+    uiprobe::substituteKeyRows(rdx);
     void* const result =
         (g_oreKeyRowsBuild != nullptr) ? g_oreKeyRowsBuild(out, rdx, r8) : nullptr;
     return result;
@@ -1831,7 +1890,6 @@ void* __fastcall detourOreKeyRowsBuild(void* out, void* rdx, void* r8)
 
 void* __fastcall detourI18nGet(void* self, void* out, const void* key, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("I18nGet");
     void* const result = (g_i18nGet != nullptr) ? g_i18nGet(self, out, key, r9) : nullptr;
     uiprobe::overrideTranslation(key, out);
     return result;
@@ -1841,6 +1899,17 @@ bool translateGuarded(void* out, const void* key, void* params)
 {
     __try {
         g_i18nGet(g_i18nSelf, out, key, params);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+bool translateWithParamsGuarded(void* out, const void* key, const void* params)
+{
+    alignas(16) std::byte shared[16]{};
+    __try {
+        g_i18nGetWithParams(g_i18nSelf, out, key, params, shared);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1876,7 +1945,6 @@ bool translateInto(void* out, const char* key)
 void* __fastcall detourSettingsGroupRegister(void* registry, const void* idView, void* provider,
                                              void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("SettingsGroupRegister");
     uiprobe::onSettingsGroupRegister(registry, idView, provider);
     void* const result = (g_settingsGroupRegister != nullptr)
                              ? g_settingsGroupRegister(registry, idView, provider, r9)
@@ -1887,7 +1955,6 @@ void* __fastcall detourSettingsGroupRegister(void* registry, const void* idView,
 
 void* __fastcall detourSettingsProviderCall(void* self, void* out, void* r8, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("SettingsProviderCall");
     void* const result =
         (g_settingsProviderCall != nullptr) ? g_settingsProviderCall(self, out, r8, r9) : nullptr;
     uiprobe::onSettingsProviderCall(self, out);
@@ -1896,7 +1963,6 @@ void* __fastcall detourSettingsProviderCall(void* self, void* out, void* r8, voi
 
 void* __fastcall detourSettingsFindComponent(void* self, void* out, const void* idView, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("SettingsFindComponent");
     void* const result = (g_settingsFindComponent != nullptr)
                              ? g_settingsFindComponent(self, out, idView, r9)
                              : nullptr;
@@ -1958,7 +2024,6 @@ void resolveCtlBag(void* publish)
 
 void __fastcall detourUiSliderPublish(void* self, float value)
 {
-    TSUKUYOMI_HOOK_COUNT("UiSliderPublish");
     if (g_uiCtlBag != nullptr && self != nullptr
         && memory::isReadable(reinterpret_cast<const char*>(self) + 8, 8)) {
         void* const owner =
@@ -2080,8 +2145,7 @@ bool takeTradeScreen(void* scene)
         static bool warned = false;
         if (!warned) {
             warned = true;
-            log().warn(L"Hooks: could not find the tick of the trade screen controller; the auto trade will open "
-                       L"the screen normally");
+            log().warn(L"Hooks: could not find the tick of the trade screen controller; the auto trade is off");
         }
         return false;
     }
@@ -2099,7 +2163,6 @@ bool takeTradeScreen(void* scene)
 
 void __fastcall detourSceneStackPush(void* stack, void* scene, void* a3, void* a4)
 {
-    TSUKUYOMI_HOOK_COUNT("SceneStackPush");
     if (scene != nullptr && g_tradePushReturn != nullptr && _ReturnAddress() == g_tradePushReturn
         && g_offstack.scene == nullptr && takeTradeScreen(scene)) {
         return;
@@ -2114,7 +2177,6 @@ void __fastcall detourSceneStackPush(void* stack, void* scene, void* a3, void* a
 
 std::uint32_t __fastcall detourContainerScreenTick(void* self)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerScreenTick");
     const freezewatch::Scope freezeScope{"ContainerScreenTick (UI thread)"};
     const std::uint32_t dirty = (g_containerScreenTick != nullptr) ? g_containerScreenTick(self) : 0;
     return dirty | containerui::onScreenTickHook(self);
@@ -2122,7 +2184,6 @@ std::uint32_t __fastcall detourContainerScreenTick(void* self)
 
 int __fastcall detourTradeHoverInvoke(void* self, void* const* bag)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeHoverInvoke");
     if (bag != nullptr) {
         tradeui::onHoverInvoke(*bag);
     }
@@ -2131,7 +2192,6 @@ int __fastcall detourTradeHoverInvoke(void* self, void* const* bag)
 
 int __fastcall detourTradeSecondaryInvoke(void* self, void* const* bag)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeSecondaryInvoke");
     const int result = (g_tradeSecondaryInvoke != nullptr) ? g_tradeSecondaryInvoke(self, bag) : 0;
     if (self != nullptr && bag != nullptr) {
         void* ctrl = nullptr;
@@ -2143,20 +2203,17 @@ int __fastcall detourTradeSecondaryInvoke(void* self, void* const* bag)
 
 void* __fastcall detourTradeSelParse(void* sel, const void* bag)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeSelParse");
     void* const result = g_tradeSelParse(sel, bag);
     tradeui::afterSelParse(sel);
     return result;
 }
 int __fastcall detourTradeSelectorTotal(void* self)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeSelectorTotal");
     const int n = g_tradeSelectorTotal(self);
     return (n > 0 && tradeui::favoriteTierShown(self)) ? n + 1 : n;
 }
 int __fastcall detourTradeTierTotal(void* self, const int* tier)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeTierTotal");
     if (tier != nullptr && tradeui::favoriteTierShown(self)) {
         if (*tier == 0) {
             return tradeui::favoriteTierRows();
@@ -2173,7 +2230,6 @@ int __fastcall detourTradeTierTotal(void* self, const int* tier)
 }
 bool __fastcall detourTradeTierVisible(void* self, const int* tier)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeTierVisible");
     if (tier != nullptr && tradeui::favoriteTierShown(self)) {
         if (*tier == 0) {
             return true;
@@ -2190,7 +2246,6 @@ bool __fastcall detourTradeTierVisible(void* self, const int* tier)
 }
 bool __fastcall detourTradeTierUnlocked(void* self, const int* tier)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeTierUnlocked");
     if (tier != nullptr && tradeui::favoriteTierShown(self)) {
         if (*tier == 0) {
             return true;
@@ -2202,8 +2257,6 @@ bool __fastcall detourTradeTierUnlocked(void* self, const int* tier)
 }
 void* __fastcall detourTradeTierName(void* ret, void* self, const int* tier)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeTierName");
-    (void)self;
     if (tier != nullptr && tradeui::favoriteTierShownAny()) {
         if (*tier == 0) {
             tradeui::writeFavoriteTierName(ret);
@@ -2216,14 +2269,12 @@ void* __fastcall detourTradeTierName(void* ret, void* self, const int* tier)
 }
 int __fastcall detourTradeCurrentTier(void* owner)
 {
-    TSUKUYOMI_HOOK_COUNT("TradeCurrentTier");
     const int value = g_tradeCurrentTier(owner);
     return tradeui::overrideTier(owner, value, _ReturnAddress());
 }
 
 void* __fastcall detourContainerScreenCtor(void* self, void* a2, void* a3, void* a4)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerScreenCtor");
     void* const result = (g_containerScreenCtor != nullptr) ? g_containerScreenCtor(self, a2, a3, a4) : self;
     containerui::onScreenConstructed(self);
     return result;
@@ -2231,7 +2282,6 @@ void* __fastcall detourContainerScreenCtor(void* self, void* a2, void* a3, void*
 
 void* __fastcall detourHudScreenCtor(void* self, void* a2, void* a3, void* a4)
 {
-    TSUKUYOMI_HOOK_COUNT("HudScreenCtor");
     void* const result = (g_hudScreenCtor != nullptr) ? g_hudScreenCtor(self, a2, a3, a4) : self;
     containerui::onHudConstructed(self);
     return result;
@@ -2239,7 +2289,6 @@ void* __fastcall detourHudScreenCtor(void* self, void* a2, void* a3, void* a4)
 
 void __fastcall detourRenderCurrentFrame(void* self, float delta)
 {
-    TSUKUYOMI_HOOK_COUNT("RenderCurrentFrame");
     DebugScreen::onFrameRendered();
     if (g_renderCurrentFrame != nullptr) {
         g_renderCurrentFrame(self, delta);
@@ -2248,7 +2297,6 @@ void __fastcall detourRenderCurrentFrame(void* self, float delta)
 
 void __fastcall detourServerLevelTick(void* level)
 {
-    TSUKUYOMI_HOOK_COUNT("ServerLevelTick");
     LARGE_INTEGER start{};
     QueryPerformanceCounter(&start);
     if (g_serverLevelTick != nullptr) {
@@ -2256,12 +2304,13 @@ void __fastcall detourServerLevelTick(void* level)
     }
     LARGE_INTEGER end{};
     QueryPerformanceCounter(&end);
-    DebugScreen::onServerTick(level, end.QuadPart - start.QuadPart);
+    if (GameData::instance().onLevelTick(level, GetCurrentThreadId(), blocks::simThread())) {
+        DebugScreen::onServerTick(end.QuadPart - start.QuadPart);
+    }
 }
 
 void* __fastcall detourLegacyParticleRender(void* engine, void* out, void* a3, void* a4, void* a5, float a6)
 {
-    TSUKUYOMI_HOOK_COUNT("LegacyParticleRender");
     if (DebugScreen::wantsParticles()) {
         int legacy = 0;
         int dataDriven = 0;
@@ -2275,7 +2324,6 @@ void* __fastcall detourLegacyParticleRender(void* engine, void* out, void* a3, v
 
 int __fastcall detourFmodSystemUpdate(void* system)
 {
-    TSUKUYOMI_HOOK_COUNT("FmodSystemUpdate");
     const int result = g_fmodSystemUpdate != nullptr ? g_fmodSystemUpdate(system) : 0;
     if (DebugScreen::wantsSounds() && DebugScreen::soundSampleDue()) {
         fmodstats::Counts counts{};
@@ -2310,7 +2358,6 @@ bool copyStartGameVersion(const void* packet, char out[32])
 
 void __fastcall detourStartGameHandle(void* self, const void* identifier, const void* packet)
 {
-    TSUKUYOMI_HOOK_COUNT("StartGameHandle");
     char version[32]{};
     DebugScreen::onStartGame(copyStartGameVersion(packet, version) ? version : nullptr);
     if (g_startGameHandle != nullptr) g_startGameHandle(self, identifier, packet);
@@ -2318,14 +2365,17 @@ void __fastcall detourStartGameHandle(void* self, const void* identifier, const 
 
 std::uintptr_t __fastcall detourLevelChunkTick(void* chunk, void* a2, void* a3, void* a4)
 {
-    DebugScreen::onChunkTicked();
+    const unsigned long sim = blocks::simThread();
+    const bool clientThread = sim == 0 || GetCurrentThreadId() == sim;
+    if (!clientThread) {
+        DebugScreen::onChunkTicked();
+    }
     return g_levelChunkTick != nullptr ? g_levelChunkTick(chunk, a2, a3, a4) : 0;
 }
 
 std::uint64_t __fastcall detourPacketCheckSize(void* self, void* a2, void* a3,
                                                unsigned int receiverIsServer)
 {
-    TSUKUYOMI_HOOK_COUNT("PacketCheckSize");
     if (receiverIsServer == 0) {
         DebugScreen::onPacketReceived();
     }
@@ -2334,32 +2384,45 @@ std::uint64_t __fastcall detourPacketCheckSize(void* self, void* a2, void* a3,
 
 std::uint64_t __fastcall detourNetworkSend(void* self, void* a2, void* a3, unsigned int a4)
 {
-    TSUKUYOMI_HOOK_COUNT("NetworkSend");
     DebugScreen::onPacketSent();
     return g_networkSend != nullptr ? g_networkSend(self, a2, a3, a4) : 0;
 }
 
 const void* __fastcall detourContainerGetItem(void* mc, const void* collectionName, int index)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerGetItem");
-    if (mc != nullptr && mc == InventoryHUD::hudManager()) {
-        if (const void* const own = InventoryHUD::offhandStackFor(collectionName, index)) {
+    if (mc != nullptr && mc == OffhandSlot::hudManager()) {
+        if (const void* const own = OffhandSlot::offhandStackFor(collectionName, index)) {
             return own;
         }
+    }
+    if (mc != nullptr && mc == ArmorHUD::hudManager()) {
+        if (const void* const own = ArmorHUD::stackFor(collectionName, index)) {
+            return own;
+        }
+    }
+    if (const void* const own = ShulkerPreview::stackFor(collectionName, index)) {
+        return own;
     }
     return g_containerGetItem(mc, collectionName, index);
 }
 
+bool __fastcall detourHudCollResolve(void* self, void* coll, std::uintptr_t collHash, std::uintptr_t index, void* name,
+                                     std::uintptr_t nameHash, void* out1, void* out2)
+{
+    if (g_hudCollBase != nullptr && containerui::hudForwardsToBase(static_cast<std::uint32_t>(nameHash))) {
+        return g_hudCollBase(self, coll, collHash, index, name, nameHash, out1, out2);
+    }
+    return g_hudCollResolve(self, coll, collHash, index, name, nameHash, out1, out2);
+}
+
 void* __fastcall detourContainerScreenDtor(void* self)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerScreenDtor");
     containerui::onScreenDestroyed(self);
     return (g_containerScreenDtor != nullptr) ? g_containerScreenDtor(self) : self;
 }
 
 int __fastcall detourContainerSm(void* sm, std::uint32_t id, int state, const void* coll, int index)
 {
-    TSUKUYOMI_HOOK_COUNT("ContainerSm");
     int result = 0;
     if (containerui::onSmHandle(sm, id, state, coll, index, result)) {
         return result;
@@ -2369,7 +2432,6 @@ int __fastcall detourContainerSm(void* sm, std::uint32_t id, int state, const vo
 
 int __fastcall detourUiEventDispatch(void* self, const void* event, void* r8, void* r9)
 {
-    TSUKUYOMI_HOOK_COUNT("UiEventDispatch");
     uiprobe::onUiEvent(self, event);
     return (g_uiEventDispatch != nullptr) ? g_uiEventDispatch(self, event, r8, r9) : 0;
 }
@@ -2414,7 +2476,7 @@ void dropStorageMark(int baseX, int baseY, int baseZ)
     g_ghostSlots[at].storage[1].store(nullptr, std::memory_order_release);
 }
 
-void armStorageFromSubChunk(void* subChunk)
+static void armStorageFromSubChunk(void* subChunk)
 {
     if (subChunk == nullptr) {
         return;
@@ -2550,7 +2612,20 @@ void* resolveI18nGet()
         return nullptr;
     }
     g_i18nSelf = const_cast<void*>(reinterpret_cast<const void*>(global));
-    return vtable[0x80 / sizeof(void*)];
+    void* const get = vtable[0x80 / sizeof(void*)];
+    constexpr unsigned char kCallParams[] = {0x4C, 0x8D, 0x4D, 0xC0, 0x48, 0x89, 0xF2, 0xE8};
+    unsigned char head[0x90]{};
+    if (memory::copyGuarded(get, head, sizeof(head))) {
+        for (std::size_t i = 0; i + sizeof(kCallParams) + 4 <= sizeof(head); ++i) {
+            if (std::memcmp(head + i, kCallParams, sizeof(kCallParams)) != 0) continue;
+            void* const body = memory::ripTarget(static_cast<const std::byte*>(get) + i + 7, 1);
+            if (memory::inGameModule(body) && memory::isExecutable(body, 1)) {
+                g_i18nGetWithParams = reinterpret_cast<I18nGetWithParamsFn>(body);
+            }
+            break;
+        }
+    }
+    return get;
 }
 
 void* resolveBlockSourceGetBlock()
@@ -2590,7 +2665,6 @@ BeRenderLoopFn g_beRenderLoop = nullptr;
 
 void __fastcall detourBeRenderLoop(void* renderer, void* ctx, unsigned int shadow)
 {
-    TSUKUYOMI_HOOK_COUNT("BeRenderLoop");
     void* source = nullptr;
     if (renderer != nullptr) {
         auto* const at = static_cast<unsigned char*>(renderer) + 0x980;
@@ -2742,11 +2816,6 @@ __declspec(noinline) bool vtableLooksSane(void* object)
     }
 }
 
-std::atomic<int> g_containerWhy{0};
-std::atomic<std::int32_t> g_containerCount{0};
-std::atomic<std::int32_t> g_containerLow{0};
-std::atomic<std::int32_t> g_containerHigh{0};
-
 __declspec(noinline) bool containerLooksSane(void* container)
 {
     if (container == nullptr) {
@@ -2756,7 +2825,6 @@ __declspec(noinline) bool containerLooksSane(void* container)
         auto* const c = static_cast<std::uint8_t*>(container);
         void* const vtable = *reinterpret_cast<void**>(c);
         if (!memory::inGameModule(vtable)) {
-            g_containerWhy.store(1, std::memory_order_relaxed);
             return false;
         }
         auto* const inner = *reinterpret_cast<std::uint8_t**>(c + 0x5f0);
@@ -2764,13 +2832,11 @@ __declspec(noinline) bool containerLooksSane(void* container)
             return true;
         }
         if (!memory::isReadable(inner, 0xf0)) {
-            g_containerWhy.store(2, std::memory_order_relaxed);
             return false;
         }
         std::uint64_t lock = 0;
         std::memcpy(&lock, inner + 0xc0, sizeof(lock));
         if (lock == 0xFFFFFFFFFFFFFFFFULL) {
-            g_containerWhy.store(3, std::memory_order_relaxed);
             return false;
         }
         std::int32_t count = 0;
@@ -2782,12 +2848,6 @@ __declspec(noinline) bool containerLooksSane(void* container)
         constexpr std::int32_t kChunkLimit = 4000000;
         const bool ok = count >= 0 && count <= 0x100000 && low <= high
                         && low >= -kChunkLimit && high <= kChunkLimit;
-        if (!ok) {
-            g_containerWhy.store(4, std::memory_order_relaxed);
-            g_containerCount.store(count, std::memory_order_relaxed);
-            g_containerLow.store(low, std::memory_order_relaxed);
-            g_containerHigh.store(high, std::memory_order_relaxed);
-        }
         return ok;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -2797,17 +2857,7 @@ __declspec(noinline) bool containerLooksSane(void* container)
 void noteContainerRefused()
 {
     if (!g_containerRefusedTold.exchange(true, std::memory_order_relaxed)) {
-        static const wchar_t* const kWhy[] = {L"?", L"the vtable is outside the game",
-                                              L"what +0x5f0 points at cannot be read",
-                                              L"the lock is -1", L"the fields look insane"};
-        const int why = g_containerWhy.load(std::memory_order_relaxed);
-        log().warn(L"Schematica: the chunk record owner looked broken, so it was not called "
-                   L"(reason {} = {} / count {} / range {}..{})",
-                   why,
-                   kWhy[(why >= 0 && why <= 4) ? why : 0],
-                   g_containerCount.load(std::memory_order_relaxed),
-                   g_containerLow.load(std::memory_order_relaxed),
-                   g_containerHigh.load(std::memory_order_relaxed));
+        log().warn(L"Schematica: the chunk record owner looked broken, so it was not called");
     }
 }
 
@@ -2860,6 +2910,27 @@ __declspec(noinline) bool sharedIsReadable(void* rec)
         return shared != nullptr && probeReadable(shared, 0x40);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
+    }
+}
+
+enum class RecordState { Usable, Empty, Broken };
+
+__declspec(noinline) RecordState recordState(void* rec)
+{
+    if (!probeReadable(rec, 0x40)) {
+        return RecordState::Broken;
+    }
+    __try {
+        void* shared = nullptr;
+        std::memcpy(&shared, static_cast<std::uint8_t*>(rec) + 0x10, sizeof(shared));
+        if (shared == nullptr) {
+            void* held = nullptr;
+            std::memcpy(&held, static_cast<std::uint8_t*>(rec) + 0x20, sizeof(held));
+            return held == nullptr ? RecordState::Empty : RecordState::Broken;
+        }
+        return probeReadable(shared, 0x40) ? RecordState::Usable : RecordState::Broken;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return RecordState::Broken;
     }
 }
 
@@ -2970,6 +3041,7 @@ struct AskSweep {
     std::int64_t total = 0;
     std::size_t wanted = 0;
     std::size_t asked = 0;
+    std::size_t missed = 0;
 };
 AskSweep g_askSweep;
 
@@ -3002,7 +3074,6 @@ bool askSweepActive()
 
 void askGhostChunkBuilds(void* params)
 {
-    const perf::Scope perfScope{perf::Slot::AskBuilds};
     if (g_chunkBuildLookup == nullptr || g_scheduleChunkBuild == nullptr ||
         params == nullptr) {
         return;
@@ -3029,51 +3100,56 @@ void askGhostChunkBuilds(void* params)
     const std::int64_t perFrame = afterOff ? sweep.total : kAskPerFrame;
     const std::int64_t stop = std::min(sweep.total, sweep.next + perFrame);
     for (; sweep.next < stop; ++sweep.next) {
-        {
-            {
-                const std::int64_t index = sweep.next;
-                const auto cy = static_cast<std::int32_t>((sweep.low[1] >> 4) + index / (nx * nz));
-                const auto cx = static_cast<std::int32_t>((sweep.low[0] >> 4) + (index / nz) % nx);
-                const auto cz = static_cast<std::int32_t>((sweep.low[2] >> 4) + index % nz);
-                if (!afterOff && !blocks::ghostSubChunkOccupied(cx << 4, cy << 4, cz << 4)) {
-                    continue;
-                }
-                ++wanted;
-                const std::int32_t at[3] = {cx, cy, cz};
-                for (void** it = fields.containerBegin; it < fields.containerEnd; it += kContainerStride) {
-                    void* const rec = callChunkBuildLookup(*it, at);
-                    if (rec == nullptr) {
-                        continue;
-                    }
-                    if (!probeReadable(rec, 0x40) || !sharedIsReadable(rec)) {
-                        continue;
-                    }
-                    ++asked;
-                    if (!everything && recordHasGeometry(rec)) {
-                        break;
-                    }
-                    clearSharedEmptyFlag(rec);
-                    askVisibilityRebuild(rec);
-                    callScheduleChunkBuild(lb, rec, reinterpret_cast<void*>(fields.cameraPos),
-                                           *it);
-                    break;
-                }
-            }
+        const std::int64_t index = sweep.next;
+        const auto cy = static_cast<std::int32_t>((sweep.low[1] >> 4) + index / (nx * nz));
+        const auto cx = static_cast<std::int32_t>((sweep.low[0] >> 4) + (index / nz) % nx);
+        const auto cz = static_cast<std::int32_t>((sweep.low[2] >> 4) + index % nz);
+        if (!afterOff && !blocks::ghostSubChunkOccupied(cx << 4, cy << 4, cz << 4)) {
+            continue;
         }
+        ++wanted;
+        const std::int32_t at[3] = {cx, cy, cz};
+        bool got = false;
+        bool broken = false;
+        for (void** it = fields.containerBegin; it < fields.containerEnd; it += kContainerStride) {
+            void* const rec = callChunkBuildLookup(*it, at);
+            if (rec == nullptr) {
+                continue;
+            }
+            const RecordState state = recordState(rec);
+            if (state != RecordState::Usable) {
+                broken = broken || state == RecordState::Broken;
+                continue;
+            }
+            got = true;
+            ++asked;
+            if (!everything && recordHasGeometry(rec)) {
+                break;
+            }
+            clearSharedEmptyFlag(rec);
+            askVisibilityRebuild(rec);
+            callScheduleChunkBuild(lb, rec, reinterpret_cast<void*>(fields.cameraPos),
+                                   *it);
+            break;
+        }
+        if (!got && broken) {
+            ++sweep.missed;
+        }
+
     }
     if (sweep.next < sweep.total) {
         return;
     }
     sweep.active = false;
 
-    if (wanted != 0 && asked == 0) {
+    if (sweep.missed != 0 && asked == 0) {
         const unsigned long long now = GetTickCount64();
         unsigned long long was = g_ghostBuildWarnedAt.load(std::memory_order_relaxed);
         if (now - was >= 30000 &&
             g_ghostBuildWarnedAt.compare_exchange_strong(was, now)) {
-            log().warn(L"Schematica: could not ask for {} chunk(s) to be rebuilt (their "
+            log().warn(L"Schematica: could not ask for {} of {} chunk(s) to be rebuilt (their "
                        L"records cannot be read)",
-                       wanted);
+                       sweep.missed, wanted);
         }
     }
 }
@@ -3121,13 +3197,12 @@ std::uint64_t rebuildKey(const std::int32_t c[3]);
 
 struct ChunkBoxTries {
     std::uint32_t tries = 0;
-    std::uint32_t stacked = 0;
     std::uint64_t startSeq = 0;
 };
 std::mutex g_chunkBoxTriesMutex;
 std::unordered_map<std::uint64_t, ChunkBoxTries> g_chunkBoxTries;
 
-void noteChunkBoxTries(const void* rec, std::uint32_t tries, std::uint32_t stacked,
+void noteChunkBoxTries(const void* rec, std::uint32_t tries,
                        std::uint64_t buildSeq)
 {
     if (rec == nullptr || !blocks::ghostOn()) {
@@ -3145,7 +3220,6 @@ void noteChunkBoxTries(const void* rec, std::uint32_t tries, std::uint32_t stack
     }
     ChunkBoxTries& one = g_chunkBoxTries[rebuildKey(c)];
     one.tries = tries;
-    one.stacked = stacked;
     one.startSeq = buildSeq;
 }
 
@@ -3420,8 +3494,7 @@ void* __fastcall detourLevelBuildDispatch(void* ret, void* params, void* third,
 }
 
 bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
-                            std::uint32_t& tries, std::uint64_t* startSeq,
-                            std::uint32_t* stacked)
+                            std::uint32_t& tries, std::uint64_t* startSeq)
 {
     const std::int32_t c[3] = {cx, cy, cz};
     std::lock_guard<std::mutex> lock(g_chunkBoxTriesMutex);
@@ -3433,9 +3506,7 @@ bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
     if (startSeq != nullptr) {
         *startSeq = found->second.startSeq;
     }
-    if (stacked != nullptr) {
-        *stacked = found->second.stacked;
-    }
+
     return true;
 }
 
@@ -3525,7 +3596,7 @@ void freezeHookGroups()
     g_groupsFrozen.store(true, std::memory_order_release);
 }
 
-void refreshHookGroups()
+static void refreshHookGroups()
 {
     if (g_groupsFrozen.load(std::memory_order_acquire)) {
         return;
@@ -3535,19 +3606,17 @@ void refreshHookGroups()
     static unsigned long long offSince[static_cast<std::size_t>(HookGroup::Count)] = {};
     constexpr unsigned long long kOffDelayMs = 2000;
 
-    const bool all = diagflags::get(diagflags::Flag::HooksAll);
     const struct {
         HookGroup group;
         bool on;
     } wants[] = {
-        {HookGroup::Ghost, all || Schematica::instance().wantsGhostHooks() || blocks::ghostOn()},
-        {HookGroup::Diag, all || diagflags::get(diagflags::Flag::FrameTrace)},
-        {HookGroup::Fullbright, all || Fullbright::instance().enabled() || AntiEffect::instance().enabled()},
+        {HookGroup::Ghost, Schematica::instance().wantsGhostHooks() || blocks::ghostOn()},
+        {HookGroup::Fullbright, Fullbright::instance().enabled() || AntiEffect::instance().enabled()},
         {HookGroup::Ability,
-         all || CreativeNoClip::instance().enabled() || FlySpeed::instance().enabled()},
-        {HookGroup::Tool, all || AutoTool::instance().enabled()},
-        {HookGroup::Fog, all || NoRender::instance().fogSuppressed()},
-        {HookGroup::Particles, all || NoRender::instance().particlesSuppressed()},
+         CreativeNoClip::instance().enabled() || FlySpeed::instance().enabled()},
+        {HookGroup::Tool, AutoTool::instance().enabled()},
+        {HookGroup::Fog, NoRender::instance().fogSuppressed()},
+        {HookGroup::Particles, NoRender::instance().particlesSuppressed()},
     };
     const unsigned long long at = GetTickCount64();
     for (const auto& want : wants) {
@@ -3572,12 +3641,6 @@ void refreshHookGroups()
         }
     }
 
-    const bool hot = all || diagflags::get(diagflags::Flag::HotCount);
-    if (hot != g_countHotPaths.load(std::memory_order_relaxed)) {
-        g_countHotPaths.store(hot, std::memory_order_relaxed);
-        setCountingHooks(hot);
-        log().info(L"Hooks: counting the hot paths = {}", hot ? L"on" : L"off");
-    }
 }
 
 void installAll()
@@ -3639,6 +3702,8 @@ void installAll()
 
     hooks.create(scanner.address(Target::BuildBlock), &detourBuildBlock,
                  reinterpret_cast<void**>(&g_buildBlock), L"buildBlock");
+    hooks.create(scanner.address(Target::MobSwing), &detourMobSwing,
+                 reinterpret_cast<void**>(&g_mobSwing), L"MobSwing");
 
     hooks.create(scanner.address(Target::GameModeContinueDestroyBlock), &detourGameModeContinueDestroyBlock,
                  reinterpret_cast<void**>(&g_gameModeContinueDestroyBlock),
@@ -3652,6 +3717,8 @@ void installAll()
 
     hooks.create(scanner.address(Target::AbilitiesAccess), &detourAbilitiesAccess,
                  reinterpret_cast<void**>(&g_abilitiesAccess), L"AbilitiesAccess", HookGroup::Ability);
+    hooks.create(scanner.address(Target::PoseDecision), &detourPoseDecision,
+                 reinterpret_cast<void**>(&g_poseDecision), L"PoseDecision", HookGroup::Ability);
 
     hooks.create(scanner.address(Target::UseItem), &detourUseItem,
                  reinterpret_cast<void**>(&g_useItem), L"useItem");
@@ -3668,8 +3735,23 @@ void installAll()
     hooks.create(scanner.address(Target::MoveInputHandler), &detourMoveInputHandler,
                  reinterpret_cast<void**>(&g_moveInputHandler), L"MoveInputHandler");
 
-    hooks.create(scanner.address(Target::InputGather), &detourInputGather,
-                 reinterpret_cast<void**>(&g_inputGather), L"InputGather");
+    if (hooks.create(scanner.address(Target::InputGather), &detourInputGather,
+                     reinterpret_cast<void**>(&g_inputGather), L"InputGather")) {
+        const auto* const site = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::InputGatherKeyCallSite));
+        const auto* const gather = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::InputGather));
+        const void* keyReturn = nullptr;
+        if (site != nullptr && gather != nullptr && memory::isReadable(site, 0x17) && site[0x12] == 0xE8) {
+            std::int32_t rel = 0;
+            std::memcpy(&rel, site + 0x13, sizeof(rel));
+            if (site + 0x17 + rel == gather) keyReturn = site + 0x17;
+        }
+        ToggleSneakSprint::instance().setKeyCallReturn(keyReturn);
+        if (keyReturn == nullptr) {
+            notice::failOnce("ToggleSneakSprint.keyCall",
+                             L"Hooks: could not locate the raw key call of InputGather; ToggleSneakSprint is unavailable",
+                             "ToggleSneakSprint is unavailable (the key input call was not found)");
+        }
+    }
 
     hooks.create(scanner.address(Target::MoveIntentFromInput), &detourMoveIntent,
                  reinterpret_cast<void**>(&g_moveIntent), L"MoveIntentFromInput");
@@ -3742,7 +3824,7 @@ void installAll()
             log().info(L"Hooks: the trade screen push returns to RVA {:#x} (auto trade keeps it off the stack)",
                        reinterpret_cast<std::uintptr_t>(g_tradePushReturn) - base);
         } else {
-            log().warn(L"Hooks: could not locate the trade screen push site; the auto trade will open the screen");
+            log().warn(L"Hooks: could not locate the trade screen push site; the auto trade is off");
         }
     }
     if (hooks.create(scanner.address(Target::ContainerScreenCtor), &detourContainerScreenCtor,
@@ -3786,6 +3868,15 @@ void installAll()
                         reinterpret_cast<void**>(&g_containerGetItem), L"ContainerGetItem")) {
         containerui::setHudGetItemSite(scanner.address(Target::HudGetItemSite),
                                        scanner.address(Target::ContainerGetItem));
+    }
+    if (scanner.found(Target::HudGetItemSite)) {
+        void* resolver = nullptr;
+        void* base = nullptr;
+        if (containerui::locateHudCollectionResolver(scanner.address(Target::HudGetItemSite), resolver, base)) {
+            g_hudCollBase = reinterpret_cast<HudCollResolveFn>(base);
+            hooks.create(resolver, &detourHudCollResolve, reinterpret_cast<void**>(&g_hudCollResolve),
+                         L"HudCollectionResolve");
+        }
     }
     hooks.create(scanner.address(Target::TradeHoverInvoke), &detourTradeHoverInvoke,
                  reinterpret_cast<void**>(&g_tradeHoverInvoke), L"TradeHoverInvoke");
@@ -3857,12 +3948,18 @@ void installAll()
 
     hooks.create(scanner.address(Target::FogSettingsFetch), &detourFogSettingsFetch,
                  reinterpret_cast<void**>(&g_fogSettingsFetch), L"FogSettingsFetch", HookGroup::Fog);
-    hooks.create(scanner.address(Target::ShulkerContentsText), &detourShulkerContentsText,
-                 reinterpret_cast<void**>(&g_shulkerContentsText), L"ShulkerContentsText");
     hooks.create(scanner.address(Target::ItemHoverTextBuild), &detourItemHoverTextBuild,
                  reinterpret_cast<void**>(&g_itemHoverTextBuild), L"ItemHoverTextBuild");
     hooks.create(scanner.address(Target::HoverRendererRender), &detourHoverRendererRender,
                  reinterpret_cast<void**>(&g_hoverRendererRender), L"HoverRendererRender");
+    hooks.create(scanner.address(Target::MobEffectsRendererRender), &detourMobEffectsRendererRender,
+                 reinterpret_cast<void**>(&g_mobEffectsRendererRender), L"MobEffectsRendererRender");
+    hooks.create(scanner.address(Target::MobEffectsLayout), &detourMobEffectsLayout,
+                 reinterpret_cast<void**>(&g_mobEffectsLayout), L"MobEffectsLayout");
+    hooks.create(scanner.address(Target::HungerRendererUpdate), &detourHungerRendererUpdate,
+                 reinterpret_cast<void**>(&g_hungerRendererUpdate), L"HungerRendererUpdate");
+    hooks.create(scanner.address(Target::HeartRendererUpdate), &detourHeartRendererUpdate,
+                 reinterpret_cast<void**>(&g_heartRendererUpdate), L"HeartRendererUpdate");
     hooks.create(scanner.address(Target::AttackCore), &detourAttackCore, reinterpret_cast<void**>(&g_attackCore),
                  L"AttackCore", HookGroup::Tool);
     hooks.create(scanner.address(Target::SendComplexTransaction), &detourSendComplexTx,
@@ -3896,8 +3993,6 @@ void installAll()
                  &tsukuyomiPacketSendTrampoline, L"PacketSend");
 
     render::installOverlayHooks();
-
-    frametrace::installHooks();
 
     worldmesh::installHooks();
     gamemodewheel::installHooks();
@@ -3990,6 +4085,16 @@ bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned
     return false;
 }
 
+bool callBuildBlockWithoutSwing(void* gameMode, void* blockPos, unsigned char face,
+                                unsigned char extra, bool simTick)
+{
+    const bool previous = t_suppressSwing;
+    t_suppressSwing = true;
+    const bool placed = callBuildBlock(gameMode, blockPos, face, extra, simTick);
+    t_suppressSwing = previous;
+    return placed;
+}
+
 void callNotifyInventoryOpen(void* client)
 {
     if (g_notifyInventoryOpen != nullptr && client != nullptr) {
@@ -4021,6 +4126,16 @@ void* uiBagSetFunction()
 }
 
 void* gameClientInstance() { return g_clientInstance.load(std::memory_order_relaxed); }
+
+bool translate(void* out, const char* key) { return translateInto(out, key); }
+
+bool translateWith(void* out, const void* key, const void* params)
+{
+    if (g_i18nGetWithParams == nullptr || g_i18nSelf == nullptr || out == nullptr || key == nullptr || params == nullptr) {
+        return false;
+    }
+    return translateWithParamsGuarded(out, key, params);
+}
 
 namespace {
 
@@ -4080,91 +4195,6 @@ bool callOpenHowToPlayScreen()
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-}
-
-namespace {
-std::ptrdiff_t g_getSceneStackSlot = -1;
-std::ptrdiff_t g_popScreenSlot = -1;
-
-bool resolvePopSlots()
-{
-    if (g_getSceneStackSlot > 0 && g_popScreenSlot > 0) {
-        return true;
-    }
-    const auto* open = reinterpret_cast<const std::uint8_t*>(Scanner::instance().address(Target::OpenHowToPlayScreen));
-    const auto* pop = reinterpret_cast<const std::uint8_t*>(Scanner::instance().address(Target::ScenePopCall));
-    if (open == nullptr || pop == nullptr || !memory::isReadable(open, 40) || !memory::isReadable(pop, 16)) {
-        return false;
-    }
-    if (open[30] != 0x48 || open[31] != 0x8B || open[32] != 0x80 || pop[7] != 0x48 || pop[8] != 0x8B || pop[9] != 0x80) {
-        return false;
-    }
-    std::int32_t a = 0;
-    std::int32_t b = 0;
-    std::memcpy(&a, open + 33, 4);
-    std::memcpy(&b, pop + 10, 4);
-    if (a <= 0 || a > 0x2000 || (a % 8) != 0 || b <= 0 || b > 0x400 || (b % 8) != 0) {
-        return false;
-    }
-    g_getSceneStackSlot = a;
-    g_popScreenSlot = b;
-    return true;
-}
-
-struct alignas(8) SceneStackRef {
-    void* alive = nullptr;
-    void* counts = nullptr;
-    void* stack = nullptr;
-};
-
-using GetSceneStackFn = SceneStackRef*(__fastcall*)(void* client, SceneStackRef* out);
-using PopScreenFn = void(__fastcall*)(void* stack, int count);
-using CountsReleaseFn = void(__fastcall*)(void* counts);
-
-bool popTopScreenGuarded(void* client)
-{
-    __try {
-        void* const* vt = *static_cast<void* const* const*>(client);
-        const auto get = reinterpret_cast<GetSceneStackFn>(vt[g_getSceneStackSlot / 8]);
-        SceneStackRef ref;
-        get(client, &ref);
-        bool ok = false;
-        if (ref.alive != nullptr && *static_cast<const volatile std::uint8_t*>(ref.alive) != 0 && ref.stack != nullptr) {
-            void* const* svt = *static_cast<void* const* const*>(ref.stack);
-            reinterpret_cast<PopScreenFn>(svt[g_popScreenSlot / 8])(ref.stack, 1);
-            ok = true;
-        }
-        if (ref.counts != nullptr) {
-            auto* const c = static_cast<std::uint8_t*>(ref.counts);
-            void* const* cvt = *reinterpret_cast<void* const* const*>(c);
-            if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 8)) == 0) {
-                reinterpret_cast<CountsReleaseFn>(cvt[0])(c);
-                if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 0xc)) == 0) {
-                    reinterpret_cast<CountsReleaseFn>(cvt[1])(c);
-                }
-            }
-        }
-        return ok;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-}
-
-bool popTopScreen()
-{
-    void* const client = g_clientInstance.load(std::memory_order_relaxed);
-    if (client == nullptr || !resolvePopSlots()) {
-        return false;
-    }
-    const bool ok = popTopScreenGuarded(client);
-    static int said = 0;
-    if (said < 4) {
-        ++said;
-        log().info(L"Hooks: popped the top screen {} (scene stack slots +{:#x} / +{:#x})", ok ? L"ok" : L"FAILED",
-                   g_getSceneStackSlot, g_popScreenSlot);
-    }
-    return ok;
 }
 
 bool offstackScreenHeld()

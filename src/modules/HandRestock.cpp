@@ -3,11 +3,11 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
-#include <optional>
 
+#include "config/Config.h"
 #include "core/Logger.h"
-#include "core/Perf.h"
 #include "game/GameData.h"
 #include "game/BlockRegistry.h"
 #include "game/ChatCommand.h"
@@ -98,6 +98,26 @@ bool callSwapGuarded(SwapSlotsRaw fn, void* container, int slotA, int slotB,
     }
 }
 
+bool durabilityRaw(const void* stack, std::int32_t slot, void* damageValue, int& max, int& damage)
+{
+    __try {
+        auto* const bytes = static_cast<const std::byte*>(stack);
+        void* const weak = *reinterpret_cast<void* const*>(bytes + 0x08);
+        void* const item = weak != nullptr ? *static_cast<void* const*>(weak) : nullptr;
+        if (item == nullptr) {
+            return false;
+        }
+        void** const vt = *static_cast<void***>(item);
+        using MaxDamageFn = short(__fastcall*)(const void*);
+        using DamageValueFn = short(__fastcall*)(const void*);
+        max = reinterpret_cast<MaxDamageFn>(vt[slot / 8])(item);
+        damage = max > 0 ? reinterpret_cast<DamageValueFn>(damageValue)(stack) : 0;
+        return true;
+    } __except (accessViolationFilter(GetExceptionCode())) {
+        return false;
+    }
+}
+
 struct ModuleRange {
     const std::byte* base = nullptr;
     size_t size = 0;
@@ -147,7 +167,7 @@ bool HandRestock::available() const
 
 void HandRestock::onScansReady()
 {
-    chatcommand::registerModuleCommand({"restock", "handrestock", "hr"},
+    chatcommand::registerModuleCommand({"restock"},
         "/tk restock add|remove|list|clear [item]",
         [this](const std::vector<std::string>& args) { return restockCommand(args); },
         [this](const std::vector<std::string>& words, std::size_t argument, std::string_view suggestion) {
@@ -180,11 +200,52 @@ void HandRestock::onScansReady()
     log().info(L"HandRestock: telling your inventory apart by {} (inventory field +{:#x})",
                m_localPlayerVtable.load() != nullptr ? L"the LocalPlayer type" : L"nothing (the newest holder is used)",
                m_inventoryDisp);
+
+    if (const std::byte* const at = Scanner::instance().address(Target::ItemMaxDamageSlotSite);
+        at != nullptr && memory::isReadable(at + 6, 4)) {
+        std::int32_t slot = 0;
+        std::memcpy(&slot, at + 6, sizeof(slot));
+        m_maxDamageSlot = slot > 0 && slot < 0x1000 && slot % 8 == 0 ? slot : 0;
+    }
+    m_damageValue = Scanner::instance().address(Target::ItemStackDamageValue);
+    log().info(L"HandRestock: durability {}, swap action {}",
+               m_maxDamageSlot != 0 && m_damageValue != nullptr ? L"ready" : L"missing",
+               ItemStackRequest::instance().canSwap() ? L"ready" : L"missing");
+}
+
+MenuItem HandRestock::buildMenu()
+{
+    std::vector<MenuItem> children;
+    children.push_back(enabledItem());
+    children.push_back(toggleKeyItem());
+    children.push_back(menu::toggle(
+        L"Swap low durability tools", [this] { return m_swapLowDurability.load(std::memory_order_relaxed); },
+        [this] {
+            m_swapLowDurability.store(!m_swapLowDurability.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }));
+    children.push_back(menu::number(
+        L"Durability threshold",
+        [this] { return static_cast<float>(m_durabilityThreshold.load(std::memory_order_relaxed)); },
+        [this](float value) {
+            m_durabilityThreshold.store(std::clamp(static_cast<int>(std::lround(value)), kMinDurabilityThreshold,
+                                                   kMaxDurabilityThreshold),
+                                        std::memory_order_relaxed);
+        },
+        true, static_cast<float>(kMinDurabilityThreshold), static_cast<float>(kMaxDurabilityThreshold)));
+
+    MenuItem item = menu::submenu(name(), std::move(children));
+    item.available = [this] { return available(); };
+    item.isOn = [this] { return enabled(); };
+    return item;
 }
 
 void HandRestock::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
+    m_swapLowDurability.store(Config::getBool(section, "swapLowDurability", false), std::memory_order_relaxed);
+    m_durabilityThreshold.store(std::clamp(Config::getInt(section, "durabilityThreshold", kDefaultDurabilityThreshold),
+                                           kMinDurabilityThreshold, kMaxDurabilityThreshold),
+                                std::memory_order_relaxed);
     std::set<std::string> names;
     if (const auto it = section.find("excluded"); it != section.end() && it->is_array()) {
         for (const auto& value : *it) {
@@ -202,11 +263,8 @@ void HandRestock::saveConfig(nlohmann::json& section) const
         std::lock_guard lock(m_excludedMutex);
         section["excluded"] = m_excluded;
     }
-    section.erase("inventoryKey");
-
-    section.erase("testKeys");
-
-    section.erase("keepServerInventoryOpen");
+    section["swapLowDurability"] = m_swapLowDurability.load(std::memory_order_relaxed);
+    section["durabilityThreshold"] = m_durabilityThreshold.load(std::memory_order_relaxed);
 }
 
 std::string HandRestock::mainHandItemName() const
@@ -218,20 +276,21 @@ std::string HandRestock::mainHandItemName() const
     return containerui::itemName(inventory.slots + kSlotStride * inventory.hand);
 }
 
-std::vector<std::string> HandRestock::restockCommand(const std::vector<std::string>& args)
+chatcommand::Reply HandRestock::restockCommand(const std::vector<std::string>& args)
 {
+    const auto parsed = chatcommand::restockAction(args);
+    if (parsed == chatcommand::RestockAction::Invalid)
+        return {{"Usage: /tk restock add|remove|list|clear [item]"}, true};
     const std::string& action = args[0];
-    if (action == "list" || action == "ls") {
-        if (args.size() != 1) return {"Usage: /tk restock list"};
+    if (action == "list") {
         std::vector<std::string> names;
         {
             std::lock_guard lock(m_excludedMutex);
             names.assign(m_excluded.begin(), m_excluded.end());
         }
-        return chatcommand::listLines(names);
+        return {chatcommand::listLines(names)};
     }
     if (action == "clear") {
-        if (args.size() != 1) return {"Usage: /tk restock clear"};
         std::size_t count;
         {
             std::lock_guard lock(m_excludedMutex);
@@ -239,15 +298,12 @@ std::vector<std::string> HandRestock::restockCommand(const std::vector<std::stri
             m_excluded.clear();
         }
         if (count != 0) uiprobe::markSettingsDirty();
-        return {"Cleared " + std::to_string(count) + " exclusions"};
+        return {{"Cleared " + std::to_string(count) + " exclusions"}};
     }
-    if (action != "add" && action != "remove" && action != "rm" && action != "del")
-        return {"Unknown command: /tk restock " + action + " (try /tk help)"};
-    if (args.size() > 2) return {"Usage: /tk restock add|remove [item]"};
     const std::string item = args.size() == 2 ? chatcommand::normalizeItem(args[1])
                                                 : chatcommand::normalizeItem(mainHandItemName());
-    if (item == "minecraft:") return {"Nothing in your main hand"};
-    if (blocks::itemByName(item) == nullptr) return {"Unknown item: " + item};
+    if (item == "minecraft:") return {{"Nothing in your main hand"}, true};
+    if (blocks::itemByName(item) == nullptr) return {{"Unknown item: " + item}, true};
     const bool adding = action == "add";
     bool changed;
     std::size_t count;
@@ -257,17 +313,14 @@ std::vector<std::string> HandRestock::restockCommand(const std::vector<std::stri
         count = m_excluded.size();
     }
     if (changed) uiprobe::markSettingsDirty();
-    if (adding) return {changed ? "Added " + item + " to the HandRestock exclusions ("
-                                 + std::to_string(count) + " items)" : item + " is already excluded"};
-    return {changed ? "Removed " + item + " from the HandRestock exclusions" : item + " is not excluded"};
+    if (adding) return {{changed ? "Added " + item + " to the HandRestock exclusions ("
+                                 + std::to_string(count) + " items)" : item + " is already excluded"}};
+    return {{changed ? "Removed " + item + " from the HandRestock exclusions" : item + " is not excluded"}};
 }
 
 void HandRestock::onEnabledChanged(bool )
 {
-    for (int spot = 0; spot < kSpotCount; ++spot) {
-        m_last[spot] = HandState{};
-        m_pending[spot] = Pending{};
-    }
+    m_resetRequested.store(true, std::memory_order_release);
 }
 
 void HandRestock::onSetSelectedSlot(void* holder)
@@ -287,6 +340,12 @@ void HandRestock::onSetSelectedSlot(void* holder)
 
 void HandRestock::onPlayerViewUpdate()
 {
+    if (m_resetRequested.exchange(false, std::memory_order_acq_rel)) {
+        for (int spot = 0; spot < kSpotCount; ++spot) {
+            m_last[spot] = HandState{};
+            m_pending[spot] = Pending{};
+        }
+    }
     if (!enabled()) {
         clearOutstanding();
         for (int spot = 0; spot < kSpotCount; ++spot) {
@@ -295,8 +354,6 @@ void HandRestock::onPlayerViewUpdate()
         }
         return;
     }
-
-    const perf::Scope guard{perf::Slot::HandRestock};
 
     serveOutstanding();
 
@@ -322,11 +379,7 @@ void HandRestock::onPlayerViewUpdate()
         return;
     }
 
-    bool clientSide = false;
-    {
-        const perf::Scope guard2{perf::Slot::HrClientSide};
-        clientSide = isClientSidePlayer(inventory.playerRaw);
-    }
+    const bool clientSide = isClientSidePlayer(inventory.playerRaw);
     if (!m_loggedClientSide || clientSide != m_clientSideKnown) {
         m_loggedClientSide = true;
         m_clientSideKnown = clientSide;
@@ -348,6 +401,134 @@ void HandRestock::onPlayerViewUpdate()
     } else {
         m_last[kSpotOffhand] = HandState{};
     }
+
+    checkDurability(inventory);
+}
+
+bool HandRestock::durabilityOf(const std::byte* stack, int& max, int& damage) const
+{
+    if (stack == nullptr || m_maxDamageSlot == 0 || m_damageValue == nullptr) {
+        return false;
+    }
+    return durabilityRaw(stack, m_maxDamageSlot, m_damageValue, max, damage);
+}
+
+int HandRestock::findDurabilitySource(const Inventory& inventory, void* item, int keepSlot, int threshold) const
+{
+    int best = -1;
+    int bestRemaining = threshold;
+    const auto consider = [&](int slot) {
+        SlotView view;
+        if (slot == keepSlot || !readSlot(inventory.slots, slot, view) || view.item != item || view.count == 0) {
+            return;
+        }
+        int max = 0;
+        int damage = 0;
+        if (!durabilityOf(inventory.slots + kSlotStride * slot, max, damage) || max <= 0) {
+            return;
+        }
+        if (max - damage > bestRemaining) {
+            best = slot;
+            bestRemaining = max - damage;
+        }
+    };
+    for (int slot = kHotbarSlots; slot < kSlotCount; ++slot) {
+        consider(slot);
+    }
+    for (int slot = 0; slot < kHotbarSlots; ++slot) {
+        consider(slot);
+    }
+    return best;
+}
+
+void HandRestock::checkDurability(const Inventory& inventory)
+{
+    if (!m_swapLowDurability.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (m_maxDamageSlot == 0 || m_damageValue == nullptr) {
+        if (!m_warnedNoDurability) {
+            m_warnedNoDurability = true;
+            log().warn(L"HandRestock: the durability functions were not found, low durability tools are not swapped");
+        }
+        return;
+    }
+    if (m_outstanding.active) {
+        return;
+    }
+
+    const int threshold = std::clamp(m_durabilityThreshold.load(std::memory_order_relaxed), kMinDurabilityThreshold,
+                                     kMaxDurabilityThreshold);
+    const Clock::time_point now = Clock::now();
+    for (int i = 0; i < kSpotCount; ++i) {
+        const Spot spot = static_cast<Spot>(i);
+        if (m_pending[spot].active || now < m_nextDurabilityAt[spot]) {
+            continue;
+        }
+        const std::byte* const stack =
+            (spot == kSpotHand) ? (inventory.hand >= 0 && inventory.hand < kHotbarSlots
+                                       ? inventory.slots + kSlotStride * inventory.hand
+                                       : nullptr)
+                                : inventory.offhand;
+        SlotView view;
+        if (stack == nullptr || !readStackAt(stack, view) || view.item == nullptr || view.count == 0) {
+            m_noReplacementItem[spot] = nullptr;
+            continue;
+        }
+        int max = 0;
+        int damage = 0;
+        if (!durabilityOf(stack, max, damage) || max <= 0) {
+            continue;
+        }
+        const int remaining = max - damage;
+        if (remaining > threshold) {
+            m_noReplacementItem[spot] = nullptr;
+            continue;
+        }
+        {
+            std::lock_guard lock(m_excludedMutex);
+            if (!m_last[spot].name.empty() && m_excluded.contains(chatcommand::normalizeItem(m_last[spot].name))) {
+                continue;
+            }
+        }
+
+        const int source = findDurabilitySource(inventory, view.item, inventory.hand, threshold);
+        const wchar_t* const where = (spot == kSpotHand) ? L"hand" : L"offhand";
+        if (source < 0) {
+            if (m_noReplacementItem[spot] != view.item) {
+                m_noReplacementItem[spot] = view.item;
+                log().info(L"HandRestock: the {} has {} durability left but nothing with more than {} is left "
+                           L"to swap in", where, remaining, threshold);
+            }
+            continue;
+        }
+        m_noReplacementItem[spot] = nullptr;
+
+        if (!ItemStackRequest::instance().canSwap()) {
+            if (!m_warnedNoSwapAction) {
+                m_warnedNoSwapAction = true;
+                log().warn(L"HandRestock: the swap action was not found, low durability tools are not swapped");
+            }
+            return;
+        }
+
+        int sourceMax = 0;
+        int sourceDamage = 0;
+        durabilityOf(inventory.slots + kSlotStride * source, sourceMax, sourceDamage);
+        const int applied = applyRefill(spot, inventory.hand, source, true);
+        if (applied == 0) {
+            m_nextDurabilityAt[spot] = now + std::chrono::milliseconds(kRetryMs);
+            return;
+        }
+        m_nextDurabilityAt[spot] = now + std::chrono::milliseconds(kDurabilityCooldownMs);
+        static int logs1 = 0;
+        if (logs1 < 200) {
+            ++logs1;
+            log().success(L"HandRestock: the {} had {} durability left, swapped it with slot {} ({} left)", where,
+                          remaining, source, sourceMax - sourceDamage);
+        }
+        return;
+    }
 }
 
 void HandRestock::noteDeliberateMove()
@@ -362,7 +543,6 @@ void HandRestock::noteDeliberateMove()
 
 void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& view)
 {
-    const perf::Scope guard{perf::Slot::HrWatch};
 
     const int slot = (spot == kSpotHand) ? inventory.hand : -1;
 
@@ -372,7 +552,7 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
 
     const HandState previous = m_last[spot];
     m_last[spot] = HandState{inventory.container, slot,     view.item,
-                             view.block,          view.aux, view.count,
+                             view.aux, view.count,
                              total};
     if (view.item != nullptr && view.count > 0) {
         m_last[spot].name = previous.item == view.item ? previous.name
@@ -414,7 +594,6 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
     m_pending[spot].destSlot = slot;
     m_pending[spot].container = inventory.container;
     m_pending[spot].item = previous.item;
-    m_pending[spot].block = previous.block;
     m_pending[spot].aux = previous.aux;
     m_pending[spot].totalBefore = previous.total;
     m_pending[spot].at = now + std::chrono::milliseconds(kSettleMs);
@@ -498,7 +677,6 @@ void HandRestock::servePending(Spot spot)
 
     SlotView wanted;
     wanted.item = pending.item;
-    wanted.block = pending.block;
     wanted.aux = pending.aux;
 
     const int keepSlot = (spot == kSpotHand) ? pending.destSlot : inventory.hand;
@@ -530,7 +708,7 @@ void HandRestock::servePending(Spot spot)
                             : readStackAt(inventory.offhand, refilled);
     if (reread) {
         m_last[spot] = HandState{inventory.container, pending.destSlot, refilled.item,
-                                 refilled.block,      refilled.aux,     refilled.count};
+                                 refilled.aux, refilled.count};
     }
 
     const wchar_t* const where = (spot == kSpotHand) ? L"hand" : L"offhand";
@@ -541,8 +719,12 @@ void HandRestock::servePending(Spot spot)
         return;
     }
 
-    log().success(L"HandRestock: the {} ran out, refilled from slot {} (x{})", where, source,
-                  sourceView.count);
+    static int logs2 = 0;
+    if (logs2 < 200) {
+        ++logs2;
+        log().success(L"HandRestock: the {} ran out, refilled from slot {} (x{})", where, source,
+                      sourceView.count);
+    }
 }
 
 bool HandRestock::emptyEverywhere(Spot spot, int destSlot) const
@@ -612,8 +794,6 @@ int HandRestock::countItem(const Inventory& inventory, void* item, std::uint16_t
     if (item == nullptr) {
         return 0;
     }
-
-    const perf::Scope guard{perf::Slot::HrCount};
 
     int total = 0;
     for (int slot = 0; slot < kSlotCount; ++slot) {
@@ -958,9 +1138,8 @@ void HandRestock::notePlayerFaulted(void* player) const
     one.player.store(player, std::memory_order_release);
 }
 
-bool HandRestock::resolveOwn(Own& out, bool wantServer, bool forOthers) const
+bool HandRestock::resolveOwn(Own& out, bool wantServer) const
 {
-    const perf::Scope guard{forOthers ? perf::Slot::HrOwnLookup : perf::Slot::HrResolve};
     out = Own{};
 
     if (localPlayerVtable() == nullptr) {
@@ -979,7 +1158,7 @@ bool HandRestock::resolveOwn(Own& out, bool wantServer, bool forOthers) const
         return out.haveClient;
     }
 
-    const auto tryClient = [this, &out, forOthers](void* holder, void* expectedPlayer, bool* faultedOut) {
+    const auto tryClient = [this, &out](void* holder, void* expectedPlayer, bool* faultedOut) {
         if (holder == nullptr || holder == m_faultedHolder.load(std::memory_order_acquire)) {
             return false;
         }
@@ -991,14 +1170,7 @@ bool HandRestock::resolveOwn(Own& out, bool wantServer, bool forOthers) const
             }
             return false;
         }
-        bool client = false;
-        {
-            std::optional<perf::Scope> guard2;
-            if (!forOthers) {
-                guard2.emplace(perf::Slot::HrClientSide);
-            }
-            client = isClientSidePlayer(inventory.playerRaw);
-        }
+        const bool client = isClientSidePlayer(inventory.playerRaw);
         if (!client || (expectedPlayer != nullptr && inventory.playerRaw != expectedPlayer)) {
             return false;
         }
@@ -1081,7 +1253,7 @@ bool HandRestock::resolveOwn(Own& out, bool wantServer, bool forOthers) const
             return false;
         }
         const GameData& game = GameData::instance();
-        if (game.knowsServerPlayer() && !game.isServerPlayer(inventory.playerRaw)) {
+        if (!game.knowsServerPlayer() || !game.isServerPlayer(inventory.playerRaw)) {
             return false;
         }
         if (m_inventoryDisp != 0 && holderOfPlayer(inventory.playerRaw) != holder) {
@@ -1141,7 +1313,7 @@ void HandRestock::ownHolders(void*& client, void*& server) const
     client = nullptr;
     server = nullptr;
     Own own;
-    if (!resolveOwn(own, true, true)) {
+    if (!resolveOwn(own, true)) {
         return;
     }
     client = own.client.holder;
@@ -1151,7 +1323,7 @@ void HandRestock::ownHolders(void*& client, void*& server) const
 void* HandRestock::ownClientHolder() const
 {
     Own own;
-    return resolveOwn(own, false, true) ? own.client.holder : nullptr;
+    return resolveOwn(own, false) ? own.client.holder : nullptr;
 }
 
 bool HandRestock::predictRefill(const Inventory& inventory, Spot spot, int destSlot,
@@ -1290,6 +1462,7 @@ void HandRestock::serveOutstanding()
     const int destSlot = m_outstanding.destSlot;
     void* const container = m_outstanding.container;
     Pending retryAs = m_outstanding.retryAs;
+    const bool durabilitySwap = m_outstanding.durabilitySwap;
     const std::uint32_t contentAtSend = m_outstanding.contentSerialAtSend;
     bool intact = false;
     {
@@ -1300,8 +1473,17 @@ void HandRestock::serveOutstanding()
             && ((spot == kSpotHand) ? readSlot(now.slots, destSlot, dest)
                                     : (now.offhand != nullptr && readStackAt(now.offhand, dest)))
             && readSlot(now.slots, m_outstanding.sourceSlot, source)) {
-            intact = dest.item == m_outstanding.predItem && dest.count == m_outstanding.predCount
-                     && (source.item == nullptr || source.count == 0);
+            if (!m_outstanding.durabilitySwap) {
+                intact = dest.item == m_outstanding.predItem && dest.count == m_outstanding.predCount
+                         && (source.item == nullptr || source.count == 0);
+            } else {
+                const bool sourceIntact = source.item == m_outstanding.predSourceItem
+                                          && source.count == m_outstanding.predSourceCount
+                                          && source.netValue == m_outstanding.predSourceNet;
+                const bool destIntact = dest.item == m_outstanding.predItem && dest.count == m_outstanding.predCount
+                                        && dest.netValue == m_outstanding.predDestNet;
+                intact = sourceIntact && (spot == kSpotOffhand || destIntact);
+            }
         }
     }
     const bool resent = !intact;
@@ -1319,6 +1501,10 @@ void HandRestock::serveOutstanding()
                        where, result);
         } else {
             log().warn(L"HandRestock: the server refused to refill the {} (result {})", where, result);
+        }
+        if (durabilitySwap) {
+            m_nextDurabilityAt[spot] = Clock::now() + std::chrono::milliseconds(kDurabilityRefusedMs);
+            return;
         }
         const bool behind = result == kResultFailedToValidateSrcSlot || result == kResultFailedToValidateDstSlot;
         if (behind && retryAs.active && retryAs.attempts < kMaxRefusedRetries) {
@@ -1361,9 +1547,12 @@ void HandRestock::serveOutstanding()
     log().error(L"HandRestock: the server refused to refill the {} (result {}) and the item could "
                 L"not be put back, the client may disagree with the server",
                 where, result);
+    if (durabilitySwap) {
+        m_nextDurabilityAt[spot] = Clock::now() + std::chrono::milliseconds(kDurabilityRefusedMs);
+    }
 }
 
-int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
+int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot, bool durabilitySwap)
 {
 
     if (m_outstanding.active) {
@@ -1385,7 +1574,11 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
             ? ItemStackRequest::instance().requestSwap(
                   ItemStackRequest::inventorySlot(inventory.slots, sourceSlot),
                   ItemStackRequest::offhandSlot(inventory.offhand))
-            : ItemStackRequest::instance().requestMove(inventory.slots, sourceSlot, destSlot);
+            : durabilitySwap
+                  ? ItemStackRequest::instance().requestSwap(
+                        ItemStackRequest::inventorySlot(inventory.slots, sourceSlot),
+                        ItemStackRequest::inventorySlot(inventory.slots, destSlot))
+                  : ItemStackRequest::instance().requestMove(inventory.slots, sourceSlot, destSlot);
 
     if (!sent) {
         if (!m_warnedNoRequest) {
@@ -1435,6 +1628,13 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot)
                                               : (inventory.offhand != nullptr && readStackAt(inventory.offhand, predicted));
         m_outstanding.predItem = read ? predicted.item : nullptr;
         m_outstanding.predCount = read ? predicted.count : 0;
+        m_outstanding.predDestNet = read ? predicted.netValue : 0;
+        SlotView source;
+        const bool readSource = readSlot(inventory.slots, sourceSlot, source);
+        m_outstanding.durabilitySwap = durabilitySwap;
+        m_outstanding.predSourceItem = readSource ? source.item : nullptr;
+        m_outstanding.predSourceCount = readSource ? source.count : 0;
+        m_outstanding.predSourceNet = readSource ? source.netValue : 0;
     }
 
     return 1;

@@ -23,6 +23,8 @@ public:
 
     void onAbilitiesAccess(void* context);
 
+    void onScansReady() override;
+
 protected:
     void onEnabledChanged(bool enabled) override;
 

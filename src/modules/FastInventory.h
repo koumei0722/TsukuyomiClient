@@ -18,7 +18,6 @@ public:
     void onInventoryOpenSent(void* client);
 
 protected:
-    bool persistEnabled() const override { return true; }
 
 private:
     FastInventory() = default;
