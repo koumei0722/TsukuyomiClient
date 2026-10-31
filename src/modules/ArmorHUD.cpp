@@ -39,8 +39,8 @@ constexpr std::uint32_t kEquipmentTypeId = 0xB06141A9u;
 constexpr std::size_t kMaxEquipStride = 0x40;
 constexpr std::size_t kArmorSlots = 4;
 
-constexpr std::ptrdiff_t kOffhandOffset = 0xD90;
-constexpr std::ptrdiff_t kMainhandOffset = 0xE28;
+constexpr std::ptrdiff_t kOffhandOffset = 0xDB8;
+constexpr std::ptrdiff_t kMainhandOffset = 0xE50;
 
 constexpr std::ptrdiff_t kInvContainerOffset = 0xB8;
 constexpr std::ptrdiff_t kInvSlotsOffset = 0x198;

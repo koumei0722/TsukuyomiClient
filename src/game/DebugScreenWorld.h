@@ -5,9 +5,21 @@
 
 namespace tsukuyomi::debugworld {
 
+const void* worldBlockAt(const std::int32_t pos[3]);
+
 int collectHitBoxes(debuglines::HitBox* out, int cap, float range, bool includeSelf);
 void setActorFunctions(void* attachPos, void* viewVector, std::int32_t rotationField);
 bool worldHeightAt(int x, int z, int& minY, int& maxYExclusive);
+
+struct ColumnCell {
+    const void* block = nullptr;
+    const void* extra = nullptr;
+    std::uint8_t skyLight = 0;
+    std::uint8_t blockLight = 0;
+    bool ok = false;
+    bool aboveTop = false;
+};
+bool readColumn(int x, int z, int yBottom, int count, ColumnCell* out);
 
 struct Wanted {
     bool target = false;
@@ -126,8 +138,7 @@ bool read(Sample& out);
 void setClimateTargets(void* sampleFunction, const void* generatorVtable, std::int32_t biomeSourceOffset);
 
 struct SurfaceTargetsIn {
-    void* columnFunction = nullptr;
-    std::int32_t samplerFromSubObject = 0;
+    const void* surfaceSite = nullptr;
     std::int32_t factoryFromSubObject = 0;
     std::int32_t factoryNoBlendFlag = 0;
     const void* densityGrid = nullptr;

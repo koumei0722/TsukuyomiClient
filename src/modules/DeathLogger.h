@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "core/ShutdownGate.h"
 #include "modules/Module.h"
 
 namespace tsukuyomi {
@@ -20,6 +21,7 @@ public:
     void loadConfig(const nlohmann::json& section) override;
     void saveConfig(nlohmann::json& section) const override;
     void onScansReady() override;
+    void shutdown() override;
 
     void onPlayerViewUpdate();
 
@@ -31,6 +33,7 @@ private:
 
     std::string resolveDimension();
 
+    ShutdownGate m_detection;
     std::atomic<const void*> m_healthAttribute{nullptr};
     std::atomic<bool> m_writeToFile{false};
 

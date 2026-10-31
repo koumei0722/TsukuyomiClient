@@ -128,8 +128,8 @@ bool resolveJson(std::byte* body, std::byte* image)
     g_isInt = reinterpret_cast<JsonBoolFn>(callTarget(body, 0x5A));
     g_isUInt = reinterpret_cast<JsonBoolFn>(callTarget(body, 0x66));
     g_asInt = reinterpret_cast<JsonIntFn>(callTarget(body, 0x74));
-    g_setBool = reinterpret_cast<SetBoolFn>(callTarget(body, 0x159));
-    g_setText = reinterpret_cast<SetTextFn>(callTarget(image, 0x167));
+    g_setBool = reinterpret_cast<SetBoolFn>(callTarget(body, 0xAE));
+    g_setText = reinterpret_cast<SetTextFn>(callTarget(image, 0x16B));
     g_indexKey = static_cast<const char*>(memory::ripTarget(body, 0x48));
     return g_isNull && g_isObject && g_index && g_isInt && g_isUInt && g_asInt
            && g_setBool && g_setText && g_indexKey
@@ -412,26 +412,26 @@ bool installHooks()
     std::byte* selectedBody = scanner.address(Target::EmoteWheelSelected);
     std::array<void*, 5> body{};
     if (released != nullptr && memory::isReadable(released, 0x270)) {
-        g_stackSlot = slotAt(released + 0x1A8);
-        g_factorySlot = slotAt(released + 0x249);
-        g_pushSlot = slotAt(released + 0x268);
-        g_createWheel = reinterpret_cast<CreateSceneFn>(callTarget(released, 0x260));
+        g_stackSlot = slotAt(released + 0x1A7);
+        g_factorySlot = slotAt(released + 0x1E6);
+        g_pushSlot = slotAt(released + 0x207);
+        g_createWheel = reinterpret_cast<CreateSceneFn>(callTarget(released, 0x1FE));
     }
     if (!ctorBody || !bindings || !g_createWheel || g_stackSlot == 0 || g_factorySlot == 0 || g_pushSlot == 0
         || !selectedBody
-        || !memory::isReadable(ctorBody, 0x16F)
-        || ctorBody[0x6D] != std::byte{0x48} || ctorBody[0x6E] != std::byte{0x8D}
-        || ctorBody[0x6F] != std::byte{0x05}
-        || ctorBody[0x168] != std::byte{0x48} || ctorBody[0x169] != std::byte{0x8D}
-        || ctorBody[0x16A] != std::byte{0xB2}
+        || !memory::isReadable(ctorBody, 0x116)
+        || ctorBody[0x6E] != std::byte{0x48} || ctorBody[0x6F] != std::byte{0x8D}
+        || ctorBody[0x70] != std::byte{0x05}
+        || ctorBody[0x10F] != std::byte{0x48} || ctorBody[0x110] != std::byte{0x8D}
+        || ctorBody[0x111] != std::byte{0xB2}
         || !bindingBodies(bindings, body)
         || !resolveJson(static_cast<std::byte*>(body[3]), static_cast<std::byte*>(body[0]))) {
         log().warn(L"GameModeWheel: a signature or binding shape was unavailable");
         return false;
     }
-    std::memcpy(&g_helperOffset, ctorBody + 0x16B, sizeof(g_helperOffset));
+    std::memcpy(&g_helperOffset, ctorBody + 0x112, sizeof(g_helperOffset));
     if (g_helperOffset <= 0 || g_helperOffset > 0x10000) return false;
-    void* table = memory::ripTarget(ctorBody, 0x70);
+    void* table = memory::ripTarget(ctorBody, 0x71);
     void* destructor = nullptr;
     if (!memory::inGameModule(table) || !memory::isReadable(table, sizeof(destructor))) return false;
     std::memcpy(&destructor, table, sizeof(destructor));

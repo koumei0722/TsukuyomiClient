@@ -33,6 +33,8 @@ public:
     bool onSendTransaction(void* player, void** transaction);
 
     void onPlayerViewUpdate();
+    bool selectHotbarSlot(int slot);
+    int selectedSlotAnnounced() const;
 
 protected:
     void onEnabledChanged(bool enabled) override;

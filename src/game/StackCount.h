@@ -6,8 +6,6 @@
 
 namespace tsukuyomi::stackcount {
 
-int maxStackSize(std::string_view name);
-
 constexpr int kSlotsPerBox = 27;
 inline int perBox(int stackSize) { return kSlotsPerBox * stackSize; }
 

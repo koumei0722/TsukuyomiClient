@@ -35,7 +35,19 @@ public:
 
     void noteDeliberateMove();
 
-    bool forEachInventorySlot(const std::function<void(const void*, int)>& fn) const;
+    bool forEachInventoryStack(const std::function<void(const void*, int)>& fn) const;
+    enum class PickResult { Selected, Pending, Missing, Unavailable, NoSlot };
+    PickResult selectItem(const std::string& name, unsigned allowedSlots = 0x1FF);
+    const void* heldStack() const;
+    bool itemMovePending() const { return m_externalSwap && m_outstanding.active; }
+    struct ClientInventory {
+        std::byte* slots = nullptr;
+        void* player = nullptr;
+        std::byte* offhand = nullptr;
+        std::byte* mainhand = nullptr;
+        int hand = -1;
+    };
+    bool clientInventory(ClientInventory& out) const;
 
 protected:
     void onEnabledChanged(bool enabled) override;
@@ -110,6 +122,7 @@ private:
     int findSource(const Inventory& inventory, const SlotView& wanted, int keepSlot) const;
 
     int applyRefill(Spot spot, int destSlot, int sourceSlot, bool durabilitySwap = false);
+    int applyLegacyRefill(const Inventory& inventory, Spot spot, int destSlot, int sourceSlot);
 
     void checkDurability(const Inventory& inventory);
     bool durabilityOf(const std::byte* stack, int& max, int& damage) const;
@@ -137,8 +150,8 @@ private:
 
     static constexpr ptrdiff_t kPlayerOffset = 0x1B0;
 
-    static constexpr ptrdiff_t kOffhandOffset = 0xD90;
-    static constexpr ptrdiff_t kMainhandOffset = 0xE28;
+    static constexpr ptrdiff_t kOffhandOffset = 0xDB8;
+    static constexpr ptrdiff_t kMainhandOffset = 0xE50;
 
     static constexpr std::size_t kLocalPlayerVtableDisp = 3;
 
@@ -245,6 +258,7 @@ private:
         std::int32_t predSourceNet = 0;
     };
     Outstanding m_outstanding;
+    bool m_externalSwap = false;
 
     alignas(void*) std::byte m_before[ItemStackOps::kStackBytes]{};
 

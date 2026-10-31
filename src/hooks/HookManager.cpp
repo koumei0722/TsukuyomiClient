@@ -141,12 +141,6 @@ bool HookManager::applyQueued()
     return true;
 }
 
-bool HookManager::groupEnabled(HookGroup group) const
-{
-    const std::lock_guard<std::recursive_mutex> guard(m_lock);
-    return m_groupOn[static_cast<std::size_t>(group)];
-}
-
 bool HookManager::setGroupEnabled(HookGroup group, bool on)
 {
     const std::lock_guard<std::recursive_mutex> guard(m_lock);

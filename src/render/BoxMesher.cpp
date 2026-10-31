@@ -299,12 +299,15 @@ std::vector<Edge> buildEdges(const std::vector<Cell>& cells, EdgeStyle style)
             unique.push_back(cell);
         }
     }
-    const auto any = [&occupied](const Key3& at) { return occupied.find(at) != occupied.end(); };
 
     std::unordered_set<Key4, Key4Hash> seen;
     seen.reserve(unique.size() * 6 + 1);
     std::unordered_map<Key3, std::vector<std::int32_t>, Key3Hash> runs;
     for (const Cell& cell : unique) {
+        const auto any = [&occupied, &cell](const Key3& at) {
+            return occupied.find(at) != occupied.end()
+                || (cell.nearMask & nearBit(at.a - cell.x, at.b - cell.y, at.c - cell.z)) != 0;
+        };
         for (std::uint8_t axis = 0; axis < 3; ++axis) {
             std::int32_t t = 0;
             std::int32_t p = 0;
@@ -795,6 +798,7 @@ std::uint64_t hashCells(const std::vector<Cell>& cells)
         mix(static_cast<std::uint32_t>(c.y));
         mix(static_cast<std::uint32_t>(c.z));
         mix(static_cast<std::uint32_t>(c.color) | (static_cast<std::uint32_t>(c.covered) << 8));
+        mix(c.nearMask);
     }
     return h ^ cells.size();
 }
@@ -803,38 +807,46 @@ std::uint64_t hashCells(const std::vector<Cell>& cells)
 
 std::size_t RegionSet::update(const std::vector<Cell>& cells, bool xray)
 {
-    if (xray != xray_) {
+    std::unordered_map<RegionKey, std::vector<Cell>, RegionKeyHash> own;
+    for (const Cell& c : cells) {
+        if (c.color >= 1 && c.color <= kMaxColor) own[regionOf(c.x, c.y, c.z)].push_back(c);
+    }
+    std::vector<RegionChange> changes;
+    changes.reserve(own.size() + own_.size());
+    for (auto& [key, list] : own) changes.push_back({key, std::move(list)});
+    for (const auto& [key, list] : own_) {
+        if (!own.contains(key)) changes.push_back({key, {}});
+    }
+    return apply(changes, false, xray);
+}
+
+std::size_t RegionSet::apply(const std::vector<RegionChange>& changes, bool reset, bool xray)
+{
+    if (reset || xray != xray_) {
+        own_.clear();
         entries_.clear();
         xray_ = xray;
     }
-    std::unordered_map<RegionKey, std::vector<Cell>, RegionKeyHash> own;
-    for (const Cell& c : cells) {
-        if (c.color == 0 || c.color > kMaxColor) {
-            continue;
-        }
-        own[regionOf(c.x, c.y, c.z)].push_back(c);
-    }
-    std::unordered_map<RegionKey, std::uint64_t, RegionKeyHash> hashes;
-    hashes.reserve(own.size());
     std::vector<RegionKey> touched;
-    for (const auto& [key, list] : own) {
-        const std::uint64_t h = hashCells(list);
-        hashes[key] = h;
-        const auto it = entries_.find(key);
-        if (it == entries_.end() || it->second.hash != h) {
-            touched.push_back(key);
+    for (const auto& change : changes) {
+        std::vector<Cell> list;
+        list.reserve(change.cells.size());
+        for (const auto& c : change.cells) {
+            if (c.color >= 1 && c.color <= kMaxColor && regionOf(c.x, c.y, c.z) == change.key) list.push_back(c);
+        }
+        const auto it = own_.find(change.key);
+        if (list.empty()) {
+            if (it != own_.end()) {
+                own_.erase(it);
+                entries_.erase(change.key);
+                touched.push_back(change.key);
+            }
+        } else if (it == own_.end() || hashCells(it->second) != hashCells(list)) {
+            own_[change.key] = std::move(list);
+            touched.push_back(change.key);
         }
     }
-    std::vector<RegionKey> removed;
-    for (const auto& [key, entry] : entries_) {
-        if (own.find(key) == own.end()) {
-            removed.push_back(key);
-            touched.push_back(key);
-        }
-    }
-    for (const RegionKey& key : removed) {
-        entries_.erase(key);
-    }
+    const auto& own = own_;
     std::unordered_map<RegionKey, bool, RegionKeyHash> dirty;
     for (const RegionKey& key : touched) {
         for (int dx = -1; dx <= 1; ++dx) {
@@ -872,9 +884,9 @@ std::size_t RegionSet::update(const std::vector<Cell>& cells, bool xray)
             }
         }
         RegionGeometry geometry = buildRegion(
-            own[key], margin, origin, [&own](const RegionKey& k) { return own.find(k) != own.end(); }, xray);
+            own.at(key), margin, origin, [&own](const RegionKey& k) { return own.find(k) != own.end(); }, xray);
         RegionEntry& entry = entries_[key];
-        entry.hash = hashes[key];
+        entry.hash = hashCells(own.at(key));
         if (entry.geometry && sameRegionGeometry(*entry.geometry, geometry)) {
             continue;
         }

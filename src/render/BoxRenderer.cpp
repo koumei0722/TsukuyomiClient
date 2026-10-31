@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 namespace tsukuyomi::boxes {
 namespace {
@@ -101,12 +102,13 @@ std::atomic<unsigned long long> g_cameraBadSince{0};
 std::atomic<std::uintptr_t> g_cameraBadSource{0};
 
 std::mutex g_boxLock;
-std::shared_ptr<const std::vector<blocks::DiffBox>> g_boxes;
+std::unordered_map<schematic::SectionKey, bool, schematic::SectionKeyHash> g_requests;
+bool g_requestPending = false, g_requestReset = false, g_requestXray = false;
 
 std::atomic<bool> g_on{false};
 std::atomic<float> g_faceAlpha{0.35F};
 std::atomic<bool> g_xray{false};
-std::atomic<unsigned long long> g_boxVersion{0};
+std::atomic<unsigned long long> g_requestVersion{0};
 
 constexpr unsigned long long kStyleStaleMs = 1000;
 std::atomic<unsigned long long> g_styleAt{0};
@@ -195,22 +197,39 @@ void noteCamera(void* cameraBase, void* source)
     }
 }
 
-void setBoxes(std::vector<blocks::DiffBox> list)
+void pushSectionRequest(SectionRequest request)
 {
-    auto shared = std::make_shared<const std::vector<blocks::DiffBox>>(std::move(list));
-    std::lock_guard<std::mutex> guard(g_boxLock);
-    g_boxes = std::move(shared);
-    g_boxVersion.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(g_boxLock);
+    if (request.reset) { g_requests.clear(); g_requestReset = true; }
+    for (const auto& key : request.collect) g_requests[key] = true;
+    for (const auto& key : request.remove) g_requests[key] = false;
+    g_requestXray = request.xray;
+    g_requestPending = true;
+    g_requestVersion.fetch_add(1, std::memory_order_release);
 }
+
+bool takeSectionRequests(SectionRequest& merged)
+{
+    std::lock_guard lock(g_boxLock);
+    if (!g_requestPending) return false;
+    merged = {};
+    merged.reset = g_requestReset; merged.xray = g_requestXray;
+    for (const auto& [key, collect] : g_requests) {
+        if (collect) merged.collect.push_back(key);
+        else merged.remove.push_back(key);
+    }
+    g_requests.clear(); g_requestReset = false; g_requestPending = false;
+    return true;
+}
+
+unsigned long long sectionRequestVersion() { return g_requestVersion.load(std::memory_order_acquire); }
 
 void setStyle(bool on, float faceAlpha, bool xray)
 {
     g_styleAt.store(GetTickCount64(), std::memory_order_relaxed);
     g_on.store(on, std::memory_order_relaxed);
     g_faceAlpha.store(faceAlpha, std::memory_order_relaxed);
-    if (g_xray.exchange(xray, std::memory_order_relaxed) != xray) {
-        g_boxVersion.fetch_add(1, std::memory_order_relaxed);
-    }
+    g_xray.store(xray, std::memory_order_relaxed);
 }
 
 bool cameraSnapshot(float eye[3], float vp[16])
@@ -224,16 +243,9 @@ bool cameraSnapshot(float eye[3], float vp[16])
     return true;
 }
 
-std::shared_ptr<const std::vector<blocks::DiffBox>> boxSnapshot()
-{
-    std::lock_guard<std::mutex> guard(g_boxLock);
-    return g_boxes;
-}
-
 bool boxesOn() { return g_on.load(std::memory_order_relaxed) && styleFresh(); }
 float boxFaceAlpha() { return g_faceAlpha.load(std::memory_order_relaxed); }
 bool boxXray() { return g_xray.load(std::memory_order_relaxed); }
-unsigned long long boxVersion() { return g_boxVersion.load(std::memory_order_relaxed); }
 
 namespace {
 
@@ -252,7 +264,7 @@ constexpr Rgb kColors[4] = {
 
 }
 
-bool boxStyle(blocks::DiffColor color, float rgb[3], float* faceAlpha)
+bool boxStyle(schematic::DiffColor color, float rgb[3], float* faceAlpha)
 {
     const auto index = static_cast<std::size_t>(color);
     if (index == 0 || index > std::size(kColors)) {

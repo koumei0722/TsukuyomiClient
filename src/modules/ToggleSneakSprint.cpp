@@ -1,6 +1,8 @@
 #include "modules/ToggleSneakSprint.h"
 
 #include "config/Config.h"
+#include "game/LookPlacement.h"
+#include "input/GameInput.h"
 #include "modules/FreeCamera.h"
 #include "ui/Menu.h"
 
@@ -96,11 +98,16 @@ void ToggleSneakSprint::onInputGatherBefore(void* out, const void* returnAddress
     const bool on = enabled();
     const bool sneak = on && m_sneak.load(std::memory_order_relaxed);
     const bool sprint = on && m_sprint.load(std::memory_order_relaxed);
-    if (!sneak && !sprint && !m_state.sneakLatched() && !m_state.sprintLatched()) {
+    const std::uint64_t sent = lookplace::inputsSent();
+    const bool force = input::sneakHoldWanted(sent);
+    input::noteSneakForced(force, sent);
+    const bool forcedBefore = m_forced;
+    m_forced = force;
+    if (!sneak && !sprint && !force && !forcedBefore && !m_state.sneakLatched() && !m_state.sprintLatched()) {
         m_state.passThrough(raw);
         return;
     }
-    const std::uint32_t bits = m_state.apply(raw, sneak, sprint);
+    const std::uint32_t bits = m_state.apply(raw, sneak, sprint, force);
     if (bits != raw) {
         writeBits(out, bits);
     }

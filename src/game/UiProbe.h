@@ -34,15 +34,20 @@ void onUiEvent(void* self, const void* event);
 
 void pumpMenuSelection();
 
+void beforeSettingsGroupResolve(void* registry, const void* idView);
 void onSettingsGroupRegister(void* registry, const void* idView, void* provider);
 
 void afterSettingsGroupRegister(void* registry, const void* idView, void* provider);
 
 void onSettingsProviderCall(void* self, void* out);
 
+void onGuiScaleGroupBuilt(void* out, int which);
+
 void onSettingsFindComponent(void* registry, void* out, const void* idView);
 
 bool openOwnPage(bool force = false);
+
+bool openWaypointPage();
 
 bool refreshOwnPage();
 

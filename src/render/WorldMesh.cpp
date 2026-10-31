@@ -1,4 +1,7 @@
+#include "game/SchematicWorld.h"
 #include "render/WorldMesh.h"
+#include "render/MeshKit.h"
+#include "render/GhostMesh.h"
 
 #include "core/Logger.h"
 #include "core/Notice.h"
@@ -9,7 +12,6 @@
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
 #include "memory/Signatures.h"
-#include "modules/FreeCamera.h"
 #include "modules/Zoom.h"
 #include "render/BoxMesher.h"
 #include "render/BoxRenderer.h"
@@ -32,6 +34,7 @@
 
 namespace tsukuyomi::worldmesh {
 namespace {
+using namespace meshkit;
 
 using NameTagStageFn = void(__fastcall*)(void* lrp, void* ctx, void* view, void* extra);
 using TessBeginFn = void(__fastcall*)(void* tess, void* unused, std::uint8_t mode, int reserve,
@@ -40,66 +43,40 @@ using TessVertexFn = void(__fastcall*)(void* tess, float x, float y, float z);
 using TessColorFn = void(__fastcall*)(void* tess, float r, float g, float b, float a);
 using RenderMeshFn = void(__fastcall*)(void* ctx, void* tess, const void* material,
                                        void* texture);
-using MaterialCtorFn = void*(__fastcall*)(void* out, void* group, const void* name);
 
 NameTagStageFn g_original = nullptr;
-using TessEndFn = void(__fastcall*)(void* tess, void* outMesh, int usage, const void* name,
-                                    unsigned int flag);
-using TessClearFn = void(__fastcall*)(void* buffers);
-using RendererFlagFn = unsigned int(__fastcall*)();
-using MeshRenderFn = void(__fastcall*)(void* mesh, void* ctxPlus10, const void* material,
-                                       void* params, void* a5, void* a6, void* texture, void* a8,
-                                       void* optional);
-using MeshDestroyFn = void(__fastcall*)(void* mesh);
-TessEndFn g_meshEnd = nullptr;
-TessClearFn g_tessClear = nullptr;
-RendererFlagFn g_rendererFlag = nullptr;
-MeshRenderFn g_meshRender = nullptr;
-MeshDestroyFn g_meshDestroy = nullptr;
+using DrawOneFn = void(__fastcall*)(void*, void*, const void*, void*, void*);
+DrawOneFn g_drawOne = nullptr;
+std::int32_t g_tagLrpField = 0, g_tagLrpSubField = 0;
+std::uint8_t g_fontWidthSlot = 0;
+std::atomic<bool> g_tagsReady{false}, g_tagsBroken{false};
+std::mutex g_tagMutex;
+std::vector<WorldTag> g_worldTags;
+std::atomic<unsigned long long> g_tagsDrawn{0}, g_tagsSkipped{0}, g_tagsWantedAt{0};
+std::atomic<bool> g_tagsNoMaterial{false};
 std::atomic<bool> g_keptBroken{false};
 std::atomic<bool> g_linesBroken{false};
 std::atomic<bool> g_debugRibbonsBroken{false};
+std::atomic<bool> g_fillsBroken{false};
 std::mutex g_debugMutex;
 std::vector<DebugLine> g_debugLines;
+std::vector<DebugLine> g_sourceLines[static_cast<int>(LineSource::Count)];
+std::vector<DebugFill> g_debugFills;
+std::vector<DebugFill> g_sourceFills[static_cast<int>(LineSource::Count)];
 std::atomic<unsigned> g_debugNoMaterial{0};
 TessBeginFn g_begin = nullptr;
 TessVertexFn g_vertex = nullptr;
 TessColorFn g_color = nullptr;
 RenderMeshFn g_render = nullptr;
-MaterialCtorFn g_matCtor = nullptr;
-void* g_matGroup = nullptr;
 
 std::atomic<bool> g_installed{false};
 std::atomic<bool> g_teardown{false};
 
-constexpr std::ptrdiff_t kCtxColor = 0x30;
-constexpr std::ptrdiff_t kCtxMatrices = 0x18;
-constexpr std::ptrdiff_t kCtxTess = 0xb8;
-constexpr std::ptrdiff_t kTessLimit = 0x29c;
-constexpr std::ptrdiff_t kTessBuilding = 0x2a0;
-constexpr std::ptrdiff_t kTessVoid = 0x255;
-constexpr std::ptrdiff_t kTessNoColor = 0x254;
-constexpr std::ptrdiff_t kTessOffset = 0x1cc;
-constexpr std::ptrdiff_t kTessScale = 0x1d8;
-constexpr std::ptrdiff_t kTessUseMatrix = 0x210;
-constexpr std::size_t kTessReadable = kTessBuilding + 4;
-constexpr std::ptrdiff_t kLrpCamera = 0x660;
-
-std::uint64_t fnv1(std::string_view text)
-{
-    std::uint64_t h = 0xCBF29CE484222325ULL;
-    for (const char c : text) {
-        h *= 0x100000001B3ULL;
-        h ^= static_cast<unsigned char>(c);
-    }
-    return h;
-}
-
-struct MaterialPtr {
-    void* info = nullptr;
-    void* ctrl = nullptr;
-};
-
+constexpr auto kCtxColor = tesslayout::kCtxColor, kCtxMatrices = tesslayout::kCtxMatrices, kCtxTess = tesslayout::kCtxTess;
+constexpr auto kTessLimit = tesslayout::kLimit, kTessBuilding = tesslayout::kBuilding, kTessVoid = tesslayout::kVoid;
+constexpr auto kTessNoColor = tesslayout::kNoColor, kTessOffset = tesslayout::kOffset, kTessScale = tesslayout::kScale;
+constexpr auto kTessUseMatrix = tesslayout::kUseMatrix, kLrpCamera = tesslayout::kLrpCamera;
+constexpr auto kTessReadable = tesslayout::kReadable;
 struct Choice {
     int mode;
     const char* name;
@@ -107,10 +84,11 @@ struct Choice {
     bool multiply;
 };
 constexpr Choice kChoices[] = {
-    {1, "selection_overlay", 0x1090, true},
+    {1, "selection_overlay", 0x1088, true},
     {2, "name_tag", 0, false},
     {5, "name_tag_depth_tested", 0, false},
-    {6, "selection_box", 0x10f0, false},
+    {6, "selection_box", 0x10e8, false},
+    {7, "name_tag_text", 0, false},
 };
 constexpr int kDefaultFlat = 1;
 constexpr int kDefaultXray = 2;
@@ -150,60 +128,12 @@ std::atomic<unsigned long long> g_noLineMaterial{0};
 std::atomic<std::size_t> g_keptMeshCount{0};
 std::atomic<bool> g_inside{false};
 
-__declspec(noinline) bool callMaterialCtor(MaterialPtr* out, void* group, const void* name)
-{
-    __try {
-        g_matCtor(out, group, name);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 __declspec(noinline) void callOriginal(void* lrp, void* ctx, void* view, void* extra)
 {
     g_original(lrp, ctx, view, extra);
 }
 
-bool infoMatches(const void* info, std::uint64_t hash)
-{
-    if (info == nullptr || !memory::isReadable(info, 0x18)) {
-        return false;
-    }
-    std::uint64_t got = 0;
-    std::memcpy(&got, static_cast<const unsigned char*>(info) + 0x10, sizeof(got));
-    return got == hash;
-}
-
-struct HashedStringBuf {
-    std::uint64_t hash;
-    char text[16];
-    std::uint64_t size;
-    std::uint64_t capacity;
-    std::uint64_t extra;
-};
-static_assert(sizeof(HashedStringBuf) == 0x30);
-
 char g_longNames[std::size(kChoices)][64]{};
-
-void makeHashed(std::size_t slot, std::string_view name, HashedStringBuf& out)
-{
-    std::memset(&out, 0, sizeof(out));
-    out.hash = fnv1(name);
-    out.size = name.size();
-    if (name.size() <= 15) {
-        std::memcpy(out.text, name.data(), name.size());
-        out.capacity = 15;
-    } else {
-        const std::size_t n = (std::min)(name.size(), sizeof(g_longNames[0]) - 1);
-        std::memcpy(g_longNames[slot], name.data(), n);
-        g_longNames[slot][n] = 0;
-        char* const at = g_longNames[slot];
-        std::memcpy(out.text, &at, sizeof(at));
-        out.size = n;
-        out.capacity = sizeof(g_longNames[0]) - 1;
-    }
-}
 
 bool resolveNamed(std::size_t slot)
 {
@@ -218,7 +148,7 @@ bool resolveNamed(std::size_t slot)
 
     if (g_matCtor != nullptr && g_matGroup != nullptr) {
         alignas(16) HashedStringBuf buf{};
-        makeHashed(slot, name, buf);
+        makeHashed(name, g_longNames[slot], sizeof(g_longNames[slot]), buf);
         MaterialPtr made{};
         const bool called = callMaterialCtor(&made, g_matGroup, &buf);
         named.ok = called && infoMatches(made.info, hash);
@@ -239,11 +169,10 @@ const void* materialFor(void* lrp, int mode)
     }
     if (choice->lrpOffset != 0) {
         auto* const at = static_cast<unsigned char*>(lrp) + choice->lrpOffset;
-        if (!memory::isReadable(at, sizeof(MaterialPtr))) {
+        void* info = nullptr;
+        if (!memory::copyGuarded(at, &info, sizeof(info))) {
             return nullptr;
         }
-        void* info = nullptr;
-        std::memcpy(&info, at, sizeof(info));
         if (!infoMatches(info, fnv1(choice->name))) {
             static std::atomic<unsigned> told{0};
             if (told.fetch_add(1, std::memory_order_relaxed) < 3) {
@@ -282,63 +211,72 @@ std::uint64_t g_preparedSerial = 0;
 
 bool keptAvailable()
 {
-    return g_meshEnd != nullptr && g_tessClear != nullptr && g_rendererFlag != nullptr
-           && g_meshRender != nullptr && g_meshDestroy != nullptr
+    return meshkit::ready()
            && !g_keptBroken.load(std::memory_order_relaxed);
 }
 
 constexpr double kRibbonPixels = 1.5;
 constexpr double kRibbonNearW = 0.05;
 
-struct MeshRequest {
-    unsigned long long version = ~0ULL;
-    bool xray = false;
-    std::shared_ptr<const std::vector<blocks::DiffBox>> list;
-};
+using MeshRequest = boxes::SectionRequest;
 std::mutex g_workLock;
 std::condition_variable g_workCv;
 bool g_workHas = false;
 bool g_workStop = false;
-MeshRequest g_work;
 bool g_resultReady = false;
 Prepared g_result;
 HANDLE g_worker = nullptr;
 std::atomic<bool> g_workerRunning{false};
 unsigned long long g_requestedVersion = ~0ULL;
-bool g_requestedXray = false;
 
 struct Regions {
-    unsigned long long version = ~0ULL;
     bool xray = false;
     boxmesh::RegionSet set;
 };
 Regions g_regions;
 
+const schematic::DiffSection* neighborDiff(void* ctx, const schematic::SectionKey& key)
+{
+    const auto& snap = *static_cast<const schematic::RenderSnapshot*>(ctx);
+    const auto it = snap.at.find(key);
+    return it == snap.at.end() ? nullptr : snap.sections[it->second].diff.get();
+}
+
+void copyPrepared(const Regions& state, Prepared& out)
+{
+    out.xray = state.xray; out.retained = true;
+    out.regions.clear(); out.regions.reserve(state.set.entries().size());
+    for (const auto& [key, entry] : state.set.entries())
+        out.regions.push_back(RegionOut{key, entry.generation, entry.geometry});
+}
+
 void buildRegions(const MeshRequest& request, Regions& state, Prepared& out)
 {
-    out.xray = request.xray;
-    out.retained = true;
-    if (state.version != request.version || state.xray != request.xray) {
-        std::vector<boxmesh::Cell> cells;
-        if (request.list) {
-            cells.reserve(request.list->size());
-            for (const blocks::DiffBox& box : *request.list) {
-                const auto color = static_cast<std::uint8_t>(box.color);
-                if (color == 0 || color > boxmesh::kMaxColor) {
-                    continue;
+    std::vector<boxmesh::RegionChange> changes;
+    for (const auto& key : request.remove) changes.push_back({{key.cx, key.cy, key.cz}, {}});
+    const auto snap = schematicworld::renderSnapshot();
+    for (const auto& key : request.collect) {
+        boxmesh::RegionChange change{{key.cx, key.cy, key.cz}, {}};
+        if (snap) {
+            const auto it = snap->at.find(key);
+            if (it != snap->at.end()) {
+                const auto& view = snap->sections[it->second];
+                if (view.diff) {
+                    std::vector<schematic::BoxCell> boxes;
+                    schematic::collectBoxesInSection(key, *view.diff, neighborDiff,
+                        const_cast<schematic::RenderSnapshot*>(snap.get()), snap->layer, !request.xray, boxes,
+                        snap->selectedColor, snap->highlightFiltered ? &snap->highlight : nullptr);
+                    change.cells.reserve(boxes.size());
+                    for (const auto& box : boxes)
+                        change.cells.push_back({box.x, box.y, box.z, box.color, box.covered, box.nearMask});
                 }
-                cells.push_back(boxmesh::Cell{box.x, box.y, box.z, color, box.covered});
             }
         }
-        state.set.update(cells, request.xray);
-        state.version = request.version;
-        state.xray = request.xray;
+        changes.push_back(std::move(change));
     }
-    out.regions.clear();
-    out.regions.reserve(state.set.entries().size());
-    for (const auto& [key, entry] : state.set.entries()) {
-        out.regions.push_back(RegionOut{key, entry.generation, entry.geometry});
-    }
+    state.set.apply(changes, request.reset, request.xray);
+    state.xray = request.xray;
+    out.xray = state.xray; out.retained = true;
 }
 
 bool buildPreparedSafely(const MeshRequest& request, Regions& regions, Prepared& out)
@@ -352,7 +290,7 @@ bool buildPreparedSafely(const MeshRequest& request, Regions& regions, Prepared&
         if (!told.exchange(true)) {
             log().warn(L"WorldMesh: preparing the boxes ran out of memory ({} box(es) in the list); nothing is "
                        L"drawn until the list changes",
-                       request.list ? request.list->size() : 0);
+                       request.collect.size());
         }
         return false;
     }
@@ -368,53 +306,94 @@ Prepared emptyPrepared(const MeshRequest& request)
 
 DWORD WINAPI workerLoop(LPVOID)
 {
+    std::unordered_map<schematic::SectionKey, bool, schematic::SectionKeyHash> pending;
+    std::vector<schematic::SectionKey> order;
+    std::size_t cursor = 0;
+    unsigned long long observed = ~0ULL;
+    bool xray = false;
+    auto publish = [&](Prepared made) {
+        std::lock_guard lock(g_workLock);
+        g_result = std::move(made); g_resultReady = true;
+    };
     for (;;) {
-        MeshRequest request;
         {
-            std::unique_lock<std::mutex> lock(g_workLock);
-            g_workCv.wait(lock, [] { return g_workStop || g_workHas; });
-            if (g_workStop) {
-                return 0;
-            }
-            request = std::move(g_work);
+            std::unique_lock lock(g_workLock);
+            g_workCv.wait(lock, [&] { return g_workStop || g_workHas || !pending.empty(); });
+            if (g_workStop) return 0;
             g_workHas = false;
         }
+        const auto started = GetTickCount64();
         Prepared made;
-        if (!buildPreparedSafely(request, g_regions, made)) {
-            made = emptyPrepared(request);
+        bool changed = false;
+        try {
+        do {
+            { std::lock_guard lock(g_workLock); if (g_workStop) return 0; }
+            const auto version = boxes::sectionRequestVersion();
+            if (observed != version) {
+                observed = version;
+                MeshRequest incoming;
+                if (boxes::takeSectionRequests(incoming)) {
+                    if (incoming.reset) {
+                        pending.clear();
+                        MeshRequest reset{true, incoming.xray, {}, {}};
+                        if (!buildPreparedSafely(reset, g_regions, made)) made = emptyPrepared(reset);
+                        changed = true;
+                    }
+                    xray = incoming.xray;
+                    for (const auto& key : incoming.collect) pending[key] = true;
+                    for (const auto& key : incoming.remove) pending[key] = false;
+                    order.clear(); order.reserve(pending.size());
+                    for (const auto& [key, collect] : pending) { (void)collect; order.push_back(key); }
+                    float eye[3]{}, vp[16]{};
+                    if (boxes::cameraSnapshot(eye, vp)) {
+                        const auto distance = [&](const schematic::SectionKey& key) {
+                            const double dx = key.cx * 16.0 + 8 - eye[0], dy = key.cy * 16.0 + 8 - eye[1],
+                                         dz = key.cz * 16.0 + 8 - eye[2];
+                            return dx * dx + dy * dy + dz * dz;
+                        };
+                        std::sort(order.begin(), order.end(), [&](const auto& l, const auto& r) { return distance(l) < distance(r); });
+                    }
+                    cursor = 0;
+                }
+            }
+            if (pending.empty()) break;
+            const auto key = order[cursor++];
+            const bool collect = pending.at(key); pending.erase(key);
+            MeshRequest request;
+            request.xray = xray;
+            if (collect) request.collect.push_back(key); else request.remove.push_back(key);
+            if (!buildPreparedSafely(request, g_regions, made)) {
+                made = emptyPrepared(request); pending.clear();
+            }
+            changed = true;
+        } while (GetTickCount64() - started < 50);
+        if (changed) {
+            copyPrepared(g_regions, made);
         }
-        {
-            std::lock_guard<std::mutex> lock(g_workLock);
-            g_result = std::move(made);
-            g_resultReady = true;
+        } catch (const std::exception&) {
+            g_regions = Regions{}; pending.clear(); order.clear(); cursor = 0;
+            made = emptyPrepared({false, xray, {}, {}}); changed = true;
+            static bool told = false;
+            if (!told) { told = true; log().warn(L"WorldMesh: merging the section requests ran out of memory"); }
         }
+        if (changed) publish(std::move(made));
     }
 }
 
 void prepare(bool xray)
 {
-    const unsigned long long version = boxes::boxVersion();
-    if (!g_workerRunning.load(std::memory_order_acquire)) {
-        return;
-    }
+    (void)xray;
+    if (!g_workerRunning.load(std::memory_order_acquire)) return;
     {
-        std::lock_guard<std::mutex> lock(g_workLock);
+        std::lock_guard lock(g_workLock);
         if (g_resultReady) {
-            g_prepared = std::move(g_result);
-            g_resultReady = false;
-            ++g_preparedSerial;
+            g_prepared = std::move(g_result); g_resultReady = false; ++g_preparedSerial;
         }
     }
-    if (version != g_requestedVersion || xray != g_requestedXray) {
+    const auto version = boxes::sectionRequestVersion();
+    if (version != g_requestedVersion) {
         g_requestedVersion = version;
-        g_requestedXray = xray;
-        {
-            std::lock_guard<std::mutex> lock(g_workLock);
-            g_work.version = version;
-            g_work.xray = xray;
-            g_work.list = boxes::boxSnapshot();
-            g_workHas = true;
-        }
+        { std::lock_guard lock(g_workLock); g_workHas = true; }
         g_workCv.notify_one();
     }
 }
@@ -457,6 +436,7 @@ struct Job {
     const void* material;
     double cam[3];
     const DebugLine* debugLines;
+    const DebugFill* debugFills;
     std::size_t edgeCount;
     float rgba[4];
     std::uint32_t limit;
@@ -467,6 +447,7 @@ struct Job {
     bool busy;
     bool failed;
     bool ribbonFailed;
+    bool fillFailed;
     DWORD code;
 };
 
@@ -507,8 +488,6 @@ void emitDebugEdge(const Job& job, const DebugLine& edge)
                  static_cast<float>(point[2] - job.cam[2]));
     }
 }
-
-void resetTessellator(void* tess);
 
 __declspec(noinline) void runLineJob(Job& job)
 {
@@ -559,6 +538,75 @@ __declspec(noinline) void runLineJob(Job& job)
         job.code = GetExceptionCode();
         if (building) resetTessellator(job.tess);
         g_linesBroken.store(true, std::memory_order_relaxed);
+    }
+}
+
+void emitDebugFill(const Job& job, const DebugFill& fill)
+{
+    double v[4][3] = {};
+    for (int i = 0; i < 4; ++i) {
+        for (int k = 0; k < 3; ++k) v[i][k] = fill.p[i][k] - job.cam[k];
+    }
+    const double e1[3] = {v[1][0] - v[0][0], v[1][1] - v[0][1], v[1][2] - v[0][2]};
+    const double e2[3] = {v[2][0] - v[0][0], v[2][1] - v[0][1], v[2][2] - v[0][2]};
+    const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const bool front = -(n[0] * v[0][0] + n[1] * v[0][1] + n[2] * v[0][2]) >= 0.0;
+    for (int j = 0; j < 4; ++j) {
+        const int i = front ? j : 3 - j;
+        g_vertex(job.tess, static_cast<float>(v[i][0]), static_cast<float>(v[i][1]), static_cast<float>(v[i][2]));
+    }
+}
+
+__declspec(noinline) void runFillJob(Job& job)
+{
+    if (g_fillsBroken.load(std::memory_order_relaxed)) return;
+    bool building = false;
+    __try {
+        auto* const tess = static_cast<unsigned char*>(job.tess);
+        float* color = nullptr;
+        std::memcpy(&color, static_cast<unsigned char*>(job.ctx) + kCtxColor, sizeof(color));
+        const std::uint32_t limit = job.limit & ~3U;
+        std::size_t at = 0;
+        while (at < job.edgeCount) {
+            if (tess[kTessBuilding] != 0 || tess[kTessVoid] != 0) {
+                job.busy = true;
+                return;
+            }
+            g_begin(tess, nullptr, kPrimitiveQuads, 0, false);
+            building = true;
+            if (tess[kTessBuilding] == 0) {
+                building = false;
+                job.busy = true;
+                return;
+            }
+            const float zero[3] = {0.0F, 0.0F, 0.0F};
+            const float one[3] = {1.0F, 1.0F, 1.0F};
+            std::memcpy(tess + kTessOffset, zero, sizeof(zero));
+            std::memcpy(tess + kTessScale, one, sizeof(one));
+            tess[kTessUseMatrix] = 0;
+            tess[kTessNoColor] = 1;
+            std::uint32_t used = 0;
+            for (; at < job.edgeCount; ++at) {
+                if (used + 4U > limit && used != 0) {
+                    break;
+                }
+                emitDebugFill(job, job.debugFills[at]);
+                used += 4U;
+            }
+            if (color != nullptr) {
+                std::memcpy(color, job.rgba, sizeof(job.rgba));
+                reinterpret_cast<unsigned char*>(color)[0x10] = 1;
+            }
+            alignas(16) unsigned char texture[0x40] = {};
+            g_render(job.ctx, tess, job.material, texture);
+            building = false;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        job.failed = true;
+        job.code = GetExceptionCode();
+        if (building) resetTessellator(job.tess);
+        g_fillsBroken.store(true, std::memory_order_relaxed);
+        job.fillFailed = true;
     }
 }
 
@@ -650,26 +698,16 @@ __declspec(noinline) void runDebugRibbonJob(Job& job)
     }
 }
 
-struct TessSaved {
-    unsigned char offsetScale[24];
-    unsigned char useMatrix;
-    unsigned char noColor;
-    float color[4];
-    unsigned char colorDirty;
-    bool haveColor;
-};
-
-bool saveState(void* ctx, void* tess, TessSaved& saved);
-void restoreState(void* ctx, void* tess, const TessSaved& saved);
-
 void drawDebugLines(void* lrp, void* ctx)
 {
     std::vector<DebugLine> lines;
+    std::vector<DebugFill> fills;
     {
         std::lock_guard lock(g_debugMutex);
         lines = g_debugLines;
+        fills = g_debugFills;
     }
-    if (lines.empty() || lrp == nullptr || ctx == nullptr) return;
+    if ((lines.empty() && fills.empty()) || lrp == nullptr || ctx == nullptr) return;
     void* tess = nullptr;
     float cam[3]{};
     std::uint32_t limit = 0;
@@ -699,6 +737,30 @@ void drawDebugLines(void* lrp, void* ctx)
     job.debugLines = lines.data();
     job.edgeCount = lines.size();
     job.limit = (limit >= 64 && limit <= (1U << 24)) ? limit : 65532;
+    const bool anyMultiply = std::any_of(fills.begin(), fills.end(), [](const DebugFill& f) { return !f.blend; });
+    const bool anyBlend = std::any_of(fills.begin(), fills.end(), [](const DebugFill& f) { return f.blend; });
+    const void* const fillMaterial = anyMultiply ? materialFor(lrp, kDefaultFlat) : nullptr;
+    const void* const blendMaterial = anyBlend ? materialFor(lrp, kDebugRibbonMode) : nullptr;
+    for (std::size_t at = 0; at < fills.size();) {
+        std::size_t end = at + 1;
+        while (end < fills.size() && fills[end].blend == fills[at].blend
+               && std::equal(fills[at].rgba, fills[at].rgba + 4, fills[end].rgba)) ++end;
+        const void* const groupMaterial = fills[at].blend ? blendMaterial : fillMaterial;
+        if (groupMaterial == nullptr) {
+            at = end;
+            continue;
+        }
+        job.debugFills = fills.data() + at;
+        job.edgeCount = end - at;
+        std::copy_n(fills[at].rgba, 4, job.rgba);
+        job.material = groupMaterial;
+        runFillJob(job);
+        if (job.failed || job.busy) break;
+        at = end;
+    }
+    job.material = material;
+    job.debugLines = lines.data();
+    const bool linesBlocked = job.failed || job.busy;
     if (anyThick) {
         double yScale = 0.0;
         float eye[3] = {};
@@ -724,7 +786,7 @@ void drawDebugLines(void* lrp, void* ctx)
             job.haveForward = false;
         }
     }
-    for (std::size_t at = 0; at < lines.size();) {
+    for (std::size_t at = 0; !linesBlocked && at < lines.size();) {
         const float* color = lines[at].rgba;
         const float width = lines[at].width;
         const bool onTop = lines[at].onTop;
@@ -758,10 +820,21 @@ void drawDebugLines(void* lrp, void* ctx)
     restoreState(ctx, tess, saved);
     if (job.failed) {
         const bool ribbons = job.ribbonFailed;
-        notice::failOnce(ribbons ? "WorldMesh.debugRibbonFailed" : "WorldMesh.lineFailed",
+        const bool filled = job.fillFailed;
+        notice::failOnce(filled ? "WorldMesh.debugFillFailed" : ribbons ? "WorldMesh.debugRibbonFailed" : "WorldMesh.lineFailed",
                          std::format(L"WorldMesh: {} failed (exception {:08X}); this drawing path is disabled",
-                                     ribbons ? L"debug ribbons" : L"lines", job.code),
+                                     filled ? L"debug fills" : ribbons ? L"debug ribbons" : L"lines", job.code),
                          "Debug lines: drawing failed inside the game; the affected drawing path is disabled");
+    }
+    if (anyBlend && blendMaterial == nullptr) {
+        notice::failOnce("WorldMesh.blendFill",
+                         L"WorldMesh: the name_tag_depth_tested material was not found; blended fills are not drawn",
+                         "Light Overlay is not drawn: its material was not found");
+    }
+    if (anyMultiply && fillMaterial == nullptr) {
+        notice::failOnce("WorldMesh.fill",
+                         L"WorldMesh: the selection_overlay material was not found; debug fills are not drawn",
+                         "Debug fills (Flexible Placement overlay) are not drawn: their material was not found");
     }
     if (anyOnTop && onTopMaterial == nullptr) {
         static std::atomic<bool> told{false};
@@ -776,48 +849,6 @@ void drawDebugLines(void* lrp, void* ctx)
     }
 }
 
-__declspec(noinline) bool saveState(void* ctx, void* tess, TessSaved& saved)
-{
-    __try {
-        auto* const t = static_cast<unsigned char*>(tess);
-        std::memcpy(saved.offsetScale, t + kTessOffset, sizeof(saved.offsetScale));
-        saved.useMatrix = t[kTessUseMatrix];
-        saved.noColor = t[kTessNoColor];
-        float* color = nullptr;
-        std::memcpy(&color, static_cast<unsigned char*>(ctx) + kCtxColor, sizeof(color));
-        saved.haveColor = color != nullptr;
-        if (color != nullptr) {
-            std::memcpy(saved.color, color, sizeof(saved.color));
-            saved.colorDirty = reinterpret_cast<unsigned char*>(color)[0x10];
-        }
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) void restoreState(void* ctx, void* tess, const TessSaved& saved)
-{
-    __try {
-        auto* const t = static_cast<unsigned char*>(tess);
-        std::memcpy(t + kTessOffset, saved.offsetScale, sizeof(saved.offsetScale));
-        t[kTessUseMatrix] = saved.useMatrix;
-        t[kTessNoColor] = saved.noColor;
-        if (saved.haveColor) {
-            float* color = nullptr;
-            std::memcpy(&color, static_cast<unsigned char*>(ctx) + kCtxColor, sizeof(color));
-            if (color != nullptr) {
-                std::memcpy(color, saved.color, sizeof(saved.color));
-                reinterpret_cast<unsigned char*>(color)[0x10] = 1;
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-struct alignas(16) MeshStorage {
-    unsigned char bytes[0x400];
-};
 struct KeptMesh {
     std::unique_ptr<MeshStorage> storage;
     std::uint8_t color = 0;
@@ -864,209 +895,6 @@ enum class KeptWhy : std::uint8_t {
 };
 std::atomic<std::size_t> g_keptLastReturned{0};
 std::atomic<KeptWhy> g_keptLastWhy{KeptWhy::Released};
-
-struct MeshName {
-    const char* text;
-    std::size_t length;
-};
-MeshName g_meshName{nullptr, 0};
-
-alignas(16) float g_sortMatrix[16] = {};
-bool pageChecked(const void* address, std::size_t size, bool write)
-{
-    struct Entry {
-        std::uintptr_t page = 0;
-        unsigned long long at = 0;
-        bool write = false;
-    };
-    constexpr std::size_t kEntries = 8;
-    constexpr unsigned long long kKeepMs = 1000;
-    thread_local Entry entries[kEntries];
-    thread_local std::size_t next = 0;
-    if (address == nullptr || size == 0) {
-        return false;
-    }
-    const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{0xFFF};
-    const auto last = (reinterpret_cast<std::uintptr_t>(address) + size - 1) & ~std::uintptr_t{0xFFF};
-    const unsigned long long now = GetTickCount64();
-    const auto known = [&](std::uintptr_t page) {
-        for (const Entry& e : entries) {
-            if (e.page == page && now - e.at < kKeepMs && (e.write || !write)) {
-                return true;
-            }
-        }
-        return false;
-    };
-    if (known(first) && known(last)) {
-        return true;
-    }
-    const bool ok = write ? memory::isWritable(address, size) : memory::isReadable(address, size);
-    if (ok) {
-        for (const std::uintptr_t page : {first, last}) {
-            if (!known(page)) {
-                entries[next] = Entry{page, now, write};
-                next = (next + 1) % kEntries;
-            }
-        }
-    }
-    return ok;
-}
-
-struct TopMatrix {
-    float* top = nullptr;
-    float* pushed = nullptr;
-    float savedTop[16] = {};
-    float savedPushed[16] = {};
-    unsigned char* stack = nullptr;
-    float* slot = nullptr;
-    float savedSlot[3] = {};
-    std::uint64_t slotIndex = 0;
-    std::uint64_t savedPushedIndex = 0;
-    unsigned char savedFlag = 0;
-    bool sortControl = false;
-    std::uint64_t* mapEntry = nullptr;
-    std::uint64_t savedMapEntry = 0;
-    std::uint64_t mapBase = 0;
-    std::uint64_t stackSize = 0;
-    std::uint64_t mapSize = 0;
-};
-
-__declspec(noinline) bool findTopMatrix(void* ctx, TopMatrix& m)
-{
-    __try {
-        unsigned char* stack = nullptr;
-        std::memcpy(&stack, static_cast<unsigned char*>(ctx) + kCtxMatrices, sizeof(stack));
-        if (stack == nullptr) {
-            return false;
-        }
-        std::uint64_t map = 0;
-        std::uint64_t mapSize = 0;
-        std::uint64_t first = 0;
-        std::uint64_t size = 0;
-        std::uint64_t pushedIndex = 0;
-        std::memcpy(&map, stack + 0x48, 8);
-        std::memcpy(&mapSize, stack + 0x50, 8);
-        std::memcpy(&first, stack + 0x58, 8);
-        std::memcpy(&size, stack + 0x60, 8);
-        std::memcpy(&pushedIndex, stack + 0x68, 8);
-        if (map == 0 || mapSize == 0 || size == 0 || (mapSize & (mapSize - 1)) != 0) {
-            return false;
-        }
-        const std::uint64_t mask = mapSize - 1;
-        const std::uint64_t topIndex = (first + size - 1) & mask;
-        std::memcpy(&m.top, reinterpret_cast<const unsigned char*>(map) + topIndex * 8, sizeof(m.top));
-        m.pushed = nullptr;
-        if (stack[0x70] == 1) {
-            const std::uint64_t index = (first + pushedIndex) & mask;
-            std::memcpy(&m.pushed, reinterpret_cast<const unsigned char*>(map) + index * 8,
-                        sizeof(m.pushed));
-            if (m.pushed == m.top) {
-                m.pushed = nullptr;
-            }
-        }
-        if (m.top == nullptr || !pageChecked(m.top, sizeof(float) * 16, true)
-            || (m.pushed != nullptr && !pageChecked(m.pushed, sizeof(float) * 16, true))) {
-            return false;
-        }
-        std::memcpy(m.savedTop, m.top, sizeof(m.savedTop));
-        if (m.pushed != nullptr) {
-            std::memcpy(m.savedPushed, m.pushed, sizeof(m.savedPushed));
-        }
-        m.stack = stack;
-        m.savedFlag = stack[0x70];
-        m.savedPushedIndex = pushedIndex;
-        m.sortControl = false;
-        m.slot = nullptr;
-        m.mapEntry = nullptr;
-        m.mapBase = map;
-        m.stackSize = size;
-        m.mapSize = mapSize;
-        if (size < mapSize) {
-            auto* const entry =
-                reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(map) + ((first + size) & mask) * 8);
-            if (pageChecked(entry, sizeof(std::uint64_t), true)) {
-                m.mapEntry = entry;
-                m.savedMapEntry = *entry;
-                std::memcpy(g_sortMatrix, m.savedTop, sizeof(g_sortMatrix));
-                m.slot = g_sortMatrix;
-                m.slotIndex = size;
-                m.sortControl = true;
-            }
-        }
-        if (!m.sortControl && size >= 2) {
-            m.slotIndex = size - 2;
-            std::memcpy(&m.slot, reinterpret_cast<const unsigned char*>(map) + ((first + m.slotIndex) & mask) * 8,
-                        sizeof(m.slot));
-            if (m.slot != nullptr && m.slot != m.top && pageChecked(m.slot, sizeof(float) * 16, true)) {
-                std::memcpy(m.savedSlot, m.slot + 12, sizeof(m.savedSlot));
-                m.sortControl = true;
-            } else {
-                m.slot = nullptr;
-            }
-        }
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) void restoreSortSlot(TopMatrix& m)
-{
-    __try {
-        if (m.mapEntry == nullptr) {
-            std::memcpy(m.slot + 12, m.savedSlot, sizeof(m.savedSlot));
-            return;
-        }
-        std::uint64_t map = 0;
-        std::uint64_t mapSize = 0;
-        std::memcpy(&map, m.stack + 0x48, 8);
-        std::memcpy(&mapSize, m.stack + 0x50, 8);
-        if (map == m.mapBase && mapSize == m.mapSize) {
-            *m.mapEntry = m.savedMapEntry;
-            return;
-        }
-        const auto mine = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(g_sortMatrix));
-        auto* const entries = reinterpret_cast<std::uint64_t*>(static_cast<std::uintptr_t>(map));
-        if (map != 0 && mapSize != 0 && mapSize <= (1ULL << 20)
-            && memory::isWritable(entries, static_cast<std::size_t>(mapSize) * sizeof(std::uint64_t))) {
-            for (std::uint64_t i = 0; i < mapSize; ++i) {
-                if (entries[i] == mine) {
-                    entries[i] = m.savedMapEntry;
-                }
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-__declspec(noinline) void restoreSortFlag(TopMatrix& m)
-{
-    __try {
-        m.stack[0x70] = m.savedFlag;
-        std::memcpy(m.stack + 0x68, &m.savedPushedIndex, sizeof(m.savedPushedIndex));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-__declspec(noinline) void restoreTranslation(TopMatrix& m)
-{
-    __try {
-        std::memcpy(m.top + 12, m.savedTop + 12, sizeof(float) * 3);
-        if (m.pushed != nullptr) {
-            std::memcpy(m.pushed + 12, m.savedPushed + 12, sizeof(float) * 3);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-void restoreTopMatrix(TopMatrix& m)
-{
-    if (m.sortControl) {
-        restoreSortSlot(m);
-        restoreSortFlag(m);
-    }
-    restoreTranslation(m);
-}
 
 struct KeptBuild {
     void* tess;
@@ -1203,67 +1031,13 @@ __declspec(noinline) bool makeKeptMesh(KeptBuild& b, void* outMesh, bool& busy)
     }
 }
 
-__declspec(noinline) void resetTessellator(void* tess)
+bool renderKeptMesh(void* ctx, const void* material, TopMatrix& m, void* mesh,
+                    const float rgba[4], const float position[3], const float sortPos[3])
 {
-    __try {
-        auto* const t = static_cast<unsigned char*>(tess);
-        t[kTessBuilding] = 0;
-        if (g_tessClear != nullptr) {
-            t[kTessVoid] = 0;
-            g_tessClear(t + 8);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
+    return renderMesh(ctx, material, m, mesh, rgba, position, sortPos, nullptr, false);
 }
 
-__declspec(noinline) void destroyKeptMesh(void* mesh)
-{
-    __try {
-        g_meshDestroy(mesh);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-__declspec(noinline) bool renderKeptMesh(void* ctx, const void* material, TopMatrix& m, void* mesh,
-                                         const float rgba[4], const float position[3], const float sortPos[3])
-{
-    __try {
-        float* color = nullptr;
-        std::memcpy(&color, static_cast<unsigned char*>(ctx) + kCtxColor, sizeof(color));
-        if (color != nullptr) {
-            std::memcpy(color, rgba, sizeof(float) * 4);
-            reinterpret_cast<unsigned char*>(color)[0x10] = 1;
-        }
-        for (int k = 0; k < 3; ++k) {
-            m.top[12 + k] = m.savedTop[12 + k] + position[0] * m.savedTop[k]
-                            + position[1] * m.savedTop[4 + k] + position[2] * m.savedTop[8 + k];
-        }
-        if (m.sortControl) {
-            if (m.mapEntry != nullptr) {
-                *m.mapEntry = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(m.slot));
-            }
-            for (int k = 0; k < 3; ++k) {
-                m.slot[12 + k] = m.savedTop[12 + k] + sortPos[0] * m.savedTop[k]
-                                 + sortPos[1] * m.savedTop[4 + k] + sortPos[2] * m.savedTop[8 + k];
-            }
-            m.stack[0x70] = 1;
-            std::memcpy(m.stack + 0x68, &m.slotIndex, sizeof(m.slotIndex));
-        } else if (m.pushed != nullptr) {
-            for (int k = 0; k < 3; ++k) {
-                m.pushed[12 + k] = m.savedPushed[12 + k] + position[0] * m.savedPushed[k]
-                                   + position[1] * m.savedPushed[4 + k] + position[2] * m.savedPushed[8 + k];
-            }
-        }
-        alignas(16) unsigned char params[0x150] = {};
-        alignas(16) unsigned char optional[0x50] = {};
-        alignas(16) unsigned char texture[0x40] = {};
-        g_meshRender(mesh, static_cast<unsigned char*>(ctx) + 0x10, material, params, nullptr, nullptr,
-                     texture, nullptr, optional);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
+void destroyKeptMesh(void* mesh) { destroyMesh(mesh); }
 
 void destroyKeptRegion(KeptRegion& region)
 {
@@ -1301,18 +1075,6 @@ void keptBroke(const wchar_t* where)
                          "Color boxes are not drawn: drawing them failed inside the game");
     }
     destroyKept(KeptWhy::Broken);
-}
-
-double regionBoxDistance(const std::int32_t origin[3], const double cam[3])
-{
-    double d2 = 0.0;
-    for (int k = 0; k < 3; ++k) {
-        const double lo = origin[k];
-        const double hi = origin[k] + static_cast<double>(boxmesh::kRegionSize);
-        const double d = cam[k] < lo ? lo - cam[k] : (cam[k] > hi ? cam[k] - hi : 0.0);
-        d2 += d * d;
-    }
-    return std::sqrt(d2);
 }
 
 void regionSide(const std::int32_t origin[3], const double cam[3], std::int8_t out[3])
@@ -1638,38 +1400,8 @@ bool rebuildKept(void* tess, const KeptFrame& frame, bool& waiting)
     return done != 0;
 }
 
-bool regionVisible(const std::int32_t origin[3], const double cam[3], const float vp[16], bool haveVp)
-{
-    if (!haveVp) {
-        return true;
-    }
-    if (regionBoxDistance(origin, cam) <= static_cast<double>(boxmesh::kRegionSize)) {
-        return true;
-    }
-    int outside[5] = {};
-    for (int i = 0; i < 8; ++i) {
-        const double x = origin[0] - 1.0 + ((i & 1) != 0 ? boxmesh::kRegionSize + 2.0 : 0.0) - cam[0];
-        const double y = origin[1] - 1.0 + ((i & 2) != 0 ? boxmesh::kRegionSize + 2.0 : 0.0) - cam[1];
-        const double z = origin[2] - 1.0 + ((i & 4) != 0 ? boxmesh::kRegionSize + 2.0 : 0.0) - cam[2];
-        const double cx = x * vp[0] + y * vp[4] + z * vp[8] + vp[12];
-        const double cy = x * vp[1] + y * vp[5] + z * vp[9] + vp[13];
-        const double cw = x * vp[3] + y * vp[7] + z * vp[11] + vp[15];
-        outside[0] += cx < -cw ? 1 : 0;
-        outside[1] += cx > cw ? 1 : 0;
-        outside[2] += cy < -cw ? 1 : 0;
-        outside[3] += cy > cw ? 1 : 0;
-        outside[4] += cw < 0.05 ? 1 : 0;
-    }
-    for (const int n : outside) {
-        if (n == 8) {
-            return false;
-        }
-    }
-    return true;
-}
-
 void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], std::uint32_t limit, bool xray,
-                       const void* flatMaterial, const void* xrayMaterial, bool borrowed)
+                       const void* flatMaterial, const void* xrayMaterial)
 {
     KeptFrame frame;
     frame.xray = xray;
@@ -1684,7 +1416,7 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
     for (std::size_t c = 1; c <= boxmesh::kMaxColor; ++c) {
         float rgb[3] = {};
         float alpha = faceAlpha;
-        if (!boxes::boxStyle(static_cast<blocks::DiffColor>(c), rgb, &alpha)) {
+        if (!boxes::boxStyle(static_cast<schematic::DiffColor>(c), rgb, &alpha)) {
             frame.palette[c][3] = 0.0F;
             frame.linePalette[c][3] = 0.0F;
             continue;
@@ -1760,7 +1492,7 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
     }
     syncKept();
     bool waiting = false;
-    const bool progressed = borrowed ? true : rebuildKept(tess, frame, waiting);
+    const bool progressed = rebuildKept(tess, frame, waiting);
     if (g_keptBroken.load(std::memory_order_relaxed)) {
         restoreState(ctx, tess, saved);
         return;
@@ -1864,12 +1596,12 @@ void drawKeptFrameBody(void* lrp, void* ctx, void* tess, const float camF[3], st
 }
 
 void drawKeptFrame(void* lrp, void* ctx, void* tess, const float camF[3], std::uint32_t limit, bool xray,
-                   const void* flatMaterial, const void* xrayMaterial, bool borrowed)
+                   const void* flatMaterial, const void* xrayMaterial)
 {
     TessSaved outer{};
     const bool saved = saveState(ctx, tess, outer);
     try {
-        drawKeptFrameBody(lrp, ctx, tess, camF, limit, xray, flatMaterial, xrayMaterial, borrowed);
+        drawKeptFrameBody(lrp, ctx, tess, camF, limit, xray, flatMaterial, xrayMaterial);
     } catch (...) {
         if (saved) {
             restoreState(ctx, tess, outer);
@@ -1949,8 +1681,7 @@ void drawBoxes(void* lrp, void* ctx)
         const void* const flatMaterial = materialFor(lrp, flatMode);
         const void* const xrayMaterial = materialFor(lrp, xrayMode);
         if ((keptXray ? xrayMaterial : flatMaterial) != nullptr) {
-            drawKeptFrame(lrp, ctx, tess, cam, limit, keptXray, flatMaterial, xrayMaterial,
-                          FreeCamera::instance().borrowing());
+            drawKeptFrame(lrp, ctx, tess, cam, limit, keptXray, flatMaterial, xrayMaterial);
         } else {
             g_noMaterial.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1958,6 +1689,110 @@ void drawBoxes(void* lrp, void* ctx)
     }
 }
 
+bool tagContext(void* lrp, void*& arg5)
+{
+    __try {
+        const auto* nested = *reinterpret_cast<const unsigned char**>(static_cast<unsigned char*>(lrp) + g_tagLrpField);
+        if (nested == nullptr) return false;
+        arg5 = *reinterpret_cast<void* const*>(nested + g_tagLrpSubField);
+        return arg5 != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool tagWidth(void* font, const char* text, std::size_t size, int& width)
+{
+    struct TextView { const char* data; std::size_t size; } value{text, size};
+    __try {
+        auto* table = *static_cast<unsigned char**>(font);
+        using WidthFn = int(__fastcall*)(void*, const TextView*, float, int);
+        const auto fn = *reinterpret_cast<WidthFn*>(table + g_fontWidthSlot);
+        width = fn(font, &value, 1.0F, 0);
+        return width >= 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool callDrawOne(void* ctx, void* view, const void* entry, void* font, void* arg5)
+{
+    __try { g_drawOne(ctx, view, entry, font, arg5); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void resolveWorldTags(const Scanner& scanner)
+{
+    const auto* draw = scanner.address(Target::NameTagDrawCall);
+    const auto* width = scanner.address(Target::NameTagFontWidthCall);
+    unsigned char a[43]{}, b[26]{};
+    constexpr unsigned char stride[]{0x49, 0x81, 0xC7, 0x90, 0, 0, 0};
+    bool ok = draw && width && memory::copyGuarded(draw, a, sizeof(a))
+        && memory::copyGuarded(width, b, sizeof(b)) && a[31] == 0xE8
+        && std::memcmp(a + 36, stride, sizeof(stride)) == 0 && b[20] == 0xFF && b[21] == 0x15;
+    if (ok) {
+        std::memcpy(&g_tagLrpField, a + 3, sizeof(g_tagLrpField));
+        std::memcpy(&g_tagLrpSubField, a + 10, sizeof(g_tagLrpSubField));
+        g_fontWidthSlot = b[6];
+        g_drawOne = reinterpret_cast<DrawOneFn>(memory::ripTarget(draw, 32));
+        ok = g_tagLrpField > 0 && g_tagLrpSubField > 0 && g_fontWidthSlot > 0
+            && g_fontWidthSlot < 0x80 && g_fontWidthSlot % sizeof(void*) == 0
+            && g_drawOne && memory::isReadable(reinterpret_cast<const void*>(g_drawOne), 1);
+    }
+    g_tagsReady.store(ok, std::memory_order_release);
+    if (ok) log().info(L"WorldMesh: world tags ready (LRP +{:#x}, nested +{:#x}, font slot {:#x})",
+        g_tagLrpField, g_tagLrpSubField, g_fontWidthSlot);
+    else log().warn(L"WorldMesh: world tags unavailable (name tag call or font width did not validate)");
+}
+
+void drawWorldTags(void* lrp, void* ctx, void* view, void* extra)
+{
+    std::vector<WorldTag> tags;
+    { std::lock_guard lock(g_tagMutex); tags = g_worldTags; }
+    if (tags.empty() || !worldTagsAvailable() || !lrp || !ctx || !view || !extra) return;
+    const auto* back = materialFor(lrp, 2);
+    const auto* textMaterial = materialFor(lrp, 7);
+    if (!back || !textMaterial) { g_tagsNoMaterial.store(true); g_tagsSkipped.fetch_add(tags.size()); return; }
+    float camera[3]{};
+    void* arg5 = nullptr;
+    if (!memory::copyGuarded(view, camera, sizeof(camera)) || !std::isfinite(camera[0])
+        || !std::isfinite(camera[1]) || !std::isfinite(camera[2]) || !tagContext(lrp, arg5)) {
+        g_tagsSkipped.fetch_add(tags.size()); return;
+    }
+    constexpr double kTagDrawDistance = 64.0;
+    for (const auto& tag : tags) {
+        const double dx = tag.pos[0] - camera[0], dy = tag.pos[1] - camera[1], dz = tag.pos[2] - camera[2];
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const double pull = distance > kTagDrawDistance ? kTagDrawDistance / distance : 1.0;
+        const float scale = static_cast<float>(tag.size * std::max(distance * pull, 4.0) / 8.0);
+        const float position[]{static_cast<float>(camera[0] + dx * pull),
+            static_cast<float>(camera[1] + dy * pull + tag.lift * scale * (1.6 / 60.0)), static_cast<float>(camera[2] + dz * pull)};
+        if (!std::isfinite(distance) || !std::isfinite(scale) || scale <= 0 || !std::isfinite(position[0])
+            || !std::isfinite(position[1]) || !std::isfinite(position[2])) { ++g_tagsSkipped; continue; }
+        std::string text = tag.text.empty() ? " " : tag.text;
+        if (tag.appendDistance) text += std::format("  {:.0f}m", std::round(distance));
+        int width = 0;
+        if (!tagWidth(extra, text.data(), text.size(), width)) { ++g_tagsSkipped; continue; }
+        const int halfWidth = std::max(width / 2, tag.minHalfWidth);
+        alignas(16) unsigned char entry[0x90]{};
+        const std::size_t length = text.size(), capacity = length < 16 ? 15 : length;
+        if (length < 16) std::memcpy(entry, text.c_str(), length + 1);
+        else { const char* buffer = text.c_str(); std::memcpy(entry, &buffer, sizeof(buffer)); }
+        std::memcpy(entry + 0x10, &length, sizeof(length));
+        std::memcpy(entry + 0x18, &capacity, sizeof(capacity));
+        const void* background = tag.backRgba[3] > 0 ? back : nullptr;
+        std::memcpy(entry + 0x20, &background, sizeof(background));
+        std::memcpy(entry + 0x28, &textMaterial, sizeof(textMaterial));
+        std::memcpy(entry + 0x30, tag.backRgba, sizeof(tag.backRgba));
+        std::memcpy(entry + 0x40, tag.textRgba, sizeof(tag.textRgba));
+        std::memcpy(entry + 0x50, position, sizeof(position));
+        std::memcpy(entry + 0x5c, &scale, sizeof(scale));
+        std::memcpy(entry + 0x60, &halfWidth, sizeof(halfWidth));
+        entry[0x70] = 1;
+        const float spacing = 10.0F;
+        std::memcpy(entry + 0x8c, &spacing, sizeof(spacing));
+        if (!callDrawOne(ctx, view, entry, extra, arg5)) {
+            g_tagsBroken.store(true, std::memory_order_release); ++g_tagsSkipped; break;
+        }
+        ++g_tagsDrawn;
+    }
+}
 void __fastcall detourNameTagStage(void* lrp, void* ctx, void* view, void* extra)
 {
     callOriginal(lrp, ctx, view, extra);
@@ -1968,22 +1803,54 @@ void __fastcall detourNameTagStage(void* lrp, void* ctx, void* view, void* extra
     if (g_inside.exchange(true, std::memory_order_seq_cst)) {
         return;
     }
+    ghostmesh::drawFrame(lrp, ctx);
     drawBoxes(lrp, ctx);
     drawDebugLines(lrp, ctx);
+    drawWorldTags(lrp, ctx, view, extra);
     g_inside.store(false, std::memory_order_release);
 }
 
 }
 
-void setDebugLines(std::vector<DebugLine> lines)
+void setWorldTags(std::vector<WorldTag> tags)
 {
+    std::lock_guard lock(g_tagMutex);
+    if (!tags.empty() && g_worldTags.empty()) g_tagsWantedAt.store(GetTickCount64());
+    if (tags.empty()) g_tagsWantedAt.store(0);
+    g_worldTags = std::move(tags);
+}
+
+bool worldTagsAvailable()
+{
+    return g_tagsReady.load(std::memory_order_acquire) && g_installed.load(std::memory_order_acquire)
+        && !g_tagsBroken.load(std::memory_order_acquire) && !g_teardown.load(std::memory_order_acquire);
+}
+
+void setDebugLines(LineSource source, std::vector<DebugLine> lines)
+{
+    std::lock_guard lock(g_debugMutex);
+    g_sourceLines[static_cast<int>(source)] = std::move(lines);
+    lines.clear();
+    for (const auto& kept : g_sourceLines) lines.insert(lines.end(), kept.begin(), kept.end());
     std::stable_sort(lines.begin(), lines.end(), [](const DebugLine& a, const DebugLine& b) {
         if (a.onTop != b.onTop) return !a.onTop;
         if (a.width != b.width) return a.width < b.width;
         return std::lexicographical_compare(a.rgba, a.rgba + 4, b.rgba, b.rgba + 4);
     });
-    std::lock_guard lock(g_debugMutex);
     g_debugLines = std::move(lines);
+}
+
+void setDebugFills(LineSource source, std::vector<DebugFill> fills)
+{
+    std::lock_guard lock(g_debugMutex);
+    g_sourceFills[static_cast<int>(source)] = std::move(fills);
+    fills.clear();
+    for (const auto& kept : g_sourceFills) fills.insert(fills.end(), kept.begin(), kept.end());
+    std::stable_sort(fills.begin(), fills.end(), [](const DebugFill& a, const DebugFill& b) {
+        if (a.blend != b.blend) return !a.blend;
+        return std::lexicographical_compare(a.rgba, a.rgba + 4, b.rgba, b.rgba + 4);
+    });
+    g_debugFills = std::move(fills);
 }
 
 bool installHooks()
@@ -1994,70 +1861,9 @@ bool installHooks()
     g_vertex = scanner.addressAs<TessVertexFn>(Target::TessellatorVertex);
     g_color = scanner.addressAs<TessColorFn>(Target::TessellatorColor);
     g_render = scanner.addressAs<RenderMeshFn>(Target::RenderMeshImmediately);
-    {
-        auto* const end = scanner.address(Target::TessellatorEnd);
-        auto* const clear = scanner.address(Target::TessellatorClear);
-        auto* const meshRender = scanner.address(Target::MeshRender);
-        auto* const meshDestroy = scanner.address(Target::MeshDestroy);
-        auto* const immediate = reinterpret_cast<const std::byte*>(g_render);
-        const auto callAt = [immediate](std::size_t at) -> void* {
-            if (std::to_integer<unsigned>(immediate[at]) != 0xE8U) {
-                return nullptr;
-            }
-            return memory::ripTarget(immediate, at + 1);
-        };
-        void* flag = nullptr;
-        bool callsMatch = false;
-        const char* nameText = nullptr;
-        std::size_t nameLength = 0;
-        if (immediate != nullptr && memory::isReadable(immediate, 0x100)) {
-            flag = callAt(0x3d);
-            callsMatch = end != nullptr && callAt(0x7a) == static_cast<void*>(end)
-                         && meshRender != nullptr && callAt(0xbb) == static_cast<void*>(meshRender)
-                         && meshDestroy != nullptr && callAt(0xc7) == static_cast<void*>(meshDestroy)
-                         && clear != nullptr && callAt(0xef) == static_cast<void*>(clear);
-            static constexpr unsigned char kLea[] = {0x48, 0x8D, 0x0D};
-            static constexpr unsigned char kMov[] = {0x48, 0xC7, 0x85, 0xE0, 0x03, 0x00, 0x00};
-            if (std::memcmp(immediate + 0x42, kLea, sizeof(kLea)) == 0
-                && std::memcmp(immediate + 0x50, kMov, sizeof(kMov)) == 0) {
-                nameText = static_cast<const char*>(memory::ripTarget(immediate, 0x45));
-                std::uint32_t length = 0;
-                std::memcpy(&length, immediate + 0x57, sizeof(length));
-                nameLength = length;
-            }
-        }
-        const bool flagOk = flag != nullptr && memory::inGameModule(flag);
-        const bool nameOk = nameText != nullptr && memory::inGameModule(nameText) && nameLength > 0
-                            && nameLength < 256 && memory::isReadable(nameText, nameLength);
-        if (flagOk && callsMatch && nameOk) {
-            g_meshEnd = reinterpret_cast<TessEndFn>(end);
-            g_tessClear = reinterpret_cast<TessClearFn>(clear);
-            g_rendererFlag = reinterpret_cast<RendererFlagFn>(flag);
-            g_meshRender = reinterpret_cast<MeshRenderFn>(meshRender);
-            g_meshDestroy = reinterpret_cast<MeshDestroyFn>(meshDestroy);
-            g_meshName = MeshName{nameText, nameLength};
-            log().info(L"WorldMesh: kept meshes are ready (boxes are kept per {}-block region in both modes "
-                       L"and drawn without re-sending the vertices)",
-                       boxmesh::kRegionSize);
-        } else {
-            notice::failOnce("WorldMesh.kept",
-                             std::format(L"WorldMesh: kept meshes are not available (signatures {}/{}/{}/{} / match "
-                                         L"the immediate path {} / renderer flag {} / mesh name {}); color boxes are "
-                                         L"not drawn",
-                                         end != nullptr, clear != nullptr, meshRender != nullptr,
-                                         meshDestroy != nullptr, callsMatch, flagOk, nameOk),
-                             "Color boxes are not drawn: the game functions for drawing them were not found");
-        }
-    }
-    if (std::byte* const site = scanner.address(Target::MaterialPtrCtorSite)) {
-        void* const group = memory::ripTarget(site, 0x11);
-        void* const ctor = memory::ripTarget(site, 0x1D);
-        if (group != nullptr && memory::isReadable(group, 8) && ctor != nullptr
-            && memory::inGameModule(ctor)) {
-            g_matGroup = group;
-            g_matCtor = reinterpret_cast<MaterialCtorFn>(ctor);
-        }
-    }
+    resolveWorldTags(scanner);
+    meshkit::resolve();
+    ghostmesh::resolve();
     if (stage == nullptr || g_begin == nullptr || g_vertex == nullptr || g_color == nullptr
         || g_render == nullptr) {
         log().warn(L"WorldMesh: the immediate-mesh path is incomplete (stage {} / begin {} / "
@@ -2091,6 +1897,21 @@ static bool active(bool xray)
 
 void report()
 {
+    ghostmesh::report();
+    static bool toldTags = false, toldTagMaterial = false, toldNoTags = false;
+    if (!toldTags && g_tagsBroken.load()) {
+        toldTags = true; log().warn(L"WorldMesh: DrawOne raised an exception; world tags stopped");
+    }
+    if (!toldTagMaterial && g_tagsNoMaterial.load()) {
+        toldTagMaterial = true; log().warn(L"WorldMesh: world tag materials unavailable");
+    }
+    const auto wantedAt = g_tagsWantedAt.load();
+    if (!toldNoTags && wantedAt && GetTickCount64() - wantedAt >= 10000 && g_tagsDrawn.load() == 0) {
+        toldNoTags = true;
+        log().warn(L"WorldMesh: no world tag was drawn ({} skipped)", g_tagsSkipped.load());
+        notice::failOnce("WorldMesh.noTags", L"Waypoints: cannot draw the world tags; see the log.",
+            "Waypoints could not draw world tags. See the log.");
+    }
     static bool warnedDebugMaterial = false;
     if (!warnedDebugMaterial && g_debugNoMaterial.load(std::memory_order_relaxed) != 0) {
         warnedDebugMaterial = true;
@@ -2137,10 +1958,9 @@ void report()
     if (!boxes::boxesOn()) {
         return;
     }
-    const auto list = boxes::boxSnapshot();
-    if (!list || list->empty()) {
-        return;
-    }
+    const auto snap = schematicworld::renderSnapshot();
+    if (!snap || std::none_of(snap->sections.begin(), snap->sections.end(),
+        [](const auto& view) { return view.diff && view.diff->anyColor; })) return;
     const bool worldDrawn = GameData::instance().msSinceView() <= 2000ULL;
     if (totalCalls == 0 && worldDrawn) {
         notice::failOnce("WorldMesh.noStage",
@@ -2162,15 +1982,23 @@ void report()
         static unsigned toldStuck = 0;
         if (toldStuck < 12) {
             ++toldStuck;
-            log().warn(L"WorldMesh: {} box(es) are waiting but nothing was drawn in {} seconds "
+            log().warn(L"WorldMesh: {} section(s) are waiting but nothing was drawn in {} seconds "
                        L"(stage calls {} / unreadable context {} / no material {} / shifted camera {})",
-                       list->size(), seconds, calls, badCtx, noMaterial, camShifted);
+                       snap->sections.size(), seconds, calls, badCtx, noMaterial, camShifted);
         }
     }
 }
 void shutdown()
 {
-    setDebugLines({});
+    setWorldTags({});
+    ghostmesh::shutdown();
+    {
+        std::lock_guard lock(g_debugMutex);
+        for (auto& lines : g_sourceLines) lines.clear();
+        g_debugLines.clear();
+        for (auto& fills : g_sourceFills) fills.clear();
+        g_debugFills.clear();
+    }
     g_keptReleaseAsked.store(true, std::memory_order_seq_cst);
     const bool pending = g_installed.load(std::memory_order_acquire)
                          && (g_keptMeshCount.load(std::memory_order_seq_cst) != 0

@@ -42,32 +42,6 @@ long long nowMs()
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-bool setBoolAbility(std::byte* layered, int index, int wanted)
-{
-    std::byte* const slot = abilities::slotOf(layered, index);
-    if (slot == nullptr) {
-        return false;
-    }
-
-    int value = 0;
-    if (!abilities::readInt(slot + abilities::kValueOffset, value)) {
-        return false;
-    }
-    if (value == wanted) {
-        return true;
-    }
-
-    if (wanted != 0) {
-        int type = 0;
-        if (abilities::readInt(slot + abilities::kTypeOffset, type)
-            && type != abilities::kTypeBool) {
-            abilities::writeInt(slot + abilities::kTypeOffset, abilities::kTypeBool);
-        }
-    }
-    abilities::writeInt(slot + abilities::kValueOffset, wanted);
-    return false;
-}
-
 }
 
 CreativeNoClip& CreativeNoClip::instance()
@@ -107,20 +81,7 @@ void CreativeNoClip::saveConfig(nlohmann::json& section) const
     section["onlyWhileFlying"] = m_onlyWhileFlying.load(std::memory_order_relaxed);
 }
 
-bool CreativeNoClip::readBoolAbility(std::byte* layered, int index)
-{
-    std::byte* const slot = abilities::slotOf(layered, index);
-    if (slot == nullptr) {
-        return false;
-    }
-    int value = 0;
-    if (!abilities::readInt(slot + abilities::kValueOffset, value)) {
-        return false;
-    }
-    return value != 0;
-}
-
-void CreativeNoClip::onAbilitiesAccess(void* context)
+void CreativeNoClip::onAbilitiesAccess(std::byte* layered)
 {
     const bool active = m_active.load(std::memory_order_relaxed);
     const bool restoring = m_restorePending.load(std::memory_order_relaxed);
@@ -128,29 +89,28 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
         return;
     }
 
-    std::byte* const layered = abilities::fromContext(context);
     if (!abilities::looksValid(layered)) {
         return;
     }
     m_ledger.observeWorld(DebugScreen::worldEntry());
 
-    const bool canFly = active && readBoolAbility(layered, abilities::kMayFly);
+    const bool canFly = active && abilities::readBool(layered, abilities::kMayFly);
     const bool forceFlying = canFly && !m_onlyWhileFlying.load(std::memory_order_relaxed);
-    const bool allowed = canFly && (forceFlying || readBoolAbility(layered, abilities::kFlying));
+    const bool allowed = canFly && (forceFlying || abilities::readBool(layered, abilities::kFlying));
     const bool wasClipping = m_clipping.exchange(allowed, std::memory_order_relaxed);
     if (allowed && !wasClipping) {
         m_noClipFromMs.store(nowMs() + kFlyingLeadMs, std::memory_order_relaxed);
     }
 
     if (forceFlying) {
-        setBoolAbility(layered, abilities::kFlying, 1);
+        abilities::setBool(layered, abilities::kFlying, true);
     }
 
     if (active) {
         m_ledger.note(layered);
         const bool noClipReady =
             allowed && nowMs() >= m_noClipFromMs.load(std::memory_order_relaxed);
-        setBoolAbility(layered, abilities::kNoClip, noClipReady ? 1 : 0);
+        abilities::setBool(layered, abilities::kNoClip, noClipReady);
         if (!m_active.load(std::memory_order_seq_cst)) {
             m_ledger.markDirty(layered);
         }
@@ -158,7 +118,7 @@ void CreativeNoClip::onAbilitiesAccess(void* context)
     }
 
     if (m_ledger.needsRestore(layered)
-        && setBoolAbility(layered, abilities::kNoClip, 0)) {
+        && abilities::setBool(layered, abilities::kNoClip, false)) {
         m_ledger.markClean(layered);
     }
 

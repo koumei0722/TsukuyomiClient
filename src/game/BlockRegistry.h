@@ -1,14 +1,11 @@
 #pragma once
 
-#include <array>
-
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-#include "game/SchematicLimits.h"
+#include "game/Structure.h"
 
 namespace tsukuyomi::blocks {
 
@@ -31,114 +28,25 @@ const void* stateVariant(const void* block, const std::vector<WantedState>& want
 inline constexpr std::size_t kStateTextBytes = 96;
 
 bool nameOfBlock(const void* block, char* out, std::size_t cap);
+void forgetWorldLookups();
 int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates);
+bool typedStatesOfBlock(const void* block, std::vector<structure::StateValue>& out);
 
 int tagsOfBlock(const void* block, char out[][kStateTextBytes], int maxTags);
 
 bool materialFlags(const void* block, bool& blocksMotion, bool& liquid);
 
-const void* rotatedBlock(const void* block, int quarters, bool* ok = nullptr);
+int usedByClick(const void* block);
+
+int clickUses(void* gameMode, const void* block, const std::int32_t pos[3], int face, const float click[3]);
+
+const void* transformedBlock(const void* block, int quarters, int mirror, bool* ok = nullptr);
 
 std::size_t lastEntryCount();
-
-void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
-                    std::int32_t sx, std::int32_t sy, std::int32_t sz, float alpha);
-void clearGhostRegion();
-bool ghostOn();
-
-float ghostAlpha();
-
-bool ghostBounds(std::int32_t* mn, std::int32_t* mx);
-
-bool lastGhostBounds(std::int32_t* mn, std::int32_t* mx);
-
-inline constexpr int kGhostLayer = 3;
-
-inline constexpr std::size_t kGhostCellLimit = kMaxSchematicCells;
-
-void setGhostPalette(std::vector<const void*> blocks);
-
-void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
-                       int layer = 0);
-
-bool dropGhostCell(std::int32_t x, std::int32_t y, std::int32_t z);
-
-void setGhostWantCell(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
-                      int layer = 0);
-bool restoreGhostCellFromWant(std::int32_t x, std::int32_t y, std::int32_t z);
-
-void setGhostWantAir(std::int32_t x, std::int32_t y, std::int32_t z);
-
-enum class DiffColor : std::uint8_t {
-    None = 0,
-    Missing = 1,
-    Wrong = 2,
-    State = 3,
-    Extra = 4,
-};
-inline constexpr std::uint8_t kDiffColorMax = static_cast<std::uint8_t>(DiffColor::Extra);
-
-bool setDiffCell(std::int32_t x, std::int32_t y, std::int32_t z, DiffColor color);
-
-std::size_t takeDiffCellChanges();
-
-DiffColor diffCellAt(std::int32_t x, std::int32_t y, std::int32_t z);
-
-void setLayerFilter(bool on, int axis, std::int32_t lo, std::int32_t hi);
-bool layerShows(std::int32_t x, std::int32_t y, std::int32_t z);
-
-enum class DiffKind : std::uint8_t {
-    Match = 0,
-    Missing = 1,
-    Wrong = 2,
-    State = 3,
-    UnknownWorld = 4,
-    UnknownWant = 5,
-    Extra = 6,
-};
-inline constexpr std::size_t kDiffKindCount = 7;
-
-DiffKind diffKindOf(const void* real, const void* want, bool wantAir);
-
-DiffKind diffKindOf(const void* real, const void* want, bool wantAir,
-                    const void* realExtra, bool realExtraKnown, bool wantWater);
-
-DiffColor colorOfDiffKind(DiffKind kind);
-
-bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void* real,
-                      const void* realExtra = nullptr, bool realExtraKnown = false);
-
-struct DiffBox {
-    std::int32_t x = 0;
-    std::int32_t y = 0;
-    std::int32_t z = 0;
-    DiffColor color = DiffColor::None;
-    bool hidden = false;
-    std::uint8_t covered = 0;
-};
-
-std::size_t collectDiffBoxes(std::vector<DiffBox>& out);
 
 std::size_t appendStateVariants(const void* block, std::vector<const void*>& out);
 
 const void* legacyOfFast(const void* block);
-
-bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ);
-
-bool ghostBoxTouchesSubChunk(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ);
-
-bool ghostInside(std::int32_t x, std::int32_t y, std::int32_t z);
-
-const void* ghostBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, int layer = 0);
-
-const void* wantBlockAt(std::int32_t x, std::int32_t y, std::int32_t z);
-
-void setGhostOverMismatch(bool on);
-bool ghostOverMismatchOn();
-
-void noteRealLayer(const void* block, int layer);
-
-int realLayer(const void* block);
 
 bool hasBlockEntity(const void* block);
 
@@ -152,25 +60,10 @@ std::vector<std::string> registeredItemNames();
 
 bool maxStackSizeOf(const char* name, int& out);
 
-bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z);
-
 void setAirBlock(const void* air);
 const void* airBlock();
 
-void dropWorldBlocks();
-bool takeWorldDropped();
-
-void waitUntilIdle();
-
 void setSimThread(unsigned long id);
 unsigned long simThread();
-
-inline constexpr std::size_t kMeshThreadLimit = 16;
-
-void noteMeshThread(unsigned long id);
-
-bool isMeshThread(unsigned long id);
-
-std::size_t meshThreadCount();
 
 }

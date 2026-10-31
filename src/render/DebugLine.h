@@ -10,4 +10,10 @@ struct DebugLine {
     bool onTop = false;
 };
 
+struct DebugFill {
+    double p[4][3];
+    float rgba[4];
+    bool blend = false;
+};
+
 }

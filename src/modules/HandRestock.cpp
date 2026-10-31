@@ -1,4 +1,5 @@
 #include "modules/HandRestock.h"
+#include "modules/AutoTool.h"
 
 #include <Windows.h>
 
@@ -13,9 +14,14 @@
 #include "game/ChatCommand.h"
 #include "game/ChatCommandParse.h"
 #include "game/ContainerUi.h"
+#include "game/EasyPlaceLogic.h"
 #include "game/UiProbe.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
+#include "game/InventoryResync.h"
+#include "game/InventoryScreen.h"
+#include "game/LegacyTransaction.h"
+#include "core/Notice.h"
 #include "input/Foreground.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
@@ -340,6 +346,10 @@ void HandRestock::onSetSelectedSlot(void* holder)
 
 void HandRestock::onPlayerViewUpdate()
 {
+    if (m_externalSwap) {
+        serveOutstanding();
+        if (!m_outstanding.active) m_externalSwap = false;
+    }
     if (m_resetRequested.exchange(false, std::memory_order_acq_rel)) {
         for (int spot = 0; spot < kSpotCount; ++spot) {
             m_last[spot] = HandState{};
@@ -347,7 +357,7 @@ void HandRestock::onPlayerViewUpdate()
         }
     }
     if (!enabled()) {
-        clearOutstanding();
+        if (!m_externalSwap) clearOutstanding();
         for (int spot = 0; spot < kSpotCount; ++spot) {
             m_last[spot] = HandState{};
             m_pending[spot] = Pending{};
@@ -555,7 +565,7 @@ void HandRestock::watch(Spot spot, const Inventory& inventory, const SlotView& v
                              view.aux, view.count,
                              total};
     if (view.item != nullptr && view.count > 0) {
-        m_last[spot].name = previous.item == view.item ? previous.name
+        m_last[spot].name = previous.item == view.item && !previous.name.empty() ? previous.name
             : containerui::itemName(spot == kSpotHand ? inventory.slots + kSlotStride * slot
                                                : inventory.offhand);
     }
@@ -709,6 +719,7 @@ void HandRestock::servePending(Spot spot)
     if (reread) {
         m_last[spot] = HandState{inventory.container, pending.destSlot, refilled.item,
                                  refilled.aux, refilled.count};
+        m_last[spot].name=containerui::itemName(spot==kSpotHand ? inventory.slots+kSlotStride*pending.destSlot : inventory.offhand);
     }
 
     const wchar_t* const where = (spot == kSpotHand) ? L"hand" : L"offhand";
@@ -761,32 +772,61 @@ bool HandRestock::emptyEverywhere(Spot spot, int destSlot) const
     return seen > 0;
 }
 
-bool HandRestock::forEachInventorySlot(const std::function<void(const void*, int)>& fn) const
+bool HandRestock::forEachInventoryStack(const std::function<void(const void*, int)>& fn) const
 {
-    if (!fn) {
-        return false;
-    }
+    if (!fn) return false;
     Inventory inventory;
-    if (!resolveClient(inventory) || inventory.slots == nullptr) {
-        return false;
-    }
+    if (!resolveClient(inventory) || inventory.slots == nullptr) return false;
+    bool complete = true;
     for (int slot = 0; slot < kSlotCount; ++slot) {
         SlotView view;
-        if (!readSlot(inventory.slots, slot, view)) {
-            continue;
-        }
-        if (view.item == nullptr || view.count == 0) {
-            continue;
-        }
-        fn(view.block, static_cast<int>(view.count));
+        if (!readSlot(inventory.slots, slot, view)) { complete = false; continue; }
+        if (view.item != nullptr && view.count > 0)
+            fn(inventory.slots + kSlotStride * slot, static_cast<int>(view.count));
     }
     if (inventory.offhand != nullptr) {
         SlotView view;
-        if (readStackAt(inventory.offhand, view) && view.item != nullptr && view.count > 0) {
-            fn(view.block, static_cast<int>(view.count));
-        }
+        if (!readStackAt(inventory.offhand, view)) complete = false;
+        else if (view.item != nullptr && view.count > 0)
+            fn(inventory.offhand, static_cast<int>(view.count));
     }
-    return true;
+    return complete;
+}
+
+const void* HandRestock::heldStack() const
+{
+    Inventory inventory;
+    SlotView view;
+    if (!resolveClient(inventory) || inventory.hand < 0 || inventory.hand >= kHotbarSlots
+        || !readSlot(inventory.slots, inventory.hand, view) || !view.item || view.count == 0) return nullptr;
+    return inventory.slots + kSlotStride * inventory.hand;
+}
+HandRestock::PickResult HandRestock::selectItem(const std::string& name, unsigned allowedSlots)
+{
+    if (name.empty()) return PickResult::Unavailable;
+    if (m_outstanding.active) return PickResult::Pending;
+    Inventory inventory;
+    if (!resolveClient(inventory)) return PickResult::Unavailable;
+    unsigned emptyHotbar = 0;
+    for (int slot = 0; slot < kSlotCount; ++slot) {
+        SlotView view;
+        if (!readSlot(inventory.slots, slot, view)) return PickResult::Unavailable;
+        if (!view.item || view.count == 0) {
+            if (slot < kHotbarSlots) emptyHotbar |= 1u << slot;
+            continue;
+        }
+        if (containerui::itemName(inventory.slots + kSlotStride * slot) != name) continue;
+        if (slot < kHotbarSlots)
+            return AutoTool::instance().selectHotbarSlot(slot) ? PickResult::Selected : PickResult::Unavailable;
+        const int dest = easyplace::pickTargetSlot(allowedSlots, inventory.hand, emptyHotbar);
+        if (dest < 0) return PickResult::NoSlot;
+        if (dest != inventory.hand && !AutoTool::instance().selectHotbarSlot(dest)) return PickResult::Unavailable;
+        noteDeliberateMove();
+        if (applyRefill(kSpotHand, dest, slot, true) == 0) return PickResult::Unavailable;
+        m_externalSwap = m_outstanding.active;
+        return PickResult::Pending;
+    }
+    return PickResult::Missing;
 }
 
 int HandRestock::countItem(const Inventory& inventory, void* item, std::uint16_t aux) const
@@ -1298,6 +1338,76 @@ bool HandRestock::resolveOwn(Own& out, bool wantServer) const
     return true;
 }
 
+int HandRestock::applyLegacyRefill(const Inventory& inventory, Spot spot, int destSlot, int sourceSlot)
+{
+    void* player = inventory.player;
+    if (player == nullptr && inventory.playerRaw != nullptr && isClientSidePlayer(inventory.playerRaw)) {
+        player = inventory.playerRaw;
+    }
+    if (player == nullptr) {
+        return 0;
+    }
+    LegacyTransaction& legacy = LegacyTransaction::instance();
+    if (!legacy.available()) {
+        notice::failOnce("HandRestock.legacy",
+                         L"HandRestock: the legacy inventory path is unavailable, so refilling on a server is off",
+                         "HandRestock cannot refill on this server: the legacy inventory path is unavailable");
+        return 0;
+    }
+    std::byte* const sourceStack = inventory.slots + kSlotStride * sourceSlot;
+    const bool sent =
+        (spot == kSpotOffhand)
+            ? legacy.swap(player, LegacyTransaction::inventorySlot(sourceSlot, sourceStack),
+                          LegacyTransaction::offhand(inventory.offhand))
+            : legacy.swap(player, LegacyTransaction::inventorySlot(sourceSlot, sourceStack),
+                          LegacyTransaction::inventorySlot(destSlot, inventory.slots + kSlotStride * destSlot));
+    if (!sent) {
+        if (!m_warnedNoRequest) {
+            m_warnedNoRequest = true;
+            log().warn(L"HandRestock: could not send the legacy refill for the {}",
+                       (spot == kSpotHand) ? L"hand" : L"offhand");
+        }
+        return 0;
+    }
+    m_warnedNoRequest = false;
+    InventoryResync::instance().markStale();
+    if (!predictRefill(inventory, spot, destSlot, sourceSlot)) {
+        if (!m_warnedNoPredict) {
+            m_warnedNoPredict = true;
+            log().warn(L"HandRestock: the legacy refill for the {} went out but the client side could not be "
+                       L"updated, the server will resend the inventory",
+                       (spot == kSpotHand) ? L"hand" : L"offhand");
+        }
+        return 1;
+    }
+    m_warnedNoPredict = false;
+    static int logs = 0;
+    if (logs < 40) {
+        ++logs;
+        log().info(L"HandRestock: moved slot {} to the {} through the legacy path", sourceSlot,
+                   (spot == kSpotHand) ? L"hand" : L"offhand");
+    }
+    return 1;
+}
+
+bool HandRestock::clientInventory(ClientInventory& out) const
+{
+    Inventory inventory;
+    if (!resolveClient(inventory) || inventory.slots == nullptr) return false;
+    out = ClientInventory{};
+    out.slots = inventory.slots;
+    out.hand = inventory.hand;
+    out.player = inventory.player;
+    if (out.player == nullptr && inventory.playerRaw != nullptr && isClientSidePlayer(inventory.playerRaw)) {
+        out.player = inventory.playerRaw;
+    }
+    if (out.player == nullptr) return false;
+    auto* const player = static_cast<std::byte*>(out.player);
+    out.offhand = inventory.offhand != nullptr ? inventory.offhand : player + kOffhandOffset;
+    out.mainhand = player + kMainhandOffset;
+    return true;
+}
+
 bool HandRestock::resolveClient(Inventory& out) const
 {
     Own own;
@@ -1568,6 +1678,10 @@ int HandRestock::applyRefill(Spot spot, int destSlot, int sourceSlot, bool durab
     }
 
     std::byte* const sourceStack = inventory.slots + kSlotStride * sourceSlot;
+
+    if (!InventoryScreen::instance().screenLooksOpen()) {
+        return applyLegacyRefill(inventory, spot, destSlot, sourceSlot);
+    }
 
     const bool sent =
         (spot == kSpotOffhand)

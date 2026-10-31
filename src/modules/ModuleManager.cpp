@@ -30,7 +30,9 @@ void ModuleManager::loadConfig()
 {
     for (Module* module : m_modules) {
         const std::string key = toUtf8(module->name());
-        module->loadConfig(Config::instance().section(key));
+        const nlohmann::json& section = Config::instance().section(key);
+        module->loadConfig(section);
+        module->setFavorite(Config::getBool(section, "favorite", false));
     }
 }
 
@@ -44,6 +46,9 @@ void ModuleManager::saveConfig()
             fresh["padKeys"] = *pad;
         }
         module->saveConfig(fresh);
+        if (module->favorite()) {
+            fresh["favorite"] = true;
+        }
         section = std::move(fresh);
     }
 }
@@ -112,6 +117,13 @@ std::vector<MenuItem> ModuleManager::buildMenuItems()
     items.reserve(m_modules.size());
     for (Module* module : m_modules) {
         items.push_back(module->buildMenu());
+        MenuItem& tab = items.back();
+        tab.isFavorite = [module] { return module->favorite(); };
+        MenuItem favorite = menu::toggle(
+            L"Favorite", [module] { return module->favorite(); },
+            [module] { module->setFavorite(!module->favorite()); });
+        const bool afterEnabled = !tab.children.empty() && tab.children.front().labelText() == L"Enabled";
+        tab.children.insert(tab.children.begin() + (afterEnabled ? 1 : 0), std::move(favorite));
         if (module->isWriteBlocked()) {
             items.back().hidden = true;
         }

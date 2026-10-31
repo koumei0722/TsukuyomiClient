@@ -33,7 +33,7 @@ struct ResourceLocation {
     std::uint64_t pathHash = 0, fullHash = 0;
 };
 static_assert(sizeof(ResourceLocation) == 0x38);
-bool makeLocation(const char* path, ResourceLocation& out);
+bool makeLocation(const char* path, ResourceLocation& out, std::int32_t fileSystem = 0);
 using GetTextureFn = TexturePtr*(__fastcall*)(void* ctx, TexturePtr* out, const ResourceLocation* location, bool forceReload);
 using DrawImageFn = void(__fastcall*)(void* ctx, const void* textureData, const float* position, const float* size,
                                       const float* uvPosition, const float* uvSize, bool flag);

@@ -14,7 +14,9 @@ struct Registered {
     float delta = 0.0f;
 };
 
-bool readRegistration(std::span<const std::byte> code, Registered& out);
+inline constexpr std::size_t kRegistrationBytes = 0x30;
+inline constexpr std::size_t kValuesDispOffset = 0x28;
+bool readRegistration(std::span<const std::byte> code, std::span<const std::byte> values, Registered& out);
 
 inline constexpr std::size_t kClampDispOffset = 0x13;
 inline constexpr std::size_t kClampNextOffset = 0x17;

@@ -142,7 +142,11 @@ inline constexpr const char* kBindChatBottom = "#tk_f3_chat_bottom";
 inline constexpr int kChatBottomOffsetY = -48;
 
 std::string hideBindingJson(const char* vanillaVisible, const char* hideBind);
-std::string chatHideBindingJson();
+inline constexpr int kVanillaChatSlot = kHideCoordsSlot + 5;
+inline constexpr const char* kBindVanillaChat = "#tk_f3_vanilla_chat";
+inline constexpr const char* kChatRowsVariable = "$tk_chat_rows_visible";
+std::string chatPanelControlsJson();
+std::string chatRowsDefaultJson();
 std::string chatJson();
 
 inline constexpr int kGamePausedSlot = kHideCoordsSlot + 3;

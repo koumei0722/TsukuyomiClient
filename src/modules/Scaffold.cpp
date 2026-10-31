@@ -1,9 +1,9 @@
 #include "modules/Scaffold.h"
 
-#include "config/Config.h"
 #include "core/Logger.h"
 #include "core/Notice.h"
-#include "core/Strings.h"
+#include "game/BlockRegistry.h"
+#include "game/DebugScreenWorld.h"
 #include "game/GameData.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
@@ -11,12 +11,16 @@
 
 #include <algorithm>
 #include <cmath>
-#include <format>
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace tsukuyomi {
+
+namespace {
+constexpr float kClickAtCorner[3]{0.0f, 0.0f, 0.0f};
+}
 
 Scaffold& Scaffold::instance()
 {
@@ -27,62 +31,8 @@ Scaffold& Scaffold::instance()
 bool Scaffold::available() const
 {
     const Scanner& scanner = Scanner::instance();
-    return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView);
-}
-
-const wchar_t* Scaffold::patternName() const
-{
-    switch (m_pattern) {
-    case Pattern::Square3: return L"Square 3x3";
-    case Pattern::Square5: return L"Square 5x5";
-    case Pattern::Square7: return L"Square 7x7";
-    case Pattern::Cross:
-    default:               return L"Cross (5)";
-    }
-}
-
-int Scaffold::squareRadius() const
-{
-    switch (m_pattern) {
-    case Pattern::Square3: return 1;
-    case Pattern::Square5: return 2;
-    case Pattern::Square7: return 3;
-    case Pattern::Cross:
-    default:               return 0;
-    }
-}
-
-const wchar_t* Scaffold::heightName() const
-{
-    switch (m_height) {
-    case Height::Manual:   return L"Manual";
-    case Height::OnEnable: return L"On enable";
-    case Height::Follow:
-    default:               return L"Follow";
-    }
-}
-
-void Scaffold::captureHeight()
-{
-    m_hasCapturedY = false;
-
-    if (m_height != Height::OnEnable) {
-        return;
-    }
-
-    if (!GameData::instance().hasPlayerView()) {
-        return;
-    }
-
-    float footX = 0.0f;
-    float footY = 0.0f;
-    float footZ = 0.0f;
-    if (!readFeet(footX, footY, footZ)) {
-        return;
-    }
-    m_capturedY = static_cast<int>(std::floor(footY)) - 1;
-    m_hasCapturedY = true;
-    log().info(L"Scaffold: height locked to Y {} (feet {:.3f} from the hitbox)", m_capturedY, footY);
+    return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView)
+        && scanner.found(Target::ServerLevelTick) && scanner.found(Target::HitResultAssign);
 }
 
 bool Scaffold::readFeet(float& outX, float& outY, float& outZ) const
@@ -94,49 +44,16 @@ bool Scaffold::readFeet(float& outX, float& outY, float& outZ) const
     if (++m_feetMisses == kFeetMissNotice) {
         notice::failOnce("Scaffold.hitbox",
                          L"Scaffold: the hitbox of the player could not be read for " + std::to_wstring(kFeetMissNotice)
-                             + L" frames in a row; no blocks are placed",
+                             + L" ticks in a row; no blocks are placed",
                          "Scaffold is not placing blocks: the hitbox of the player could not be read");
     }
     return false;
-}
-
-bool Scaffold::resolveY(float footY, int& outY) const
-{
-    switch (m_height) {
-    case Height::Manual:
-        outY = m_manualY.load(std::memory_order_relaxed);
-        return true;
-
-    case Height::OnEnable:
-        if (!m_hasCapturedY) {
-            return false;
-        }
-        outY = m_capturedY;
-        return true;
-
-    case Height::Follow:
-    default:
-        outY = static_cast<int>(std::floor(footY)) - 1;
-        return true;
-    }
 }
 
 int Scaffold::buildTargets(const BlockPos& center, BlockPos (&targets)[kMaxTargets]) const
 {
     int count = 0;
     targets[count++] = center;
-
-    if (const int radius = squareRadius(); radius > 0) {
-        for (int dx = -radius; dx <= radius; ++dx) {
-            for (int dz = -radius; dz <= radius; ++dz) {
-                if (dx == 0 && dz == 0) {
-                    continue;
-                }
-                targets[count++] = BlockPos{center.x + dx, center.y, center.z + dz};
-            }
-        }
-        return count;
-    }
 
     static constexpr int kDx[] = {1, -1, 0, 0};
     static constexpr int kDz[] = {0, 0, 1, -1};
@@ -154,6 +71,15 @@ unsigned char Scaffold::faceTowardCenter(const BlockPos& pos, const BlockPos& ce
     if (pos.z < center.z) { return 3; }
 
     return 4;
+}
+
+bool Scaffold::alreadyFilled(const BlockPos& pos)
+{
+    const std::int32_t at[3]{pos.x, pos.y, pos.z};
+    const void* const block = debugworld::worldBlockAt(at);
+    bool blocksMotion = false;
+    bool liquid = false;
+    return block != nullptr && blocks::materialFlags(block, blocksMotion, liquid) && blocksMotion;
 }
 
 void Scaffold::placeAll()
@@ -180,10 +106,7 @@ void Scaffold::placeAll()
         return;
     }
 
-    int planeY = 0;
-    if (!resolveY(footY, planeY)) {
-        return;
-    }
+    const int planeY = static_cast<int>(std::floor(footY)) - 1;
     if (planeY < kMinY || planeY > kMaxY) {
         return;
     }
@@ -194,11 +117,6 @@ void Scaffold::placeAll()
     const bool moved = !m_hasLastCenter || center.x != m_lastCenter.x
                        || center.y != m_lastCenter.y || center.z != m_lastCenter.z;
 
-    const Clock::time_point now = Clock::now();
-    if (!moved && now < m_nextResend) {
-        return;
-    }
-    m_nextResend = now + std::chrono::milliseconds(kResendIntervalMs);
     m_lastCenter = center;
     m_hasLastCenter = true;
 
@@ -206,12 +124,18 @@ void Scaffold::placeAll()
     const int count = buildTargets(center, targets);
 
     int placed = 0;
+    int filled = 0;
     constexpr bool simTick = false;
     m_placing = true;
     for (int i = 0; i < count; ++i) {
-        BlockPos target = targets[i];
-        if (hooks::callBuildBlockWithoutSwing(gameMode, &target, faceTowardCenter(target, center), 0,
-                                              simTick)) {
+        const BlockPos& target = targets[i];
+        if (alreadyFilled(target)) {
+            ++filled;
+            continue;
+        }
+        std::int32_t at[3]{target.x, target.y, target.z};
+        if (hooks::callBuildBlockAimedWithoutSwing(gameMode, at, faceTowardCenter(target, center), kClickAtCorner,
+                                                   0, simTick)) {
             ++placed;
         }
     }
@@ -221,22 +145,24 @@ void Scaffold::placeAll()
         return;
     }
 
+    const Clock::time_point now = Clock::now();
     if (now >= m_nextLog) {
         m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-        log().info(L"Scaffold: {} Y {} ({}) at ({}, {}) {}/{} placed (feet {:.3f} from the hitbox)",
-                   patternName(), planeY, heightName(), center.x, center.z, placed, count, footY);
+        log().info(L"Scaffold: Y {} at ({}, {}) {}/{} placed, {} already filled (feet {:.3f} from the hitbox)",
+                   planeY, center.x, center.z, placed, count, filled, footY);
     }
 }
 
-void Scaffold::onPlayerViewUpdate()
+void Scaffold::onClientTick()
 {
-    if (!enabled() || m_placing) {
-        return;
+    if (m_placing) return;
+    if (m_resetRequested.exchange(false, std::memory_order_acquire)) {
+        m_hasLastCenter = false;
+        m_warnedNoGameMode = false;
+        m_feetMisses = 0;
+        m_nextLog = Clock::time_point{};
     }
-
-    if (m_height == Height::OnEnable && !m_hasCapturedY) {
-        captureHeight();
-    }
+    if (!enabled()) return;
 
     placeAll();
 }
@@ -246,81 +172,23 @@ MenuItem Scaffold::buildMenu()
     std::vector<MenuItem> children;
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
-    children.push_back(menu::choice(
-        L"Pattern", {L"Cross (5)", L"Square 3x3", L"Square 5x5", L"Square 7x7"},
-        [this] { return static_cast<int>(m_pattern); },
-        [this](int at) { m_pattern = static_cast<Pattern>(std::clamp(at, 0, 3)); }));
-    children.push_back(menu::choice(
-        L"Height", {L"Follow", L"Manual", L"On enable"},
-        [this] { return static_cast<int>(m_height); }, [this](int at) {
-            m_height = static_cast<Height>(std::clamp(at, 0, 2));
-            if (enabled()) {
-                captureHeight();
-            } else {
-                m_hasCapturedY = false;
-            }
-        }));
-
-    MenuItem fixedY = menu::text(
-        L"Fixed Y",
-        [this] { return std::format(L"{}", m_manualY.load(std::memory_order_relaxed)); },
-        [this](std::wstring typed) {
-            int value = 0;
-            if (!parseTypedInt(typed, value)) {
-                return;
-            }
-            value = std::clamp(value, kMinY, kMaxY);
-            if (m_manualY.exchange(value, std::memory_order_relaxed) != value) {
-                log().info(L"Scaffold: fixed Y set to {}", value);
-            }
-        });
-    fixedY.available = [this] { return m_height == Height::Manual; };
-    children.push_back(std::move(fixedY));
-
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
     item.isOn = [this] { return enabled(); };
     return item;
 }
 
-void Scaffold::loadConfig(const nlohmann::json& section)
-{
-    Module::loadConfig(section);
-
-    const int pattern =
-        std::clamp(Config::getInt(section, "pattern", static_cast<int>(Pattern::Cross)), 0, 3);
-    m_pattern = static_cast<Pattern>(pattern);
-
-    const int height =
-        std::clamp(Config::getInt(section, "height", static_cast<int>(Height::Follow)), 0, 2);
-    m_height = static_cast<Height>(height);
-
-    m_manualY.store(std::clamp(Config::getInt(section, "fixedY", 64), kMinY, kMaxY),
-                    std::memory_order_relaxed);
-}
-
 void Scaffold::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
-    section["pattern"] = static_cast<int>(m_pattern);
-    section["height"] = static_cast<int>(m_height);
-    section["fixedY"] = m_manualY.load(std::memory_order_relaxed);
+    section.erase("pattern");
+    section.erase("height");
+    section.erase("fixedY");
 }
 
-void Scaffold::onEnabledChanged(bool enabled)
+void Scaffold::onEnabledChanged(bool )
 {
-    m_hasLastCenter = false;
-    m_warnedNoGameMode = false;
-    m_feetMisses = 0;
-
-    m_nextLog = Clock::time_point{};
-
-    if (!enabled) {
-        m_hasCapturedY = false;
-        return;
-    }
-
-    captureHeight();
+    m_resetRequested.store(true, std::memory_order_release);
 }
 
 }

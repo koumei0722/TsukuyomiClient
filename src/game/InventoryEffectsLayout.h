@@ -4,7 +4,7 @@
 
 namespace tsukuyomi::invfx {
 
-inline constexpr int kMaxRows = 38;
+inline constexpr int kMaxRows = 39;
 
 inline constexpr int kPanelHeight = 166;
 inline constexpr int kSurvivalRight = 88;

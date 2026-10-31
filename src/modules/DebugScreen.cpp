@@ -387,9 +387,8 @@ void DebugScreen::onScansReady()
             std::memcpy(constants.table, memory::ripTarget(loop, 28), sizeof(constants.table));
             std::memcpy(&constants.topCell, loop + 1, sizeof(constants.topCell));
             debugworld::SurfaceTargetsIn targets{};
-            targets.columnFunction = memory::ripTarget(call, 15);
-            std::memcpy(&targets.samplerFromSubObject, call + 3, sizeof(std::int32_t));
-            std::memcpy(&targets.factoryFromSubObject, call + 29, sizeof(std::int32_t));
+            targets.surfaceSite = call;
+            std::memcpy(&targets.factoryFromSubObject, call + 10, sizeof(std::int32_t));
             targets.factoryNoBlendFlag = static_cast<std::int32_t>(static_cast<std::uint8_t>(flags[11]));
             targets.densityGrid = scanner.address(Target::DensityGridEntry);
             debugworld::setSurfaceTargets(targets, constants);
@@ -412,7 +411,9 @@ void DebugScreen::onScansReady()
                                      ds::hideBindingJson("#player_position_visible", ds::kBindHideCoords));
     uiprobe::registerDefReplaceArray("hud", "number_of_days_played", "bindings",
                                      ds::hideBindingJson("#number_of_days_played_visible", ds::kBindHideDays));
-    uiprobe::registerDefAppend("hud", "chat_panel", "bindings", ds::chatHideBindingJson());
+
+    uiprobe::registerDefReplaceControls("hud", "chat_panel", ds::chatPanelControlsJson());
+    uiprobe::registerDefProperty("hud", "chat_panel", ds::kChatRowsVariable, ds::chatRowsDefaultJson());
     uiprobe::registerDefExtension("hud", "hud_content", "", ds::chatJson());
     uiprobe::registerDefExtension("hud", "hud_content", "", ds::pausedJson());
 
@@ -449,6 +450,7 @@ void DebugScreen::publishHudOptions()
     writeBool(ds::kHideCoordsSlot, on && hideCoordinates());
     writeBool(ds::kHideDaysSlot, on && hideDaysPlayed());
     writeBool(ds::kChatBottomSlot, on && chatBottomLeft());
+    writeBool(ds::kVanillaChatSlot, !(on && chatBottomLeft()));
     writeBool(ds::kGamePausedSlot, on && DebugKeys::instance().pausedByKey());
 }
 
@@ -1203,10 +1205,11 @@ void DebugScreen::onHudCreated(void* ctrl)
     boundBool += cui::bindPersistentBool(ctrl, ds::kBindHideCoords, ds::kHideCoordsSlot) ? 1 : 0;
     boundBool += cui::bindPersistentBool(ctrl, ds::kBindHideDays, ds::kHideDaysSlot) ? 1 : 0;
     boundBool += cui::bindPersistentBool(ctrl, ds::kBindChatBottom, ds::kChatBottomSlot) ? 1 : 0;
+    boundBool += cui::bindPersistentBool(ctrl, ds::kBindVanillaChat, ds::kVanillaChatSlot) ? 1 : 0;
     boundBool += cui::bindPersistentBool(ctrl, ds::kBindGamePaused, ds::kGamePausedSlot) ? 1 : 0;
     constexpr int kWanted = ds::kTextSlotCount;
     if (g_bindLogs.fetch_add(1, std::memory_order_relaxed) < kMaxBindLogs) {
-        if (boundText == kWanted && boundBool == 2 * kWanted + 4) {
+        if (boundText == kWanted && boundBool == 2 * kWanted + 5) {
             log().info(L"DebugScreen: bound {} text / {} bool values to the HUD controller", boundText,
                        boundBool);
         } else {

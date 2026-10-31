@@ -23,6 +23,8 @@ public:
 
     int onUseItemTransaction(void* gameMode, void* itemStack, int extra);
 
+    static bool playerSneaking(void* gameMode);
+
 protected:
 
 private:
@@ -31,8 +33,6 @@ private:
     using Clock = std::chrono::steady_clock;
 
     bool shouldRepeat(void* gameMode) const;
-
-    static bool playerSneaking(void* gameMode);
 
     static constexpr std::size_t kGameModePlayerOffset = 0x08;
     static constexpr std::size_t kPlayerContextOffset = 0x08;

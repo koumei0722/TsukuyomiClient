@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "bot/BotHooks.h"
 #include "core/Logger.h"
 #include "core/Strings.h"
 #include "game/BlockRegistry.h"
@@ -31,12 +32,15 @@ constexpr std::size_t kPacketSize = 0xf0;
 constexpr std::size_t kValues = 0x30;
 constexpr std::size_t kEnums = 0x60;
 constexpr std::size_t kCommands = 0xa8;
+constexpr std::size_t kSoftEnums = 0xc0;
 constexpr std::size_t kStringSize = 0x20;
 constexpr std::size_t kEnumSize = 0x38;
+constexpr std::size_t kSoftEnumSize = 0x38;
 constexpr std::size_t kCommandSize = 0x80;
 constexpr std::size_t kOverloadSize = 0x20;
 constexpr std::size_t kParamSize = 0x28;
 constexpr std::uint32_t kEnumType = 0x300000;
+constexpr std::uint32_t kSoftEnumType = 0x4100000;
 constexpr std::uint16_t kNotCheatFlag = 0x80;
 constexpr std::uint8_t kParamAutocompleteExpansion = 0x1;
 static_assert(sizeof(std::string) == kStringSize);
@@ -51,8 +55,8 @@ std::atomic_bool g_flagsLogged{false};
 std::atomic_bool g_registrySourceLogged{false};
 std::atomic_bool g_packetSourceLogged{false};
 std::atomic_bool g_lateLogged{false};
-std::array<std::atomic_bool, 5> g_typeMissingLogged{};
-std::array<std::atomic_bool, 5> g_typeFoundLogged{};
+std::array<std::atomic_bool, 9> g_typeMissingLogged{};
+std::array<std::atomic_bool, 9> g_typeFoundLogged{};
 std::array<std::atomic_bool, 2> g_booleanLogged{};
 std::atomic<void*> g_patchedRegistry{nullptr};
 std::atomic<void*> g_lateTriedRegistry{nullptr};
@@ -158,18 +162,21 @@ bool itemNames(const RawVector& values, std::size_t valueCount,
     return true;
 }
 
-bool registeredParamType(Target target, const char* expectedName, std::uint32_t& type)
+bool registeredParamType(Target target, std::uint32_t& type)
 {
     const auto* site = Scanner::instance().address(target);
-    if (site == nullptr || !memory::isReadable(site, 14)) return false;
-    const auto* registration = static_cast<const std::byte*>(memory::ripTarget(site, 3));
-    const auto* name = memory::ripTarget(site + 7, 3);
-    const std::size_t length = std::strlen(expectedName) + 1;
-    std::vector<char> text(length);
-    if (registration == nullptr || !memory::isReadable(registration + 8, sizeof(type))
-        || !memory::isReadable(name, length)
-        || !memory::copyGuarded(name, text.data(), length) || std::memcmp(text.data(), expectedName, length) != 0) return false;
-    if (!memory::copyGuarded(registration + 8, &type, sizeof(type))) return false;
+    if (site == nullptr || !memory::isReadable(site, 25)) return false;
+    const auto* parser = memory::ripTarget(site, 3);
+    const auto* registration = static_cast<const std::byte*>(memory::ripTarget(site + 7, 3));
+    std::int32_t typeDisp = 0;
+    if (!memory::copyGuarded(site + 16, &typeDisp, sizeof(typeDisp))) return false;
+    const auto* typeField = site + 24 + typeDisp;
+    const void* registeredParser = nullptr;
+    std::uint32_t initializedType = 0;
+    if (registration == nullptr || typeField != registration + 8 || !memory::inGameModule(parser)
+        || !memory::copyGuarded(registration, &registeredParser, sizeof(registeredParser)) || registeredParser != parser
+        || !memory::copyGuarded(site + 20, &initializedType, sizeof(initializedType))
+        || !memory::copyGuarded(typeField, &type, sizeof(type)) || type != initializedType) return false;
     return (type & 0xfff00000u) == 0x100000u && (type & 0xfffffu) != 0;
 }
 
@@ -177,12 +184,13 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet)
 {
     if (source == nullptr || !memory::isReadable(source, kPacketSize)) return false;
     std::memcpy(packet, source, kPacketSize);
-    RawVector values{}, enums{}, commands{};
-    std::size_t valueCount = 0, enumCount = 0, commandCount = 0;
+    RawVector values{}, enums{}, commands{}, softEnums{};
+    std::size_t valueCount = 0, enumCount = 0, commandCount = 0, softEnumCount = 0;
     if (!getVector(packet, kValues, kStringSize, values, valueCount)
         || !getVector(packet, kEnums, kEnumSize, enums, enumCount)
         || !getVector(packet, kCommands, kCommandSize, commands, commandCount)
-        || enumCount > UINT32_MAX - 5) return false;
+        || !getVector(packet, kSoftEnums, kSoftEnumSize, softEnums, softEnumCount)
+        || enumCount > UINT32_MAX - 5 || softEnumCount > 0xfffff) return false;
 
     std::optional<std::uint32_t> itemIndex, booleanIndex;
     for (std::size_t i = 0; i < enumCount && !(itemIndex && booleanIndex); ++i) {
@@ -220,18 +228,23 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet)
         log().info(L"ChatCommand: toggles use {} Boolean enum", booleanIndex ? L"the packet's" : L"an added");
     auto spec = chatcommand::buildTkCommandSpec(static_cast<std::uint32_t>(enumCount), itemIndex,
                                                  itemValues, settingscommand::completion(), booleanIndex);
+    bot::addTkCompletion(spec, static_cast<std::uint32_t>(enumCount), booleanIndex);
     using chatcommand::ParamType;
-    std::array<std::uint32_t, 5> paramTypes{};
-    struct TypeSite { ParamType type; Target target; const char* name; const char* label; };
+    std::array<std::uint32_t, 9> paramTypes{};
+    static_assert(std::tuple_size_v<decltype(paramTypes)> == std::tuple_size_v<decltype(g_typeFoundLogged)>);
+    struct TypeSite { ParamType type; Target target; const char* label; };
     const TypeSite sites[] = {
-        {ParamType::Json, Target::JsonCommandParamSite, "raw json message", "json"},
-        {ParamType::Int, Target::IntCommandParamSite, "data", "int"},
-        {ParamType::Float, Target::FloatCommandParamSite, "minimumVolume", "float"},
-        {ParamType::String, Target::StringCommandParamSite, "criteria", "string"}
+        {ParamType::Json, Target::JsonCommandParamSite, "json"},
+        {ParamType::Int, Target::IntCommandParamSite, "int"},
+        {ParamType::Float, Target::FloatCommandParamSite, "float"},
+        {ParamType::Player, Target::PlayerCommandParamSite, "player"},
+        {ParamType::Position, Target::PositionCommandParamSite, "position"},
+        {ParamType::BlockPosition, Target::BlockPositionCommandParamSite, "block position"},
+        {ParamType::String, Target::StringCommandParamSite, "string"}
     };
     for (const auto& site : sites) {
         const auto at = static_cast<std::size_t>(site.type);
-        if (registeredParamType(site.target, site.name, paramTypes[at])) {
+        if (registeredParamType(site.target, paramTypes[at])) {
             if (!g_typeFoundLogged[at].exchange(true))
                 log().info(L"ChatCommand: the {} parameter type is {:#x} (from the game's type registration)",
                            toUtf16(site.label), paramTypes[at]);
@@ -267,6 +280,18 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet)
         putVector(entry + 0x20, indices, definition.values.size() * sizeof(std::uint32_t));
     }
 
+    if (!spec.softEnums.empty()) {
+        auto* newSoftEnums = appendVector(owned, packet, kSoftEnums, softEnums, softEnumCount, spec.softEnums.size(), kSoftEnumSize);
+        for (std::size_t i = 0; i < spec.softEnums.size(); ++i) {
+            const auto& definition = spec.softEnums[i];
+            auto* entry = newSoftEnums + i * kSoftEnumSize;
+            putString(owned, entry, definition.name);
+            auto* strings = owned.make(definition.values.size() * kStringSize);
+            for (std::size_t j = 0; j < definition.values.size(); ++j) putString(owned, strings + j * kStringSize, definition.values[j]);
+            putVector(entry + 0x20, strings, definition.values.size() * kStringSize);
+        }
+    }
+
     if (!g_flagsLogged.exchange(true))
         log().info(L"ChatCommand: tk is added as a non-cheat command (flags {:#x})", kNotCheatFlag);
 
@@ -286,10 +311,12 @@ bool makePacket(const void* source, OwnedBytes& owned, std::byte* packet)
             auto* param = params + j * kParamSize;
             putString(owned, param, definition[j].name);
             const bool isEnum = definition[j].type == ParamType::Enum;
+            const bool isSoft = definition[j].type == ParamType::SoftEnum;
             writeAt<std::uint32_t>(param, 0x20, isEnum ? kEnumType | definition[j].enumIndex
-                                                    : paramTypes[static_cast<std::size_t>(definition[j].type)]);
+                                              : isSoft ? kSoftEnumType | static_cast<std::uint32_t>(softEnumCount + definition[j].enumIndex)
+                                                       : paramTypes[static_cast<std::size_t>(definition[j].type)]);
             writeAt<std::uint8_t>(param, 0x24, definition[j].optional ? 1 : 0);
-            writeAt<std::uint8_t>(param, 0x25, isEnum ? kParamAutocompleteExpansion : 0);
+            writeAt<std::uint8_t>(param, 0x25, isEnum || isSoft ? kParamAutocompleteExpansion : 0);
         }
     }
     return true;

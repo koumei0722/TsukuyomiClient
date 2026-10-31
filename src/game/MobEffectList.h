@@ -16,7 +16,7 @@ struct Effect {
     std::uint32_t color = 0;
 };
 
-inline constexpr int kMaxId = 0x25;
+inline constexpr int kMaxId = 0x26;
 
 void resolve();
 bool ready();

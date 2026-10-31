@@ -27,6 +27,11 @@ public:
 
     void selectGameMode(int mode) { m_selectedMode.store(mode, std::memory_order_release); }
     void onPauseWheelClosed() { m_pauseWheelClosed.store(true, std::memory_order_release); }
+    bool viewPerspective(int& out) const
+    {
+        out = m_perspective;
+        return m_perspectiveKnown;
+    }
 
 private:
     DebugKeys() = default;
@@ -65,7 +70,6 @@ private:
     std::int32_t m_guiDataField = 0;
     void* m_clearMessages = nullptr;
     void* m_pauseGameA = nullptr;
-    void* m_chatCommand = nullptr;
     void* m_pauseGameB = nullptr;
     std::atomic<int> m_selectedMode{-1};
     void* m_lastPlayer = nullptr;
@@ -78,7 +82,6 @@ private:
     std::int32_t m_clientOptionsSlot = 0;
     std::int32_t m_optionLookupSlot = 0;
     std::int32_t m_pauseOptionId = 0;
-    std::int32_t m_smoothLightingId = 0;
     std::int32_t m_profanityFilterId = 0;
     bool flipOptionAndBack(std::int32_t optionId, bool& changed);
     void* m_boolOptionSet = nullptr;

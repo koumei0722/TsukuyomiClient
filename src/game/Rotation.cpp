@@ -30,8 +30,25 @@ void rotateLocal(int quarters, std::int32_t x, std::int32_t z, std::int32_t& out
     }
 }
 
-Footprint rotatedFootprint(int quarters, std::int32_t originX, std::int32_t originZ,
-                           std::int32_t sizeX, std::int32_t sizeZ)
+void transformLocal(int quarters, int mirror, int x, int z, int& outX, int& outZ)
+{
+    if (mirror == 1) z = -z;
+    if (mirror == 2) x = -x;
+    rotateLocal(quarters, x, z, outX, outZ);
+}
+
+void inverseLocal(int quarters, int mirror, int x, int z, int& outX, int& outZ)
+{
+    int rx = 0, rz = 0;
+    rotateLocal(-quarters, x, z, rx, rz);
+    x = rx; z = rz;
+    if (mirror == 1) z = -z;
+    if (mirror == 2) x = -x;
+    outX = x; outZ = z;
+}
+
+Footprint transformedFootprint(int quarters, int mirror, int originX, int originZ,
+                               int sizeX, int sizeZ)
 {
     Footprint out;
     if (sizeX <= 0 || sizeZ <= 0) {
@@ -45,8 +62,8 @@ Footprint rotatedFootprint(int quarters, std::int32_t originX, std::int32_t orig
     std::int32_t az = 0;
     std::int32_t bx = 0;
     std::int32_t bz = 0;
-    rotateLocal(quarters, 0, 0, ax, az);
-    rotateLocal(quarters, sizeX - 1, sizeZ - 1, bx, bz);
+    transformLocal(quarters, mirror, 0, 0, ax, az);
+    transformLocal(quarters, mirror, sizeX - 1, sizeZ - 1, bx, bz);
     out.x0 = originX + (ax < bx ? ax : bx);
     out.z0 = originZ + (az < bz ? az : bz);
     out.x1 = originX + (ax < bx ? bx : ax) + 1;

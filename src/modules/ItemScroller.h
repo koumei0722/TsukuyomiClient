@@ -154,6 +154,8 @@ private:
     static bool wantedCells(const Recipe& recipe, int gridSize, std::vector<Ingredient>& want);
     enum class Step { Done, Yield, Fail };
     Step dropCraftFromOutput(const Recipe& recipe);
+    int craftItemsForEmptyHand(const Slot& output) const;
+    bool leftClickOutput(const Slot& output);
     bool pendingStacks() const;
     bool craftPendingSettled();
     unsigned long long m_craftPendingSince = 0;

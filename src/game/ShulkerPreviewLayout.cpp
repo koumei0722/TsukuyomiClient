@@ -160,7 +160,7 @@ std::string bundleJson()
                         {"anchor_to", "top_left"},
                         {"text", kBindName},
                         {"enable_profanity_filter", true},
-                        {"bindings", json::array({{{"binding_name", kBindName}, {"binding_condition", "visible"}}})}};
+                        {"bindings", json::array({{{"binding_name", kBindName}, {"binding_condition", kCondition}}})}};
     const json header = {{"type", "stack_panel"},
                          {"orientation", "horizontal"},
                          {"size", {"default", 15}},
@@ -171,7 +171,7 @@ std::string bundleJson()
                          {"controls", json::array({named("bundle_label", label)})}};
     const json selectedText = {{"text", kBindSelectedName},
                                {"bindings", json::array({{{"binding_name", kBindSelectedName},
-                                                          {"binding_condition", "visible"}}})}};
+                                                          {"binding_condition", kCondition}}})}};
     const json selected = {{"anchor_to", "bottom_middle"},
                            {"anchor_from", "top_middle"},
                            {"visible", false},

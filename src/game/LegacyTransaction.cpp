@@ -124,6 +124,52 @@ bool sendGuarded(SendPayload& p, const void** faultPc, const void** faultAddress
     }
 }
 
+struct ResyncPayload {
+    void** (__fastcall* makeTransaction)(void**, std::uint32_t, const void*);
+    void(__fastcall* send)(void*, void**);
+    void* player;
+    EmptyTransaction empty;
+    std::uint32_t transactionType;
+    std::ptrdiff_t typeOffset;
+    std::ptrdiff_t actionOffset;
+    std::ptrdiff_t slotOffset;
+    std::int32_t action;
+    std::int32_t slot;
+    std::uint32_t madeType;
+};
+
+void deleteTransaction(void* transaction)
+{
+    auto* const vtable = *static_cast<void***>(transaction);
+    reinterpret_cast<void*(__fastcall*)(void*, unsigned)>(vtable[0])(transaction, 1);
+}
+
+bool resyncGuarded(ResyncPayload& p, const void** faultPc, const void** faultAddress)
+{
+    __try {
+        void* transaction = nullptr;
+        p.makeTransaction(&transaction, p.transactionType, &p.empty);
+        if (transaction == nullptr) {
+            return false;
+        }
+        auto* const bytes = static_cast<std::byte*>(transaction);
+        p.madeType = *reinterpret_cast<const std::uint32_t*>(bytes + p.typeOffset);
+        if (p.madeType != p.transactionType) {
+            deleteTransaction(transaction);
+            return false;
+        }
+        *reinterpret_cast<std::int32_t*>(bytes + p.actionOffset) = p.action;
+        *reinterpret_cast<std::int32_t*>(bytes + p.slotOffset) = p.slot;
+        p.send(p.player, &transaction);
+        if (transaction != nullptr) {
+            deleteTransaction(transaction);
+        }
+        return true;
+    } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
+        return false;
+    }
+}
+
 struct ModuleRange {
     const std::byte* base = nullptr;
     std::size_t size = 0;
@@ -331,6 +377,54 @@ bool LegacyTransaction::apply(void* player, const Change& a, const Change& b)
         m_makeTransaction = nullptr;
         m_faulted = true;
         return false;
+    }
+    return sent;
+}
+
+bool LegacyTransaction::requestResync(void* player)
+{
+    if (player == nullptr || m_makeTransaction == nullptr || m_send == nullptr) {
+        return false;
+    }
+    if (!playerLooksUsable(player)) {
+        if (!m_warnedPlayer) {
+            m_warnedPlayer = true;
+            log().warn(L"LegacyTransaction: the player object does not look like the local one, "
+                       L"the legacy path is skipped");
+        }
+        return false;
+    }
+
+    ResyncPayload payload{};
+    payload.makeTransaction = reinterpret_cast<decltype(payload.makeTransaction)>(m_makeTransaction);
+    payload.send = reinterpret_cast<decltype(payload.send)>(m_send);
+    payload.player = player;
+    payload.transactionType = kItemReleaseTransaction;
+    payload.typeOffset = kTransactionTypeOffset;
+    payload.actionOffset = kReleaseActionOffset;
+    payload.slotOffset = kReleaseSlotOffset;
+    payload.action = kReleaseAction;
+    payload.slot = kMismatchedSlot;
+    fillEmptyTransaction(payload.empty);
+
+    const void* faultPc = nullptr;
+    const void* faultAddress = nullptr;
+    const bool sent = resyncGuarded(payload, &faultPc, &faultAddress);
+    if (faultPc != nullptr) {
+        log().error(L"LegacyTransaction: faulted at {} while touching {} (resync), "
+                    L"the legacy path is disabled",
+                    faultPc, faultAddress);
+        m_makeTransaction = nullptr;
+        m_faulted = true;
+        return false;
+    }
+    if (!sent && payload.madeType != 0 && payload.madeType != kItemReleaseTransaction) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            log().error(L"LegacyTransaction: the factory made type {} instead of the release transaction, "
+                        L"the inventory resync is skipped", payload.madeType);
+        }
     }
     return sent;
 }

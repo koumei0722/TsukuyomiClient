@@ -26,7 +26,7 @@ public:
     void onScansReady() override;
     void shutdown() override;
 
-    void onCameraWrite(void* cameraBase, void* source);
+    float scaleProjection(float tangent) const;
 
     bool zooming() const { return m_zooming.load(std::memory_order_acquire); }
 
@@ -39,26 +39,7 @@ protected:
 private:
     Zoom() = default;
 
-    static constexpr std::ptrdiff_t kFovOffset = 0x50;
-
-    static constexpr float kFovMin = 0.1f;
-    static constexpr float kFovMax = 3.2f;
-
-    static constexpr std::ptrdiff_t kWriteFov = 0x57;
-    static constexpr std::size_t kWriteFovSize = 5;
-
-    Patch m_patchFov;
-
-    static constexpr std::ptrdiff_t kWriteFov2 = 0x16;
-    static constexpr std::size_t kWriteFov2Size = 7;
-    Patch m_patchFov2;
-
-    float m_baseFov[2]{};
-    bool m_baseFovReady = false;
-
-    std::atomic<bool> m_restoreFov{false};
-    std::atomic<bool> m_applyFov{false};
-    std::atomic<bool> m_restoredForUnload{false};
+    Patch m_projection[2];
 
     static constexpr float kMinFactor = 1.25f;
     static constexpr float kMaxFactor = 30.0f;

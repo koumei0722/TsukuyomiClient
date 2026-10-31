@@ -1,3 +1,4 @@
+#include "game/SchematicWorld.h"
 #include "game/BlockWrite.h"
 
 #include <atomic>
@@ -13,25 +14,12 @@
 
 #include "core/Logger.h"
 #include "game/BlockRegistry.h"
-#include "game/GameData.h"
+#include "game/SubChunkTable.h"
 #include "memory/Memory.h"
-#include "memory/Scanner.h"
 
 namespace tsukuyomi::blockwrite {
 
 namespace {
-
-using RegionSetBlockFn = bool(__fastcall*)(void*, const void*, const void*, unsigned int,
-                                           unsigned int, void*);
-
-std::atomic<void*> g_region{nullptr};
-std::atomic<unsigned long long> g_regionSeen{0};
-std::atomic<void*> g_regionPlayer{nullptr};
-std::atomic<void*> g_regionVtable{nullptr};
-
-std::atomic<unsigned int> g_mode{0};
-std::atomic<unsigned int> g_updateFlags{0};
-std::atomic<void*> g_actor{nullptr};
 
 std::atomic<void*> g_renderRegion{nullptr};
 std::atomic<unsigned long long> g_renderRegionSeen{0};
@@ -57,34 +45,6 @@ __declspec(noinline) bool safeRead(void* to, const void* from, std::size_t size)
     }
 }
 
-}
-
-void noteRegion(void* region, unsigned int mode, unsigned int updateFlags, void* actor)
-{
-    if (region == nullptr) {
-        return;
-    }
-    if (onCurrentStack(region)) {
-        return;
-    }
-    g_region.store(region, std::memory_order_relaxed);
-    g_regionSeen.store(GetTickCount64(), std::memory_order_relaxed);
-    g_regionPlayer.store(GameData::instance().player(), std::memory_order_relaxed);
-    {
-        void* vtable = nullptr;
-        if (memory::isReadable(region, sizeof(vtable))) {
-            std::memcpy(&vtable, region, sizeof(vtable));
-        }
-        g_regionVtable.store(vtable, std::memory_order_relaxed);
-    }
-    g_mode.store(mode > 1 ? 0U : mode, std::memory_order_relaxed);
-    g_updateFlags.store(updateFlags, std::memory_order_relaxed);
-    g_actor.store(actor, std::memory_order_relaxed);
-}
-
-void* region()
-{
-    return g_region.load(std::memory_order_relaxed);
 }
 
 void noteRenderRegion(void* region)
@@ -116,7 +76,7 @@ std::uint64_t regionGeneration()
 
 __declspec(noinline) bool regionIsAlive(void* region)
 {
-    if (region == nullptr) {
+    if (!memory::plausiblePointer(region)) {
         return false;
     }
     __try {
@@ -126,7 +86,7 @@ __declspec(noinline) bool regionIsAlive(void* region)
             return false;
         }
         void* const chunkSource = *reinterpret_cast<void**>(bs + 0x28);
-        if (chunkSource == nullptr) {
+        if (!memory::plausiblePointer(chunkSource)) {
             return false;
         }
         void* const sourceVtable = *reinterpret_cast<void**>(chunkSource);
@@ -134,46 +94,6 @@ __declspec(noinline) bool regionIsAlive(void* region)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-}
-
-bool placeAt(const BlockPos& at, const void* block)
-{
-    void* const target = g_region.load(std::memory_order_relaxed);
-    if (target == nullptr || block == nullptr) {
-        return false;
-    }
-    void* const player = GameData::instance().player();
-    void* const notedPlayer = g_regionPlayer.load(std::memory_order_relaxed);
-    if (player == nullptr || notedPlayer == nullptr || player != notedPlayer) {
-        constexpr unsigned long long kFreshMs = 60000;
-        const auto seen = g_regionSeen.load(std::memory_order_relaxed);
-        if (seen == 0 || GetTickCount64() - seen > kFreshMs) {
-            return false;
-        }
-    } else {
-        void* const noted = g_regionVtable.load(std::memory_order_relaxed);
-        void* vtable = nullptr;
-        if (noted == nullptr || !memory::isReadable(target, 0x40)
-            || !memory::inGameModule(noted)) {
-            return false;
-        }
-        std::memcpy(&vtable, target, sizeof(vtable));
-        if (vtable != noted) {
-            return false;
-        }
-    }
-    const Scanner& scanner = Scanner::instance();
-    if (!scanner.found(Target::BlockSourceSetBlock)) {
-        return false;
-    }
-    const auto setBlock = scanner.addressAs<RegionSetBlockFn>(Target::BlockSourceSetBlock);
-    if (setBlock == nullptr) {
-        return false;
-    }
-    const int pos[3] = {at.x, at.y, at.z};
-    return setBlock(target, pos, block, g_mode.load(std::memory_order_relaxed),
-                    g_updateFlags.load(std::memory_order_relaxed),
-                    g_actor.load(std::memory_order_relaxed));
 }
 
 namespace {
@@ -314,188 +234,87 @@ void setKnownBlocks(const void* const* blocks, std::size_t count)
 
 namespace {
 
-constexpr unsigned int subChunkIndex(int x, int y, int z)
-{
-    return static_cast<unsigned int>(((x & 15) << 8) | ((z & 15) << 4) | (y & 15));
-}
-
-constexpr std::size_t kSubChunkSlots = 4096;
-
-struct SubChunkSlot {
-    std::atomic<int> baseX{0};
-    std::atomic<int> baseY{0};
-    std::atomic<int> baseZ{0};
-    std::atomic<void*> chunk{nullptr};
-    std::atomic<void*> chunkAlt{nullptr};
-    std::atomic<bool> used{false};
-};
-
-SubChunkSlot g_subChunks[kSubChunkSlots];
-std::atomic<std::size_t> g_subChunkCount{0};
-
-thread_local int t_writePos[3] = {0, 0, 0};
-thread_local bool t_writePosValid = false;
-
-constexpr std::size_t kSlotIndexSize = 8192;
-std::atomic<std::uint64_t> g_slotIndexKey[kSlotIndexSize] = {};
-std::atomic<std::uint32_t> g_slotIndexVal[kSlotIndexSize] = {};
-
-std::uint64_t slotIndexKeyOf(int baseX, int baseY, int baseZ)
-{
-    const std::uint64_t ux = static_cast<std::uint32_t>(baseX >> 4) & 0x1FFFFFu;
-    const std::uint64_t uy = static_cast<std::uint32_t>(baseY >> 4) & 0x1FFFFFu;
-    const std::uint64_t uz = static_cast<std::uint32_t>(baseZ >> 4) & 0x1FFFFFu;
-    return (std::uint64_t{1} << 63) | (ux << 42) | (uy << 21) | uz;
-}
-
-std::size_t slotIndexHash(std::uint64_t key)
-{
-    key ^= key >> 33;
-    key *= 0xff51afd7ed558ccdULL;
-    key ^= key >> 33;
-    return static_cast<std::size_t>(key) & (kSlotIndexSize - 1);
-}
-
-void slotIndexInsert(int baseX, int baseY, int baseZ, std::size_t slot)
-{
-    const std::uint64_t key = slotIndexKeyOf(baseX, baseY, baseZ);
-    std::size_t h = slotIndexHash(key);
-    for (std::size_t n = 0; n < kSlotIndexSize; ++n, h = (h + 1) & (kSlotIndexSize - 1)) {
-        std::uint64_t cur = g_slotIndexKey[h].load(std::memory_order_acquire);
-        if (cur == 0
-            && g_slotIndexKey[h].compare_exchange_strong(cur, key, std::memory_order_acq_rel)) {
-            g_slotIndexVal[h].store(static_cast<std::uint32_t>(slot + 1),
-                                    std::memory_order_release);
-            return;
-        }
-        if (cur == key) {
-            g_slotIndexVal[h].store(static_cast<std::uint32_t>(slot + 1),
-                                    std::memory_order_release);
-            return;
-        }
-    }
-}
+subchunks::Table g_subChunks;
+constexpr std::size_t kNoSlot = subchunks::Table::kNone;
 
 std::size_t findSubChunkSlot(int baseX, int baseY, int baseZ)
 {
-    const std::uint64_t key = slotIndexKeyOf(baseX, baseY, baseZ);
-    std::size_t h = slotIndexHash(key);
-    for (std::size_t n = 0; n < kSlotIndexSize; ++n, h = (h + 1) & (kSlotIndexSize - 1)) {
-        const std::uint64_t cur = g_slotIndexKey[h].load(std::memory_order_acquire);
-        if (cur == 0) {
-            return kSubChunkSlots;
-        }
-        if (cur != key) {
-            continue;
-        }
-        const std::uint32_t v = g_slotIndexVal[h].load(std::memory_order_acquire);
-        if (v == 0 || v > kSubChunkSlots) {
-            return kSubChunkSlots;
-        }
-        const std::size_t i = v - 1;
-        if (g_subChunks[i].used.load(std::memory_order_acquire)
-            && g_subChunks[i].baseX.load(std::memory_order_relaxed) == baseX
-            && g_subChunks[i].baseY.load(std::memory_order_relaxed) == baseY
-            && g_subChunks[i].baseZ.load(std::memory_order_relaxed) == baseZ) {
-            return i;
-        }
-        return kSubChunkSlots;
-    }
-    return kSubChunkSlots;
+    return g_subChunks.find(baseX, baseY, baseZ);
 }
 
-void storeSubChunkPointer(SubChunkSlot& slot, void* subChunk)
+void warnSlotsFull()
 {
-    void* const was = slot.chunk.exchange(subChunk, std::memory_order_acq_rel);
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true, std::memory_order_relaxed)) {
+        log().warn(L"BlockWrite: ran out of position-to-SubChunk slots ({} chunks) while "
+                   L"learning the chunks the schematic covers; the blocks of the chunks "
+                   L"past this cannot be read, so no ghost or color box is decided there",
+                   subchunks::Table::kMaxSlots);
+    }
+}
+
+void warnPointerNotesFull()
+{
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true, std::memory_order_relaxed)) {
+        log().warn(L"BlockWrite: ran out of SubChunk-to-position notes ({}); writes to chunks "
+                   L"loaded after this do not update the ghost until the schematic is redrawn",
+                   subchunks::Table::kMaxSlots);
+    }
+}
+
+std::size_t addSubChunkSlot(int baseX, int baseY, int baseZ)
+{
+    const std::size_t slot = g_subChunks.add(baseX, baseY, baseZ);
+    if (slot == kNoSlot) {
+        warnSlotsFull();
+    }
+    return slot;
+}
+
+void storeSubChunkPointer(std::size_t at, void* subChunk)
+{
+    subchunks::Table::Slot* const slot = g_subChunks.slot(at);
+    if (slot == nullptr) {
+        return;
+    }
+    void* const alt = slot->ptr[1].load(std::memory_order_acquire);
+    void* const was = slot->ptr[0].exchange(subChunk, std::memory_order_acq_rel);
     if (was != nullptr && was != subChunk) {
-        slot.chunkAlt.store(was, std::memory_order_release);
+        slot->ptr[1].store(was, std::memory_order_release);
+    }
+    if (subChunk != nullptr && subChunk != was && subChunk != alt
+        && !g_subChunks.notePointer(subChunk, at)) {
+        warnPointerNotesFull();
     }
 }
 
-void learnSubChunk(void* subChunk, unsigned int index)
-{
-    if (!t_writePosValid || subChunk == nullptr || index >= 4096) {
-        return;
-    }
-    const int x = t_writePos[0];
-    const int y = t_writePos[1];
-    const int z = t_writePos[2];
-    if (subChunkIndex(x, y, z) != index) {
-        return;
-    }
-    if (!blocks::ghostBoxTouchesSubChunk(x >> 4 << 4, y >> 4 << 4, z >> 4 << 4)) {
-        return;
-    }
-    const int baseX = x >> 4 << 4;
-    const int baseY = y >> 4 << 4;
-    const int baseZ = z >> 4 << 4;
-
-    noteStorageVtablesOf(subChunk);
-
-    const std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
-    if (at < kSubChunkSlots) {
-        storeSubChunkPointer(g_subChunks[at], subChunk);
-        return;
-    }
-    if (g_subChunkCount.load(std::memory_order_acquire) >= kSubChunkSlots) {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true, std::memory_order_relaxed)) {
-            log().warn(L"BlockWrite: ran out of position-to-SubChunk slots ({} chunks)",
-                       kSubChunkSlots);
-        }
-        return;
-    }
-    const std::size_t slot = g_subChunkCount.fetch_add(1, std::memory_order_acq_rel);
-    if (slot >= kSubChunkSlots) {
-        return;
-    }
-    g_subChunks[slot].baseX.store(baseX, std::memory_order_relaxed);
-    g_subChunks[slot].baseY.store(baseY, std::memory_order_relaxed);
-    g_subChunks[slot].baseZ.store(baseZ, std::memory_order_relaxed);
-    g_subChunks[slot].chunk.store(subChunk, std::memory_order_relaxed);
-    g_subChunks[slot].chunkAlt.store(nullptr, std::memory_order_relaxed);
-    g_subChunks[slot].used.store(true, std::memory_order_release);
-    slotIndexInsert(baseX, baseY, baseZ, slot);
-}
-
-}
-
-void noteWritePos(const int pos[3])
-{
-    if (pos == nullptr) {
-        t_writePosValid = false;
-        return;
-    }
-    t_writePos[0] = pos[0];
-    t_writePos[1] = pos[1];
-    t_writePos[2] = pos[2];
-    t_writePosValid = true;
-}
-
-const void* readWorldAt(int x, int y, int z)
-{
-    const std::size_t at = findSubChunkSlot(x >> 4 << 4, y >> 4 << 4, z >> 4 << 4);
-    if (at >= kSubChunkSlots) {
-        return nullptr;
-    }
-    void* const chunk = g_subChunks[at].chunk.load(std::memory_order_acquire);
-    if (chunk == nullptr) {
-        return nullptr;
-    }
-    return readBlock(chunk, 0, subChunkIndex(x, y, z));
 }
 
 bool readWorldExtraAt(int x, int y, int z, const void*& out)
 {
     out = nullptr;
     const std::size_t at = findSubChunkSlot(x >> 4 << 4, y >> 4 << 4, z >> 4 << 4);
-    if (at >= kSubChunkSlots) {
+    if (at == kNoSlot) {
         return false;
     }
-    void* const chunk = g_subChunks[at].chunk.load(std::memory_order_acquire);
+    void* const chunk = g_subChunks.slot(at)->ptr[0].load(std::memory_order_acquire);
     if (chunk == nullptr) {
         return false;
     }
+    return readExtraOf(chunk, beIndexOf(x, y, z), out);
+}
+
+const void* readBlockOf(void* subChunk, unsigned layer, unsigned beIndex)
+{
+    if (!subChunk) return nullptr;
+    return readBlock(subChunk, layer, beIndex);
+}
+
+bool readExtraOf(void* chunk, unsigned beIndex, const void*& out)
+{
+    out = nullptr;
+    if (!chunk || beIndex >= 4096) return false;
     void* storage = nullptr;
     if (!safeRead(&storage, static_cast<const std::uint8_t*>(chunk) + kStorageBase + 8,
                   sizeof(storage))) {
@@ -504,7 +323,7 @@ bool readWorldExtraAt(int x, int y, int z, const void*& out)
     if (storage == nullptr) {
         return true;
     }
-    const void* const got = readBlock(chunk, 1, subChunkIndex(x, y, z));
+    const void* const got = readBlockOf(chunk, 1, beIndex);
     if (got == nullptr) {
         return false;
     }
@@ -518,42 +337,30 @@ void noteSubChunkAt(int baseX, int baseY, int baseZ, void* subChunk)
         return;
     }
     noteStorageVtablesOf(subChunk);
-    const std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
-    if (at < kSubChunkSlots) {
-        storeSubChunkPointer(g_subChunks[at], subChunk);
-        return;
-    }
-    if (g_subChunkCount.load(std::memory_order_acquire) >= kSubChunkSlots) {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true, std::memory_order_relaxed)) {
-            log().warn(L"BlockWrite: ran out of position-to-SubChunk slots ({} chunks) while "
-                       L"learning the chunks the schematic covers; the blocks of the chunks "
-                       L"past this cannot be read, so no ghost or color box is decided there",
-                       kSubChunkSlots);
+    std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
+    if (at == kNoSlot) {
+        at = addSubChunkSlot(baseX, baseY, baseZ);
+        if (at == kNoSlot) {
+            return;
         }
-        return;
     }
-    const std::size_t slot = g_subChunkCount.fetch_add(1, std::memory_order_acq_rel);
-    if (slot >= kSubChunkSlots) {
-        return;
-    }
-    g_subChunks[slot].baseX.store(baseX, std::memory_order_relaxed);
-    g_subChunks[slot].baseY.store(baseY, std::memory_order_relaxed);
-    g_subChunks[slot].baseZ.store(baseZ, std::memory_order_relaxed);
-    g_subChunks[slot].chunk.store(subChunk, std::memory_order_relaxed);
-    g_subChunks[slot].chunkAlt.store(nullptr, std::memory_order_relaxed);
-    g_subChunks[slot].used.store(true, std::memory_order_release);
-    slotIndexInsert(baseX, baseY, baseZ, slot);
+    storeSubChunkPointer(at, subChunk);
 }
 
 void forgetSubChunkAt(int baseX, int baseY, int baseZ)
 {
     const std::size_t at = findSubChunkSlot(baseX, baseY, baseZ);
-    if (at >= kSubChunkSlots) {
+    if (at == kNoSlot) {
         return;
     }
-    g_subChunks[at].chunk.store(nullptr, std::memory_order_release);
-    g_subChunks[at].chunkAlt.store(nullptr, std::memory_order_release);
+    subchunks::Table::Slot* const slot = g_subChunks.slot(at);
+    slot->ptr[0].store(nullptr, std::memory_order_release);
+    slot->ptr[1].store(nullptr, std::memory_order_release);
+}
+
+void noteLiveSubChunk(void* subChunk)
+{
+    noteStorageVtablesOf(subChunk);
 }
 
 bool worldPosOfSubChunkWrite(void* subChunk, unsigned int index, int out[3])
@@ -561,106 +368,35 @@ bool worldPosOfSubChunkWrite(void* subChunk, unsigned int index, int out[3])
     if (subChunk == nullptr || out == nullptr || index >= 4096) {
         return false;
     }
-    const std::size_t used = std::min(g_subChunkCount.load(std::memory_order_acquire),
-                                      kSubChunkSlots);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (!g_subChunks[i].used.load(std::memory_order_acquire)) {
-            continue;
-        }
-        if (g_subChunks[i].chunk.load(std::memory_order_relaxed) != subChunk
-            && g_subChunks[i].chunkAlt.load(std::memory_order_relaxed) != subChunk) {
-            continue;
-        }
-        out[0] = g_subChunks[i].baseX.load(std::memory_order_relaxed)
-                 + static_cast<int>((index >> 8) & 15u);
-        out[1] = g_subChunks[i].baseY.load(std::memory_order_relaxed)
-                 + static_cast<int>(index & 15u);
-        out[2] = g_subChunks[i].baseZ.load(std::memory_order_relaxed)
-                 + static_cast<int>((index >> 4) & 15u);
-        return true;
+    const std::size_t at = g_subChunks.findByPointer(subChunk);
+    if (at == kNoSlot) {
+        return false;
     }
-    return false;
-}
-
-std::size_t knownSubChunkCount()
-{
-    std::size_t live = 0;
-    const std::size_t used = std::min(g_subChunkCount.load(std::memory_order_acquire),
-                                      kSubChunkSlots);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_subChunks[i].used.load(std::memory_order_acquire)
-            && g_subChunks[i].chunk.load(std::memory_order_relaxed) != nullptr) {
-            ++live;
-        }
-    }
-    return live;
+    const subchunks::Table::Slot* const slot = g_subChunks.slot(at);
+    out[0] = slot->baseX.load(std::memory_order_relaxed) + static_cast<int>((index >> 8) & 15u);
+    out[1] = slot->baseY.load(std::memory_order_relaxed) + static_cast<int>(index & 15u);
+    out[2] = slot->baseZ.load(std::memory_order_relaxed) + static_cast<int>((index >> 4) & 15u);
+    return true;
 }
 
 void forgetSubChunks()
 {
-    for (std::size_t i = 0; i < kSubChunkSlots; ++i) {
-        g_subChunks[i].used.store(false, std::memory_order_release);
-        g_subChunks[i].chunk.store(nullptr, std::memory_order_relaxed);
-        g_subChunks[i].chunkAlt.store(nullptr, std::memory_order_relaxed);
-    }
-    for (std::size_t h = 0; h < kSlotIndexSize; ++h) {
-        g_slotIndexVal[h].store(0, std::memory_order_relaxed);
-        g_slotIndexKey[h].store(0, std::memory_order_release);
-    }
-    g_subChunkCount.store(0, std::memory_order_release);
+    g_subChunks.clear();
 }
 
 void noteWorldChanged(bool leftAWorld)
 {
+    schematicworld::onWorldChanged();
+    blocks::forgetWorldLookups();
     if (leftAWorld) {
-        const bool wasShown = blocks::ghostOn();
-        blocks::dropWorldBlocks();
-        {
-            std::lock_guard<std::mutex> guard(g_knownLock);
-            publishKnownLocked(nullptr);
-        }
-        log().info(L"Schematica: left a world, so the blocks from there are no longer "
-                   L"answered (the schematic was {})",
-                   wasShown ? L"shown" : L"not shown");
+        blocks::setAirBlock(nullptr);
+        std::lock_guard<std::mutex> guard(g_knownLock);
+        publishKnownLocked(nullptr);
     }
     forgetSubChunks();
     g_renderRegion.store(nullptr, std::memory_order_relaxed);
     g_renderRegionSeen.store(0, std::memory_order_relaxed);
-    g_region.store(nullptr, std::memory_order_relaxed);
-    g_regionVtable.store(nullptr, std::memory_order_relaxed);
-    g_regionPlayer.store(nullptr, std::memory_order_relaxed);
-    g_actor.store(nullptr, std::memory_order_relaxed);
     g_regionGeneration.fetch_add(1, std::memory_order_release);
-}
-
-namespace {
-std::atomic<int> g_selfWrite{0};
-}
-
-void beginSelfWrite()
-{
-    g_selfWrite.fetch_add(1, std::memory_order_acq_rel);
-}
-
-void endSelfWrite()
-{
-    if (g_selfWrite.fetch_sub(1, std::memory_order_acq_rel) <= 0) {
-        g_selfWrite.store(0, std::memory_order_release);
-    }
-}
-
-bool selfWriting()
-{
-    return g_selfWrite.load(std::memory_order_acquire) > 0;
-}
-
-const void* onSubChunkWrite(void* subChunk, unsigned int layer, unsigned int index,
-                            const void* block)
-{
-    if (layer == 0) {
-        learnSubChunk(subChunk, index);
-    }
-    return block;
 }
 
 namespace {
@@ -668,6 +404,7 @@ using GetChunkAtFn = void*(__fastcall*)(void*, const int*);
 
 thread_local bool t_lastWasMissingChunk = false;
 thread_local bool t_lastWasOutsideWorld = false;
+thread_local bool t_lastWasAboveTop = false;
 }
 
 bool lastFindWasMissingChunk()
@@ -678,6 +415,11 @@ bool lastFindWasMissingChunk()
 bool lastFindWasOutsideWorld()
 {
     return t_lastWasOutsideWorld;
+}
+
+bool lastFindWasAboveTop()
+{
+    return t_lastWasAboveTop;
 }
 
 constexpr std::ptrdiff_t kSourceLoose = 0x1c;
@@ -699,10 +441,9 @@ __declspec(noinline) void* getChunkLoose(GetChunkAtFn fn, std::uint8_t* bs, cons
     return got;
 }
 
-__declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
+__declspec(noinline) void* findChunk(void* region, int x, int z)
 {
     t_lastWasMissingChunk = false;
-    t_lastWasOutsideWorld = false;
     if (region == nullptr) {
         return nullptr;
     }
@@ -720,7 +461,7 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
             || !memory::inGameModule(reinterpret_cast<const void*>(getChunkAt))) {
             return nullptr;
         }
-        const int base = y >> 4 << 4;
+        const int base = 0;
         const int at[3] = {x >> 4 << 4, base, z >> 4 << 4};
         auto* chunk = static_cast<std::uint8_t*>(getChunkAt(bs, at));
         if (chunk == nullptr) {
@@ -730,6 +471,20 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
             t_lastWasMissingChunk = true;
             return nullptr;
         }
+        return chunk;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+__declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
+{
+    t_lastWasOutsideWorld = false;
+    t_lastWasAboveTop = false;
+    auto* chunk = static_cast<std::uint8_t*>(findChunk(region, x, z));
+    if (!chunk) return nullptr;
+    const int base = y >> 4 << 4;
+    __try {
         auto* const meta = *reinterpret_cast<std::uint8_t**>(chunk + 0x58);
         if (meta == nullptr) {
             return nullptr;
@@ -738,11 +493,15 @@ __declspec(noinline) void* findSubChunk(void* region, int x, int y, int z)
         std::int16_t high = 0;
         std::memcpy(&low, meta + 0xc8, sizeof(low));
         std::memcpy(&high, meta + 0xca, sizeof(high));
-        if (base < low || base >= high) {
+        if (base < low) {
             t_lastWasOutsideWorld = true;
             return nullptr;
         }
-        auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x140);
+        if (base >= high) {
+            t_lastWasAboveTop = true;
+            return nullptr;
+        }
+        auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x1c8);
         if (table == nullptr) {
             return nullptr;
         }

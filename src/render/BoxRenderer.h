@@ -5,23 +5,29 @@
 #include <memory>
 #include <vector>
 
-#include "game/BlockRegistry.h"
+#include "game/SchematicSections.h"
 
 namespace tsukuyomi::boxes {
 
 void noteCamera(void* cameraBase, void* source);
 
-void setBoxes(std::vector<blocks::DiffBox> list);
+struct SectionRequest {
+    bool reset = false;
+    bool xray = false;
+    std::vector<schematic::SectionKey> collect;
+    std::vector<schematic::SectionKey> remove;
+};
+void pushSectionRequest(SectionRequest request);
+bool takeSectionRequests(SectionRequest& merged);
+unsigned long long sectionRequestVersion();
 
 void setStyle(bool on, float faceAlpha, bool xray);
 
-bool boxStyle(blocks::DiffColor color, float rgb[3], float* faceAlpha);
+bool boxStyle(schematic::DiffColor color, float rgb[3], float* faceAlpha);
 
 bool cameraSnapshot(float eye[3], float vp[16]);
-std::shared_ptr<const std::vector<blocks::DiffBox>> boxSnapshot();
 bool boxesOn();
 float boxFaceAlpha();
 bool boxXray();
-unsigned long long boxVersion();
 
 }

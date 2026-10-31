@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -44,13 +45,13 @@ public:
 
     bool fogSuppressed() const
     {
-        return enabled() && m_off[static_cast<std::size_t>(Stage::Fog)]
+        return enabled() && m_off[static_cast<std::size_t>(Stage::Fog)].load(std::memory_order_relaxed)
                && !m_stageBlocked[static_cast<std::size_t>(Stage::Fog)];
     }
 
     bool particlesSuppressed() const
     {
-        return enabled() && m_off[static_cast<std::size_t>(Stage::Particles)]
+        return enabled() && m_off[static_cast<std::size_t>(Stage::Particles)].load(std::memory_order_relaxed)
                && !m_stageBlocked[static_cast<std::size_t>(Stage::Particles)];
     }
 
@@ -82,7 +83,7 @@ private:
 
     void applyStages();
 
-    bool m_off[kStageCount] = {};
+    std::atomic<bool> m_off[kStageCount]{};
     bool m_stageBlocked[kStageCount] = {};
     std::vector<Patch> m_patches[kStageCount];
 

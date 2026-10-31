@@ -21,29 +21,6 @@ void surfaceCells(int minY, int maxY, int& cellMin, int& count)
     count = static_cast<int>(static_cast<unsigned>(minY) >> 31) + s + r9 - e - 8;
 }
 
-bool findTopSurface(const SurfaceConstants& k, float offset, float factor, int cellMin, int count, int& y)
-{
-    for (int i = k.topCell; i >= 0; --i) {
-        const int cy = (i + cellMin) * 8;
-        float d = static_cast<float>(cy) * k.negInv128 + k.one + offset;
-        d *= factor;
-        d *= (d > 0.0f) ? k.table[1] : k.table[0];
-        d += k.minus90;
-        const float tTop = static_cast<float>(count - i) * k.half;
-        float top = k.minus10;
-        if (!(0.0f > tTop)) {
-            top = (tTop <= k.one) ? tTop * (d - k.minus10) + k.minus10 : d;
-        }
-        const float tBot = static_cast<float>(i) / k.three;
-        const float v = (k.one < tBot) ? top : (top + k.minus15) * tBot + k.plus15;
-        if (v > k.fifty) {
-            y = cy;
-            return true;
-        }
-    }
-    return false;
-}
-
 bool interpolateGrid(const float* grid, int cellMin, int x, int y, int z, float& out)
 {
     const int lx = x & 15;

@@ -223,7 +223,6 @@ void ItemScroller::saveFavorites() const
     if (!m_favoritesDirty) {
         return;
     }
-    m_favoritesDirty = false;
     nlohmann::json root;
     root["global"] = nlohmann::json::array();
     for (const std::string& k : m_globalFavorites) {
@@ -243,6 +242,9 @@ void ItemScroller::saveFavorites() const
     std::ofstream out(std::filesystem::path(favoritesFilePath()), std::ios::binary | std::ios::trunc);
     if (out) {
         out << root.dump(2);
+        out.flush();
+        out.close();
+        if (out.good()) m_favoritesDirty = false;
     }
 }
 

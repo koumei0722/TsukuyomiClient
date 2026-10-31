@@ -35,6 +35,7 @@ struct Value {
     std::int64_t number = 0;
     double real = 0.0;
     std::string text;
+    std::vector<std::int32_t> ints;
     std::vector<std::int64_t> numbers;
     std::vector<ValuePtr> list;
     std::map<std::string, ValuePtr> compound;

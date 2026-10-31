@@ -82,6 +82,8 @@ void setHudCtorAddress(const void* ctor);
 using HudCreatedFn = void (*)(void* ctrl);
 void onHudConstructed(void* ctrl);
 void addHudObserver(HudCreatedFn fn);
+void onHudResolving(void* ctrl);
+void armHudCatchUp();
 void setHudGetItemSite(const void* site, const void* getItem);
 void* hudContainerManager(void* ctrl);
 
@@ -110,6 +112,7 @@ bool dropCursor(bool all);
 int creativeCategoryOf(const void* stack);
 
 bool storageFill(const void* stack, int& current, int& capacity);
+int isStorageItem(const void* stack);
 bool nbtContents(const void* stack, int& usedSlots, int& totalItems);
 struct NbtItem {
     int slot = -1;
@@ -156,7 +159,7 @@ volatile float* persistentFloat(int slot);
 bool bindPersistentBool(void* ctrl, const char* name, int slot);
 bool bindPersistentFloat(void* ctrl, const char* name, int slot);
 
-inline constexpr int kPersistentTextSlots = 383;
+inline constexpr int kPersistentTextSlots = 384;
 inline constexpr int kPersistentTextBytes = 256;
 inline constexpr int kPersistentTextMax = kPersistentTextBytes - 17;
 bool writePersistentText(int slot, const char* text, std::size_t length);

@@ -32,4 +32,6 @@ void* ripTarget(const std::byte* at, std::size_t dispOffset);
 
 std::size_t functionSize(const void* address);
 
+void* allocateNear(const void* target, bool executable = false);
+
 }

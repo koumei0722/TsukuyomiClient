@@ -33,6 +33,7 @@ struct Entry {
     int health = -1;
     std::vector<std::uint8_t> face;
     int faceSide = 0;
+    std::int32_t platform = -1;
 };
 void sortEntries(std::vector<Entry>& entries);
 int estimateWidth(std::string_view utf8);

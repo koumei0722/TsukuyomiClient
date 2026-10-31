@@ -1,5 +1,6 @@
 #include "memory/Memory.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -150,6 +151,59 @@ std::size_t functionSize(const void* address)
         return 0;
     }
     return static_cast<std::size_t>(entry->EndAddress - entry->BeginAddress);
+}
+
+void* allocateNear(const void* target, bool executable)
+{
+    if (target == nullptr) {
+        return nullptr;
+    }
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const std::uintptr_t granularity = system.dwAllocationGranularity;
+    const std::uintptr_t origin = reinterpret_cast<std::uintptr_t>(target);
+    constexpr std::uintptr_t kReach = 0x7FFF0000;
+    const std::uintptr_t lowest = std::max<std::uintptr_t>(
+        origin > kReach ? origin - kReach : 0, reinterpret_cast<std::uintptr_t>(system.lpMinimumApplicationAddress));
+    const std::uintptr_t highest = std::min<std::uintptr_t>(
+        origin + kReach, reinterpret_cast<std::uintptr_t>(system.lpMaximumApplicationAddress));
+
+    std::uintptr_t at = (origin / granularity) * granularity;
+    while (at > lowest + granularity) {
+        at -= granularity;
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == 0) {
+            break;
+        }
+        if (info.State == MEM_FREE) {
+            if (void* const page = VirtualAlloc(reinterpret_cast<void*>(at), system.dwPageSize,
+                                                MEM_RESERVE | MEM_COMMIT,
+                                                executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE)) {
+                return page;
+            }
+        } else {
+            at = (reinterpret_cast<std::uintptr_t>(info.AllocationBase) / granularity) * granularity;
+        }
+    }
+    at = ((origin + granularity) / granularity) * granularity;
+    while (at + granularity < highest) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof(info)) == 0) {
+            break;
+        }
+        if (info.State == MEM_FREE) {
+            if (void* const page = VirtualAlloc(reinterpret_cast<void*>(at), system.dwPageSize,
+                                                MEM_RESERVE | MEM_COMMIT,
+                                                executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE)) {
+                return page;
+            }
+            at += granularity;
+        } else {
+            const std::uintptr_t next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+            at = ((next + granularity - 1) / granularity) * granularity;
+        }
+    }
+    return nullptr;
 }
 
 }

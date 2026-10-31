@@ -43,6 +43,7 @@ constexpr std::ptrdiff_t kStackAux = 0x20;
 struct Api {
     CtorFn ctor = nullptr;
     LoadFn load = nullptr;
+    void* stackVtable = nullptr;
     int fixupSlot = -1;
     void** allocatorAt = nullptr;
     DeleteFn gameDelete = nullptr;
@@ -92,6 +93,8 @@ bool buildStackGuarded(void* elem, const void* tag)
     __try {
         std::memset(elem, 0, sizeof(ShulkerPreview::Elem));
         g_api.ctor(elem);
+
+        *static_cast<void**>(elem) = g_api.stackVtable;
         g_api.load(elem, tag);
         auto* const bytes = static_cast<std::byte*>(elem);
         void* weak = *reinterpret_cast<void**>(bytes + kStackItem);
@@ -163,19 +166,6 @@ bool hoverNameCallGuarded(const void* stack, void* out)
     }
 }
 
-bool freeGameStringGuarded(void* str)
-{
-    __try {
-        const std::uint64_t capacity = *reinterpret_cast<const std::uint64_t*>(static_cast<std::byte*>(str) + 0x18);
-        if (capacity >= 16) {
-            g_api.gameDelete(*reinterpret_cast<void**>(str), static_cast<std::size_t>(capacity + 1));
-        }
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
 std::atomic<bool> g_loggedAsk{false};
 std::atomic<bool> g_loggedCurrent{false};
 std::atomic<bool> g_loggedShow{false};
@@ -194,15 +184,18 @@ void ShulkerPreview::resolveTooltip()
     std::byte* const contents = scanner.address(Target::ShulkerContentsText);
     std::byte* const append = scanner.address(Target::ShulkerHoverAppend);
 
-    if (std::byte* at = findInFunction(contents, "48 8D 4D ? E8 ? ? ? ? 48 8D 4D ? 48 89 F2 E8 ? ? ? ?")) {
+    if (std::byte* at = findInFunction(contents, "48 8D 4D C0 E8 ? ? ? ? 90 48 89 5D C0 C7 45 40 00 00 00 00 C6 45 50 00 48 8D 4D C0 4C 89 FA E8 ? ? ? ?")) {
         api.ctor = reinterpret_cast<CtorFn>(callTarget(at + 4));
-        api.load = reinterpret_cast<LoadFn>(callTarget(at + 16));
+        api.load = reinterpret_cast<LoadFn>(callTarget(at + 32));
+    }
+    if (std::byte* at = findInFunction(contents, "48 8D 1D ? ? ? ? 0F 57 F6 4C 8D B5 C0 00 00 00")) {
+        api.stackVtable = memory::ripTarget(at, 3);
     }
     if (std::byte* at = findInFunction(contents, "48 8B 01 48 8B 80 ? ? ? ? 48 8D 55")) {
         api.fixupSlot = readDisp32(at + 6);
     }
 
-    if (std::byte* at = findInFunction(append, "4D 8D 7C 24 01 48 8B 0D ? ? ? ? 48 8B 01 48 8B 40 08 4C 89 FA FF 15")) {
+    if (std::byte* at = findInFunction(append, "49 8D 54 24 01 48 8B 0D ? ? ? ? 48 8B 01 48 8B 40 08 FF 15")) {
         api.allocatorAt = static_cast<void**>(memory::ripTarget(at, 8));
     }
 
@@ -219,7 +212,8 @@ void ShulkerPreview::resolveTooltip()
     api.tagHash = scanner.addressAs<TagHashFn>(Target::CompoundTagHash);
     api.hoverName = scanner.addressAs<HoverNameFn>(Target::ItemStackHoverName);
     auto slotOk = [](int slot) { return slot > 0 && slot < 0x1000 && slot % 8 == 0; };
-    api.ready = api.ctor != nullptr && api.load != nullptr && slotOk(api.fixupSlot)
+    api.ready = api.ctor != nullptr && api.load != nullptr && api.stackVtable != nullptr
+                && memory::inGameModule(api.stackVtable) && memory::isReadable(api.stackVtable, sizeof(void*)) && slotOk(api.fixupSlot)
                 && api.allocatorAt != nullptr && api.gameDelete != nullptr;
     g_api = api;
     gamestring::configure(api.allocatorAt, api.gameDelete);
@@ -478,7 +472,8 @@ std::string displayNameOf(const void* stack)
         return name;
     }
     gamestring::read(str, name);
-    if (!freeGameStringGuarded(str)) {
+
+    if (!gamestring::release(str)) {
         log().error(L"ShulkerPreview: freeing an item's display name faulted");
     }
     return name;

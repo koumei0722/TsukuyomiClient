@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdint>
-
 namespace tsukuyomi::dbgsurface {
 
 struct SurfaceConstants {
@@ -21,8 +19,6 @@ struct SurfaceConstants {
 bool surfaceConstantsLookRight(const SurfaceConstants& k);
 
 void surfaceCells(int minY, int maxY, int& cellMin, int& count);
-
-bool findTopSurface(const SurfaceConstants& k, float offset, float factor, int cellMin, int count, int& y);
 
 inline constexpr int kGridXZ = 5;
 inline constexpr int kGridY = 41;

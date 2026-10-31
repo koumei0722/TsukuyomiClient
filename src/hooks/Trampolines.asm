@@ -127,9 +127,10 @@ tsukuyomiPacketSendTrampolineEntry proc
     movdqu [rsp + 50h], xmm5
 
     sub rsp, 20h
-    mov rcx, rdx
+    xchg rcx, rdx
     call tsukuyomiOnPacketSend
     add rsp, 20h
+    mov r10, rax
 
     movdqu xmm0, [rsp + 00h]
     movdqu xmm1, [rsp + 10h]
@@ -139,6 +140,7 @@ tsukuyomiPacketSendTrampolineEntry proc
     movdqu xmm5, [rsp + 50h]
     add rsp, 60h
 
+    test r10, r10
     pop r11
     pop r10
     pop r9
@@ -148,9 +150,59 @@ tsukuyomiPacketSendTrampolineEntry proc
 
     mov rsp, rbp
     pop rbp
+    jz packet_send_go
+    xor eax, eax
+    ret
+packet_send_go:
 
     jmp qword ptr [tsukuyomiPacketSendTrampoline]
 
 tsukuyomiPacketSendTrampolineEntry endp
+
+extern tsukuyomiSessionTickFinished : proc
+extern tsukuyomiSessionTickFirstTrampoline : qword
+extern tsukuyomiSessionTickCatchupTrampoline : qword
+
+SESSION_TICK_FINISH macro entryName, sessionReg, branchNumber, trampolineName
+entryName proc
+    pushfq
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 80h
+    movdqu [rsp + 20h], xmm0
+    movdqu [rsp + 30h], xmm1
+    movdqu [rsp + 40h], xmm2
+    movdqu [rsp + 50h], xmm3
+    movdqu [rsp + 60h], xmm4
+    movdqu [rsp + 70h], xmm5
+    mov rcx, sessionReg
+    mov edx, branchNumber
+    call tsukuyomiSessionTickFinished
+    movdqu xmm0, [rsp + 20h]
+    movdqu xmm1, [rsp + 30h]
+    movdqu xmm2, [rsp + 40h]
+    movdqu xmm3, [rsp + 50h]
+    movdqu xmm4, [rsp + 60h]
+    movdqu xmm5, [rsp + 70h]
+    add rsp, 80h
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+    popfq
+    jmp qword ptr [trampolineName]
+entryName endp
+endm
+
+SESSION_TICK_FINISH tsukuyomiSessionTickFirstEntry, r14, 1, tsukuyomiSessionTickFirstTrampoline
+SESSION_TICK_FINISH tsukuyomiSessionTickCatchupEntry, r15, 2, tsukuyomiSessionTickCatchupTrampoline
 
 end

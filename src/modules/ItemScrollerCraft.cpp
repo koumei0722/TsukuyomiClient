@@ -4,6 +4,7 @@
 #include "core/Notice.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
+#include "game/CraftAmount.h"
 #include "game/ItemStackRequest.h"
 
 #include <Windows.h>
@@ -503,7 +504,7 @@ void ItemScroller::rightClickCraftOneStack(const Slot& output)
                 return true;
             }
             --*left;
-            leftClick(output);
+            leftClickOutput(output);
             const int size = cui::countOf(cursor());
             if (size <= *sizeLast || size >= cui::maxStackOf(cursor())) {
                 return true;
@@ -661,7 +662,7 @@ ItemScroller::Step ItemScroller::dropCraftFromOutput(const Recipe& recipe)
         if (before > 0 && before + perSet > cui::maxStackOf(held)) {
             break;
         }
-        leftClick(out);
+        leftClickOutput(out);
         if (cui::countOf(cursor()) <= before) {
             break;
         }
@@ -676,6 +677,39 @@ ItemScroller::Step ItemScroller::dropCraftFromOutput(const Recipe& recipe)
         }
     }
     return taken > 0 ? Step::Done : Step::Fail;
+}
+
+int ItemScroller::craftItemsForEmptyHand(const Slot& output) const
+{
+    const void* out = stackOf(output);
+    if (!craftamount::available() || !cursorEmpty() || cui::isEmpty(out)) {
+        return 0;
+    }
+    const int perSet = cui::countOf(out);
+    if (perSet <= 0) {
+        return 0;
+    }
+    int sets = cui::maxStackOf(out) / perSet;
+    bool anyIngredient = false;
+    for (const Slot& s : gridSlots()) {
+        const int n = countIn(s);
+        if (n > 0) {
+            sets = std::min(sets, n);
+            anyIngredient = true;
+        }
+    }
+    return (anyIngredient && sets >= 2) ? sets * perSet : 0;
+}
+
+bool ItemScroller::leftClickOutput(const Slot& output)
+{
+    const int items = craftItemsForEmptyHand(output);
+    if (items > 0) {
+        craftamount::setNext(items);
+    }
+    const bool ok = leftClick(output);
+    craftamount::clear();
+    return ok;
 }
 
 void ItemScroller::endMassCraftSession()
@@ -700,6 +734,11 @@ void ItemScroller::massCraftTick()
     }
     if (!m_mcActiveWas) {
         m_mcActiveWas = true;
+        if (!craftamount::available()) {
+            notice::failOnce("ItemScroller.craftAmount",
+                             L"ItemScroller: the craft-from-output hook (CraftFromOutput) is missing; mass craft makes one set per click",
+                             "ItemScroller: mass craft is slower (one set per click)");
+        }
     }
 
     massCraftStep();

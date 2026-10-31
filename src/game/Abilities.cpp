@@ -13,34 +13,22 @@ int accessViolationFilter(unsigned long code)
                : EXCEPTION_CONTINUE_SEARCH;
 }
 
-constexpr ptrdiff_t kContextLayeredOffset = 0x08;
+}
 
-bool readPointerGuarded(const void* address, std::byte*& value)
+bool readByte(const void* address, std::uint8_t& value)
 {
     __try {
-        value = *static_cast<std::byte* const*>(address);
+        value = *static_cast<const std::uint8_t*>(address);
         return true;
     } __except (accessViolationFilter(GetExceptionCode())) {
         return false;
     }
 }
 
-}
-
-bool readInt(const void* address, int& value)
+bool writeByte(void* address, std::uint8_t value)
 {
     __try {
-        value = *static_cast<const int*>(address);
-        return true;
-    } __except (accessViolationFilter(GetExceptionCode())) {
-        return false;
-    }
-}
-
-bool writeInt(void* address, int value)
-{
-    __try {
-        *static_cast<int*>(address) = value;
+        *static_cast<std::uint8_t*>(address) = value;
         return true;
     } __except (accessViolationFilter(GetExceptionCode())) {
         return false;
@@ -67,20 +55,11 @@ bool writeFloat(void* address, float value)
     }
 }
 
-std::byte* fromContext(void* context)
-{
-    if (context == nullptr) {
-        return nullptr;
-    }
-    std::byte* layered = nullptr;
-    if (!readPointerGuarded(static_cast<std::byte*>(context) + kContextLayeredOffset, layered)) {
-        return nullptr;
-    }
-    return layered;
-}
-
 std::byte* at(std::byte* layered, int layer, int index)
 {
+    if (layered == nullptr || layer < 0 || layer >= kLayerCount || index < 0 || index >= kCount) {
+        return nullptr;
+    }
     return layered + kArrayOffset + kLayerStride * layer + kStride * index;
 }
 
@@ -90,12 +69,12 @@ bool looksValid(std::byte* layered)
         return false;
     }
 
-    int type = 0;
-    if (!readInt(at(layered, kPlayerLayer, kFlySpeed) + kTypeOffset, type)
+    std::uint8_t type = 0;
+    if (!readByte(at(layered, kPlayerLayer, kFlySpeed) + kTypeOffset, type)
         || type != kTypeFloat) {
         return false;
     }
-    if (!readInt(at(layered, kPlayerLayer, kWalkSpeed) + kTypeOffset, type)
+    if (!readByte(at(layered, kPlayerLayer, kWalkSpeed) + kTypeOffset, type)
         || type != kTypeFloat) {
         return false;
     }
@@ -104,18 +83,54 @@ bool looksValid(std::byte* layered)
 
 std::byte* slotOf(std::byte* layered, int index)
 {
+    if (layered == nullptr || index < 0 || index >= kCount) {
+        return nullptr;
+    }
     for (int layer = kLayerCount - 1; layer >= 0; --layer) {
         std::byte* const slot = at(layered, layer, index);
-        int type = 0;
-        if (!readInt(slot + kTypeOffset, type)) {
+        std::uint8_t type = 0;
+        if (!readByte(slot + kTypeOffset, type)) {
             return nullptr;
         }
-        if (type == kTypeBool || type == kTypeFloat) {
-            return slot;
+        if (type != kTypeUnset) {
+            return type == kTypeBool || type == kTypeFloat ? slot : nullptr;
         }
     }
 
     return at(layered, kPlayerLayer, index);
+}
+
+bool readBool(std::byte* layered, int index)
+{
+    std::byte* const slot = slotOf(layered, index);
+    std::uint8_t type = 0;
+    std::uint8_t value = 0;
+    return slot != nullptr && readByte(slot + kTypeOffset, type) && type == kTypeBool
+        && readByte(slot + kValueOffset, value) && value == 1;
+}
+
+bool setBool(std::byte* layered, int index, bool wanted)
+{
+    std::byte* const slot = slotOf(layered, index);
+    std::uint8_t type = 0;
+    if (slot == nullptr || !readByte(slot + kTypeOffset, type)
+        || (type != kTypeUnset && type != kTypeBool)) {
+        return false;
+    }
+    if (type == kTypeBool) {
+        std::uint8_t value = 0;
+        if (!readByte(slot + kValueOffset, value)) {
+            return false;
+        }
+        if (value == static_cast<std::uint8_t>(wanted)) {
+            return true;
+        }
+    }
+
+    if (writeByte(slot + kValueOffset, static_cast<std::uint8_t>(wanted)) && type == kTypeUnset) {
+        writeByte(slot + kTypeOffset, kTypeBool);
+    }
+    return false;
 }
 
 void RestoreLedger::observeWorld(std::uint64_t world)

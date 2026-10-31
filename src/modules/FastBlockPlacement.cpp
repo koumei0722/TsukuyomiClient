@@ -3,21 +3,49 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
+#include "core/Strings.h"
+#include "game/BlockRegistry.h"
+#include "game/BuildOver.h"
+#include "game/ContainerUi.h"
+#include "game/DebugScreenWorld.h"
+#include "game/FlexibleLogic.h"
 #include "game/GameData.h"
 #include "game/HeldItem.h"
+#include "game/LookPlacement.h"
 #include "hooks/Detours.h"
 #include "input/Foreground.h"
+#include "input/GameInput.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
+#include "modules/HandRestock.h"
+#include "modules/ModuleManager.h"
 
 #include <Windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <numbers>
+#include <cstring>
+#include <format>
 #include <utility>
 
 namespace tsukuyomi {
+
+namespace {
+
+bool samePos(const std::int32_t a[3], const std::int32_t b[3])
+{
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+}
+
+const wchar_t* const kRestrictionNames[fastplace::kRestrictionCount]{
+    L"Plane", L"Face", L"Column", L"Line", L"Layer", L"Diagonal"};
+const wchar_t* const kModeKeyLabels[fastplace::kRestrictionCount]{
+    L"Plane mode key", L"Face mode key", L"Column mode key", L"Line mode key", L"Layer mode key", L"Diagonal mode key"};
+const char* const kModeKeyNames[fastplace::kRestrictionCount]{
+    "planeModeKeys", "faceModeKeys", "columnModeKeys", "lineModeKeys", "layerModeKeys", "diagonalModeKeys"};
+
+}
 
 FastBlockPlacement& FastBlockPlacement::instance()
 {
@@ -25,124 +53,52 @@ FastBlockPlacement& FastBlockPlacement::instance()
     return module;
 }
 
+const std::array<std::vector<int>, fastplace::kRestrictionCount>& FastBlockPlacement::defaultModeKeys()
+{
+    static const std::array<std::vector<int>, fastplace::kRestrictionCount> keys{
+        std::vector<int>{'Z', '1'}, std::vector<int>{'Z', '2'}, std::vector<int>{'Z', '3'},
+        std::vector<int>{'Z', '4'}, std::vector<int>{'Z', '6'}, std::vector<int>{'Z', '5'}};
+    return keys;
+}
+
+void FastBlockPlacement::onUpdate()
+{
+    for (int i = 0; i < fastplace::kRestrictionCount; ++i) {
+        if (!m_modeKeys[static_cast<std::size_t>(i)].triggered() || !input::isInGameplay()) continue;
+        m_restriction.store(i, std::memory_order_relaxed);
+        log().info(L"FastBlockPlacement: restriction mode set to {} by its key", kRestrictionNames[i]);
+        ModuleManager::instance().postNotice("\xC2\xA7" "b[Tsukuyomi]" "\xC2\xA7" "r Set Placement Restriction mode to \xC2\xA7" "a"
+                                             + toUtf8(kRestrictionNames[i]));
+    }
+}
+
+bool FastBlockPlacement::suppressHotbarSlot(int slot) const
+{
+    if (slot < 0 || slot > 8) return false;
+    const GameButtons& buttons = GameButtons::instance();
+    for (const Hotkey& key : m_modeKeys) {
+        const std::vector<int> combo = key.combo();
+        if (combo.size() < 2 || combo.back() != '1' + slot) continue;
+        bool prefixHeld = true;
+        for (std::size_t i = 0; i + 1 < combo.size() && prefixHeld; ++i) prefixHeld = buttons.comboKeyHeld(combo[i]);
+        if (prefixHeld) return true;
+    }
+    return false;
+}
+
 void FastBlockPlacement::onScansReady()
 {
     helditem::resolve();
+    buildover::resolve();
     m_useButton = GameButtons::instance().watchButton(gamebuttonlogic::button::buildOrInteract);
 }
 
 bool FastBlockPlacement::available() const
 {
     const Scanner& scanner = Scanner::instance();
-    return scanner.found(Target::BuildBlock) && scanner.found(Target::PlayerView)
-        && helditem::ready();
-}
-
-const wchar_t* FastBlockPlacement::axisName() const
-{
-    switch (m_axis) {
-    case Axis::X: return L"X";
-    case Axis::Z: return L"Z";
-    case Axis::Y:
-    default:      return L"Y";
-    }
-}
-
-FastBlockPlacement::BlockPos FastBlockPlacement::shiftByFace(BlockPos pos, unsigned char face)
-{
-    switch (face) {
-    case 0: --pos.y; break;
-    case 1: ++pos.y; break;
-    case 2: --pos.z; break;
-    case 3: ++pos.z; break;
-    case 4: --pos.x; break;
-    case 5: ++pos.x; break;
-    default: break;
-    }
-    return pos;
-}
-
-void FastBlockPlacement::faceCandidates(float stepX, float stepY, float stepZ,
-                                        unsigned char (&out)[4]) const
-{
-    float primary = 0.0f;
-    float secondary = 0.0f;
-    unsigned char primaryPlus = 0;
-    unsigned char primaryMinus = 0;
-    unsigned char secondaryPlus = 0;
-    unsigned char secondaryMinus = 0;
-
-    switch (m_axis) {
-    case Axis::X:
-        primary = stepY;   primaryPlus = 1;   primaryMinus = 0;
-        secondary = stepZ; secondaryPlus = 3; secondaryMinus = 2;
-        break;
-    case Axis::Z:
-        primary = stepX;   primaryPlus = 5;   primaryMinus = 4;
-        secondary = stepY; secondaryPlus = 1; secondaryMinus = 0;
-        break;
-    case Axis::Y:
-    default:
-        primary = stepX;   primaryPlus = 5;   primaryMinus = 4;
-        secondary = stepZ; secondaryPlus = 3; secondaryMinus = 2;
-        break;
-    }
-
-    if (std::fabs(secondary) > std::fabs(primary)) {
-        std::swap(primary, secondary);
-        std::swap(primaryPlus, secondaryPlus);
-        std::swap(primaryMinus, secondaryMinus);
-    }
-
-    const unsigned char primaryForward = (primary >= 0.0f) ? primaryPlus : primaryMinus;
-    const unsigned char primaryBack = (primary >= 0.0f) ? primaryMinus : primaryPlus;
-    const unsigned char secondaryForward = (secondary >= 0.0f) ? secondaryPlus : secondaryMinus;
-    const unsigned char secondaryBack = (secondary >= 0.0f) ? secondaryMinus : secondaryPlus;
-
-    out[0] = primaryForward;
-    out[1] = primaryBack;
-    out[2] = secondaryForward;
-    out[3] = secondaryBack;
-}
-
-unsigned char FastBlockPlacement::faceForCell(const BlockPos& pos,
-                                              const unsigned char (&candidates)[4],
-                                              const BlockPos* targets, int count)
-{
-    for (const unsigned char face : candidates) {
-        const BlockPos shifted = shiftByFace(pos, face);
-        for (int i = 0; i < count; ++i) {
-            if (targets[i].x == shifted.x && targets[i].y == shifted.y
-                && targets[i].z == shifted.z) {
-                return face;
-            }
-        }
-    }
-
-    return candidates[0];
-}
-
-bool FastBlockPlacement::alreadyPlaced(const BlockPos& pos) const
-{
-    for (const BlockPos& done : m_placed) {
-        if (done.x == pos.x && done.y == pos.y && done.z == pos.z) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void FastBlockPlacement::rememberPlaced(const BlockPos& pos)
-{
-    if (alreadyPlaced(pos)) {
-        return;
-    }
-
-    if (m_placed.size() >= kMaxPlacedMemory) {
-        const auto drop = static_cast<std::ptrdiff_t>(kMaxPlacedMemory / 4);
-        m_placed.erase(m_placed.begin(), m_placed.begin() + drop);
-    }
-    m_placed.push_back(pos);
+    return scanner.found(Target::BuildBlock) && scanner.found(Target::ServerLevelTick)
+        && scanner.found(Target::HitResultAssign) && scanner.found(Target::HitResultPick) && helditem::ready()
+        && buildover::ready();
 }
 
 MenuItem FastBlockPlacement::buildMenu()
@@ -151,14 +107,29 @@ MenuItem FastBlockPlacement::buildMenu()
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
     children.push_back(menu::choice(
-        L"Locked axis", {L"X", L"Y", L"Z"}, [this] { return static_cast<int>(m_axis); },
-        [this](int at) { m_axis = static_cast<Axis>(std::clamp(at, 0, 2)); }));
-    children.push_back(menu::number(
-        L"Range", [this] { return static_cast<float>(m_range); },
-        [this](float value) {
-            m_range = std::clamp(static_cast<int>(value), kMinRange, kMaxRange);
-        },
-        true, static_cast<float>(kMinRange), static_cast<float>(kMaxRange)));
+        L"Restriction mode",
+        std::vector<std::wstring>(std::begin(kRestrictionNames), std::end(kRestrictionNames)),
+        [this] { return m_restriction.load(std::memory_order_relaxed); },
+        [this](int at) { m_restriction.store(std::clamp(at, 0, fastplace::kRestrictionCount - 1), std::memory_order_relaxed); }));
+    children.push_back(menu::text(
+        L"Layer height",
+        [this] { return std::format(L"{}", m_layerHeight.load(std::memory_order_relaxed)); },
+        [this](std::wstring typed) {
+            int value = 0;
+            if (!parseTypedInt(typed, value)) return;
+            m_layerHeight.store(std::clamp(value, fastplace::kMinLayerHeight, fastplace::kMaxLayerHeight),
+                                std::memory_order_relaxed);
+        }));
+    for (int i = 0; i < fastplace::kRestrictionCount; ++i) {
+        Hotkey* const key = &m_modeKeys[static_cast<std::size_t>(i)];
+        children.push_back(menu::keybind(kModeKeyLabels[i], [key] { return key->combo(); },
+            [key](std::vector<int> combo) { key->set(std::move(combo)); }, defaultModeKeys()[static_cast<std::size_t>(i)]));
+        bindPad(children.back(), *key);
+        children.back().hidden = true;
+    }
+    children.push_back(menu::toggle(
+        L"Remember orientation", [this] { return m_rememberOrientation.load(std::memory_order_relaxed); },
+        [this] { m_rememberOrientation.store(!m_rememberOrientation.load(std::memory_order_relaxed), std::memory_order_relaxed); }));
 
     MenuItem item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
@@ -169,237 +140,294 @@ MenuItem FastBlockPlacement::buildMenu()
 void FastBlockPlacement::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
-
-    const int mode = std::clamp(Config::getInt(section, "mode", static_cast<int>(Axis::Y)), 0, 2);
-    m_axis = static_cast<Axis>(mode);
-
-    m_range = std::clamp(Config::getInt(section, "distance", kDefaultRange), kMinRange, kMaxRange);
+    m_restriction.store(std::clamp(Config::getInt(section, "restrictionMode", static_cast<int>(fastplace::Restriction::Face)),
+                                   0, fastplace::kRestrictionCount - 1),
+                        std::memory_order_relaxed);
+    m_layerHeight.store(std::clamp(Config::getInt(section, "layerHeight", 1), fastplace::kMinLayerHeight,
+                                   fastplace::kMaxLayerHeight),
+                        std::memory_order_relaxed);
+    m_rememberOrientation.store(Config::getBool(section, "rememberOrientation", true), std::memory_order_relaxed);
+    for (int i = 0; i < fastplace::kRestrictionCount; ++i) {
+        std::vector<int> combo = defaultModeKeys()[static_cast<std::size_t>(i)];
+        if (const auto it = section.find(kModeKeyNames[i]); it != section.end() && it->is_array()) {
+            combo.clear();
+            for (const auto& value : *it) if (value.is_number_integer()) combo.push_back(value.get<int>());
+        }
+        m_modeKeys[static_cast<std::size_t>(i)].set(std::move(combo));
+    }
 }
 
 void FastBlockPlacement::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
-    section["mode"] = static_cast<int>(m_axis);
-    section["distance"] = m_range;
-
+    section.erase("mode");
+    section.erase("distance");
+    section.erase("placementsPerTick");
+    section.erase("itemListType");
+    section.erase("itemBlacklist");
+    section.erase("itemWhitelist");
+    section["restrictionMode"] = m_restriction.load(std::memory_order_relaxed);
+    section["layerHeight"] = m_layerHeight.load(std::memory_order_relaxed);
+    section["rememberOrientation"] = m_rememberOrientation.load(std::memory_order_relaxed);
+    for (int i = 0; i < fastplace::kRestrictionCount; ++i) section[kModeKeyNames[i]] = m_modeKeys[static_cast<std::size_t>(i)].combo();
 }
 
 void FastBlockPlacement::onEnabledChanged(bool enabled)
 {
     if (!enabled) {
         m_resetRequested.store(true, std::memory_order_release);
+        m_holdId.fetch_add(1, std::memory_order_acq_rel);
     }
 }
 
 void FastBlockPlacement::applyReset()
 {
-    if (m_resetRequested.exchange(false, std::memory_order_acq_rel)) {
-        m_hasBase = false;
-        m_manualDone = false;
-        m_seenEmptyHand = false;
-        m_placed.clear();
+    if (m_resetRequested.exchange(false, std::memory_order_acq_rel) && m_hold.active) {
+        endHold(L"turned off");
     }
+}
+
+bool FastBlockPlacement::handReady(void* gameMode) const
+{
+    bool empty = false;
+    return helditem::mainHandEmpty(gameMode, empty) && !empty;
+}
+
+bool FastBlockPlacement::readAim(std::int32_t pos[3], int& face, float rel[3])
+{
+    unsigned char hit[hooks::kHitResultBytes]{};
+    void* const live = hooks::hitResultAddress();
+    if (live == nullptr || !memory::copyGuarded(live, hit, sizeof(hit))) return false;
+    int kind = -1;
+    std::memcpy(&kind, hit + 0x18, sizeof(kind));
+    face = hit[0x1c];
+    if (kind != 0 || face < 0 || face > 5) return false;
+    std::memcpy(pos, hit + 0x20, sizeof(std::int32_t) * 3);
+    float point[3]{};
+    std::memcpy(point, hit + 0x2c, sizeof(point));
+    for (int i = 0; i < 3; ++i) {
+        if (!std::isfinite(point[i])) return false;
+        rel[i] = std::clamp(point[i] - static_cast<float>(pos[i]), 0.0F, 1.0F);
+    }
+    return true;
+}
+
+bool FastBlockPlacement::placementCell(void* gameMode, const std::int32_t pos[3], int face, std::int32_t out[3])
+{
+    const int buildOver = buildover::canBuildOver(gameMode, pos);
+    if (buildOver < 0) return false;
+    if (buildOver == 1) std::copy_n(pos, 3, out);
+    else flexible::offset(pos, face, out);
+    return true;
+}
+
+bool FastBlockPlacement::vacant(void* gameMode, const std::int32_t pos[3])
+{
+    return buildover::canBuildOver(gameMode, pos) == 1;
+}
+
+bool FastBlockPlacement::usedByClick(void* gameMode, const std::int32_t pos[3], int face, const float click[3], bool sneaking)
+{
+    if (sneaking) return false;
+    const void* block = debugworld::worldBlockAt(pos);
+    if (block == nullptr) return false;
+    const int used = blocks::clickUses(gameMode, block, pos, face, click);
+    if (used < 0) {
+        static int said = 0;
+        if (said++ < 4) log().warn(L"FastBlockPlacement: could not ask the game whether a click uses {}, {}, {}; not clicking it", pos[0], pos[1], pos[2]);
+    }
+    return used != 0;
 }
 
 bool FastBlockPlacement::onBuildBlock(void* gameMode, void* blockPos, unsigned char face,
                                       unsigned char extra, bool simTick)
 {
-    if (!m_placing) applyReset();
-    if (m_placing) {
-        return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
-    }
-
-    m_gameMode = gameMode;
-
+    applyReset();
     if (!enabled()) {
         return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
 
-    m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
-
-    if (m_manualDone) {
-        if (!handReady(gameMode)) return false;
-
-        BlockPos redirect = m_base;
-        const bool result = hooks::callBuildBlock(gameMode, &redirect, face, extra, simTick);
-        placeRange();
-        return result;
+    if (m_hold.active) {
+        return false;
     }
 
-    int pos[3]{};
-    if (!memory::copyGuarded(blockPos, pos, sizeof(pos))) {
+    std::int32_t pos[3]{};
+    if (face > 5 || !memory::copyGuarded(blockPos, pos, sizeof(pos))) {
         return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
     }
-
-    m_base = shiftByFace(BlockPos{pos[0], pos[1], pos[2]}, face);
-    m_hasBase = true;
-    m_manualDone = true;
-    m_seenEmptyHand = false;
-
-    rememberPlaced(m_base);
-
-    log().info(L"FastBlockPlacement: base ({}, {}, {}) face {}", m_base.x, m_base.y, m_base.z,
-               static_cast<int>(face));
-
+    const int buildOver = buildover::canBuildOver(gameMode, pos);
     const bool result = hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
-    placeRange();
+    if (result && buildOver >= 0) {
+        startHold(gameMode, pos, face, buildOver == 1);
+    } else if (result && m_holdLogs < kMaxHoldLogs) {
+        ++m_holdLogs;
+        log().warn(L"FastBlockPlacement: could not ask whether {}, {}, {} can be built over; not starting", pos[0], pos[1], pos[2]);
+    }
     return result;
 }
 
-void FastBlockPlacement::onPlayerViewUpdate()
+void FastBlockPlacement::startHold(void* gameMode, const std::int32_t pos[3], int face, bool buildOver)
 {
-    if (!m_placing) applyReset();
-    if (!m_hasBase || m_placing) {
-        return;
-    }
+    m_hold = Hold{};
+    m_hold.active = true;
+    m_hold.gameMode = gameMode;
+    if (buildOver) std::copy_n(pos, 3, m_hold.first);
+    else flexible::offset(pos, face, m_hold.first);
+    m_hold.sideFirst = face;
+    std::copy_n(m_hold.first, 3, m_hold.last);
 
-    if (GameButtons::instance().buttonHeld(m_useButton)) {
-        m_holdUntil = Clock::now() + std::chrono::milliseconds(kHoldMs);
-        placeRange();
-        return;
+    std::int32_t aim[3]{};
+    int aimFace = -1;
+    float rel[3]{};
+    if (!readAim(aim, aimFace, rel) || !samePos(aim, pos) || aimFace != face) flexible::facePoint(face, 0.5F, rel);
+    for (int i = 0; i < 3; ++i) {
+        m_hold.clickInFirst[i] = std::clamp(static_cast<float>(pos[i] - m_hold.first[i]) + rel[i], 0.0F, 1.0F);
     }
-
-    if (Clock::now() > m_holdUntil) {
-        m_hasBase = false;
-        m_manualDone = false;
-        m_seenEmptyHand = false;
-        m_placed.clear();
+    flexible::Look look;
+    m_hold.horizontalFirst = flexible::horizontalFromYaw(lookplace::readLook(look) ? look.yaw
+                                                                                    : GameData::instance().playerView().yaw);
+    m_holdId.fetch_add(1, std::memory_order_acq_rel);
+    if (m_holdLogs < kMaxHoldLogs) {
+        ++m_holdLogs;
+        log().info(L"FastBlockPlacement: first ({}, {}, {}) face {} facing {} ({}, layer height {})", m_hold.first[0],
+                   m_hold.first[1], m_hold.first[2], face, m_hold.horizontalFirst,
+                   kRestrictionNames[m_restriction.load(std::memory_order_relaxed)], m_layerHeight.load(std::memory_order_relaxed));
     }
 }
 
-bool FastBlockPlacement::handReady(void* gameMode)
+void FastBlockPlacement::endHold(const wchar_t* why)
 {
-    bool empty = false;
-    if (!helditem::mainHandEmpty(gameMode, empty)) return false;
-    if (empty && !m_seenEmptyHand) {
-        m_seenEmptyHand = true;
-        log().info(L"FastBlockPlacement: the hand is empty; waiting for a refill");
+    if (m_hold.active && (m_hold.placed > 0 || m_hold.scheduled > 0) && m_holdLogs < kMaxHoldLogs) {
+        ++m_holdLogs;
+        log().info(L"FastBlockPlacement: {} after {} placed ({} at most in a tick), {} rotated", why, m_hold.placed,
+                   m_maxPerTick, m_hold.scheduled);
     }
-    return !empty;
+    m_hold = Hold{};
+    m_budget = 0;
+    m_maxPerTick = 0;
+    m_holdId.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void FastBlockPlacement::placeRange()
+void FastBlockPlacement::onClientTick()
 {
-    if (!enabled() || m_placing || m_gameMode == nullptr || !m_hasBase
-        || !input::isInGameplay()) {
+    m_gameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    applyReset();
+    m_budget = 0;
+    if (!m_hold.active) return;
+    if (!GameButtons::instance().buttonHeld(m_useButton)) {
+        endHold(L"released");
         return;
     }
+    if (!enabled() || !input::isInGameplay()) return;
+    m_budget = kPlacementsPerTick;
+}
 
-    if (!handReady(m_gameMode)) return;
+bool FastBlockPlacement::wantsPick() const
+{
+    return m_budget > 0 && m_hold.active && GetCurrentThreadId() == m_gameThread.load(std::memory_order_relaxed);
+}
 
-    const Clock::time_point now = Clock::now();
-    const PlayerView view = GameData::instance().playerView();
-    constexpr bool simTick = false;
-
-    constexpr float kDegToRad = std::numbers::pi_v<float> / 180.0f;
-    const float yawRad = view.yaw * kDegToRad;
-    const float pitchRad = view.pitch * kDegToRad;
-    const float cosPitch = std::cos(pitchRad);
-    const float dirX = -std::sin(yawRad) * cosPitch;
-    const float dirY = -std::sin(pitchRad);
-    const float dirZ = std::cos(yawRad) * cosPitch;
-
-    float stepX = 0.0f;
-    float stepY = 0.0f;
-    float stepZ = 0.0f;
-    switch (m_axis) {
-    case Axis::X: stepY = dirY; stepZ = dirZ; break;
-    case Axis::Z: stepX = dirX; stepY = dirY; break;
-    case Axis::Y:
-    default:      stepX = dirX; stepZ = dirZ; break;
-    }
-
-    const float length = std::sqrt(stepX * stepX + stepY * stepY + stepZ * stepZ);
-    if (length < kMinDirection) {
-        return;
-    }
-    stepX /= length;
-    stepY /= length;
-    stepZ /= length;
-
-    const bool resendDue = now >= m_nextResend;
-
-    constexpr int firstStep = kFirstStep;
-
-    BlockPos targets[kMaxRange + 1];
-    int count = 0;
-    for (int step = firstStep; step <= m_range; ++step) {
-        const auto distance = static_cast<float>(step);
-
-        BlockPos target;
-        target.x = static_cast<int>(std::floor(view.x + stepX * distance));
-        target.y = static_cast<int>(std::floor(view.y + stepY * distance));
-        target.z = static_cast<int>(std::floor(view.z + stepZ * distance));
-
-        switch (m_axis) {
-        case Axis::X: target.x = m_base.x; break;
-        case Axis::Z: target.z = m_base.z; break;
-        case Axis::Y:
-        default:      target.y = m_base.y; break;
-        }
-
-        bool duplicate = false;
-        for (int i = 0; i < count; ++i) {
-            if (targets[i].x == target.x && targets[i].y == target.y
-                && targets[i].z == target.z) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            targets[count++] = target;
-        }
-    }
-
-    if (count == 0) {
-        return;
-    }
-
-    unsigned char candidates[4] = {};
-    faceCandidates(stepX, stepY, stepZ, candidates);
-
-    int attempted = 0;
+void FastBlockPlacement::onPicked()
+{
+    applyReset();
     int placed = 0;
-    unsigned char lastFace = candidates[0];
+    while (m_budget > 0 && m_hold.active && enabled() && input::isInGameplay()) {
+        if (!placeOnce()) break;
+        --m_budget;
+        ++placed;
+        if (m_budget > 0 && !hooks::repickHitResult()) break;
+    }
+    m_budget = 0;
+    if (placed > m_maxPerTick) m_maxPerTick = placed;
+}
 
-    m_placing = true;
-    for (int i = 0; i < count; ++i) {
-        BlockPos target = targets[i];
+bool FastBlockPlacement::placeOnce()
+{
+    Hold& hold = m_hold;
+    void* const gameMode = GameData::instance().gameMode();
+    if (gameMode == nullptr || gameMode != hold.gameMode) {
+        endHold(L"the game mode changed");
+        return false;
+    }
+    if (lookplace::busy() || HandRestock::instance().itemMovePending()) return false;
+    if (!handReady(gameMode)) return false;
+    const std::string item = containerui::itemName(HandRestock::instance().heldStack());
+    if (item.empty()) return false;
 
-        if (alreadyPlaced(target) && !resendDue) {
-            continue;
+    std::int32_t pos[3]{};
+    int face = -1;
+    float rel[3]{};
+    if (!readAim(pos, face, rel)) return false;
+    std::int32_t cell[3]{};
+    if (!placementCell(gameMode, pos, face, cell)) return false;
+    if (samePos(cell, hold.last) || !vacant(gameMode, cell)) return false;
+    if (!fastplace::allowed(static_cast<fastplace::Restriction>(m_restriction.load(std::memory_order_relaxed)),
+                            m_layerHeight.load(std::memory_order_relaxed), cell, face, hold.first, hold.sideFirst)) {
+        return false;
+    }
+
+    const bool sneaking = input::sneakHeldWithin(input::kSneakHoldGraceMs);
+    std::int32_t support[3]{pos[0], pos[1], pos[2]};
+    int supportFace = face;
+    float click[3]{rel[0], rel[1], rel[2]};
+    const bool remember = m_rememberOrientation.load(std::memory_order_relaxed);
+    if (remember && !samePos(cell, pos)) {
+        std::int32_t against[3]{};
+        flexible::offset(cell, flexible::opposite(hold.sideFirst), against);
+        float againstClick[3]{};
+        fastplace::supportClick(hold.clickInFirst, hold.sideFirst, againstClick);
+        if (samePos(against, pos)
+            || (buildover::canBuildOver(gameMode, against) == 0
+                && !usedByClick(gameMode, against, hold.sideFirst, againstClick, sneaking))) {
+            std::copy_n(against, 3, support);
+            supportFace = hold.sideFirst;
+            std::copy_n(againstClick, 3, click);
         }
-
-        const unsigned char face = faceForCell(target, candidates, targets, count);
-        lastFace = face;
-
-        if (!handReady(m_gameMode)) break;
-
-        ++attempted;
-        if (hooks::callBuildBlockWithoutSwing(m_gameMode, &target, face, 0, simTick)) {
-            ++placed;
+    }
+    if (usedByClick(gameMode, support, supportFace, click, sneaking)) {
+        if (!hold.saidUsed && m_holdLogs < kMaxHoldLogs) {
+            ++m_holdLogs;
+            log().info(L"FastBlockPlacement: not clicking {}, {}, {} (the game would use it; sneak to place against it)",
+                       support[0], support[1], support[2]);
         }
-        rememberPlaced(target);
-    }
-    m_placing = false;
-
-    if (resendDue) {
-        m_nextResend = now + std::chrono::milliseconds(kResendIntervalMs);
+        hold.saidUsed = true;
+        return false;
     }
 
-    if (attempted == 0) {
-        return;
+    flexible::Look real;
+    if (remember && lookplace::readLook(real) && flexible::horizontalFromYaw(real.yaw) != hold.horizontalFirst) {
+        lookplace::Request request;
+        request.gameMode = gameMode;
+        std::copy_n(support, 3, request.pos);
+        request.face = static_cast<std::uint8_t>(supportFace);
+        std::copy_n(click, 3, request.click);
+        request.look = flexible::Look{real.pitch, flexible::yawOf(hold.horizontalFirst)};
+        request.owner = "FastBlockPlacement";
+        const std::array<std::int32_t, 3> target{cell[0], cell[1], cell[2]};
+        const std::uint64_t id = m_holdId.load(std::memory_order_acquire);
+        request.stillValid = [this, target, id, item] {
+            void* const now = GameData::instance().gameMode();
+            return enabled() && m_holdId.load(std::memory_order_acquire) == id && input::isInGameplay()
+                && !HandRestock::instance().itemMovePending()
+                && containerui::itemName(HandRestock::instance().heldStack()) == item && now != nullptr
+                && vacant(now, target.data());
+        };
+        if (lookplace::schedule(std::move(request))) {
+            ++hold.scheduled;
+        } else if (!hold.saidRotation && m_holdLogs < kMaxHoldLogs) {
+            ++m_holdLogs;
+            log().warn(L"FastBlockPlacement: could not schedule the rotated placement at {}, {}, {}", cell[0], cell[1], cell[2]);
+            hold.saidRotation = true;
+        }
+        return false;
     }
 
-    if (now >= m_nextLog) {
-        m_nextLog = now + std::chrono::milliseconds(kLogIntervalMs);
-        log().info(L"FastBlockPlacement: {} yaw {:.1f} pitch {:.1f} face {} (end {}) "
-                   L"({}, {}, {}) -> ({}, {}, {}) {}/{} placed",
-                   axisName(), view.yaw, view.pitch, static_cast<int>(candidates[0]),
-                   static_cast<int>(lastFace), targets[0].x, targets[0].y, targets[0].z,
-                   targets[count - 1].x, targets[count - 1].y, targets[count - 1].z, placed,
-                   attempted);
+    if (!hooks::callBuildBlockAimedWithoutSwing(gameMode, support, static_cast<unsigned char>(supportFace), click, 0, false)) {
+        return false;
     }
+    std::copy_n(cell, 3, hold.last);
+    ++hold.placed;
+    return true;
 }
 
 }

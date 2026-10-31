@@ -47,6 +47,11 @@ Patch makeAtomicPatch(void* address, std::vector<std::byte> bytes, const char* n
 
 Patch makeStubPatch(void* function, std::span<const std::byte> stub, const char* name = nullptr);
 
+Patch makeIndirectCallPatch(void* callInstruction, const void* replacement, const char* name = nullptr);
+
+Patch makeDirectCallPatch(void* callInstruction, const void* replacement, void** originalOut,
+                          const char* name = nullptr);
+
 std::size_t movssStoreLength(const void* address);
 
 }

@@ -108,6 +108,30 @@ bool fillGuarded(void* ctx, const float* rect, const float* color, float alpha)
     }
 }
 
+struct FontHandleLayout {
+    int flag = -1, index = -1, table = -1, tableBegin = -1, tableEnd = -1, fallback = -1;
+    const std::uint64_t* invalidIndex = nullptr;
+};
+FontHandleLayout g_fontHandle;
+void* __fastcall fontOfHandleInline(void* handle)
+{
+    const auto* const h = static_cast<const std::byte*>(handle);
+    const auto* const flag = *reinterpret_cast<const std::uint8_t* const*>(h + g_fontHandle.flag);
+    if (flag == nullptr || *flag == 0) {
+        return nullptr;
+    }
+    const std::uint64_t index = *reinterpret_cast<const std::uint64_t*>(h + g_fontHandle.index);
+    if (index != *g_fontHandle.invalidIndex) {
+        const auto* const table = *reinterpret_cast<const std::byte* const*>(h + g_fontHandle.table);
+        const auto* const begin = *reinterpret_cast<const std::byte* const*>(table + g_fontHandle.tableBegin);
+        const auto* const end = *reinterpret_cast<const std::byte* const*>(table + g_fontHandle.tableEnd);
+        if (index < static_cast<std::uint64_t>(end - begin) / 16) {
+            return *reinterpret_cast<void* const*>(begin + index * 16);
+        }
+    }
+    return *reinterpret_cast<void* const*>(h + g_fontHandle.fallback);
+}
+
 void* fontGuarded(void* client, void* handle)
 {
     __try {
@@ -161,49 +185,49 @@ bool checkContext(void* ctx)
     }
     g_ctx = CtxApi{};
     g_ctx.vtable = vt;
-    void* slots[32]{};
+    void* slots[40]{};
     if (!readGuarded(vt, slots, sizeof(slots))) {
         return false;
     }
-    if (startsWith(slots[15], "41 56 56 57 53 48 83 EC 68 0F 29 74 24 50 0F 28 F3 4C 89 C3 48 89 D7 48 89 CE 48 8B 05",
+    if (startsWith(slots[16], "41 56 56 57 53 48 83 EC 68 0F 29 74 24 50 0F 28 F3 4C 89 C3 48 89 D7 48 89 CE 48 8B 05",
                    30)) {
-        g_ctx.fill = reinterpret_cast<FillFn>(slots[15]);
+        g_ctx.fill = reinterpret_cast<FillFn>(slots[16]);
     }
-    if (startsWith(slots[5],
-                   "41 56 56 57 53 48 83 EC 68 4C 89 C0 49 89 D0 48 8B B4 24 D0 00 00 00 4C 8B 9C 24 C8 00 00 00 "
-                   "4C 8B 94 24 B0 00 00 00 48 8B 91 88 00 00 00 48 3B",
-                   48)) {
-        g_ctx.drawText = reinterpret_cast<DrawTextFn>(slots[5]);
+    if (startsWith(slots[6],
+                   "41 57 41 56 56 57 53 48 83 EC 70 4C 89 C0 49 89 D0 48 8B B4 24 E0 00 00 00 4C 8B 9C 24 D8 00 00 00 "
+                   "4C 8B 94 24 C0 00 00 00 48 8B 91 88 00 00 00 48 3B",
+                   50)) {
+        g_ctx.drawText = reinterpret_cast<DrawTextFn>(slots[6]);
     }
-    if (startsWith(slots[6], "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC", 15)
-        && findInFunction(static_cast<std::byte*>(slots[6]), "4C 89 85 ? ? ? ? F3 0F 11 8D ? ? ? ? 48 89 8D ? ? ? ? 48 8B 41 10")
+    if (startsWith(slots[7], "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC", 15)
+        && findInFunction(static_cast<std::byte*>(slots[7]), "4C 89 C7 F3 0F 11 8D ? ? ? ? 48 89 8D ? ? ? ? 48 8B 41 10")
                != nullptr) {
-        g_ctx.flushText = reinterpret_cast<FlushTextFn>(slots[6]);
+        g_ctx.flushText = reinterpret_cast<FlushTextFn>(slots[7]);
     }
-    if (startsWith(slots[7],
+    if (startsWith(slots[8],
                    "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC B8 00 00 00 48 8D AC 24 80 00 00 00 44 0F 29 4D 20 "
-                   "44 0F 29 45 10 0F 29 7D 00 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 4D 89 CE 4D 89 C4 48 89 CF 4C 8B 85 A8 00 00 00 "
-                   "4C 8B 8D A0 00 00 00 44 0F B6 95 B0 00 00 00",
-                   84)) {
-        g_ctx.drawImage = reinterpret_cast<DrawImageFn>(slots[7]);
+                   "44 0F 29 45 10 0F 29 7D 00 0F 29 75 F0 48 C7 45 E8 FE FF FF FF 4D 89 CE 4D 89 C4 48 89 55 D0 48 89 CF "
+                   "4C 8B AD A8 00 00 00 48 8B B5 A0 00 00 00 0F B6 85 B0 00 00 00",
+                   87)) {
+        g_ctx.drawImage = reinterpret_cast<DrawImageFn>(slots[8]);
     }
-    if (startsWith(slots[9],
+    if (startsWith(slots[10],
                    "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC ? ? ? ? 48 8D AC 24 80 00 00 00 0F 29 B5 ? ? ? ? "
                    "48 C7 85 ? ? ? ? FE FF FF FF 4C 8B B1 ? ? ? ? 48 8B 99 ? ? ? ? 49 39 DE 0F 84",
                    64)) {
-        auto* const at = static_cast<std::byte*>(slots[9]);
+        auto* const at = static_cast<std::byte*>(slots[10]);
         const int begin = readDisp32(at + 0x30), end = readDisp32(at + 0x37);
         if (begin > 0 && begin < 0x400 && end == begin + 8) {
-            g_ctx.flushImages = reinterpret_cast<FlushImagesFn>(slots[9]);
+            g_ctx.flushImages = reinterpret_cast<FlushImagesFn>(slots[10]);
             g_ctx.imageQueueBegin = begin;
             g_ctx.imageQueueEnd = end;
         }
     }
-    if (startsWith(slots[31],
-                   "55 41 56 56 57 53 48 83 EC 50 48 8D 6C 24 50 48 C7 45 F8 FE FF FF FF 48 89 D6 49 83 78 18 00 0F 84 "
-                   "? ? ? ? 41 83 38 0A 0F 85",
-                   43)) {
-        g_ctx.getTexture = reinterpret_cast<GetTextureFn>(slots[31]);
+    if (startsWith(slots[32],
+                   "55 56 57 53 48 83 EC 58 48 8D 6C 24 50 48 C7 45 00 FE FF FF FF 48 89 D3 49 83 78 18 00 74 ? "
+                   "41 83 38 0A 0F 85",
+                   37)) {
+        g_ctx.getTexture = reinterpret_cast<GetTextureFn>(slots[32]);
     }
     static bool told = false;
     if (!told) {
@@ -221,7 +245,7 @@ bool imagesReady()
     return g_ctx.getTexture != nullptr && g_ctx.drawImage != nullptr && g_ctx.flushImages != nullptr;
 }
 
-bool makeLocation(const char* path, ResourceLocation& out)
+bool makeLocation(const char* path, ResourceLocation& out, std::int32_t fileSystem)
 {
     const std::size_t size = path != nullptr ? std::strlen(path) : 0;
     if (size < 16) {
@@ -233,6 +257,7 @@ bool makeLocation(const char* path, ResourceLocation& out)
         hash = (hash * kPrime) ^ static_cast<unsigned char>(path[i]);
     }
     out = ResourceLocation{};
+    out.fileSystem = fileSystem;
     out.path = path;
     out.pathSize = size;
     out.pathCapacity = size;
@@ -335,18 +360,37 @@ void resolve()
     std::byte* const render = scanner.address(Target::HoverRendererRender);
     std::byte* const boxSize = scanner.address(Target::HoverBoxSizeStore);
     void* const drawItem = scanner.address(Target::UiDrawItem);
-    if (boxSize != nullptr && memory::isReadable(boxSize, 10)) {
-        api.boxW = static_cast<std::uint8_t>(boxSize[4]);
-        api.boxH = static_cast<std::uint8_t>(boxSize[9]);
+    if (boxSize != nullptr && memory::isReadable(boxSize, 4)) {
+        api.boxW = static_cast<std::uint8_t>(boxSize[3]);
+        api.boxH = api.boxW + static_cast<int>(sizeof(float));
     }
-    if (std::byte* at = findInFunction(render, "48 8B 80 ? ? ? ? 4C 8D 75 ? 48 89 D9 4C 89 F2 FF 15 ? ? ? ? 4C 89 F1 E8")) {
-        api.clientFontSlot = readDisp32(at + 3);
-        api.fontOfHandle = reinterpret_cast<FontOfHandleFn>(callTarget(at + 26));
+    if (std::byte* at = findInFunction(render, "48 8B 80 ? ? ? ? 48 8D 55 ? 48 89 D9 FF 15 ? ? ? ? 48 8B 45 ? 48 85 C0")) {
+        const int base = static_cast<std::uint8_t>(at[10]);
+        FontHandleLayout layout;
+        layout.flag = static_cast<std::uint8_t>(at[23]) - base;
+        std::byte* const pick = findInFunction(render, "48 8B 4D ? 48 3B 0D ? ? ? ? 74 ? 4C 8B 45 ? 49 8B 40 ? 4D 8B 40 ? 49 29 C0 49 C1 F8 04");
+        std::byte* const fallback = findInFunction(render, "48 C1 E1 04 48 01 C8 EB ? 48 8D 45 ? 48 8B 08");
+        if (pick != nullptr && fallback != nullptr) {
+            layout.index = static_cast<std::uint8_t>(pick[3]) - base;
+            layout.invalidIndex = reinterpret_cast<const std::uint64_t*>(pick + 11 + readDisp32(pick + 7));
+            layout.table = static_cast<std::uint8_t>(pick[16]) - base;
+            layout.tableBegin = static_cast<std::uint8_t>(pick[20]);
+            layout.tableEnd = static_cast<std::uint8_t>(pick[24]);
+            layout.fallback = static_cast<std::uint8_t>(fallback[12]) - base;
+        }
+        const bool fits = layout.flag >= 0 && layout.index >= 0 && layout.table >= 0 && layout.fallback >= 0
+                          && layout.flag + 8 <= 0x80 && layout.index + 8 <= 0x80 && layout.table + 8 <= 0x80
+                          && layout.fallback + 8 <= 0x80 && memory::inGameModule(layout.invalidIndex);
+        if (fits) {
+            g_fontHandle = layout;
+            api.clientFontSlot = readDisp32(at + 3);
+            api.fontOfHandle = &fontOfHandleInline;
+        }
     }
     if (std::byte* at = findInFunction(render, "48 8D 4D ? E8 ? ? ? ? 0F 28 B5")) {
         api.fontHandleDtor = reinterpret_cast<FontHandleDtorFn>(callTarget(at + 4));
     }
-    api.textFieldsOk = findInFunction(render, "48 8B 4F 40 48 83 7F 48 10 72 ? 48 8B 7F 30") != nullptr;
+    api.textFieldsOk = findInFunction(render, "48 8B 47 40 48 83 7F 48 10 72 ? 48 8B 7F 30") != nullptr;
     std::byte* const fillSite = scanner.address(Target::ShaderColorFillSite);
     std::byte* const tintSite = scanner.address(Target::GlintTintSite);
     if (fillSite != nullptr && tintSite != nullptr && memory::isReadable(fillSite, 14) && memory::isReadable(tintSite, 8)

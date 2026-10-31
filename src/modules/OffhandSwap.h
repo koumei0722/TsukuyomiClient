@@ -64,71 +64,8 @@ private:
         return (slot == kHeldSlot) ? hands.selected : slot;
     }
 
-    void servePending();
-
-    struct NetIdFix {
-        bool active = false;
-        std::byte* hand = nullptr;
-        std::byte* mainhand = nullptr;
-        std::byte* offhand = nullptr;
-        int slot = -1;
-
-        std::int32_t handValue = 0;
-        std::int32_t offhandValue = 0;
-
-        void* handItem = nullptr;
-        void* offhandItem = nullptr;
-        void* holder = nullptr;
-
-        unsigned long long giveUpAtMs = 0;
-    };
-    NetIdFix m_netIdFix;
-
-    struct OffhandArrival {
-        std::int32_t netId = 0;
-        unsigned long long atMs = 0;
-        unsigned int serial = 0;
-    };
-    mutable std::mutex m_offhandLock;
-    OffhandArrival m_offhand;
-    OffhandArrival latestOffhand() const;
-    struct OffhandWatch {
-        bool armed = false;
-        OffhandArrival first;
-    };
-    OffhandWatch m_offhandWatch;
-    OffhandArrival firstOffhandSinceArmed() const;
-    std::atomic<std::int32_t> m_loggedOffhandNetId{-1};
-
-    void serveNetIdFix();
-
-    void beginNetIdFix(const Hands& hands, int slot);
-
-    static constexpr unsigned long long kNetIdWaitMs = 2000;
-
     static constexpr std::ptrdiff_t kPacketContainerIdOffset = 0x30;
-    static constexpr std::ptrdiff_t kPacketSlotsOffset = 0xA0;
     static constexpr std::size_t kPacketMinSize = 0xB8;
-    static constexpr std::size_t kEntrySize = 0x60;
-    static constexpr std::ptrdiff_t kEntryItemOffset = 0x08;
-    static constexpr std::ptrdiff_t kEntryNetIdOffset = 0x20;
-    static constexpr int kOffhandContainerId = 119;
-
-    struct Pending {
-        bool active = false;
-        std::int32_t requestId = 0;
-        std::byte* hand[2] = {};
-        int selected = -1;
-        unsigned long long giveUpAtMs = 0;
-        bool haveHand = false;
-        void* handItem = nullptr;
-        std::int32_t handValue = 0;
-        std::uint8_t handCount = 0;
-        void* holder = nullptr;
-    };
-    Pending m_pending;
-
-    static constexpr unsigned long long kResponseWaitMs = 1500;
 
     static constexpr int kSlotCount = 36;
     static constexpr int kHotbarSlots = 9;
@@ -142,8 +79,8 @@ private:
     static constexpr std::ptrdiff_t kSlotsOffset = 0x198;
     static constexpr std::ptrdiff_t kPlayerOffset = 0x1B0;
 
-    static constexpr std::ptrdiff_t kOffhandOffset = 0xD90;
-    static constexpr std::ptrdiff_t kMainhandOffset = 0xE28;
+    static constexpr std::ptrdiff_t kOffhandOffset = 0xDB8;
+    static constexpr std::ptrdiff_t kMainhandOffset = 0xE50;
 
     static constexpr std::ptrdiff_t kStackItemOffset = 0x08;
     static constexpr std::ptrdiff_t kStackCountOffset = 0x22;
@@ -154,8 +91,6 @@ private:
     std::atomic<int> m_requestedSlot{kNoRequest};
 
     std::atomic<unsigned long long> m_requestedAtMs{0};
-
-    static constexpr unsigned long long kQueueWaitMs = 500;
 
     static constexpr unsigned long long kStaleRequestMs = 2000;
 

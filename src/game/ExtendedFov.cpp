@@ -29,8 +29,8 @@ constexpr char kSection[] = "ExtendedFov";
 constexpr std::ptrdiff_t kFieldsOffset = 0x10;
 constexpr std::ptrdiff_t kMaxOffset = 0x14;
 constexpr std::ptrdiff_t kValueOffset = 0x18;
-constexpr std::size_t kSignatureBytes = 0x40;
-constexpr std::size_t kVtableLea = 0x13;
+constexpr std::size_t kSignatureBytes = kRegistrationBytes;
+constexpr std::size_t kVtableLea = 0x14;
 constexpr int kMaxOptions = 8;
 constexpr int kScanAttempts = 24;
 constexpr auto kRetryInterval = std::chrono::seconds(5);
@@ -263,8 +263,11 @@ void start()
 
     std::byte* const site = Scanner::instance().address(Target::FovOptionCtor);
     std::array<std::byte, kSignatureBytes> code{};
-    if (site == nullptr || !memory::copyGuarded(site, code.data(), code.size())
-        || !readRegistration(code, g_reg)) {
+    std::array<std::byte, 4 * sizeof(float)> values{};
+    const void* const pool = memory::ripTarget(site, kValuesDispOffset);
+    if (site == nullptr || !memory::isReadable(site, code.size()) || !memory::copyGuarded(site, code.data(), code.size())
+        || !memory::isReadable(pool, values.size()) || !memory::copyGuarded(pool, values.data(), values.size())
+        || !readRegistration(code, values, g_reg)) {
         log().error(L"ExtendedFov: the field of view option was not found in the game. Not raising the limit");
         return;
     }

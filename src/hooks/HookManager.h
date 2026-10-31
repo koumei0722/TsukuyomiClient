@@ -31,8 +31,6 @@ public:
     bool applyQueued();
 
     bool setGroupEnabled(HookGroup group, bool on);
-    bool groupEnabled(HookGroup group) const;
-
 private:
     HookManager() = default;
 

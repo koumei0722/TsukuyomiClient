@@ -4,7 +4,7 @@
 
 namespace tsukuyomi::invhud {
 
-inline constexpr int kColumns = 9, kRows = 3, kCells = 27, kPitch = 18;
+inline constexpr int kColumns = 9, kRows = 3, kPitch = 18;
 inline constexpr int kWidth = kColumns * kPitch;
 inline constexpr int kHeight = kRows * kPitch;
 inline constexpr int kFirstSlot = 9;

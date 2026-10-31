@@ -363,16 +363,16 @@ void onScansReady()
     g_selTier = scanner.addressAs<SelPartFn>(Target::TradeSelTier);
     g_selIndex = scanner.addressAs<SelPartFn>(Target::TradeSelIndex);
     g_getOffer = scanner.addressAs<GetOfferFn>(Target::TradeGetOffer);
-    auto selFields = [](const void* fn, std::ptrdiff_t& value, std::ptrdiff_t& flag) {
+    auto selFields = [](const void* fn, std::size_t valueAt, std::ptrdiff_t& value, std::ptrdiff_t& flag) {
         const auto* c = static_cast<const std::uint8_t*>(fn);
-        if (c != nullptr && memory::isReadable(c, 0x2c) && c[22] == 0x0F && c[23] == 0xB6 && c[24] == 0x49
-            && c[39] == 0x8B && c[40] == 0x46) {
-            flag = c[25];
-            value = c[41];
+        if (c != nullptr && memory::isReadable(c, valueAt + 3) && c[22] == 0x80 && c[23] == 0x79 && c[25] == 0
+            && c[valueAt] == 0x8B && c[valueAt + 1] == 0x46) {
+            flag = c[24];
+            value = c[valueAt + 2];
         }
     };
-    selFields(reinterpret_cast<const void*>(g_selTier), g_selTierValue, g_selTierFlag);
-    selFields(reinterpret_cast<const void*>(g_selIndex), g_selIndexValue, g_selIndexFlag);
+    selFields(reinterpret_cast<const void*>(g_selTier), 0xcd, g_selTierValue, g_selTierFlag);
+    selFields(reinterpret_cast<const void*>(g_selIndex), 0xd2, g_selIndexValue, g_selIndexFlag);
     g_tradePossible = scanner.addressAs<TradePossibleFn>(Target::TradePossible);
     if (const auto* x = static_cast<const std::uint8_t*>(bindingInvoke("#trade_cross_out_visible"));
         x != nullptr && memory::isReadable(x, 0xa0)) {
@@ -434,8 +434,9 @@ void onScansReady()
             const std::byte* b = callAfter(ctor, kCtorBytes, fnv("#trade_possible"), nullptr);
             if (a != nullptr && a == b) {
                 for (std::size_t k = (at > 0x20 ? at - 0x20 : 0); k + 7 <= at; ++k) {
-                    if (static_cast<std::uint8_t>(ctor[k]) == 0x4C && static_cast<std::uint8_t>(ctor[k + 1]) == 0x8D
-                        && static_cast<std::uint8_t>(ctor[k + 2]) == 0xA8) {
+                    const auto b0 = static_cast<std::uint8_t>(ctor[k]), b1 = static_cast<std::uint8_t>(ctor[k + 1]),
+                               b2 = static_cast<std::uint8_t>(ctor[k + 2]);
+                    if ((b0 == 0x4C && b1 == 0x8D && b2 == 0xA8) || (b0 == 0x49 && b1 == 0x81 && b2 == 0xC5)) {
                         std::int32_t disp = 0;
                         std::memcpy(&disp, ctor + k + 3, 4);
                         if (disp > 0 && disp < 0x4000) {

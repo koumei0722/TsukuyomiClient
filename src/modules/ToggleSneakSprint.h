@@ -30,6 +30,7 @@ private:
     std::atomic<bool> m_sprint{true};
 
     toggleinput::ToggleInput m_state;
+    bool m_forced = false;
 };
 
 }

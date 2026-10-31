@@ -1,5 +1,6 @@
 #include "modules/PlayerList.h"
 
+#include "config/Config.h"
 #include "core/Logger.h"
 #include "core/Paths.h"
 #include "core/Strings.h"
@@ -7,6 +8,7 @@
 #include "game/ContainerUi.h"
 #include "game/GameData.h"
 #include "game/GameModeIds.h"
+#include "game/NameTagPlatform.h"
 #include "game/PlayerListMemory.h"
 #include "game/PngWrite.h"
 #include "game/UiProbe.h"
@@ -142,7 +144,7 @@ void PlayerList::onScansReady()
     writeFloat(pl::kGhostAlphaSlot, 0.0f);
     for (int i = 0; i < pl::kMaxPlayers; ++i) writeFloat(pl::kNameAlphaSlot + i, 1.0f);
     if (std::byte* const site = Scanner::instance().address(Target::HealthAttributeLoad)) {
-        m_healthAttribute.store(memory::ripTarget(site, 8), std::memory_order_relaxed);
+        m_healthAttribute.store(memory::ripTarget(site, 3), std::memory_order_relaxed);
     }
     if (m_healthAttribute.load(std::memory_order_relaxed) == nullptr) {
         log().warn(L"PlayerList: the health attribute was not found; hearts are not shown");
@@ -163,13 +165,15 @@ PlayerList::LevelSlots PlayerList::inspectSlots(const void* vtable)
         const void* fn = nullptr;
         unsigned char code[8]{};
         std::int32_t disp = 0;
-        bool ok = readPointer(vtable, kSlots[i], fn) && memory::inGameModule(fn)
-            && memory::copyGuarded(fn, code, sizeof(code)) && code[0] == 0x48 && code[1] == 0x8B
-            && code[2] == (i == 2 ? 0x89 : 0x81) && code[7] == (i == 2 ? 0xE9 : 0xC3);
-        if (ok && i != 2) {
-            std::memcpy(&disp, code + 3, sizeof(disp));
-            ok = disp > 0 && disp < 0x10000;
+        bool ok = readPointer(vtable, kSlots[i], fn) && memory::inGameModule(fn);
+        if (ok && i == 2) {
+            ok = pl::mem::levelFetchLooksRight(fn);
+        } else if (ok) {
+            ok = memory::copyGuarded(fn, code, sizeof(code)) && code[0] == 0x48 && code[1] == 0x8B
+                && code[2] == 0x81 && code[7] == 0xC3;
+            if (ok) std::memcpy(&disp, code + 3, sizeof(disp));
         }
+        if (i != 2) ok = ok && disp > 0 && disp < 0x10000;
         if (ok) {
             if (i == 0) result.players = disp;
             else if (i == 1) result.scoreboard = disp;
@@ -233,6 +237,7 @@ void PlayerList::onPlayerViewUpdate()
                     && GameData::copyComponent(actor, kGameTypeComponent, sizeof(mode), &mode)
                     && mode == gamemode::kSpectator;
                 pl::Entry entry{std::string(player.name, player.nameLength), spectator, has[i], scores[i]};
+                entry.platform = player.platform;
                 std::uint8_t attributes[kAttributesSize]{};
                 float current = 0.0f, maximum = 0.0f;
                 if (healthKnown && memory::plausiblePointer(actor)
@@ -293,11 +298,21 @@ void PlayerList::publish(bool held, std::uint64_t now)
     if (!sample.objective) {
         for (const auto& entry : sample.entries) heartsMode = heartsMode || (!entry.spectator && entry.health >= 0);
     }
+    const bool showPlatform = m_showPlatform.load(std::memory_order_relaxed);
+    const auto platformOf = [showPlatform](const pl::Entry& entry) {
+        return showPlatform ? nametag::platformLabel(entry.platform) : std::string_view{};
+    };
+    const auto nameText = [&](const pl::Entry& entry) {
+        const auto label = platformOf(entry);
+        return label.empty() ? pl::displayName(entry) : nametag::withPlatform(pl::displayName(entry), label);
+    };
     std::string widestName, widestScore;
     int nameWidth = -1, scoreWidth = -1;
     for (const auto& entry : sample.entries) {
-        const auto name = pl::displayName(entry);
-        if (const int width = pl::estimateWidth(entry.name); width > nameWidth) { nameWidth = width; widestName = name; }
+        const auto name = nameText(entry);
+        const auto label = platformOf(entry);
+        const int width = pl::estimateWidth(label.empty() ? entry.name : nametag::withPlatform(entry.name, label));
+        if (width > nameWidth) { nameWidth = width; widestName = name; }
         if (entry.hasScore && !heartsMode) {
             const auto score = pl::scoreText(entry.score);
             if (const int width = pl::estimateWidth(score); width > scoreWidth) { scoreWidth = width; widestScore = score; }
@@ -322,7 +337,7 @@ void PlayerList::publish(bool held, std::uint64_t now)
             const int slot = c * pl::kMaxRows + r;
             const int index = pl::playerAt(arrangement, c, r, count);
             const pl::Entry* entry = index >= 0 ? &sample.entries[index] : nullptr;
-            writeText(pl::kNameSlot + slot, entry != nullptr ? pl::displayName(*entry) : "");
+            writeText(pl::kNameSlot + slot, entry != nullptr ? nameText(*entry) : "");
             writeText(pl::kScoreSlot + slot, entry != nullptr && entry->hasScore && !entry->spectator
                 ? pl::scoreText(entry->score) : "");
             writeFloat(pl::kNameAlphaSlot + slot, entry != nullptr && entry->spectator ? 144.0f / 255.0f : 1.0f);
@@ -416,6 +431,11 @@ MenuItem PlayerList::buildMenu()
     children.push_back(menu::keybind(L"List players key", [this] { return m_listKey.combo(); },
         [this](std::vector<int> combo) { m_listKey.set(std::move(combo)); }, {}));
     bindPad(children.back(), m_listKey);
+    children.push_back(menu::toggle(L"Show platform in player list", [this] { return m_showPlatform.load(std::memory_order_relaxed); }, [this] {
+        const bool value = !m_showPlatform.load(std::memory_order_relaxed);
+        m_showPlatform.store(value, std::memory_order_relaxed);
+        log().info(L"PlayerList: show platform is {}", value ? L"on" : L"off");
+    }));
     auto item = menu::submenu(name(), std::move(children));
     item.available = [this] { return available(); };
     item.isOn = [this] { return enabled(); };
@@ -432,11 +452,13 @@ void PlayerList::loadConfig(const nlohmann::json& section)
         for (const auto& value : *it) if (value.is_number_integer()) combo.push_back(value.get<int>());
     }
     m_listKey.set(std::move(combo));
+    m_showPlatform.store(Config::getBool(section, "showPlatform", true), std::memory_order_relaxed);
 }
 
 void PlayerList::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
     section["listKeys"] = m_listKey.combo();
+    section["showPlatform"] = m_showPlatform.load(std::memory_order_relaxed);
 }
 }

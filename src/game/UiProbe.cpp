@@ -5,6 +5,7 @@
 #include "core/Notice.h"
 #include "core/Strings.h"
 #include "game/GameVersion.h"
+#include "game/CustomGuiScale.h"
 #include "game/KeyRowBuffers.h"
 #include "game/OreUiPatch.h"
 #include "game/StackCount.h"
@@ -18,10 +19,13 @@
 #include "modules/Module.h"
 #include "modules/ModuleManager.h"
 #include "modules/Schematica.h"
+#include "modules/Waypoints.h"
 
+#include <chrono>
 #include <Windows.h>
 
 #include <algorithm>
+#include <charconv>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
@@ -161,11 +165,33 @@ constexpr int kScreenSettings = 3;
 constexpr int kScreenMaterials = 4;
 constexpr int kScreenVerifier = 5;
 constexpr int kScreenLayers = 6;
-constexpr int kScreenCount = 7;
+constexpr int kScreenPlacements = 7;
+constexpr int kScreenSelection = 8;
+constexpr int kScreenWaypoints = 9;
+constexpr int kScreenCount = 10;
 std::atomic<int> g_pgScreen{kScreenMenu};
+std::atomic<int> g_pgLastSchematicaScreen{kScreenMenu};
+bool g_waypointOpening = false;
 
 char g_hdrTitleText[96] = "Schematica";
 
+int selectedIndex(const Schematica& mod)
+{
+    const auto selected=mod.selectedPlacement();
+    for (std::size_t i=0;i<mod.placementCount();++i) if (mod.placementId(i)==selected) return static_cast<int>(i);
+    return -1;
+}
+std::wstring placementName(const Schematica& mod, std::size_t index)
+{
+    schematic::PlacementSpec p;
+    mod.placementSpec(mod.placementId(index),p);
+    return p.name;
+}
+bool placementEnabled(const Schematica& mod, std::size_t index)
+{
+    schematic::PlacementSpec p;
+    return mod.placementSpec(mod.placementId(index),p) && p.enabled;
+}
 const char* pageHeaderTitle()
 {
     const auto ascii = [](char* out, size_t cap, const std::wstring& text) {
@@ -179,16 +205,25 @@ const char* pageHeaderTitle()
         out[at] = 0;
     };
     switch (g_pgScreen.load(std::memory_order_relaxed)) {
+    case kScreenWaypoints:
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s", "Waypoints");
+        break;
     case kScreenBlueprints:
-        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Schematic Placements",
+        std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Load Schematics",
                       kHeaderTitle);
+        break;
+    case kScreenPlacements:
+        std::snprintf(g_hdrTitleText,sizeof(g_hdrTitleText),"%s => Schematic Placements",kHeaderTitle);
+        break;
+    case kScreenSelection:
+        std::snprintf(g_hdrTitleText,sizeof(g_hdrTitleText),"%s => Area Selection",kHeaderTitle);
         break;
     case kScreenBlueprint: {
         char name[64]{};
         Schematica& mod = Schematica::instance();
-        const int at = mod.editingIndex();
+        const int at = selectedIndex(mod);
         if (at >= 0) {
-            ascii(name, sizeof(name), mod.blueprintName(static_cast<size_t>(at)));
+            ascii(name, sizeof(name), placementName(mod, static_cast<size_t>(at)));
         }
         std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => Configure: %s", kHeaderTitle,
                       (name[0] != 0) ? name : "(none)");
@@ -206,9 +241,9 @@ const char* pageHeaderTitle()
     case kScreenVerifier: {
         char name[64]{};
         Schematica& mod2 = Schematica::instance();
-        const int at2 = mod2.editingIndex();
+        const int at2 = selectedIndex(mod2);
         if (at2 >= 0) {
-            ascii(name, sizeof(name), mod2.blueprintName(static_cast<size_t>(at2)));
+            ascii(name, sizeof(name), placementName(mod2, static_cast<size_t>(at2)));
         }
         std::snprintf(g_hdrTitleText, sizeof(g_hdrTitleText), "%s => %s: %s", kHeaderTitle,
                       (g_pgScreen.load(std::memory_order_relaxed) == kScreenMaterials)
@@ -415,7 +450,13 @@ struct PageDonors {
     bool ok = false;
 };
 
-bool collectPageDonors(void* self, PageDonors& out)
+struct DonorSources {
+    const void* vec = nullptr;
+    const void* elem = nullptr;
+    const void* str = nullptr;
+};
+
+bool collectPageDonors(void* self, PageDonors& out, DonorSources* sources = nullptr)
 {
     out = PageDonors{};
     static const std::string kBaseSpace = "settings_common";
@@ -445,6 +486,7 @@ bool collectPageDonors(void* self, PageDonors& out)
         return false;
     }
     std::memcpy(out.vecSrc, reinterpret_cast<const void*>(controls->value), sizeof(out.vecSrc));
+    if (sources != nullptr) sources->vec = reinterpret_cast<const void*>(controls->value);
     out.arrTag = controls->tag;
     out.arrSeq = controls->seq;
     if (out.vecSrc[1] <= out.vecSrc[0]
@@ -460,6 +502,7 @@ bool collectPageDonors(void* self, PageDonors& out)
         return false;
     }
     std::memcpy(out.elemVal, reinterpret_cast<const void*>(firstElem), sizeof(out.elemVal));
+    if (sources != nullptr) sources->elem = reinterpret_cast<const void*>(firstElem);
     {
         std::vector<Entry> sample;
         std::uintptr_t sampleCount = 0;
@@ -485,6 +528,7 @@ bool collectPageDonors(void* self, PageDonors& out)
         if ((one.tag & 0xFF) == kTagString
             && memory::isReadable(reinterpret_cast<const void*>(one.value), sizeof(out.strRec))) {
             std::memcpy(out.strRec, reinterpret_cast<const void*>(one.value), sizeof(out.strRec));
+            if (sources != nullptr) sources->str = reinterpret_cast<const void*>(one.value);
             out.strTag = one.tag;
             out.strSeq = one.seq;
             break;
@@ -844,6 +888,94 @@ std::uintptr_t* buildPartDefinition(void* self, uitree::Arena& arena, const Page
     return arena.makeValue(donorWords, node);
 }
 
+bool copyHeaderPayload(uitree::Arena& arena, std::uintptr_t& value, std::uintptr_t tag,
+                       std::vector<std::uintptr_t>& parents)
+{
+    const auto type = tag & 0xFF;
+    if (type != kTagString && type != 6 && type != kTagObject) return true;
+    if (std::find(parents.begin(), parents.end(), value) != parents.end()) return false;
+    parents.push_back(value);
+    const auto copy = [&]() -> bool {
+        if (type == kTagString) {
+            unsigned char record[uitree::kRecordBytes]{};
+            if (!memory::copyGuarded(reinterpret_cast<const void*>(value), record, sizeof(record))) return false;
+            std::uintptr_t body = 0;
+            std::memcpy(&body, record, sizeof(body));
+            std::string text;
+            const auto room = arena.capacityText() - arena.usedText();
+            for (std::size_t i = 0; i < room; ++i) {
+                char ch = 0;
+                if (!memory::copyGuarded(reinterpret_cast<const void*>(body + i), &ch, 1)) return false;
+                if (ch == '\0') {
+                    const auto* const copied = arena.makeStringRecord(record, arena.takeText(text.c_str(), true));
+                    if (copied == nullptr) return false;
+                    value = reinterpret_cast<std::uintptr_t>(copied);
+                    return true;
+                }
+                text.push_back(ch);
+            }
+            return false;
+        }
+        if (type == kTagObject) {
+            const std::uintptr_t source[2]{value, tag};
+            std::vector<Entry> entries;
+            std::uintptr_t count = 0;
+            if (!collectEntries(source, entries, count)) return false;
+            std::vector<uitree::KeyValue> items;
+            for (auto& entry : entries) {
+                if (!copyHeaderPayload(arena, entry.value, entry.tag, parents)) return false;
+                items.push_back({reinterpret_cast<const char*>(entry.key), entry.value, entry.tag, entry.seq});
+            }
+            const auto* const node = arena.makeMap(items.empty() ? nullptr : items.data(), items.size());
+            if (node == nullptr) return false;
+            value = reinterpret_cast<std::uintptr_t>(node);
+            return true;
+        }
+        std::uintptr_t vec[uitree::kVectorWords]{};
+        if (!memory::copyGuarded(reinterpret_cast<const void*>(value), vec, sizeof(vec))
+            || vec[1] < vec[0] || (vec[1] - vec[0]) % sizeof(std::uintptr_t) != 0) return false;
+        const auto count = (vec[1] - vec[0]) / sizeof(std::uintptr_t);
+        if (count > (arena.capacityWords() - arena.usedWords()) / uitree::kValueWords) return false;
+        std::vector<const std::uintptr_t*> elements;
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uintptr_t at = 0;
+            std::uintptr_t element[uitree::kValueWords]{};
+            if (!memory::copyGuarded(reinterpret_cast<const void*>(vec[0] + i * sizeof(at)), &at, sizeof(at))
+                || !memory::copyGuarded(reinterpret_cast<const void*>(at), element, sizeof(element))
+                || !copyHeaderPayload(arena, element[0], element[1], parents)) return false;
+            auto* const own = arena.takeWords(uitree::kValueWords);
+            if (own == nullptr) return false;
+            std::memcpy(own, element, sizeof(element));
+            elements.push_back(own);
+        }
+        const auto* const copied = arena.makeVector(vec, elements.empty() ? nullptr : elements.data(), elements.size());
+        if (copied == nullptr) return false;
+        value = reinterpret_cast<std::uintptr_t>(copied);
+        return true;
+    };
+    const bool ok = copy();
+    parents.pop_back();
+    return ok;
+}
+
+void* copyHeaderDefinition(const void* source)
+{
+    static uitree::TreeNode nodes[kArenaNodes]{};
+    static std::uintptr_t words[kArenaWords]{};
+    static unsigned char records[kArenaRecords][uitree::kRecordBytes]{};
+    static char text[kArenaText]{};
+    static uitree::Arena arena(nodes, kArenaNodes, words, kArenaWords, &records[0][0], kArenaRecords, text, kArenaText);
+    std::uintptr_t value[uitree::kValueWords]{};
+    if (!memory::copyGuarded(source, value, sizeof(value))) return nullptr;
+    arena.reset();
+    std::vector<std::uintptr_t> parents;
+    if (!copyHeaderPayload(arena, value[0], kTagObject, parents)) return nullptr;
+    auto* const own = arena.takeWords(uitree::kValueWords);
+    if (own == nullptr) return nullptr;
+    std::memcpy(own, value, sizeof(value));
+    return own;
+}
+
 void* buildHeader(void* self)
 {
     if (g_hdrReady) {
@@ -857,6 +989,13 @@ void* buildHeader(void* self)
     if (!lookupGuarded(self, &kSpace, &kName, top) || top == nullptr
         || !memory::isReadable(top, sizeof(g_hdrValue))) {
         log().warn(L"UiProbe: could not look up the header original");
+        return nullptr;
+    }
+
+    top = copyHeaderDefinition(top);
+    if (top == nullptr) {
+        static int failures = 0;
+        if (failures++ < 8) log().warn(L"UiProbe: could not copy the header original");
         return nullptr;
     }
 
@@ -1185,7 +1324,30 @@ constexpr int kActMatList = 6;
 constexpr int kActMatRefresh = 7;
 constexpr int kActMatWrite = 8;
 constexpr int kActMatClear = 9;
+constexpr int kActFileLoad=11;
+constexpr int kActFileDelete=12;
+constexpr int kActPlacementRemove=13;
+constexpr int kActSelectionBox=21, kActSelectionAction=22;
+constexpr int kActWaypoint = 30;
+std::atomic<std::uint64_t> g_selectionPageRevision{0};
+std::atomic<unsigned long long> g_selectionPageUpdated{0};
+std::atomic<unsigned long long> g_selectionPageTypedAt{0};
+std::atomic<bool> g_selectionPageActive{false};
+constexpr int kActMatScope = 23, kActMatHide = 24, kActMatSort = 25, kActMatMultiplier = 26;
+constexpr int kActPaste = 27, kActPasteStop = 28;
+constexpr int kActMatCollect = 29;
+std::atomic<std::uint64_t> g_pgPasteRevision{0};
+std::atomic<bool> g_pgPasteAwait{false};
+std::atomic<bool> g_pgPasteArmed{false};
+unsigned long long g_pgPasteUpdated = 0;
+std::atomic<std::uint64_t> g_pgMaterialRevision{0};
+std::atomic<bool> g_pgMaterialAwait{false};
+unsigned long long g_pgMaterialEditAt = 0;
 constexpr int kActMatIgnore = 10;
+constexpr int kActVerScope = 14, kActVerRefresh = 15, kActVerKind = 16, kActVerPair = 17,
+    kActVerIgnore = 18, kActVerClearSel = 19, kActVerClearIgnored = 20;
+std::atomic<std::uint64_t> g_pgVerifierSerial{0};
+std::atomic<bool> g_pgVerifierAwait{false};
 int g_pgRowAct[kMaxPageRows]{};
 int g_pgRowArg[kMaxPageRows]{};
 
@@ -1205,7 +1367,7 @@ std::uintptr_t g_pgTopElems[kMaxPageRows]{};
 size_t g_pgTopCount = 0;
 int g_pgRowMenuTab[kMaxPageRows]{};
 int g_pgRowMenuIdx[kMaxPageRows]{};
-int g_pgRowBlueprint[kMaxPageRows]{};
+std::uint64_t g_pgRowPlacement[kMaxPageRows]{};
 
 const char* pageRowControlName(int kind)
 {
@@ -1217,6 +1379,23 @@ const char* pageRowControlName(int kind)
 }
 std::atomic<std::uintptr_t> g_pgCtl[kMaxPageRows]{};
 char g_pgLastText[kMaxPageRows][kPageTextBytes]{};
+struct EditBoxBinding {
+    std::uintptr_t box = 0;
+    std::uintptr_t elem = 0;
+    std::ptrdiff_t nameAt = 0;
+    unsigned long long missedAt = 0;
+};
+EditBoxBinding g_pgBind[kMaxPageRows]{};
+
+void forgetPageEditBoxes()
+{
+    for (auto& box : g_pgCtl) {
+        box.store(0);
+    }
+    for (auto& bind : g_pgBind) {
+        bind = EditBoxBinding{};
+    }
+}
 std::uintptr_t g_pgElems[kMaxPageRows]{};
 std::uintptr_t g_pgVec[4]{};
 constexpr char kPageSizeKey[] = "size";
@@ -1269,6 +1448,7 @@ constexpr char kPageExitId[] = "button.menu_exit";
 constexpr char kPageExitVar[] = "$pressed_button_name";
 
 std::atomic<unsigned long long> g_pgReopenAt{0};
+std::atomic<unsigned long long> g_ownPageOpenRequestAt{0};
 
 std::atomic<unsigned long long> g_pgSelfEscUntil{0};
 
@@ -1318,6 +1498,9 @@ void cancelPageReopen()
 {
     g_ptPressed.store(-1);
     g_pgPressed.store(-1);
+    g_pgReopenAt.store(0);
+    g_pgCloseDeadline.store(0);
+    g_ownPageOpenRequestAt.store(0);
 }
 constexpr unsigned long long kPageReopenDelayMs = 120;
 
@@ -1367,7 +1550,7 @@ size_t buildPageTexts()
         g_pgRowArg[at] = 0;
         g_pgRowMenuTab[at] = -1;
         g_pgRowMenuIdx[at] = -1;
-        g_pgRowBlueprint[at] = -1;
+        g_pgRowPlacement[at] = 0;
         g_pgRowKind[at] = kRowButton;
         g_pgIsEdit[at] = false;
         g_pgRowChild[at] = (group >= 0);
@@ -1421,7 +1604,7 @@ size_t buildPageTexts()
         g_pgRowAct[at] = kActItem;
         g_pgRowMenuTab[at] = tab;
         g_pgRowMenuIdx[at] = static_cast<int>(index);
-        g_pgRowBlueprint[at] = (tab == 1) ? mod.editingIndex() : -1;
+        g_pgRowPlacement[at] = (tab == 1) ? mod.selectedPlacement() : 0;
         if (item->kind == MenuItemKind::Text && item->getText && item->setText) {
             g_pgRowKind[at] = kRowEdit;
         } else if (item->kind == MenuItemKind::Number && item->getNumber && item->setNumber) {
@@ -1447,7 +1630,7 @@ size_t buildPageTexts()
         g_pgRowKind[at] = kind;
     };
 
-    const auto addGoto = [&](const char* text, int screen, int blueprint,
+    const auto addGoto = [&](const char* text, int screen, std::uint64_t placement,
                              const char* width = nullptr) {
         const long at = newRow(width);
         if (at < 0) {
@@ -1456,7 +1639,7 @@ size_t buildPageTexts()
         std::snprintf(g_pgTexts[at], kPageTextBytes, "%s", text);
         g_pgRowAct[at] = kActGoto;
         g_pgRowArg[at] = screen;
-        g_pgRowBlueprint[at] = blueprint;
+        g_pgRowPlacement[at] = placement;
         g_pgRowKind[at] = kRowButton;
     };
 
@@ -1464,9 +1647,9 @@ size_t buildPageTexts()
         const char* text;
         int screen;
     };
-    static const TabDef kMainTabs[] = {{"Placements", kScreenBlueprints},
+    static const TabDef kMainTabs[] = {{"Load",kScreenBlueprints},{"Placements", kScreenPlacements},
                                        {"Configuration", kScreenSettings},
-                                       {"Render Layers", kScreenLayers}};
+                                       {"Render Layers", kScreenLayers},{"Area Selection",kScreenSelection}};
     static const TabDef kPlaceTabs[] = {{"Configure", kScreenBlueprint},
                                         {"Material List", kScreenMaterials},
                                         {"Verifier", kScreenVerifier}};
@@ -1499,12 +1682,12 @@ size_t buildPageTexts()
         const int before = slot;
         slot = kSlotBottom;
         if (backScreen != kScreenMenu) {
-            addGoto(backText, backScreen, -1, "40%");
+            addGoto(backText, backScreen, 0, "40%");
             addPlain(kRowDivider, nullptr, "20%");
         } else {
             addPlain(kRowDivider, nullptr, "60%");
         }
-        addGoto("Schematica menu", kScreenMenu, -1, "40%");
+        addGoto("Schematica menu", kScreenMenu, 0, "40%");
         slot = before;
     };
 
@@ -1571,150 +1754,262 @@ size_t buildPageTexts()
         return std::clamp(want, 96, 420);
     };
 
-    const auto addListRow = [&](size_t which) {
-        char name[kPageTextBytes]{};
-        copyAscii(name, sizeof(name), mod.blueprintName(which).c_str());
-        const bool shown = mod.blueprintVisible(which);
-
+    const auto addFileRow=[&](std::size_t which) {
+        char name[kPageTextBytes]{};copyAscii(name,sizeof(name),mod.fileName(which).c_str());
+        int sx=0,sy=0,sz=0;std::size_t solid=0;
+        char label[kPageTextBytes]{};
+        if (mod.fileInfo(which,sx,sy,sz,solid)) std::snprintf(label,sizeof(label),"%s [%d x %d x %d]",name,sx,sy,sz);
+        else std::snprintf(label,sizeof(label),"%s [not loaded yet]",name);
         beginRow(nullptr);
-        {
-            char label[kPageTextBytes]{};
-            std::snprintf(label, sizeof(label), "%s%s", shown ? kColGreen : kColGray, name);
-            addGoto(label, kScreenBlueprint, static_cast<int>(which), "52%");
-        }
-        {
-            const long at = newRow("26%");
-            if (at >= 0) {
-                std::snprintf(g_pgTexts[at], kPageTextBytes, "%s",
-                              shown ? "Placement: ON" : "Placement: OFF");
-                g_pgRowAct[at] = kActShow;
-                g_pgRowBlueprint[at] = static_cast<int>(which);
-                g_pgRowKind[at] = kRowButton;
-            }
-        }
-        {
-            const MenuItem* const del = schematicaRowOf(1, 4);
-            const std::wstring armed = (del != nullptr) ? del->valueText() : std::wstring{};
-            char armedText[kPageTextBytes]{};
-            copyAscii(armedText, sizeof(armedText), armed.c_str());
-            const bool armedHere = (armed.rfind(L"press again: ", 0) == 0)
-                                   && (std::strstr(armedText, name) != nullptr)
-                                   && (name[0] != 0);
-            const long at = newRow("20%");
-            if (at >= 0) {
-                std::snprintf(g_pgTexts[at], kPageTextBytes, "%s",
-                              armedHere ? "Remove: sure?" : "Remove");
-                g_pgRowAct[at] = kActItem;
-                g_pgRowMenuTab[at] = 1;
-                g_pgRowMenuIdx[at] = 4;
-                g_pgRowBlueprint[at] = static_cast<int>(which);
-                g_pgRowKind[at] = kRowButton;
-            }
+        addPlain(kRowLabel,label,"56%");
+        for (int action=0;action<2;++action) {
+            const auto row=newRow("22%");if(row<0)continue;
+            const bool armed=action==1 && mod.deleteArmed() && mod.m_deleteArmedName==mod.fileName(which);
+            std::snprintf(g_pgTexts[row],kPageTextBytes,"%s",action==0?"Load":armed?"Delete: sure?":"Delete");
+            g_pgRowAct[row]=action==0?kActFileLoad:kActFileDelete;
+            g_pgRowArg[row]=static_cast<int>(which);
         }
         endRow();
-        {
-            int sx = 0;
-            int sy = 0;
-            int sz = 0;
-            std::size_t solid = 0;
-            char text[kPageTextBytes]{};
-            if (mod.blueprintInfo(which, sx, sy, sz, solid)) {
-                std::snprintf(text, sizeof(text), "    %d, %d, %d   [%d x %d x %d]",
-                              mod.blueprintPos(which, 0), mod.blueprintPos(which, 1),
-                              mod.blueprintPos(which, 2), sx, sy, sz);
-            } else {
-                std::snprintf(text, sizeof(text), "    %d, %d, %d   [not loaded yet]",
-                              mod.blueprintPos(which, 0), mod.blueprintPos(which, 1),
-                              mod.blueprintPos(which, 2));
-            }
-            addPlain(kRowLabel, text);
+    };
+    const auto addPlacementRow=[&](std::size_t which) {
+        schematic::PlacementSpec p;
+        if(!mod.placementSpec(mod.placementId(which),p))return;
+        char name[kPageTextBytes]{},file[kPageTextBytes]{},label[kPageTextBytes]{};
+        copyAscii(name,sizeof(name),p.name.c_str());copyAscii(file,sizeof(file),p.schematic.c_str());
+        std::snprintf(label,sizeof(label),"%s%s (%s) %d, %d, %d [%d/%s]%s",
+            mod.selectedPlacement()==p.id?kColGreen:kColGray,name,file,p.x,p.y,p.z,p.rotation*90,
+            p.mirror==schematic::Mirror::None?"None":p.mirror==schematic::Mirror::X?"X":"Z",p.locked?" [Locked]":"");
+        addPlain(kRowLabel,label);
+        beginRow(nullptr);
+        const auto enabledRow=newRow("34%");
+        if(enabledRow>=0) {
+            std::snprintf(g_pgTexts[enabledRow],kPageTextBytes,"Enabled: %s",p.enabled?"ON":"OFF");
+            g_pgRowAct[enabledRow]=kActShow;g_pgRowPlacement[enabledRow]=p.id;
         }
+        addGoto("Configure",kScreenBlueprint,p.id,"33%");
+        const auto remove=newRow("33%");
+        if(remove>=0) {
+            std::snprintf(g_pgTexts[remove],kPageTextBytes,"Remove");
+            g_pgRowAct[remove]=kActPlacementRemove;g_pgRowPlacement[remove]=p.id;
+        }
+        endRow();
     };
 
     const int screen = g_pgScreen.load(std::memory_order_relaxed);
     switch (screen) {
-    case kScreenBlueprints: {
-        addTabStrip(kMainTabs, std::size(kMainTabs), kScreenBlueprints);
-        const size_t count = mod.blueprintCount();
-        for (size_t i = 0; i < count && rows + 6 < kMaxPageRows; ++i) {
-            addListRow(i);
+    case kScreenWaypoints: {
+        auto& waypointsMod = Waypoints::instance();
+        const auto pageUtf8 = [](const std::string& text) {
+            std::size_t cut = std::min(text.size(), kPageTextBytes - 1);
+            while (cut < text.size() && cut > 0 && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80) --cut;
+            return text.substr(0, cut);
+        };
+        addPlain(kRowHeader, "New waypoint");
+        const auto nameRow = rows;
+        if (addItem(Waypoints::kPageTab, 0)) {
+            const auto* item = schematicaRowOf(Waypoints::kPageTab, 0);
+            const auto text = pageUtf8(toUtf8(item->getText()));
+            std::snprintf(g_pgHints[nameRow], kPageTextBytes, "%s", text.c_str());
         }
-        if (count == 0) {
-            addPlain(kRowLabel, "No blueprints: use Import .mcstructure");
+        addItem(Waypoints::kPageTab, 1);
+        std::size_t colorCount = 0;
+        const auto* colors = waypoints::palette(colorCount);
+        const auto selectedColor = waypointsMod.draftColor();
+        for (std::size_t i = 0; i < colorCount; ++i) {
+            if (i % 8 == 0) beginRow(nullptr);
+            const auto text = std::string(colors[i].code) + colors[i].name;
+            addPick(text.c_str(), kActWaypoint, 100 + static_cast<int>(i), colors[i].rgb == selectedColor, "12%");
+            if (i % 8 == 7) endRow();
         }
+        beginRow("100%c");
+        for (std::size_t i = 2; i < 5; ++i) addItem(Waypoints::kPageTab, i, "33%");
+        endRow();
+        beginRow(nullptr);
+        addPick("Here (player)", kActWaypoint, 1, false, "50%");
+        addPick("+ Add waypoint", kActWaypoint, 0, false, "50%");
+        endRow();
         addPlain(kRowDivider, nullptr);
-        addItem(0, 0);
-        addBottomNav("< Schematica menu", kScreenMenu);
+        const auto list = waypointsMod.pageRows();
+        char heading[kPageTextBytes]{};
+        if (waypointsMod.hasWorld()) std::snprintf(heading, sizeof(heading), "Waypoints in %s (%zu)", waypointsMod.currentDimension().c_str(), list.size());
+        else std::snprintf(heading, sizeof(heading), "%s", "Waypoints (not saved on this server)");
+        addPlain(kRowLabel, heading);
+        std::size_t shown = 0;
+        for (; shown < list.size() && rows + 6 < kMaxPageRows; ++shown) {
+            const auto& row = list[shown];
+            beginRow(nullptr);
+            const auto label = pageUtf8(row.label);
+            addPlain(kRowLabel, label.c_str(), "60%");
+            addPick(row.visible ? "Shown" : "Hidden", kActWaypoint, 1000 + static_cast<int>(shown), row.visible, "20%");
+            addPick("§cRemove", kActWaypoint, 2000 + static_cast<int>(shown), false, "20%");
+            endRow();
+        }
+        if (shown < list.size()) {
+            char more[kPageTextBytes]{};
+            std::snprintf(more, sizeof(more), "... and %zu more", list.size() - shown);
+            addPlain(kRowLabel, more);
+        }
+        break;
+    }
+    case kScreenSelection: {
+        addTabStrip(kMainTabs,std::size(kMainTabs),kScreenSelection);
+        const auto area=mod.areaSelection();
+        g_selectionPageRevision=mod.selectionRevision();
+        g_selectionPageUpdated=GetTickCount64();
+        g_selectionPageActive.store(true);
+        addItem(3,0);
+        addPlain(kRowLabel,"Boxes");
+        for (std::size_t i=0;i<area.boxes.size() && rows+22<kMaxPageRows;++i)
+            addPick(area.boxes[i].name.c_str(),kActSelectionBox,static_cast<int>(i),static_cast<int>(i)==area.selected,"100%");
+        beginRow(nullptr);
+        addPick("+ Add box",kActSelectionAction,2,false,"50%");
+        addPick("- Remove",kActSelectionAction,4,false,"50%");
+        endRow();
+        for (int corner=0;corner<2;++corner) {
+            addPlain(kRowLabel,corner==0?"Corner 1":"Corner 2");
+            beginRow("100%c");
+            for (int a=0;a<3;++a) addItem(3,static_cast<std::size_t>(1+corner*3+a),"33%");
+            endRow();
+            beginRow(nullptr);
+            addPick("Here (crosshair)",kActSelectionAction,corner,false,"50%");
+            addPick("To player",kActSelectionAction,6+corner,false,"50%");
+            endRow();
+        }
+        char text[kPageTextBytes]{};
+        if (area.selected>=0 && static_cast<std::size_t>(area.selected)<area.boxes.size()) {
+            selection::Area selected; selected.boxes.push_back(area.boxes[area.selected]);
+            std::int32_t lo[3]{},hi[3]{};
+            if (selected.boundsOf(lo,hi)) {
+                std::snprintf(text,sizeof(text),"Size: %lld x %lld x %lld (%llu blocks)",
+                    static_cast<long long>(hi[0])-lo[0]+1,static_cast<long long>(hi[1])-lo[1]+1,static_cast<long long>(hi[2])-lo[2]+1,
+                    static_cast<unsigned long long>(selected.blockCount()));
+                addPlain(kRowLabel,text);
+            }
+        }
+        std::snprintf(text,sizeof(text),"Total: %zu boxes, %llu blocks",area.boxes.size(),static_cast<unsigned long long>(area.blockCount()));
+        addPlain(kRowLabel,text);
+        addItem(3,7);
+        if (area.originSet) { beginRow("100%c"); for (std::size_t i=8;i<11;++i) addItem(3,i,"33%"); endRow(); }
+        addItem(3,11); addItem(3,12);
+        addPlain(kRowLabel,"\xc2\xa7" "7Blocks only (block entities and entities are not saved)");
+        addPlain(kRowLabel,"Set corners with keys, Here, or numeric fields.");
+        const auto status=mod.selectionSaveStatus();
+        if (!status.empty()) addPlain(kRowLabel,status.c_str());
+        addBottomNav("< Back",kScreenMenu);
+        break;
+    }
+    case kScreenBlueprints: {
+        addTabStrip(kMainTabs,std::size(kMainTabs),kScreenBlueprints);
+        const auto count=mod.fileCount();
+        std::size_t shown=0;
+        for (;shown<count && rows+5<kMaxPageRows;++shown) addFileRow(shown);
+        if(shown<count) {char text[kPageTextBytes]{};std::snprintf(text,sizeof(text),"... and %u more (not shown)",static_cast<unsigned>(count-shown));addPlain(kRowLabel,text);}
+        if(count==0)addPlain(kRowLabel,"No schematics: use Import .mcstructure");
+        addItem(0,0);
+        addBottomNav("< Schematica menu",kScreenMenu);
+        break;
+    }
+    case kScreenPlacements: {
+        addTabStrip(kMainTabs,std::size(kMainTabs),kScreenPlacements);
+        if(!mod.inWorld())addPlain(kRowLabel,"Not in a world");
+        else {
+            if(!mod.placementsSaved())addPlain(kRowLabel,"Placements here are not saved");
+            const auto count=mod.placementCount();std::size_t shown=0;
+            for(;shown<count && rows+6<kMaxPageRows;++shown)addPlacementRow(shown);
+            if(shown<count) {char text[kPageTextBytes]{};std::snprintf(text,sizeof(text),"... and %u more (not shown)",static_cast<unsigned>(count-shown));addPlain(kRowLabel,text);}
+        }
+        addBottomNav("< Schematica menu",kScreenMenu);
         break;
     }
     case kScreenBlueprint: {
-        addTabStrip(kPlaceTabs, std::size(kPlaceTabs), kScreenBlueprint);
-        {
-            char name[kPageTextBytes]{};
-            const int at = mod.editingIndex();
-            if (at >= 0) {
-                copyAscii(name, sizeof(name), mod.blueprintName(static_cast<size_t>(at)).c_str());
+        addTabStrip(kPlaceTabs,std::size(kPlaceTabs),kScreenBlueprint);
+        schematic::PlacementSpec p;
+        if(!mod.placementSpec(mod.selectedPlacement(),p))addPlain(kRowLabel,"Select a placement first");
+        else {
+            addItem(1,0);
+            beginRow(nullptr);for(std::size_t i=1;i<=3;++i)addItem(1,i,"33%");endRow();
+            addPlain(kRowHeader,"Placement origin");
+            beginRow("100%c");for(std::size_t i=4;i<=6;++i)addItem(1,i,"33%");endRow();
+            addItem(1,7);
+            beginRow(nullptr);for(std::size_t i=8;i<=10;++i)addItem(1,i,"33%");endRow();
+            const auto status=mod.pasteStatus();
+            if (!status.empty()) addPlain(kRowLabel,status.c_str());
+            beginRow(nullptr);
+            if (mod.pasting()) addAct("Stop",kActPasteStop,0,"100%");
+            else {
+                addAct(mod.pasteArmed(p.id)?"Paste again to confirm":"Paste",kActPaste,0,"100%");
+                g_pgRowPlacement[rows-1]=p.id;
             }
-            char text[kPageTextBytes]{};
-            std::snprintf(text, sizeof(text), "Schematic: %s", (name[0] != 0) ? name : "(none)");
-            addPlain(kRowLabel, text);
+            endRow();
+            addPlain(kRowHeader,"Placement grid (size 0 = enclosing size)");
+            addItem(1,11);
+            for(std::size_t first=12;first<=18;first+=3) {beginRow("100%c");for(std::size_t i=first;i<first+3;++i)addItem(1,i,"33%");endRow();}
+            beginRow(nullptr);addItem(1,21,"50%");addItem(1,22,"50%");endRow();
+            addPlain(kRowHeader,"Paste schematic (creative; cheats/OP required)");
+            for (std::size_t i=23;i<=26;++i) addItem(1,i);
+            addPlain(kRowLabel,"Blocks only. Layer 1 (waterlogging) and block entity contents are omitted.");
         }
-        {
-            const int at = mod.editingIndex();
-            int sx = 0;
-            int sy = 0;
-            int sz = 0;
-            std::size_t solid = 0;
-            char text[kPageTextBytes]{};
-            if (at >= 0 && mod.blueprintInfo(static_cast<size_t>(at), sx, sy, sz, solid)) {
-                std::snprintf(text, sizeof(text), "Enclosing size: %d x %d x %d  (%u blocks)",
-                              sx, sy, sz, static_cast<unsigned>(solid));
-            } else {
-                std::snprintf(text, sizeof(text), "Enclosing size: not loaded yet");
-            }
-            addPlain(kRowLabel, text);
-        }
-        addPlain(kRowHeader, "Placement");
-        addItem(1, 0);
-        beginRow(nullptr);
-        addItem(1, 5, "50%");
-        addItemAs(1, 6, "50%", true);
-        endRow();
-        addPlain(kRowHeader, "Placement origin");
-        beginRow("100%c");
-        addItem(1, 1, "33%");
-        addItem(1, 2, "33%");
-        addItem(1, 3, "33%");
-        endRow();
-        addPlain(kRowDivider, nullptr);
-        addItem(1, 4);
-        addBottomNav("< Placements", kScreenBlueprints);
+        g_pgPasteRevision.store(mod.pasteRevision());
+        g_pgPasteArmed.store(mod.pasteArmed(mod.selectedPlacement()));
+        g_pgPasteAwait.store(true); g_pgPasteUpdated=GetTickCount64();
+        addBottomNav("< Placements",kScreenPlacements);
         break;
     }
+
     case kScreenMaterials: {
         addTabStrip(kPlaceTabs, std::size(kPlaceTabs), kScreenMaterials);
-        const int at = mod.editingIndex();
-        {
-            static constexpr const char* kListNames[Schematica::kMaterialListTypeCount] = {
-                "List: All", "List: Missing"};
-            char clear[kPageTextBytes]{};
-            const std::size_t ignored = mod.ignoredMaterialCount();
-            std::snprintf(clear, sizeof(clear), "Clear ignored (%u)",
-                          static_cast<unsigned>(ignored));
+        const int at = selectedIndex(mod);
+        g_pgMaterialRevision.store(mod.materialRevision());
+        beginRow(nullptr);
+        addPick("This placement", kActMatScope, 0, !mod.materialScopeAll(), "50%");
+        addPick("All placements", kActMatScope, 1, mod.materialScopeAll(), "50%");
+        endRow();
+        beginRow(nullptr);
+        addAct(mod.materialListType() == Schematica::kMaterialAll ? "List: All" : "List: Missing only", kActMatList, 0, "32%");
+        if (const long row = newRow("36%"); row >= 0) {
+            g_pgRowKind[row] = kRowEdit;
+            g_pgIsEdit[row] = true;
+            g_pgRowAct[row] = kActMatMultiplier;
+            std::snprintf(g_pgLabels[row], kPageTextBytes, "Multiplier");
+            std::snprintf(g_pgHints[row], kPageTextBytes, "%d", mod.materialMultiplier());
+        }
+        addPick("Hide available", kActMatHide, 0, mod.materialHideAvailable(), "32%");
+        endRow();
+        beginRow(nullptr);
+        static constexpr const char* columns[] = {"Item", "Total", "Missing", "Available"};
+        for (int column = 0; column < 4; ++column) {
+            char text[kPageTextBytes]{};
+            std::snprintf(text, sizeof(text), "Sort: %s%s", columns[column],
+                mod.materialSort() == column ? (mod.materialSortDescending() ? " v" : " ^") : "");
+            addPick(text, kActMatSort, column, mod.materialSort() == column, "25%");
+        }
+        endRow();
+        beginRow(nullptr);
+        addAct("Refresh", kActMatRefresh, 0, "25%");
+        addAct("Write to file", kActMatWrite, 0, "35%");
+        char clear[kPageTextBytes]{};
+        std::snprintf(clear, sizeof(clear), "Clear ignored (%zu)", mod.ignoredMaterialCount());
+        addAct(clear, kActMatClear, 0, "40%");
+        endRow();
+        if (!writes::blocked("Schematica:collect")) {
             beginRow(nullptr);
-            addAct(kListNames[std::clamp(mod.materialListType(), 0,
-                                         Schematica::kMaterialListTypeCount - 1)],
-                   kActMatList, 0, "26%");
-            addAct("Refresh", kActMatRefresh, 0, "20%");
-            addAct("Write to file", kActMatWrite, 0, "28%");
-            addAct(clear, kActMatClear, 0, "26%");
+            addPick(mod.materialAutoCollect() ? "Auto collect from containers: ON" : "Auto collect from containers: OFF",
+                    kActMatCollect, 0, mod.materialAutoCollect(), "100%");
             endRow();
+        }
+        const auto [done, total] = mod.materialItemProgress();
+        g_pgMaterialAwait.store(done < total);
+        g_pgMaterialEditAt = 0;
+        if (done < total) {
+            char progress[kPageTextBytes]{};
+            std::snprintf(progress, sizeof(progress), "Resolving items... %zu / %zu", done, total);
+            addPlain(kRowLabel, progress);
         }
         std::size_t kinds = 0;
         const size_t left = (kMaxPageRows > rows + 10) ? (kMaxPageRows - rows - 10) : 0;
         const size_t room = left / 3;
-        const auto list = (at >= 0)
-                              ? mod.blueprintMaterials(static_cast<size_t>(at), room, &kinds)
+        const auto list = (at >= 0 || mod.materialScopeAll())
+                              ? mod.placementMaterials((at >= 0 ? mod.placementId(static_cast<size_t>(at)) : 0), room, &kinds)
                               : std::vector<Schematica::MaterialRow>{};
         std::vector<std::string> names;
         names.reserve(list.size());
@@ -1727,34 +2022,36 @@ size_t buildPageTexts()
                 body = colon + 1;
             }
             std::string shown(body);
-            if (shown.size() > 30) {
-                shown = shown.substr(0, 27) + "...";
+            const std::size_t nameLimit = one.noItem ? 20 : 30;
+            if (shown.size() > nameLimit) {
+                shown = shown.substr(0, nameLimit - 3) + "...";
             }
+            if (one.noItem) shown += " (no item)";
             longest = std::max(longest, shown.size());
             names.push_back(std::move(shown));
         }
         const int nameW = nameWidthFor(longest);
         {
             beginRow("19px");
-            addColumns("Item", "Total", true, true, false, 0, nameW, "SB+stacks", "Missing",
-                       "Avail", "88%");
+            addColumns("Item", "Total", true, true, false, 0, nameW, "Missing", "Available",
+                       nullptr, "88%");
             addPlain(kRowDivider, nullptr, "12%");
             endRow();
         }
-        if (at < 0) {
+        if (at < 0 && !mod.materialScopeAll()) {
             addPlain(kRowLabel, "- pick a schematic first");
-        } else if (list.empty()) {
+        } else if (list.empty() && done == total) {
             addPlain(kRowLabel, (mod.materialListType() == Schematica::kMaterialMissing)
                                     ? "- nothing missing (or nothing counted yet)"
                                     : "- nothing loaded yet: turn Show on once");
         }
         for (size_t i = 0; i < list.size(); ++i) {
             char count[24]{};
-            std::snprintf(count, sizeof(count), "%u", static_cast<unsigned>(list[i].count));
+            std::snprintf(count, sizeof(count), "%llu", static_cast<unsigned long long>(list[i].count));
             char rawName[kPageTextBytes]{};
             copyAscii(rawName, sizeof(rawName), list[i].name.c_str());
             const std::string stacks = (list[i].stackSize > 0)
-                                           ? stackcount::formatStacks(list[i].count, list[i].stackSize)
+                                           ? stackcount::formatStacks(list[i].available, list[i].stackSize)
                                            : std::string(kColGray) + "-";
             char missing[24]{};
             if (!list[i].missingKnown) {
@@ -1762,21 +2059,21 @@ size_t buildPageTexts()
             } else if (list[i].missing == 0) {
                 std::snprintf(missing, sizeof(missing), "%s0", kColGreen);
             } else {
-                std::snprintf(missing, sizeof(missing), "%s%u", kColAqua,
-                              static_cast<unsigned>(list[i].missing));
+                std::snprintf(missing, sizeof(missing), "%s%llu", kColAqua,
+                              static_cast<unsigned long long>(list[i].missing));
             }
-            char avail[24]{};
+            char avail[kPageTextBytes]{};
             if (!list[i].availableKnown) {
                 std::snprintf(avail, sizeof(avail), "%s-", kColGray);
             } else {
                 const bool enough =
                     !list[i].missingKnown || list[i].available >= list[i].missing;
-                std::snprintf(avail, sizeof(avail), "%s%u", enough ? kColGreen : kColRed,
-                              static_cast<unsigned>(list[i].available));
+                std::snprintf(avail, sizeof(avail), "%s%llu (%s)", enough ? kColGreen : kColRed,
+                              static_cast<unsigned long long>(list[i].available), stacks.c_str());
             }
             beginRow("19px");
             addColumns(names[i].c_str(), count, false, true, list[i].hasIcon,
-                       list[i].iconIdAux, nameW, stacks.c_str(), missing, avail, "88%");
+                       list[i].iconIdAux, nameW, missing, avail, nullptr, "88%");
             addAct("X", kActMatIgnore, 0, "12%");
             if (rows > 0 && g_pgRowAct[rows - 1] == kActMatIgnore) {
                 std::snprintf(g_pgHints[rows - 1], kPageTextBytes, "%s", rawName);
@@ -1794,39 +2091,68 @@ size_t buildPageTexts()
     }
     case kScreenVerifier: {
         addTabStrip(kPlaceTabs, std::size(kPlaceTabs), kScreenVerifier);
-        std::size_t tally[blocks::kDiffKindCount]{};
-        mod.diffTally(tally);
-        std::size_t seen = 0;
-        for (const std::size_t one : tally) {
-            seen += one;
+        const auto report = mod.verifierReport();
+        const auto selection = mod.verifierSelection();
+        const bool all = mod.verifierScopeAll();
+        g_pgVerifierSerial.store(report ? report->serial : 0);
+        if (!report || !report->complete) g_pgVerifierAwait.store(true);
+        beginRow(nullptr);
+        addPick("This placement", kActVerScope, 0, !all, "50%");
+        addPick("All placements", kActVerScope, 1, all, "50%");
+        endRow();
+        char text[kPageTextBytes]{};
+        beginRow(nullptr);
+        addAct("Refresh", kActVerRefresh, 0, "25%");
+        std::snprintf(text, sizeof(text), "Sections %zu / %zu checked", report ? report->sectionsDone : 0,
+            report ? report->sectionsTotal : 0);
+        addPlain(kRowLabel, text, "75%"); endRow();
+        if (!report || !report->complete) addPlain(kRowLabel, "§7Counting... (counts update while you play)");
+        const struct { schematic::DiffKind kind; const char* label; const char* color; } kinds[] = {
+            {schematic::DiffKind::Missing, "Missing", kColAqua}, {schematic::DiffKind::Extra, "Extra", kColPurple},
+            {schematic::DiffKind::Wrong, "Wrong block", kColRed}, {schematic::DiffKind::State, "Wrong state", kColGold}};
+        for (const auto& value : kinds) {
+            const auto count = report ? report->counts[static_cast<std::size_t>(value.kind)] : 0;
+            std::snprintf(text, sizeof(text), "%s%s %zu", value.color, value.label, count);
+            addPick(text, kActVerKind, static_cast<int>(value.kind),
+                selection.active && selection.kind == value.kind, nullptr);
         }
-        const struct {
-            const char* label;
-            std::size_t at;
-            const char* color;
-        } kRowsOf[] = {
-            {"Correct", 0, kColGreen},      {"Missing", 1, kColAqua},
-            {"Extra", 6, kColPurple},       {"Wrong block", 2, kColRed},
-            {"Wrong state", 3, kColGold},   {"World not read", 4, kColGray},
-            {"State unresolved", 5, kColGray},
+        if (all) std::snprintf(text, sizeof(text), "%sCorrect %zu", kColGreen, report ? report->counts[0] : 0);
+        else std::snprintf(text, sizeof(text), "%sCorrect -", kColGray);
+        addPlain(kRowLabel, text);
+        addPlain(kRowLabel, selection.active ? "Selected kind pairs (most first)" : "Select a kind to show pairs");
+        const auto shortName = [](const std::string& name) {
+            auto result = name.starts_with("minecraft:") ? name.substr(10) : name;
+            char ascii[19]{}; copyAscii(ascii, sizeof(ascii), toUtf16(result).c_str());
+            return std::string(ascii);
         };
-        size_t longest = std::strlen("Status");
-        for (const auto& one : kRowsOf) {
-            longest = std::max(longest, std::strlen(one.label));
+        std::size_t shown = 0, total = 0;
+        const schematicworld::VerifierPair* nearest = nullptr;
+        if (report && selection.active) for (std::size_t i = 0; i < report->pairs.size(); ++i) {
+            const auto& pair = report->pairs[i];
+            if (pair.kind != selection.kind) continue;
+            ++total;
+            const bool picked = selection.pair && pair.wantEntry == selection.wantEntry && pair.real == selection.real;
+            if ((!selection.pair || picked) && (!nearest || pair.nearestDist2 < nearest->nearestDist2)) nearest = &pair;
+            if (rows + 12 >= kMaxPageRows) continue;
+            const auto want = shortName(pair.wantName), real = shortName(pair.realName);
+            std::snprintf(text, sizeof(text), "%s -> %s x%zu", want.c_str(), real.c_str(), pair.count);
+            beginRow(nullptr);
+            addPick(text, kActVerPair, static_cast<int>(i), picked, "88%");
+            addAct("X", kActVerIgnore, static_cast<int>(i), "12%");
+            endRow(); ++shown;
         }
-        const int nameW = nameWidthFor(longest);
-        addColumns("Status", "Count", true, false, false, 0, nameW);
-        if (seen == 0) {
-            addPlain(kRowLabel, "- no result yet: turn Show on and wait");
+        if (total > shown) {
+            std::snprintf(text, sizeof(text), "... and %zu more", total - shown); addPlain(kRowLabel, text);
         }
-        for (const auto& one : kRowsOf) {
-            char label[kPageTextBytes]{};
-            char count[24]{};
-            std::snprintf(label, sizeof(label), "%s%s", one.color, one.label);
-            std::snprintf(count, sizeof(count), "%s%u", one.color,
-                          static_cast<unsigned>(tally[one.at]));
-            addColumns(label, count, false, false, false, 0, nameW);
-        }
+        if (nearest) {
+            std::snprintf(text, sizeof(text), "Nearest: %d %d %d (%.0f m)", nearest->nearest[0], nearest->nearest[1],
+                nearest->nearest[2], std::sqrt(nearest->nearestDist2));
+            addPlain(kRowLabel, text);
+        } else if (selection.active) addPlain(kRowLabel, "Nearest: -");
+        beginRow(nullptr);
+        addAct("Clear selection", kActVerClearSel, 0, "50%");
+        std::snprintf(text, sizeof(text), "Clear ignored (%zu)", mod.verifierIgnoredCount());
+        addAct(text, kActVerClearIgnored, 0, "50%"); endRow();
         addBottomNav("< Configure", kScreenBlueprint);
         break;
     }
@@ -1942,10 +2268,10 @@ size_t buildPageTexts()
     default: {
         char placements[kPageTextBytes]{};
         std::snprintf(placements, sizeof(placements), "Schematic Placements (%u)",
-                      static_cast<unsigned>(mod.blueprintCount()));
+                      static_cast<unsigned>(mod.placementCount()));
         beginRow(nullptr);
-        addGoto(placements, kScreenBlueprints, -1, "50%");
-        addItem(0, 0, "50%");
+        addGoto("Load schematics",kScreenBlueprints,0,"50%");
+        addGoto(placements,kScreenPlacements,0,"50%");
         endRow();
         static constexpr const char* kModeNames[Schematica::kLayerModeCount] = {
             "All", "Single layer", "All below", "All above", "Layer range"};
@@ -1954,15 +2280,18 @@ size_t buildPageTexts()
                       kModeNames[std::clamp(mod.layerMode(), 0,
                                             Schematica::kLayerModeCount - 1)]);
         beginRow(nullptr);
-        addGoto("Configuration menu", kScreenSettings, -1, "50%");
-        addGoto(layers, kScreenLayers, -1, "50%");
+        addGoto("Configuration menu", kScreenSettings, 0, "50%");
+        addGoto(layers, kScreenLayers, 0, "50%");
+        endRow();
+        beginRow(nullptr);
+        addGoto("Area Selection",kScreenSelection,0,"50%");
         endRow();
         addPlain(kRowDivider, nullptr);
         {
-            const size_t count = mod.blueprintCount();
+            const size_t count = mod.placementCount();
             size_t shown = 0;
             for (size_t i = 0; i < count; ++i) {
-                shown += mod.blueprintVisible(i) ? 1 : 0;
+                shown += placementEnabled(mod, i) ? 1 : 0;
             }
             char left[kPageTextBytes]{};
             char right[kPageTextBytes]{};
@@ -1985,7 +2314,7 @@ size_t buildPageTexts()
 
     {
         const bool wide = (screen == kScreenMaterials) || (screen == kScreenVerifier)
-                          || (screen == kScreenBlueprints);
+                          || (screen == kScreenBlueprints) || (screen == kScreenPlacements);
         std::snprintf(g_pgBodyW, sizeof(g_pgBodyW), "%s", wide ? kBodyWideW : kBodyNarrowW);
         std::snprintf(g_pgBodyX, sizeof(g_pgBodyX), "%s", "0px");
     }
@@ -2001,7 +2330,7 @@ bool pageLeftRowSelected(size_t row)
     if (g_ptKind[row] == kLeftTab) {
         return g_ptIndex[row] == g_pgTab.load(std::memory_order_relaxed);
     }
-    return g_ptIndex[row] == Schematica::instance().editingIndex();
+    return g_ptIndex[row] == selectedIndex(Schematica::instance());
 }
 
 constexpr char kTabTopicVar[] = "$section_topic";
@@ -2063,11 +2392,11 @@ void buildPageTabTexts()
     }
 
     Schematica& mod = Schematica::instance();
-    const size_t count = mod.blueprintCount();
+    const size_t count = mod.placementCount();
     for (size_t i = 0; i < count && rows < kMaxLeftRows; ++i) {
-        const bool shown = mod.blueprintVisible(i);
+        const bool shown = placementEnabled(mod, i);
         char name[kPageTextBytes]{};
-        copyAscii(name, sizeof(name), mod.blueprintName(i).c_str());
+        copyAscii(name, sizeof(name), placementName(mod, i).c_str());
         std::snprintf(g_ptTexts[rows], kPageTextBytes, "%c %s", shown ? '*' : ' ', name);
         g_ptKind[rows] = kLeftFile;
         g_ptIndex[rows] = static_cast<int>(i);
@@ -2151,10 +2480,10 @@ Part buildColumnsRow(size_t i, bool iconsUsable)
     row.kids.push_back(cell("nm", g_pgTexts[i], std::to_string(nameW) + "px", false));
     row.kids.push_back(cell("ct", g_pgHints[i], kCountColW, true));
     if (g_pgLabels[i][0] != 0) {
-        row.kids.push_back(cell("sk", g_pgLabels[i], kStackColW, true));
+        row.kids.push_back(cell("sk", g_pgLabels[i], g_pgRowIconCol[i] ? kCountColW : kStackColW, true));
     }
     if (g_pgCols[i][0][0] != 0) {
-        row.kids.push_back(cell("c3", g_pgCols[i][0], kCountColW, true));
+        row.kids.push_back(cell("c3", g_pgCols[i][0], g_pgRowIconCol[i] ? "180px" : kCountColW, true));
     }
     if (g_pgCols[i][1][0] != 0) {
         row.kids.push_back(cell("c4", g_pgCols[i][1], kCountColW, true));
@@ -2330,8 +2659,8 @@ void* buildSchematicaPage(void* self)
         log().warn(L"UiProbe: the templates could not be collected (clickable rows cannot be "
                    L"built)");
     }
+    forgetPageEditBoxes();
     for (size_t i = 0; i < kMaxPageRows; ++i) {
-        g_pgCtl[i].store(0);
         g_pgLastText[i][0] = '\0';
         g_pgIsEdit[i] = false;
         g_pgRowKind[i] = kRowButton;
@@ -2731,7 +3060,7 @@ std::uintptr_t childByName(std::uintptr_t control, const wchar_t* want)
     return 0;
 }
 
-bool readStdString(const char* at, std::string& out, size_t cap = 64)
+bool readStdString(const char* at, std::string& out, size_t cap = 64, bool verifyText = false)
 {
     char snapshot[0x20]{};
     if (!memory::copyGuarded(at, snapshot, sizeof(snapshot))) {
@@ -2749,6 +3078,7 @@ bool readStdString(const char* at, std::string& out, size_t cap = 64)
         const char* text = nullptr;
         std::memcpy(&text, snapshot, sizeof(text));
         if (len >= sizeof(buf)
+            || (verifyText && !memory::isReadable(text, static_cast<size_t>(len) + 1))
             || !memory::copyGuarded(text, buf, static_cast<size_t>(len) + 1)) {
             return false;
         }
@@ -2760,16 +3090,8 @@ bool readStdString(const char* at, std::string& out, size_t cap = 64)
     return true;
 }
 
-bool readEditBoxText(std::uintptr_t box, std::string& out)
+bool findItemNameBinding(std::uintptr_t at, std::uintptr_t& elemOut, std::ptrdiff_t& nameAtOut)
 {
-    std::uintptr_t at = box;
-    for (const wchar_t* step : {L"centering_panel", L"clipper_panel", L"display_text"}) {
-        at = childByName(at, step);
-        if (at == 0) {
-            return false;
-        }
-    }
-
     constexpr std::ptrdiff_t kBindSpan = 0x400;
     for (std::ptrdiff_t off = 0; off + 24 <= 0x160; off += sizeof(void*)) {
         if (off == kControlChildren) {
@@ -2792,50 +3114,110 @@ bool readEditBoxText(std::uintptr_t box, std::string& out)
             continue;
         }
         std::uintptr_t elements[16]{};
-        if (!memory::copyGuarded(reinterpret_cast<const void*>(vec[0]), elements,
-                                 static_cast<size_t>(bytes))) {
+        if (!memory::isReadable(reinterpret_cast<const void*>(vec[0]), static_cast<size_t>(bytes))
+            || !memory::copyGuarded(reinterpret_cast<const void*>(vec[0]), elements,
+                                    static_cast<size_t>(bytes))) {
             continue;
         }
         for (std::uintptr_t i = 0; i < count; ++i) {
             const std::uintptr_t elem = elements[i];
-            char elemHead[0x40]{};
-            if (elem == 0 || !memory::copyGuarded(reinterpret_cast<const void*>(elem), elemHead,
-                                                   sizeof(elemHead))) {
+            if (elem == 0 || !memory::isReadable(reinterpret_cast<const void*>(elem), kBindSpan)) {
                 continue;
             }
-            std::ptrdiff_t nameAt = -1;
             for (std::ptrdiff_t s = 0; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
                 std::string name;
-                if (readStdString(reinterpret_cast<const char*>(elem + s), name)
+                if (readStdString(reinterpret_cast<const char*>(elem + s), name, 64, true)
                     && name == "#item_name") {
-                    nameAt = s;
-                    break;
+                    elemOut = elem;
+                    nameAtOut = s;
+                    return true;
                 }
             }
-            if (nameAt < 0) {
-                continue;
+        }
+    }
+    return false;
+}
+
+bool readEditBoxText(std::uintptr_t box, std::string& out, EditBoxBinding& bind)
+{
+    constexpr std::ptrdiff_t kBindSpan = 0x400;
+    std::string name;
+    if (bind.box != box || bind.elem == 0
+        || !readStdString(reinterpret_cast<const char*>(bind.elem + bind.nameAt), name)
+        || name != "#item_name") {
+        const unsigned long long now = GetTickCount64();
+        if (bind.box == box && bind.elem == 0 && bind.missedAt != 0 && now - bind.missedAt < 1000) {
+            return false;
+        }
+        bind = EditBoxBinding{};
+        bind.box = box;
+        bind.missedAt = now;
+        std::uintptr_t at = box;
+        for (const wchar_t* step : {L"centering_panel", L"clipper_panel", L"display_text"}) {
+            at = childByName(at, step);
+            if (at == 0) {
+                return false;
             }
-            for (std::ptrdiff_t s = nameAt + 0x20; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
-                std::string text;
-                if (!readStdString(reinterpret_cast<const char*>(elem + s), text)) {
-                    continue;
-                }
-                if (text.empty() || text.size() > 32) {
-                    continue;
-                }
-                bool numeric = true;
-                for (const char c : text) {
-                    if ((c < '0' || c > '9') && c != '.' && c != '-' && c != '+') {
-                        numeric = false;
-                        break;
-                    }
-                }
-                if (!numeric) {
-                    continue;
-                }
-                out = text;
-                return true;
+        }
+        std::uintptr_t elem = 0;
+        std::ptrdiff_t nameAt = -1;
+        if (!findItemNameBinding(at, elem, nameAt)) {
+            return false;
+        }
+        bind.elem = elem;
+        bind.nameAt = nameAt;
+        bind.missedAt = 0;
+    }
+    const std::uintptr_t elem = bind.elem;
+    const std::ptrdiff_t nameAt = bind.nameAt;
+    for (std::ptrdiff_t s = nameAt + 0x20; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
+        std::string text;
+        if (!readStdString(reinterpret_cast<const char*>(elem + s), text, 64, true)) {
+            continue;
+        }
+        if (text.empty() || text.size() > 32) {
+            continue;
+        }
+        bool numeric = true;
+        for (const char c : text) {
+            if ((c < '0' || c > '9') && c != '.' && c != '-' && c != '+') {
+                numeric = false;
+                break;
             }
+        }
+        if (!numeric) {
+            continue;
+        }
+        out = text;
+        return true;
+    }
+    return false;
+}
+
+bool readEditBoxFreeText(std::uintptr_t box, std::string& out, EditBoxBinding& bind)
+{
+    constexpr std::ptrdiff_t kBindSpan = 0x400;
+    std::string numeric;
+    if (readEditBoxText(box, numeric, bind)) {
+        out = numeric;
+        return true;
+    }
+    if (bind.box != box || bind.elem == 0) {
+        return false;
+    }
+    std::vector<std::string> seen;
+    for (std::ptrdiff_t s = bind.nameAt + 0x20; s + 0x20 <= kBindSpan; s += sizeof(void*)) {
+        std::string text;
+        if (!readStdString(reinterpret_cast<const char*>(bind.elem + s), text, 64, true) || text.empty()
+            || text.front() == '#') {
+            continue;
+        }
+        seen.push_back(std::move(text));
+    }
+    for (const std::string& candidate : seen) {
+        if (std::count(seen.begin(), seen.end(), candidate) >= 2) {
+            out = candidate;
+            return true;
         }
     }
     return false;
@@ -3508,7 +3890,7 @@ constexpr std::ptrdiff_t kCompActionEnabledFnPtr = 0x380;
 constexpr std::ptrdiff_t kCompActionFn = 0x388;
 constexpr std::ptrdiff_t kCompActionFnPtr = 0x3C0;
 constexpr std::ptrdiff_t kCompType = 0x3C8;
-constexpr size_t kCompSize = 0x3E0;
+constexpr size_t kCompSize = 0x3D0;
 constexpr unsigned char kCompTypeGroupInfo = 7;
 
 std::atomic<void*> g_ownSectionComp{nullptr};
@@ -3565,9 +3947,15 @@ void publishOwnComponent(const unsigned char* comp)
 
 constexpr size_t kPublishWords = (kMaxOwnItems + 63) / 64;
 std::atomic<unsigned long long> g_publishMask[kPublishWords]{};
+std::atomic<bool> g_guiScalePublish{false};
+std::atomic<const unsigned char*> g_guiScaleComponents[2]{};
+std::atomic<int> g_guiScaleSliders[2]{-1, -1};
+std::atomic<void*> g_guiScaleInserted[2]{};
+void flushGuiScalePublishes();
 
 bool anyPublishPending()
 {
+    if (g_guiScalePublish.load(std::memory_order_relaxed)) return true;
     for (size_t w = 0; w < kPublishWords; ++w) {
         if (g_publishMask[w].load(std::memory_order_relaxed) != 0) {
             return true;
@@ -3622,6 +4010,7 @@ void flushOwnPublishes()
             publishOwnComponent(ownItemComponent(static_cast<int>(w * 64 + bit)));
         }
     }
+    flushGuiScalePublishes();
     g_publishing.store(false);
 }
 
@@ -4030,6 +4419,9 @@ struct OwnOptionSet {
 };
 OwnOptionSet g_ownOptionSets[kMaxOptionSets]{};
 std::atomic<size_t> g_ownOptionSetCount{0};
+alignas(16) unsigned char g_guiScaleOptions[kMaxChoices + 1][kOptionStride]{};
+alignas(16) unsigned char g_guiScaleCustomElement[kOptionStride]{};
+std::atomic<std::uintptr_t> g_guiScaleLabelObject{0};
 
 struct OptionSpan {
     std::uintptr_t count;
@@ -4047,6 +4439,7 @@ std::atomic<bool> g_ownOptionLabelVtableReady{false};
 
 const wchar_t* ownOptionLabelTextFor(const void* self)
 {
+    if (self != nullptr && reinterpret_cast<std::uintptr_t>(self) == g_guiScaleLabelObject.load()) return L"Custom";
     const size_t count = g_ownOptionSetCount.load();
     for (size_t i = 0; i < count && i < kMaxOptionSets; ++i) {
         const OwnOptionSet& set = g_ownOptionSets[i];
@@ -4743,7 +5136,7 @@ MenuItem* schematicaRowOf(int want, size_t index)
     buildOwnItems();
     MenuItem* tab = nullptr;
     for (MenuItem& one : g_ownMenuTree) {
-        if (one.labelText() == L"Schematica") {
+        if (one.labelText() == (want >= 100 ? L"Waypoints" : L"Schematica")) {
             tab = &one;
             break;
         }
@@ -4828,6 +5221,7 @@ bool schematicaRowText(size_t index, char* out, size_t cap)
 
 void requestPageRebuild(bool closeItOurselves)
 {
+    forgetPageEditBoxes();
     const unsigned long long want = GetTickCount64() + kPageReopenDelayMs;
     unsigned long long have = g_pgReopenAt.load();
     bool alreadyBooked = false;
@@ -4860,14 +5254,14 @@ void pumpPagePress()
                 }
             } else {
                 Schematica& mod = Schematica::instance();
-                const int beforeAt = mod.editingIndex();
-                mod.selectBlueprint(static_cast<size_t>(g_ptIndex[row]));
+                const int beforeAt = selectedIndex(mod);
+                mod.selectPlacement(mod.placementId(static_cast<size_t>(g_ptIndex[row])));
                 if (g_pgTab.load() == kEmptyTab) {
                     g_pgTab.store(1);
                 }
-                if (beforeAt != mod.editingIndex()) {
+                if (beforeAt != selectedIndex(mod)) {
                     log().info(L"UiProbe: selected blueprint {}",
-                               mod.blueprintName(static_cast<size_t>(g_ptIndex[row])));
+                               placementName(mod, static_cast<size_t>(g_ptIndex[row])));
                 }
             }
         }
@@ -4878,18 +5272,24 @@ void pumpPagePress()
     if (idx < 0 || static_cast<size_t>(idx) >= kMaxPageRows) {
         return;
     }
+    if (g_pgRowKind[idx] == kRowButton && !g_pgIsEdit[idx]) {
+        forgetPageEditBoxes();
+    }
     if (g_pgRowAct[idx] == kActGoto) {
         const int want = g_pgRowArg[idx];
         if (want < 0 || want >= kScreenCount) {
             return;
         }
         bool changed = false;
-        if (g_pgRowBlueprint[idx] >= 0
-            && Schematica::instance().editingIndex() != g_pgRowBlueprint[idx]) {
-            Schematica::instance().selectBlueprint(static_cast<size_t>(g_pgRowBlueprint[idx]));
+        if (g_pgRowPlacement[idx] != 0
+            && Schematica::instance().selectedPlacement() != g_pgRowPlacement[idx]) {
+            Schematica::instance().selectPlacement(g_pgRowPlacement[idx]);
             changed = true;
         }
         const int before = g_pgScreen.exchange(want);
+        if (want == kScreenVerifier && before != want) {
+            Schematica::instance().refreshVerifier(); g_pgVerifierAwait.store(true);
+        }
         changed = changed || (before != want);
         if (!changed) {
             return;
@@ -4901,6 +5301,45 @@ void pumpPagePress()
     if (g_pgRowAct[idx] == kActNone) {
         return;
     }
+    if (g_pgRowAct[idx] == kActPaste || g_pgRowAct[idx] == kActPasteStop) {
+        auto& mod=Schematica::instance();
+        if (g_pgRowAct[idx] == kActPaste) mod.pressPaste(g_pgRowPlacement[idx]);
+        else mod.stopPaste();
+        requestPageRebuild(false); return;
+    }
+    if (g_pgRowAct[idx] >= kActVerScope && g_pgRowAct[idx] <= kActVerClearIgnored) {
+        auto& mod = Schematica::instance();
+        const auto serial = g_pgVerifierSerial.load();
+        switch (g_pgRowAct[idx]) {
+        case kActVerScope: mod.setVerifierScopeAll(g_pgRowArg[idx] != 0); g_pgVerifierAwait.store(true); break;
+        case kActVerRefresh: mod.refreshVerifier(); g_pgVerifierAwait.store(true); break;
+        case kActVerKind: mod.selectVerifierKind(static_cast<schematic::DiffKind>(g_pgRowArg[idx])); break;
+        case kActVerPair: mod.selectVerifierPair(static_cast<std::size_t>(g_pgRowArg[idx]), serial); break;
+        case kActVerIgnore: mod.ignoreVerifierPair(static_cast<std::size_t>(g_pgRowArg[idx]), serial); g_pgVerifierAwait.store(true); break;
+        case kActVerClearSel: mod.clearVerifierSelection(); break;
+        case kActVerClearIgnored: mod.clearVerifierIgnored(); g_pgVerifierAwait.store(true); break;
+        default: break;
+        }
+        requestPageRebuild(g_pgRowKind[idx] == kRowPick);
+        return;
+    }
+    if (g_pgRowAct[idx] == kActMatCollect) {
+        Schematica::instance().toggleMaterialAutoCollect();
+        requestPageRebuild(g_pgRowKind[idx] == kRowPick);
+        return;
+    }
+    if (g_pgRowAct[idx] >= kActMatScope && g_pgRowAct[idx] <= kActMatMultiplier) {
+        auto& mod = Schematica::instance();
+        switch (g_pgRowAct[idx]) {
+        case kActMatScope: mod.setMaterialScopeAll(g_pgRowArg[idx] != 0); break;
+        case kActMatHide: mod.toggleMaterialHideAvailable(); break;
+        case kActMatSort: mod.setMaterialSort(g_pgRowArg[idx]); break;
+        case kActMatMultiplier: return;
+        default: break;
+        }
+        requestPageRebuild(g_pgRowKind[idx] == kRowPick);
+        return;
+    }
     if (g_pgRowAct[idx] >= kActMatList && g_pgRowAct[idx] <= kActMatIgnore) {
         Schematica& mod = Schematica::instance();
         switch (g_pgRowAct[idx]) {
@@ -4909,11 +5348,12 @@ void pumpPagePress()
             break;
         case kActMatRefresh:
             mod.askMaterialRefresh();
+            g_pgMaterialAwait.store(true);
             break;
         case kActMatWrite: {
-            const int which = mod.editingIndex();
+            const int which = selectedIndex(mod);
             std::wstring path;
-            if (which >= 0 && mod.writeMaterialList(static_cast<size_t>(which), path)) {
+            if ((which >= 0 || mod.materialScopeAll()) && mod.writeMaterialList(path)) {
                 log().success(L"UiProbe: wrote the material list to {}", path);
             } else {
                 log().warn(L"UiProbe: could not write the material list");
@@ -4952,19 +5392,44 @@ void pumpPagePress()
         requestPageRebuild(false);
         return;
     }
-    if (g_pgRowAct[idx] == kActShow) {
-        const int which = g_pgRowBlueprint[idx];
-        if (which < 0 || static_cast<size_t>(which) >= Schematica::instance().blueprintCount()) {
-            return;
+    if(g_pgRowAct[idx]==kActFileLoad || g_pgRowAct[idx]==kActFileDelete) {
+        auto& mod=Schematica::instance();const auto which=static_cast<std::size_t>(g_pgRowArg[idx]);
+        if(g_pgRowAct[idx]==kActFileLoad)mod.loadFileAsPlacement(which);
+        else {
+            const auto name=mod.fileName(which);const auto now=GetTickCount64();
+            const auto armed=mod.m_deleteArmedAt.load();
+            if(now>=mod.m_deleteRestAt.load() && !name.empty()) {
+                if(mod.m_deleteArmedName==name && armed!=0 && now-armed>=Schematica::kDeleteMinMs && now-armed<Schematica::kDeleteArmMs) {
+                    mod.m_deleteArmedAt.store(0);mod.m_deleteArmedName.clear();mod.m_deleteRestAt.store(now+Schematica::kDeleteRestMs);mod.deleteFile(which);
+                } else {mod.m_deleteArmedName=name;mod.m_deleteArmedAt.store(now);}
+            }
         }
-        const bool was = Schematica::instance().blueprintVisible(static_cast<size_t>(which));
-        Schematica::instance().setBlueprintVisible(static_cast<size_t>(which), !was);
-        log().info(L"UiProbe: {} display set to {}",
-                   Schematica::instance().blueprintName(static_cast<size_t>(which)),
-                   was ? L"OFF" : L"ON");
-        requestPageRebuild(false);
-        return;
+        requestPageRebuild(false);return;
     }
+    if (g_pgRowAct[idx]==kActSelectionBox) {
+        const int picked=g_pgRowArg[idx];
+        Schematica::instance().editSelection([picked](auto& area) {
+            if (picked>=0 && static_cast<std::size_t>(picked)<area.boxes.size()) area.selected=picked;
+        });
+        requestPageRebuild(false); return;
+    }
+    if (g_pgRowAct[idx]==kActSelectionAction) {
+        Schematica::instance().selectionAction(g_pgRowArg[idx]);
+        requestPageRebuild(false); return;
+    }
+    if (g_pgRowAct[idx] == kActWaypoint) {
+        Waypoints::instance().pageAction(g_pgRowArg[idx]);
+        requestPageRebuild(false); return;
+    }
+    if(g_pgRowAct[idx]==kActPlacementRemove) {
+        Schematica::instance().removePlacement(g_pgRowPlacement[idx]);requestPageRebuild(false);return;
+    }
+    if (g_pgRowAct[idx] == kActShow) {
+        auto& mod=Schematica::instance();schematic::PlacementSpec p;
+        if(mod.placementSpec(g_pgRowPlacement[idx],p))mod.setPlacementEnabled(p.id,!p.enabled);
+        requestPageRebuild(false);return;
+    }
+
     MenuItem* const row = schematicaRow(static_cast<size_t>(idx));
     if (row == nullptr) {
         log().warn(L"UiProbe: page row {} has no item", idx);
@@ -4976,18 +5441,18 @@ void pumpPagePress()
     if (g_pgRowKind[idx] == kRowSlider) {
         return;
     }
-    if (g_pgRowBlueprint[idx] >= 0
-        && Schematica::instance().editingIndex() != g_pgRowBlueprint[idx]) {
-        Schematica::instance().selectBlueprint(static_cast<size_t>(g_pgRowBlueprint[idx]));
+    if (g_pgRowPlacement[idx] != 0
+        && Schematica::instance().selectedPlacement() != g_pgRowPlacement[idx]) {
+        Schematica::instance().selectPlacement(g_pgRowPlacement[idx]);
     }
     const std::wstring before = row->labelText() + L" = " + row->valueText();
-    const size_t countBefore = Schematica::instance().blueprintCount();
+    const size_t countBefore = Schematica::instance().placementCount();
     if (row->activate) {
         row->activate();
     }
-    if (Schematica::instance().blueprintCount() < countBefore) {
+    if (Schematica::instance().placementCount() < countBefore) {
         g_pgTab.store(kEmptyTab);
-        g_pgScreen.store(kScreenBlueprints);
+        g_pgScreen.store(kScreenPlacements);
     }
     schematicaRowText(static_cast<size_t>(idx), g_pgTexts[idx], kPageTextBytes);
     log().info(L"UiProbe: page row {} pressed ({} -> {})", idx, before,
@@ -5032,8 +5497,8 @@ void pumpPageEntry()
     }
     lastPoll = at;
     Schematica& mod = Schematica::instance();
-    const int keepEditing = mod.editingIndex();
-    int nowEditing = keepEditing;
+    const auto keepEditing = mod.selectedPlacement();
+    auto nowEditing = keepEditing;
     for (size_t i = 0; i < kMaxPageRows; ++i) {
         if (!g_pgIsEdit[i]) {
             continue;
@@ -5051,26 +5516,39 @@ void pumpPageEntry()
             continue;
         }
         std::string text;
-        if (!readEditBoxText(box, text) || text.empty()) {
+        MenuItem* const row = schematicaRow(i);
+        const bool freeText = row != nullptr && row->textInput == TextInputKind::FreeText;
+        if (!(freeText ? readEditBoxFreeText(box, text, g_pgBind[i]) : readEditBoxText(box, text, g_pgBind[i]))
+            || text.empty()) {
             continue;
         }
         if (std::strncmp(text.c_str(), g_pgLastText[i], kPageTextBytes) == 0) {
             continue;
         }
         std::snprintf(g_pgLastText[i], kPageTextBytes, "%s", text.c_str());
-        MenuItem* const row = schematicaRow(i);
+        if (g_pgRowAct[i] == kActMatMultiplier) {
+            int value = 0;
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+            if (parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size())
+                mod.setMaterialMultiplier(value);
+            g_pgMaterialAwait.store(true);
+            g_pgMaterialEditAt = at;
+            continue;
+        }
         if (row == nullptr || !row->setText) {
             continue;
         }
-        if (g_pgRowBlueprint[i] >= 0 && nowEditing != g_pgRowBlueprint[i]) {
-            mod.selectBlueprintQuiet(static_cast<size_t>(g_pgRowBlueprint[i]));
-            nowEditing = g_pgRowBlueprint[i];
+        if (g_pgRowPlacement[i] != 0 && nowEditing != g_pgRowPlacement[i]) {
+            mod.selectPlacement(g_pgRowPlacement[i]);
+            nowEditing = g_pgRowPlacement[i];
         }
         row->setText(toUtf16(text));
-        log().info(L"UiProbe: page row {} typed [{}] -> {}", i, toUtf16(text), row->valueText());
+        if (g_pgRowMenuTab[i]==3) g_selectionPageTypedAt.store(GetTickCount64());
+        if (g_pgRowMenuTab[i] != Waypoints::kPageTab)
+            log().info(L"UiProbe: page row {} typed [{}] -> {}", i, toUtf16(text), row->valueText());
     }
-    if (nowEditing != keepEditing && keepEditing >= 0) {
-        mod.selectBlueprintQuiet(static_cast<size_t>(keepEditing));
+    if (nowEditing != keepEditing && keepEditing != 0) {
+        mod.selectPlacement(keepEditing);
     }
 }
 
@@ -5205,8 +5683,8 @@ void pumpToggleState()
         return;
     }
     Schematica& mod = Schematica::instance();
-    const int keepEditing = mod.editingIndex();
-    int nowEditing = keepEditing;
+    const auto keepEditing = mod.selectedPlacement();
+    auto nowEditing = keepEditing;
     for (size_t i = 0; i < kMaxPageRows; ++i) {
         if (g_pgRowKind[i] != kRowToggle) {
             continue;
@@ -5215,9 +5693,9 @@ void pumpToggleState()
         if (item == nullptr) {
             continue;
         }
-        if (g_pgRowBlueprint[i] >= 0 && nowEditing != g_pgRowBlueprint[i]) {
-            mod.selectBlueprintQuiet(static_cast<size_t>(g_pgRowBlueprint[i]));
-            nowEditing = g_pgRowBlueprint[i];
+        if (g_pgRowPlacement[i] != 0 && nowEditing != g_pgRowPlacement[i]) {
+            mod.selectPlacement(g_pgRowPlacement[i]);
+            nowEditing = g_pgRowPlacement[i];
         }
         const float want = item->toggleState() ? 1.0F : 0.0F;
         if (g_pgToldOnce[i] && g_pgToldToggle[i] == want) {
@@ -5235,8 +5713,8 @@ void pumpToggleState()
         g_pgToldToggle[i] = want;
         g_pgToldOnce[i] = true;
     }
-    if (nowEditing != keepEditing && keepEditing >= 0) {
-        mod.selectBlueprintQuiet(static_cast<size_t>(keepEditing));
+    if (nowEditing != keepEditing && keepEditing != 0) {
+        mod.selectPlacement(keepEditing);
     }
 
     for (size_t t = 0; t < g_ptCount; ++t) {
@@ -5290,6 +5768,7 @@ float ownItemNumber(int index)
 bool ownItemNumberRange(int index, float& min, float& max)
 {
     const MenuItem* const item = ownMenuItem(index);
+    if (item != nullptr && item->numberRange) return item->numberRange(min, max);
     if (item == nullptr || item->numberMin >= item->numberMax) {
         return false;
     }
@@ -5742,35 +6221,32 @@ bool callStdFunctionInto(void* fn, void* out)
     return true;
 }
 
-void* findRegistryNode(void* registry, const std::wstring& id)
+void* findSettingsNode(void* registry, const std::wstring& id, std::size_t headOffset)
 {
-    if (registry == nullptr || !memory::isReadable(registry, 0x40 * 8)) {
-        return nullptr;
-    }
-    std::uintptr_t words[0x40]{};
-    std::memcpy(words, registry, sizeof(words));
-    for (size_t i = 0; i < 0x40; ++i) {
-        const auto head = reinterpret_cast<void*>(words[i]);
-        if (head == nullptr || !memory::isReadable(head, 0x70)) {
-            continue;
-        }
-        void* node = head;
-        for (size_t step = 0; step < 4096; ++step) {
-            std::uintptr_t next = 0;
-            std::memcpy(&next, node, sizeof(next));
-            if (next == 0 || !memory::isReadable(reinterpret_cast<const void*>(next), 0x70)) {
-                break;
-            }
-            node = reinterpret_cast<void*>(next);
-            if (node == head) {
-                break;
-            }
-            if (readString(static_cast<const char*>(node) + 0x10) == id) {
-                return node;
-            }
-        }
+    if (registry == nullptr || !memory::isReadable(static_cast<const char*>(registry) + headOffset, 16)) return nullptr;
+    std::uintptr_t head = 0;
+    std::size_t count = 0;
+    std::memcpy(&head, static_cast<const char*>(registry) + headOffset, sizeof(head));
+    std::memcpy(&count, static_cast<const char*>(registry) + headOffset + 8, sizeof(count));
+    if (!memory::isReadable(reinterpret_cast<const void*>(head), 16)) return nullptr;
+    std::uintptr_t node = 0;
+    std::memcpy(&node, reinterpret_cast<const void*>(head), sizeof(node));
+    std::uintptr_t previous = head;
+    for (std::size_t walked = 0; node != head; ++walked) {
+        if (walked >= count || !memory::isReadable(reinterpret_cast<const void*>(node), 0x48)) return nullptr;
+        std::uintptr_t back = 0;
+        std::memcpy(&back, reinterpret_cast<const char*>(node) + 8, sizeof(back));
+        if (back != previous) return nullptr;
+        if (readString(reinterpret_cast<const char*>(node) + 0x10) == id) return reinterpret_cast<void*>(node);
+        previous = node;
+        std::memcpy(&node, reinterpret_cast<const void*>(node), sizeof(node));
     }
     return nullptr;
+}
+
+void* findRegistryNode(void* registry, const std::wstring& id)
+{
+    return findSettingsNode(registry, id, 0x10);
 }
 
 bool captureKeyGroupProvider(void* registry)
@@ -5987,6 +6463,26 @@ void buildOwnItems()
             row.module = static_cast<int>(i);
             row.child = static_cast<int>(c);
             row.comp = nullptr;
+            ++count;
+        }
+    }
+    if (customguiscale::active() && count < kMaxOwnItems) {
+        const int parent = static_cast<int>(g_ownMenuTree.size());
+        MenuItem holder;
+        holder.hidden = true;
+        holder.children.push_back(customguiscale::sliderItem());
+        holder.children.push_back(customguiscale::sliderItem());
+        g_ownMenuTree.push_back(std::move(holder));
+        for (int which = 0; which < 2 && count < kMaxOwnItems; ++which) {
+            OwnItem& row = g_ownItems[count];
+            std::snprintf(row.id, sizeof(row.id), "%s", customguiscale::kSliderIds[which]);
+            std::snprintf(row.nameKey, sizeof(row.nameKey), "%s", row.id);
+            copyAscii(row.text, sizeof(row.text), L"Custom scale");
+            row.type = 2;
+            row.module = parent;
+            row.child = which;
+            row.comp = nullptr;
+            g_guiScaleSliders[which].store(static_cast<int>(count));
             ++count;
         }
     }
@@ -6374,6 +6870,9 @@ void rebuildOwnComponents(void* groupDonor)
     g_ownCompsReady.store(false);
     g_ownSectionComp.store(nullptr);
     g_ownGroupDonor.store(groupDonor);
+    for (auto& comp : g_guiScaleComponents) comp.store(nullptr);
+    for (auto& comp : g_guiScaleInserted) comp.store(nullptr);
+    g_guiScalePublish.store(false);
     g_providerLinkCount.store(0);
     g_ownOptionSetCount.store(0);
     for (size_t w = 0; w < kPublishWords; ++w) {
@@ -6467,6 +6966,18 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], int owner)
                 picked[picks++] = g_ownItems[i].comp;
             }
         }
+        std::stable_partition(picked, picked + picks, [](void* comp) {
+            const int index = findOwnItemByComp(comp);
+            if (index < 0) {
+                return false;
+            }
+            const int module = g_ownItems[static_cast<size_t>(index)].module;
+            if (module < 0 || static_cast<size_t>(module) >= g_ownMenuTree.size()) {
+                return false;
+            }
+            const MenuItem& tab = g_ownMenuTree[static_cast<size_t>(module)];
+            return tab.isFavorite && tab.isFavorite();
+        });
     } else {
         const int module = g_ownItems[static_cast<size_t>(owner)].module;
         for (size_t i = 0; i < items && picks < kMaxOwnItems; ++i) {
@@ -6510,6 +7021,38 @@ void fillOwnGroup(void* out, const std::uintptr_t (&vec)[3], int owner)
     }
     const std::uintptr_t end = begin + picks * 8;
     std::memcpy(static_cast<char*>(out) + 0x08, &end, sizeof(end));
+}
+
+void beforeSettingsGroupResolve(void* registry, const void* idView)
+{
+    if (readStringView(idView) != kTabsGroupId || !writes::allowed("SettingsGroupRegister")
+        || !writes::allowed("SettingsProviderCall") || !writes::allowed("SettingsFindComponent")) return;
+    auto* const tabs = static_cast<char*>(findRegistryNode(registry, L"settings-tabs-groups"));
+    if (tabs == nullptr || !memory::isReadable(tabs, 0x70)) return;
+    void* impl = nullptr;
+    std::memcpy(&impl, tabs + 0x68, sizeof(impl));
+    if (impl != tabs + 0x30) return;
+    if (findRegistryNode(registry, L"tsukuyomi") == nullptr) {
+        onSettingsGroupRegister(registry, idView, tabs + 0x30);
+        afterSettingsGroupRegister(registry, idView, tabs + 0x30);
+    }
+    if (findRegistryNode(registry, L"tsukuyomi") == nullptr) return;
+    auto* const cached = static_cast<char*>(findSettingsNode(registry, L"settings-tabs-groups", 0x50));
+    if (cached != nullptr && memory::isWritable(cached + 0x30, 0x18)) {
+        std::uintptr_t vec[3]{};
+        std::memcpy(vec, cached + 0x30, sizeof(vec));
+        if (vec[1] < vec[0] || vec[2] < vec[1] || (vec[1] - vec[0]) % sizeof(void*) != 0) return;
+        const std::size_t bytes = vec[1] - vec[0];
+        if (bytes != 0 && !memory::isReadable(reinterpret_cast<const void*>(vec[0]), bytes)) return;
+        for (std::uintptr_t at = vec[0]; at < vec[1]; at += sizeof(void*)) {
+            const void* comp = nullptr;
+            std::memcpy(&comp, reinterpret_cast<const void*>(at), sizeof(comp));
+            if (readCompId(comp) == kOwnGroupIdBytes) return;
+        }
+        onSettingsProviderCall(impl, cached + 0x30);
+    }
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true)) log().info(L"UiProbe: registered our settings groups in an existing registry");
 }
 
 void afterSettingsGroupRegister(void* registry, const void* idView, void* provider)
@@ -6567,6 +7110,85 @@ void afterSettingsGroupRegister(void* registry, const void* idView, void* provid
         }
     }
     g_ownProvidersReady.store(false);
+}
+
+void flushGuiScalePublishes()
+{
+    if (!g_guiScalePublish.exchange(false)) return;
+    for (auto& slot : g_guiScaleComponents) {
+        const auto* const comp = slot.load();
+        if (customguiscale::isCustomComponentId(readCompId(comp))) publishOwnComponent(comp);
+    }
+    for (auto& slider : g_guiScaleSliders) publishOwnComponent(ownItemComponent(slider.load()));
+}
+
+void onGuiScaleGroupBuilt(void* out, int which)
+{
+    if (!customguiscale::active() || which < 0 || which > 1 || out == nullptr || !memory::isReadable(out, 0x18)) {
+        return;
+    }
+    std::uintptr_t vec[3]{};
+    std::memcpy(vec, out, sizeof(vec));
+    if (vec[0] == 0 || vec[1] <= vec[0] || vec[2] < vec[1] || (vec[1] - vec[0]) % 8 != 0
+        || !memory::isReadable(reinterpret_cast<const void*>(vec[0]), vec[1] - vec[0])
+        || !memory::isWritable(out, sizeof(vec))) {
+        return;
+    }
+    const size_t count = (vec[1] - vec[0]) / 8;
+    size_t at = count;
+    for (size_t i = 0; i < count; ++i) {
+        void* comp = nullptr;
+        std::memcpy(&comp, reinterpret_cast<const void*>(vec[0] + i * 8), sizeof(comp));
+        if (comp == nullptr || !memory::isReadable(comp, kCompType + 1)) {
+            continue;
+        }
+        if (static_cast<const unsigned char*>(comp)[kCompType] == 2) {
+            g_donorByType[2].store(comp);
+        }
+        if (at == count && customguiscale::isCustomComponentId(readCompId(comp))) {
+            at = i;
+            g_guiScaleComponents[which].store(static_cast<const unsigned char*>(comp));
+        }
+    }
+    if (at == count) {
+        return;
+    }
+    buildOwnItems();
+    const int slider = g_guiScaleSliders[which].load();
+    if (slider < 0 || !ensureOwnItem(static_cast<size_t>(slider))) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            log().warn(L"CustomGuiScale: the Custom scale slider could not be built (no number component to copy)");
+        }
+        return;
+    }
+    void* const own = g_ownItems[static_cast<size_t>(slider)].comp;
+    if (own == nullptr || g_guiScaleInserted[which].exchange(own) == own) {
+        static std::atomic<bool> told{false};
+        if (own != nullptr && !told.exchange(true)) {
+            log().warn(L"CustomGuiScale: the settings group was built twice for one settings model; the slider is "
+                       L"left out of the second list (it is owned by the first)");
+        }
+        return;
+    }
+    const size_t bytes = (count + 1) * sizeof(void*);
+    std::uintptr_t begin = vec[0];
+    std::uintptr_t cap = vec[2];
+    if (bytes > vec[2] - vec[0]) {
+        void* const buffer = hooks::callGameAllocate(bytes);
+        if (buffer == nullptr) {
+            g_guiScaleInserted[which].store(nullptr);
+            return;
+        }
+        begin = reinterpret_cast<std::uintptr_t>(buffer);
+        cap = begin + bytes;
+        std::memcpy(buffer, reinterpret_cast<const void*>(vec[0]), count * sizeof(void*));
+    }
+    auto* const slots = reinterpret_cast<std::uintptr_t*>(begin);
+    std::memmove(slots + at + 2, slots + at + 1, (count - at - 1) * sizeof(void*));
+    slots[at + 1] = reinterpret_cast<std::uintptr_t>(own);
+    const std::uintptr_t made[3] = {begin, begin + bytes, cap};
+    std::memcpy(out, made, sizeof(made));
 }
 
 void onSettingsProviderCall(void* self, void* out)
@@ -6727,6 +7349,18 @@ void* findRegistryComponent(const char* id)
     return nullptr;
 }
 
+bool openWaypointPage()
+{
+    const int before = g_pgScreen.load();
+    if (before >= kScreenMenu && before < kScreenWaypoints) g_pgLastSchematicaScreen.store(before);
+    g_pgScreen.store(kScreenWaypoints);
+    g_waypointOpening = true;
+    const bool opened = openOwnPage(false);
+    g_waypointOpening = false;
+    if (!opened) g_pgScreen.store(before);
+    return opened;
+}
+
 bool openOwnPage(bool force)
 {
     static std::atomic<unsigned long long> lastAt{0};
@@ -6737,21 +7371,25 @@ bool openOwnPage(bool force)
     lastAt.store(now);
     if (!force) {
         Schematica& mod = Schematica::instance();
-        const int beforeAt = mod.editingIndex();
+        const int beforeAt = selectedIndex(mod);
         const std::wstring beforeName =
-            (beforeAt >= 0) ? mod.blueprintName(static_cast<size_t>(beforeAt)) : std::wstring{};
+            (beforeAt >= 0) ? placementName(mod, static_cast<size_t>(beforeAt)) : std::wstring{};
         mod.refreshFiles();
-        const int afterAt = mod.editingIndex();
+        const int afterAt = selectedIndex(mod);
         const std::wstring afterName =
-            (afterAt >= 0) ? mod.blueprintName(static_cast<size_t>(afterAt)) : std::wstring{};
+            (afterAt >= 0) ? placementName(mod, static_cast<size_t>(afterAt)) : std::wstring{};
         int screen = g_pgScreen.load();
         const int was = screen;
+        if (screen == kScreenWaypoints && !g_waypointOpening) {
+            const int previous = g_pgLastSchematicaScreen.load();
+            screen = previous >= kScreenMenu && previous < kScreenWaypoints ? previous : kScreenMenu;
+        }
         const bool perBlueprint = screen == kScreenBlueprint || screen == kScreenMaterials
                                   || screen == kScreenVerifier;
         if (screen < 0 || screen >= kScreenCount) {
             screen = kScreenMenu;
         } else if (perBlueprint && (afterName.empty() || afterName != beforeName)) {
-            screen = kScreenBlueprints;
+            screen = kScreenPlacements;
         }
         if (screen != was) {
             g_pgScreen.store(screen);
@@ -6863,8 +7501,6 @@ void resolveMaybePressed()
     }
     g_ownCaptureRequest.store(index);
 }
-
-std::atomic<unsigned long long> g_ownPageOpenRequestAt{0};
 
 void pumpSettingsKeybind()
 {
@@ -7202,6 +7838,42 @@ void removeCrashWatch()
 
 bool takeSettingsDirty() { return g_settingsDirty.exchange(false); }
 
+bool appendCustomGuiScaleOption(std::uintptr_t& count, const void*& first)
+{
+    if (count == 0 || first == nullptr) return false;
+    if (count > kMaxChoices) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) log().warn(L"CustomGuiScale: {} vanilla choices exceed the copy capacity {}", count, kMaxChoices);
+        return false;
+    }
+    if (!memory::isReadable(first, count * kOptionStride)) return false;
+    if (g_guiScaleLabelObject.load() == 0) {
+        const auto make = Scanner::instance().addressAs<MakeOptionElementFn>(Target::MakeOptionElement);
+        if (make == nullptr) return false;
+        alignas(16) unsigned char two[0x40]{};
+        alignas(16) unsigned char one[0x20]{};
+        writeArgString(two, "Custom");
+        writeArgString(two + 0x20, "Custom");
+        writeArgString(one, "Custom");
+        const unsigned char flag = 0;
+        std::memset(g_guiScaleCustomElement, 0, kOptionStride);
+        make(g_guiScaleCustomElement, customguiscale::kCustomValue, two, one, &flag);
+        std::uintptr_t label = 0;
+        std::memcpy(&label, g_guiScaleCustomElement + kOptionLabelPtr, sizeof(label));
+        if (label == 0 || !memory::isReadable(reinterpret_cast<const void*>(label), 0x48)
+            || !prepareOwnOptionLabelVtable(reinterpret_cast<const void*>(label))) return false;
+        const auto own = reinterpret_cast<std::uintptr_t>(&g_ownOptionLabelVtable[0]);
+        std::memcpy(reinterpret_cast<void*>(label), &own, sizeof(own));
+        g_guiScaleLabelObject.store(label);
+    }
+    std::memcpy(g_guiScaleOptions, first, count * kOptionStride);
+    std::memcpy(g_guiScaleOptions[count], g_guiScaleCustomElement, kOptionStride);
+    first = g_guiScaleOptions;
+    ++count;
+    return true;
+}
+
+void requestGuiScalePublish() { g_guiScalePublish.store(true); }
 void markSettingsDirty() { g_settingsDirty.store(true); }
 
 void pumpSettingsToggle()
@@ -7241,9 +7913,6 @@ void pumpSettingsToggle()
 
 void pumpMenuSelection()
 {
-    if (const unsigned long long at = g_ownPageOpenRequestAt.exchange(0); at != 0 && GetTickCount64() - at < 1000) {
-        openOwnPage(true);
-    }
     {
         static const int escapeButton = GameButtons::instance().watchButton(gamebuttonlogic::button::menuCancel);
         static std::uint64_t seenEscape = 0;
@@ -7251,12 +7920,45 @@ void pumpMenuSelection()
         if (now != seenEscape) {
             if (!selfEscapeInFlight()) {
                 cancelPageReopen();
+                g_pgVerifierAwait.store(false);
+                g_pgPasteAwait.store(false);
+                g_selectionPageActive.store(false);
+                g_pgMaterialAwait.store(false);
             }
             g_pgBag.store(nullptr);
+            forgetPageEditBoxes();
         }
         seenEscape = now;
     }
+    if (const unsigned long long at = g_ownPageOpenRequestAt.exchange(0); at != 0 && GetTickCount64() - at < 1000) {
+        openOwnPage(true);
+    }
     pumpPagePress();
+    if (g_pgPasteAwait.load() && g_pgScreen.load()==kScreenBlueprint && g_pgReopenAt.load()==0 && g_pgCloseDeadline.load()==0
+        && GetTickCount64()-g_pgPasteUpdated>=1000
+        && (g_pgPasteRevision.load()!=Schematica::instance().pasteRevision()
+            || (g_pgPasteArmed.load() && !Schematica::instance().pasteArmed(Schematica::instance().selectedPlacement())))) {
+        g_pgPasteUpdated=GetTickCount64(); requestPageRebuild(true);
+    }
+    if (g_selectionPageActive.load() && g_pgScreen.load()==kScreenSelection && g_pgReopenAt.load()==0 && g_pgCloseDeadline.load()==0
+        && GetTickCount64()-g_selectionPageTypedAt.load()>=1500
+        && GetTickCount64()-g_selectionPageUpdated>=1000
+        && g_selectionPageRevision!=Schematica::instance().selectionRevision()) {
+        requestPageRebuild(true);
+    }
+    if (g_pgVerifierAwait.load() && g_pgScreen.load() == kScreenVerifier
+        && g_pgReopenAt.load() == 0 && g_pgCloseDeadline.load() == 0) {
+        const auto report = Schematica::instance().verifierReport();
+        if (report && report->complete && report->serial != g_pgVerifierSerial.load()) {
+            g_pgVerifierAwait.store(false); requestPageRebuild(true);
+        }
+    }
+    if (g_pgMaterialAwait.load() && g_pgScreen.load() == kScreenMaterials && g_pgReopenAt.load() == 0 && g_pgCloseDeadline.load() == 0
+        && g_pgMaterialRevision.load() != Schematica::instance().materialRevision()) {
+        if (g_pgMaterialEditAt == 0 || GetTickCount64() - g_pgMaterialEditAt >= 700) {
+            g_pgMaterialAwait.store(false); requestPageRebuild(true);
+        }
+    }
     pumpToggleState();
     pumpPageReopen();
     pumpPageEntry();
@@ -7564,13 +8266,44 @@ const std::uintptr_t* buildObjectElement(const nlohmann::json& obj, std::string&
     return g_extArena->makeValue(g_extDonors.elemVal, node);
 }
 
+bool collectExtDonors(void* self)
+{
+    struct Cache {
+        void* self = nullptr;
+        PageDonors donors;
+        DonorSources sources;
+        bool bools = false;
+        Entry trueEntry, falseEntry;
+    };
+    static Cache cache;
+    auto same = [](const void* at, const void* copy, std::size_t size) {
+        unsigned char now[64]{};
+        return at != nullptr && size <= sizeof(now) && memory::copyGuarded(at, now, size) && std::memcmp(now, copy, size) == 0;
+    };
+    if (cache.self == self && cache.donors.ok && same(cache.sources.vec, cache.donors.vecSrc, sizeof(cache.donors.vecSrc))
+        && same(cache.sources.elem, cache.donors.elemVal, sizeof(cache.donors.elemVal))
+        && same(cache.sources.str, cache.donors.strRec, sizeof(cache.donors.strRec))) {
+        g_extDonors = cache.donors;
+        g_extBools = cache.bools;
+        if (cache.bools) { g_extTrue = cache.trueEntry; g_extFalse = cache.falseEntry; }
+        return true;
+    }
+    cache = Cache{};
+    DonorSources sources;
+    if (!collectPageDonors(self, g_extDonors, &sources)) return false;
+    collectExtBools(self);
+    cache.self = self; cache.donors = g_extDonors; cache.sources = sources;
+    cache.bools = g_extBools;
+    if (g_extBools) { cache.trueEntry = g_extTrue; cache.falseEntry = g_extFalse; }
+    return true;
+}
+
 void* buildExtension(void* self, const DefExtension& ext, void* vanilla, std::string& err)
 {
-    if (!collectPageDonors(self, g_extDonors)) {
+    if (!collectExtDonors(self)) {
         err = "the templates could not be collected";
         return nullptr;
     }
-    collectExtBools(self);
     std::vector<Entry> entries;
     std::uintptr_t count = 0;
     if (!collectEntries(vanilla, entries, count) || entries.empty()) {
@@ -7985,7 +8718,9 @@ void* extendDefinition(void* self, const void* space, const void* name, void* va
             return nullptr;
         }
         std::string err;
+        const auto buildStart = std::chrono::steady_clock::now();
         ExtBuild build = buildWithOwnArena(self, ext, vanilla, err);
+        const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - buildStart).count();
         if (build.built == nullptr) {
             if (ext.failureLogs < 4) {
                 ++ext.failureLogs;
@@ -8006,12 +8741,17 @@ void* extendDefinition(void* self, const void* space, const void* name, void* va
         while (ext.history.size() > kKeptBuilds) {
             ext.history.erase(ext.history.begin());
         }
+        static int slowLogged = 0;
+        if (buildMs >= 500 && slowLogged < 8) {
+            ++slowLogged;
+            log().warn(L"UiProbe: extending {}.{} took {} ms (build {})", toUtf16(ext.space), toUtf16(ext.name), buildMs, ext.builds);
+        }
         if (ext.builds <= 4) {
             log().info(L"UiProbe: extended {}.{} (+{} / +{} controls, {} array(s), {} value(s); build {}: "
-                       L"{} nodes / {} words / {} records / {} chars; {} kept)",
+                       L"{} nodes / {} words / {} records / {} chars; {} kept; {} ms)",
                        toUtf16(ext.space), toUtf16(ext.name), ext.front.size(), ext.back.size(),
                        ext.appends.size(), ext.props.size(), ext.builds, ext.need.nodes, ext.need.words,
-                       ext.need.records, ext.need.text, ext.history.size());
+                       ext.need.records, ext.need.text, ext.history.size(), buildMs);
         } else if (ext.builds == 5) {
             log().info(L"UiProbe: {}.{} was built 5 times; later builds are not logged (older builds are freed, "
                        L"{} kept)", toUtf16(ext.space), toUtf16(ext.name), kKeptBuilds);

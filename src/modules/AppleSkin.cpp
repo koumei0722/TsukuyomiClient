@@ -33,10 +33,10 @@ constexpr std::uint32_t kAttributesComponent = 0xFD3B0613u;
 constexpr std::size_t kAttributesSize = 0x50;
 constexpr std::size_t kAttributeId = 4;
 constexpr std::ptrdiff_t kStackItem = 0x08;
-constexpr std::ptrdiff_t kMainhandStack = 0xE28;
+constexpr std::ptrdiff_t kMainhandStack = 0xE50;
 constexpr std::size_t kIconStride = 12;
-constexpr std::size_t kHungerJitterStore = 0xDF8;
-constexpr std::size_t kHeartVectorLea = 0x4E9;
+constexpr std::size_t kHungerJitterStore = 0xFE4;
+constexpr std::size_t kHeartVectorLea = 0x496;
 
 bool readBytes(const void* at, void* out, std::size_t size)
 {
@@ -134,7 +134,7 @@ void AppleSkin::onScansReady()
         }
     }
     if (std::byte* const fn = scanner.address(Target::HeartRendererUpdate)) {
-        if (startsWith(fn + kHeartVectorLea, {0x48, 0x8D, 0x86})) {
+        if (startsWith(fn + kHeartVectorLea, {0x49, 0x8D, 0x87})) {
             const std::int32_t disp = readDisp(fn + kHeartVectorLea + 3);
             if (disp > 0x100 && disp < 0x8000) m_heartIcons = disp;
         }
@@ -145,7 +145,7 @@ void AppleSkin::onScansReady()
         if (attrs[i] != nullptr) memory::copyGuarded(static_cast<const char*>(attrs[i]) + kAttributeId, &ids[i], 4);
     }
     if (std::byte* const site = scanner.address(Target::HealthAttributeLoad)) {
-        m_healthAttribute = memory::ripTarget(site, 8);
+        m_healthAttribute = memory::ripTarget(site, 3);
     }
     if (std::byte* const site = scanner.address(Target::DifficultySite)) {
         m_levelOffset = readDisp(site + 3);

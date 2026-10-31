@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "memory/Patch.h"
@@ -32,7 +33,13 @@ public:
 
     void onCameraWrite(void* cameraBase, void* frame);
 
+    void onPlayerViewUpdate();
+
     bool freezesAim() const { return active() || m_look.load(std::memory_order_acquire) != kLookIdle; }
+
+    bool blocksHotbarScroll() const;
+
+    bool blocksDismount() const;
 
     void onMoveInput(void* input);
 
@@ -42,10 +49,6 @@ public:
     void onInputGather(void* out, void* src);
 
     bool intentFresh() const;
-
-    bool borrowForChunkReload();
-
-    bool borrowing() const;
 
     bool freezeViewVector(float* out);
 
@@ -104,23 +107,22 @@ private:
     static constexpr ptrdiff_t kWriteZ = 0x25;
     static constexpr size_t kWriteSize = 5;
 
-    static constexpr ptrdiff_t kWriteYaw = 0x0D;
-    static constexpr ptrdiff_t kWritePitch = 0x18;
-    static constexpr ptrdiff_t kWriteYawFollow = 0xA5;
-    static constexpr size_t kWriteYawSize = 5;
-    static constexpr size_t kWritePitchSize = 4;
+    static constexpr ptrdiff_t kWriteYaw = 0x1F;
+    static constexpr ptrdiff_t kWriteYawFollow = 0xA0;
+    static constexpr size_t kWriteYawSize = 4;
     static constexpr size_t kWriteYawFollowSize = 6;
+
+    static constexpr ptrdiff_t kWriteHeadPacked = 0x09;
+    static constexpr size_t kWriteHeadPackedSize = 4;
+    static constexpr ptrdiff_t kWriteHeadAlt = 0xF1;
+    static constexpr size_t kWriteHeadAltSize = 5;
+    static constexpr ptrdiff_t kWriteHeadAltPair = 0xF6;
+    static constexpr size_t kWriteHeadAltPairSize = 6;
 
     static constexpr ptrdiff_t kWriteHead = 0x09;
     static constexpr size_t kWriteHeadSize = 5;
     static constexpr ptrdiff_t kWriteHeadPair = 0x0E;
-    static constexpr size_t kWriteHeadPairSize = 7;
     static constexpr size_t kWriteHeadInputPairSize = 6;
-
-    static constexpr ptrdiff_t kWriteHeadAlt = -0x14F;
-    static constexpr size_t kWriteHeadAltSize = 5;
-    static constexpr ptrdiff_t kWriteHeadAltPair = -0x14A;
-    static constexpr size_t kWriteHeadAltPairSize = 6;
 
     static constexpr std::byte kThirdPersonBack{1};
 
@@ -160,40 +162,50 @@ private:
     std::atomic<unsigned long long> m_intentAt{0};
     static constexpr unsigned long long kIntentFreshMs = 120;
 
-    float m_speed = kDefaultSpeed;
+    std::atomic<float> m_speed{kDefaultSpeed};
 
     Patch m_patchX;
     Patch m_patchY;
     Patch m_patchZ;
 
-    unsigned long long m_borrowUntil = 0;
-    bool m_borrowSynced = false;
-    float m_borrowX = 0.0f;
-    float m_borrowY = 0.0f;
-    float m_borrowZ = 0.0f;
-
-    static constexpr float kBorrowJump = 4096.0f;
-    static constexpr unsigned long long kBorrowMs = 600;
-
-    bool applyBorrow(std::byte* cameraBase);
-    void endBorrow(std::byte* cameraBase);
-
-    std::atomic<bool> m_borrowActive{false};
-    std::atomic<unsigned long long> m_borrowQuietUntil{0};
-    static constexpr unsigned long long kBorrowQuietMs = 250;
-
     Patch m_patchYaw;
-    Patch m_patchPitch;
     Patch m_patchYawFollow;
 
     Patch m_patchHead;
-    Patch m_patchHeadPair;
     Patch m_patchHeadAlt;
     Patch m_patchHeadAltPair;
     Patch m_patchHeadInput;
     Patch m_patchHeadInputPair;
 
     Patch m_patchPerspective;
+
+    std::atomic<bool> m_vehicleLook{true};
+    Patch m_patchVehicleOrbit;
+    Patch m_patchVehicleLook;
+    Patch m_patchVehicleOrbitLimit;
+    Patch m_patchVehicleOrbitClamp;
+    Patch m_patchVehicleLookLimit;
+    Patch m_patchVehicleLookClamp;
+    void syncVehicleLook();
+    static constexpr ptrdiff_t kVehicleOrbitStore = 0xE7;
+    static constexpr ptrdiff_t kVehicleLookStore = 0xFB;
+    static constexpr size_t kVehicleOrbitStoreSize = 5;
+    static constexpr size_t kVehicleLookStoreSize = 6;
+    static constexpr ptrdiff_t kVehicleOrbitLimit = 0x78;
+    static constexpr ptrdiff_t kVehicleOrbitClamp = 0x7D;
+    static constexpr ptrdiff_t kVehicleLookLimit = 0xAF;
+    static constexpr ptrdiff_t kVehicleLookClamp = 0xBE;
+
+    int m_dismountButton = -1;
+    std::atomic<bool> m_scrollSpeed{true};
+    int m_wheelLeftButton = -1;
+    int m_wheelRightButton = -1;
+    std::uint64_t m_wheelLeftSeen = 0;
+    std::uint64_t m_wheelRightSeen = 0;
+    void updateWheel();
+    static constexpr float kSpeedStep = 0.03125f;
+    static constexpr unsigned long long kSpeedShownMs = 1500;
+    std::atomic<unsigned long long> m_speedChangedAt{0};
 
     int m_moveButtons[kMoveKeyCount]{-1, -1, -1, -1, -1, -1, -1};
     std::atomic<std::uint64_t> m_rawSeenMs[kMoveKeyCount]{};
@@ -205,6 +217,18 @@ private:
     float m_y = 0.0f;
     float m_z = 0.0f;
     bool m_synced = false;
+
+    std::atomic<bool> m_showCoords{true};
+    std::atomic<float> m_shownX{0.0f};
+    std::atomic<float> m_shownY{0.0f};
+    std::atomic<float> m_shownZ{0.0f};
+    std::atomic<float> m_shownYaw{0.0f};
+    std::atomic<bool> m_shownValid{false};
+    std::string m_lastBar;
+    unsigned long long m_lastBarAt = 0;
+    bool m_barShown = false;
+    static constexpr unsigned long long kBarRefreshMs = 1000;
+    static constexpr unsigned long long kBarMinIntervalMs = 50;
 };
 
 }

@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include "core/Logger.h"
+#include "game/LevelTickLogic.h"
 #include "core/Notice.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
@@ -72,6 +73,7 @@ bool GameData::onLevelTick(const void* level, unsigned long thread, unsigned lon
             ? 0 : 1;
         m_tickLevels[slot].store(level, std::memory_order_relaxed);
         m_tickLevelAt[slot].store(now, std::memory_order_relaxed);
+        m_tickLevelSince[slot].store(now, std::memory_order_relaxed);
         if (m_tickLevelLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
             log().info(L"GameData: a level ticks at {:#x} on thread {} (client thread {})",
                        reinterpret_cast<std::uintptr_t>(level), thread, clientThread);
@@ -82,24 +84,54 @@ bool GameData::onLevelTick(const void* level, unsigned long thread, unsigned lon
 
 bool GameData::integratedServer() const
 {
-    const unsigned long long now = GetTickCount64();
+    leveltick::Seat seats[2];
     for (int i = 0; i < 2; ++i) {
-        const unsigned long long at = m_tickLevelAt[i].load(std::memory_order_relaxed);
-        if (at == 0 || (now > at && now - at > 2000) || m_tickLevels[i].load(std::memory_order_relaxed) == nullptr) {
-            return false;
-        }
+        seats[i] = {m_tickLevels[i].load(std::memory_order_relaxed), m_tickLevelAt[i].load(std::memory_order_relaxed),
+                    m_tickLevelSince[i].load(std::memory_order_relaxed)};
     }
-    return m_tickLevels[0].load(std::memory_order_relaxed) != m_tickLevels[1].load(std::memory_order_relaxed);
+    return leveltick::tickingTogether(seats[0], seats[1], GetTickCount64());
+}
+
+namespace {
+bool gdCopyGuarded(const void* address, void* out, std::size_t size);
 }
 
 void GameData::setGameMode(void* gameMode)
 {
+    if (gameMode == nullptr) {
+        m_droppedGameMode.store(this->gameMode(), std::memory_order_relaxed);
+        m_gameMode.store(nullptr, std::memory_order_relaxed);
+        return;
+    }
+    void* dropped = gameMode;
+    m_droppedGameMode.compare_exchange_strong(dropped, nullptr, std::memory_order_relaxed);
     m_gameMode.store(gameMode, std::memory_order_relaxed);
+}
+
+void GameData::setPlayerGameModeOffset(std::size_t offset)
+{
+    m_playerGameModeOffset.store(offset, std::memory_order_relaxed);
 }
 
 void* GameData::gameMode() const
 {
-    return m_gameMode.load(std::memory_order_relaxed);
+    void* current = nullptr;
+    void* const player = m_player.load(std::memory_order_relaxed);
+    if (player == nullptr) {
+        current = m_gameMode.load(std::memory_order_relaxed);
+    } else {
+        const std::size_t offset = m_playerGameModeOffset.load(std::memory_order_relaxed);
+        if (offset == 0) {
+            return nullptr;
+        }
+        void* owner = nullptr;
+        if (!gdCopyGuarded(static_cast<const std::byte*>(player) + offset, &current, sizeof(current))
+            || current == nullptr
+            || !gdCopyGuarded(static_cast<const std::byte*>(current) + 8, &owner, sizeof(owner)) || owner != player) {
+            return nullptr;
+        }
+    }
+    return current == m_droppedGameMode.load(std::memory_order_relaxed) ? nullptr : current;
 }
 
 void GameData::setPlayer(void* player)
@@ -203,20 +235,20 @@ bool gdReadPointer(const void* at, void*& out)
     }
 }
 
-bool gdCopyComponent(const void* self, std::uint32_t typeId, std::size_t stride, void* out)
+void* gdComponentAddress(const void* self, std::uint32_t typeId, std::size_t stride)
 {
     __try {
         const auto* const base = static_cast<const char*>(self);
         const std::uintptr_t registry = *reinterpret_cast<const std::uintptr_t*>(base + 0x10);
         const std::uint32_t id = *reinterpret_cast<const std::uint32_t*>(base + 0x18);
         if (registry == 0) {
-            return false;
+            return nullptr;
         }
 
         const std::uintptr_t first = *reinterpret_cast<const std::uintptr_t*>(registry + 0x68);
         const std::uintptr_t last = *reinterpret_cast<const std::uintptr_t*>(registry + 0x70);
         if (first == 0 || last <= first || (last - first) % 0x20 != 0) {
-            return false;
+            return nullptr;
         }
         constexpr std::uintptr_t kMaxEntries = 4096;
         const std::uintptr_t entries = (last - first) / 0x20;
@@ -230,7 +262,7 @@ bool gdCopyComponent(const void* self, std::uint32_t typeId, std::size_t stride,
             }
         }
         if (store == 0) {
-            return false;
+            return nullptr;
         }
 
         const std::uint32_t low = id & 0x3ffffu;
@@ -239,35 +271,50 @@ bool gdCopyComponent(const void* self, std::uint32_t typeId, std::size_t stride,
         const std::uintptr_t pagesEnd = *reinterpret_cast<const std::uintptr_t*>(store + 0x10);
         if (pagesBegin == 0 || pagesEnd <= pagesBegin
             || page >= (pagesEnd - pagesBegin) / sizeof(std::uintptr_t)) {
-            return false;
+            return nullptr;
         }
         const std::uintptr_t sparse =
             *reinterpret_cast<const std::uintptr_t*>(pagesBegin + page * sizeof(std::uintptr_t));
         if (sparse == 0) {
-            return false;
+            return nullptr;
         }
         const std::uint32_t packed =
             *reinterpret_cast<const std::uint32_t*>(sparse + (low & 0x7ffu) * 4);
         if (((id & 0xfffc0000u) ^ packed) > 0x3fffeu) {
-            return false;
+            return nullptr;
         }
 
         const std::uintptr_t table = *reinterpret_cast<const std::uintptr_t*>(store + 0x50);
         if (table == 0) {
-            return false;
+            return nullptr;
         }
         const std::uintptr_t dense =
             *reinterpret_cast<const std::uintptr_t*>(table + ((packed >> 4) & 0x3ff8u));
         if (dense == 0) {
-            return false;
+            return nullptr;
         }
-        std::memcpy(out, reinterpret_cast<const void*>(dense + (packed & 0x7fu) * stride), stride);
+        return reinterpret_cast<void*>(dense + (packed & 0x7fu) * stride);
+    } __except (gdAccessViolationFilter(GetExceptionCode())) {
+        return nullptr;
+    }
+}
+
+bool gdCopyComponent(const void* self, std::uint32_t typeId, std::size_t stride, void* out)
+{
+    __try {
+        const void* component = gdComponentAddress(self, typeId, stride);
+        if (component == nullptr) return false;
+        std::memcpy(out, component, stride);
         return true;
     } __except (gdAccessViolationFilter(GetExceptionCode())) {
         return false;
     }
 }
+}
 
+void* GameData::componentAddress(const void* actor, std::uint32_t typeId, std::size_t stride)
+{
+    return gdComponentAddress(actor, typeId, stride);
 }
 
 bool GameData::copyComponent(const void* actor, std::uint32_t typeId, std::size_t stride, void* out)

@@ -9,7 +9,6 @@
 #include <string_view>
 #include <iterator>
 #include <atomic>
-#include <cmath>
 #include <mutex>
 #include <vector>
 
@@ -35,7 +34,7 @@ constexpr std::ptrdiff_t kNodeValue = 0x50;
 constexpr std::ptrdiff_t kLegacyDefaultBlock = 0x240;
 constexpr std::ptrdiff_t kBlockLegacyAt = 0x68;
 
-constexpr std::size_t kLeaDisp = 47 + 3;
+constexpr std::size_t kLeaDisp = 39 + 3;
 
 constexpr std::size_t kMinEntries = 64;
 constexpr std::size_t kMaxEntries = 100000;
@@ -124,13 +123,13 @@ __declspec(noinline) const void* callTransformBlock(TransformBlockFn fn, const v
 
 }
 
-const void* rotatedBlock(const void* block, int quarters, bool* ok)
+const void* transformedBlock(const void* block, int quarters, int mirror, bool* ok)
 {
     if (ok != nullptr) {
         *ok = false;
     }
     const int turn = ((quarters % 4) + 4) % 4;
-    if (block == nullptr || turn == 0) {
+    if (block == nullptr || (turn == 0 && mirror == 0)) {
         if (ok != nullptr) {
             *ok = (block != nullptr);
         }
@@ -149,7 +148,8 @@ const void* rotatedBlock(const void* block, int quarters, bool* ok)
     }
     const auto fn = reinterpret_cast<TransformBlockFn>(scanner.address(Target::BlockTransform));
     bool faulted = false;
-    const void* const turned = callTransformBlock(fn, block, static_cast<unsigned>(turn), 0u, faulted);
+    const void* const turned = callTransformBlock(fn, block, static_cast<unsigned>(turn),
+                                                 static_cast<unsigned>(mirror), faulted);
     if (faulted) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1, std::memory_order_relaxed) < 4) {
@@ -275,6 +275,7 @@ struct StateSlot {
     std::uint32_t mask = 0;
     const void* desc = nullptr;
     std::vector<std::string> names;
+    nbt::Tag tag = nbt::Tag::End;
 };
 
 using StateValueNameFn = void*(__fastcall*)(const void*, void*, unsigned int);
@@ -306,6 +307,37 @@ bool stateValueName(const void* desc, unsigned int value, std::string& out)
     return readStdString(static_cast<const std::uint8_t*>(tag) + 0x08, out);
 }
 
+nbt::Tag stateValueTagType(const void* desc, unsigned int value)
+{
+    if (desc == nullptr || !memory::isReadable(desc, sizeof(void*))) {
+        return nbt::Tag::End;
+    }
+    const void* vtable = nullptr;
+    StateValueNameFn fn = nullptr;
+    if (!safeCopy(&vtable, desc, sizeof(vtable)) || vtable == nullptr
+        || !safeCopy(&fn, static_cast<const std::uint8_t*>(vtable) + 8, sizeof(fn)) || fn == nullptr) {
+        return nbt::Tag::End;
+    }
+    alignas(8) std::uint8_t holder[0x20] = {};
+    fn(desc, holder, value);
+    const void* tag = nullptr;
+    std::memcpy(&tag, holder, sizeof(tag));
+    const void* tagVtable = nullptr;
+    const void* getId = nullptr;
+    std::uint8_t code[3] = {};
+    if (tag == nullptr || !safeCopy(&tagVtable, tag, sizeof(tagVtable)) || tagVtable == nullptr
+        || !safeCopy(&getId, static_cast<const std::uint8_t*>(tagVtable) + 0x28, sizeof(getId)) || getId == nullptr
+        || !safeCopy(code, getId, sizeof(code)) || code[0] != 0xB0 || code[2] != 0xC3) {
+        return nbt::Tag::End;
+    }
+    switch (code[1]) {
+    case 1: return nbt::Tag::Byte;
+    case 3: return nbt::Tag::Int;
+    case 8: return nbt::Tag::String;
+    default: return nbt::Tag::End;
+    }
+}
+
 std::vector<std::string> readStateValueNames(const void* desc, std::uint32_t count)
 {
     std::vector<std::string> out;
@@ -322,9 +354,11 @@ std::vector<std::string> readStateValueNames(const void* desc, std::uint32_t cou
     }
     return out;
 }
-std::vector<StateSlot> readStateSlots(const void* legacy)
+std::vector<StateSlot> readStateSlots(const void* legacy, bool* complete = nullptr)
 {
     std::vector<StateSlot> out;
+    bool valid=true;
+    if (complete) *complete=false;
     const void* const head = readPointer(legacy, 0x1d8);
     if (head == nullptr || !memory::isReadable(head, 0x20)) {
         return out;
@@ -333,11 +367,14 @@ std::vector<StateSlot> readStateSlots(const void* legacy)
     for (int guard = 0; !stack.empty() && guard < 512 && out.size() < 64; ++guard) {
         const void* const node = stack.back();
         stack.pop_back();
-        if (node == nullptr || node == head || !memory::isReadable(node, 0x40)) {
+        if (node == head) continue;
+        if (node == nullptr || !memory::isReadable(node, 0x40)) {
+            valid=false;
             continue;
         }
         std::uint8_t raw[0x40] = {};
         if (!safeCopy(raw, node, sizeof(raw))) {
+            valid=false;
             continue;
         }
         if (raw[0x19] == 0) {
@@ -357,12 +394,15 @@ std::vector<StateSlot> readStateSlots(const void* legacy)
             }
             if (!slot.name.empty() && slot.values > 0 && slot.mask != 0) {
                 slot.names = readStateValueNames(slot.desc, slot.values);
+                slot.tag = stateValueTagType(slot.desc, 0);
+                if (!slot.names.empty() && slot.tag != nbt::Tag::String) slot.tag = nbt::Tag::End;
                 out.push_back(std::move(slot));
-            }
+            } else valid=false;
         }
         stack.push_back(readPointer(node, 0x00));
         stack.push_back(readPointer(node, 0x10));
     }
+    if (complete) *complete=valid && stack.empty();
     return out;
 }
 
@@ -391,9 +431,22 @@ std::string stateNamesOf(const void* block)
 namespace {
 
 std::mutex g_blockLookupMutex;
+void forgetLegacyCache();
 std::unordered_map<const void*, std::string> g_legacyNames;
 bool g_legacyNamesReady = false;
-std::unordered_map<const void*, std::vector<StateSlot>> g_legacySlots;
+struct CachedStateSlots {
+    std::vector<StateSlot> slots;
+    bool complete=false;
+};
+std::unordered_map<const void*, CachedStateSlots> g_legacySlots;
+std::vector<const void*> g_forgottenLegacies;
+
+const CachedStateSlots& cachedStateSlots(const void* legacy)
+{
+    const auto [found,inserted]=g_legacySlots.try_emplace(legacy);
+    if (inserted) found->second.slots=readStateSlots(legacy,&found->second.complete);
+    return found->second;
+}
 
 }
 
@@ -420,6 +473,15 @@ bool nameOfBlock(const void* block, char* out, std::size_t cap)
             }
         }
         g_legacyNamesReady = true;
+        if (!g_forgottenLegacies.empty()) {
+            std::size_t same = 0;
+            for (const void* key : g_forgottenLegacies) same += g_legacyNames.count(key);
+            static unsigned said = 0;
+            if (said++ < 4)
+                log().info(L"Blocks: rebuilt the block name table for the new world ({} kinds, {} of {} old BlockLegacy addresses are still there)",
+                           g_legacyNames.size(), same, g_forgottenLegacies.size());
+            g_forgottenLegacies.clear();
+        }
     }
     const auto found = g_legacyNames.find(legacy);
     if (found == g_legacyNames.end()) {
@@ -427,6 +489,21 @@ bool nameOfBlock(const void* block, char* out, std::size_t cap)
     }
     std::snprintf(out, cap, "%s", found->second.c_str());
     return true;
+}
+
+void forgetWorldLookups()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_blockLookupMutex);
+        if (g_legacyNamesReady) {
+            g_forgottenLegacies.clear();
+            for (const auto& [key, name] : g_legacyNames) g_forgottenLegacies.push_back(key);
+        }
+        g_legacyNames.clear();
+        g_legacyNamesReady = false;
+        g_legacySlots.clear();
+    }
+    forgetLegacyCache();
 }
 
 int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates)
@@ -443,12 +520,9 @@ int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates)
         return 0;
     }
     std::lock_guard<std::mutex> lock(g_blockLookupMutex);
-    auto slots = g_legacySlots.find(legacy);
-    if (slots == g_legacySlots.end()) {
-        slots = g_legacySlots.emplace(legacy, readStateSlots(legacy)).first;
-    }
+    const auto& slots=cachedStateSlots(legacy);
     int rows = 0;
-    for (const StateSlot& slot : slots->second) {
+    for (const StateSlot& slot : slots.slots) {
         if (rows >= maxStates) {
             break;
         }
@@ -462,6 +536,32 @@ int statesOfBlock(const void* block, char out[][kStateTextBytes], int maxStates)
         ++rows;
     }
     return rows;
+}
+
+bool typedStatesOfBlock(const void* block,std::vector<structure::StateValue>& out)
+{
+    out.clear();
+    if (!block || !memory::isReadable(block,0x128)) return false;
+    const void* legacy=readPointer(block,kBlockLegacyAt);
+    if (!legacy || !memory::isReadable(legacy,0x248)) return false;
+    std::uint16_t index=0;
+    if (!safeCopy(&index,static_cast<const std::uint8_t*>(block)+0x120,sizeof(index))) return false;
+    std::lock_guard lock(g_blockLookupMutex);
+    const auto& slots=cachedStateSlots(legacy);
+    if (!slots.complete) return false;
+    for (const auto& slot : slots.slots) {
+        const auto value=(index&slot.mask)>>slot.shift;
+        if (slot.tag==nbt::Tag::End || value>=slot.values) { out.clear(); return false; }
+        structure::StateValue state;
+        state.name=slot.name; state.tag=slot.tag;
+        if (slot.tag==nbt::Tag::String) {
+            if (value>=slot.names.size()) { out.clear(); return false; }
+            state.text=slot.names[value];
+        } else state.number=value;
+        out.push_back(std::move(state));
+    }
+    std::sort(out.begin(),out.end(),[](const auto& a,const auto& b) { return a.name<b.name; });
+    return true;
 }
 
 int tagsOfBlock(const void* block, char out[][kStateTextBytes], int maxTags)
@@ -495,19 +595,96 @@ int tagsOfBlock(const void* block, char out[][kStateTextBytes], int maxTags)
 
 bool materialFlags(const void* block, bool& blocksMotion, bool& liquid)
 {
-    constexpr std::ptrdiff_t kMaterialAt = 0x28;
-    constexpr std::size_t kLiquidAt = 0x02;
-    constexpr std::size_t kBlocksMotionAt = 0x03;
+    constexpr std::ptrdiff_t kMaterialFlagsAt = 0x29;
     const void* const legacy = readPointer(block, kBlockLegacyAt);
-    const void* const material = readPointer(legacy, kMaterialAt);
-    std::uint8_t bytes[4]{};
-    if (material == nullptr || !safeCopy(bytes, material, sizeof(bytes))
-        || bytes[kLiquidAt] > 1 || bytes[kBlocksMotionAt] > 1) {
+    std::uint8_t flags = 0;
+    if (!memory::plausiblePointer(legacy)
+        || !safeCopy(&flags, static_cast<const std::byte*>(legacy) + kMaterialFlagsAt, sizeof flags)) return false;
+    liquid = (flags & 0x02) != 0;
+    blocksMotion = (flags & 0x04) != 0;
+    return true;
+}
+
+namespace {
+using UseEventTypeFn = std::uint8_t(__fastcall*)(const void*);
+
+__declspec(noinline) bool useEventTypeGuarded(UseEventTypeFn fn, const void* handler, std::uint8_t& out) noexcept
+{
+    __try {
+        out = fn(handler);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-    liquid = bytes[kLiquidAt] != 0;
-    blocksMotion = bytes[kBlocksMotionAt] != 0;
-    return true;
+}
+}
+
+int usedByClick(const void* block)
+{
+    static const auto site = [] {
+        struct Site { std::int32_t tableAt = 0; std::uint8_t event = 0; bool ok = false; } out;
+        const auto* at = Scanner::instance().address(Target::BlockUseListenerSite);
+        if (at == nullptr || !safeCopy(&out.tableAt, at + 1, sizeof(out.tableAt)) || !safeCopy(&out.event, at + 10, 1)) return out;
+        out.ok = out.tableAt > 0 && out.tableAt < 0x1000 && out.tableAt % 8 == 0;
+        if (!out.ok) log().warn(L"Block use listener: unexpected table offset {:#x}", out.tableAt);
+        return out;
+    }();
+    if (!site.ok || block == nullptr) return -1;
+    const void* const legacy = readPointer(block, kBlockLegacyAt);
+    if (legacy == nullptr) return -1;
+    const auto* const table = static_cast<const std::uint8_t*>(legacy) + site.tableAt;
+    std::uintptr_t range[2]{};
+    if (!safeCopy(range, table + 8, sizeof(range)) || range[1] < range[0] || (range[1] - range[0]) % 8 != 0
+        || (range[1] - range[0]) / 8 > 64) return -1;
+    for (auto at = range[0]; at < range[1]; at += 8) {
+        const void* const handler = readPointer(reinterpret_cast<const void*>(at), 0);
+        const void* const fn = readPointer(readPointer(handler, 0), 8);
+        if (fn == nullptr || !memory::inGameModule(fn)) return -1;
+        std::uint8_t event = 0;
+        if (!useEventTypeGuarded(reinterpret_cast<UseEventTypeFn>(const_cast<void*>(fn)), handler, event)) return -1;
+        if (event == site.event) return 1;
+    }
+    return 0;
+}
+
+namespace {
+struct OptionalHit {
+    float point[3];
+    bool has;
+};
+using BlockUseFn = bool(__fastcall*)(const void* block, void* player, const std::int32_t* pos, std::uint8_t face,
+                                     std::uint8_t source, const OptionalHit* hit);
+
+__declspec(noinline) bool blockUseGuarded(BlockUseFn fn, const void* block, void* player, const std::int32_t* pos,
+                                          std::uint8_t face, const OptionalHit* hit, bool& out) noexcept
+{
+    __try {
+        out = fn(block, player, pos, face, 0, hit);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}
+
+int clickUses(void* gameMode, const void* block, const std::int32_t pos[3], int face, const float click[3])
+{
+    const auto fn = reinterpret_cast<BlockUseFn>(Scanner::instance().address(Target::BlockUse));
+    void* const player = const_cast<void*>(readPointer(gameMode, 8));
+    if (fn == nullptr || player == nullptr || block == nullptr || pos == nullptr || click == nullptr || face < 0 || face > 5) {
+        return -1;
+    }
+    OptionalHit hit{};
+    for (int i = 0; i < 3; ++i) hit.point[i] = static_cast<float>(pos[i]) + click[i];
+    hit.has = true;
+    const std::int32_t at[3]{pos[0], pos[1], pos[2]};
+    bool used = false;
+    if (!blockUseGuarded(fn, block, player, at, static_cast<std::uint8_t>(face), &hit, used)) {
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1, std::memory_order_relaxed) < 4) log().warn(L"Blocks: Block::use faulted at {}, {}, {}", pos[0], pos[1], pos[2]);
+        return -1;
+    }
+    return used ? 1 : 0;
 }
 
 const void* stateVariant(const void* block, const std::vector<WantedState>& want,
@@ -589,294 +766,8 @@ const void* stateVariant(const void* block, const std::vector<WantedState>& want
 }
 
 namespace {
-
-std::atomic<bool> g_ghostOn{false};
-std::atomic<bool> g_ghostArmed{false};
-std::atomic<bool> g_worldDropped{false};
-std::int32_t g_ghostMin[3] = {};
-std::int32_t g_ghostMax[3] = {};
-std::atomic<float> g_ghostAlpha{0.45F};
-
-std::atomic<bool> g_layerOn{false};
-std::atomic<int> g_layerAxis{1};
-std::atomic<std::int32_t> g_layerLo{0};
-std::atomic<std::int32_t> g_layerHi{0};
-
-std::vector<std::uint16_t> g_drawCells;
-
-std::vector<std::uint16_t> g_drawCells2;
-
-std::vector<std::uint16_t> g_wantCells;
-std::vector<std::uint16_t> g_wantCells2;
-std::atomic<const std::uint16_t*> g_wantCellsPtr{nullptr};
-std::atomic<const std::uint16_t*> g_wantCells2Ptr{nullptr};
-
-constexpr std::uint16_t kWantAirTag = 0xFFFFu;
-
-std::vector<std::uint8_t> g_diffCells;
-std::atomic<std::uint8_t*> g_diffCellsPtr{nullptr};
-std::atomic<const std::uint16_t*> g_drawCells2Ptr{nullptr};
-std::vector<const void*> g_drawPalette;
-std::atomic<const std::uint16_t*> g_drawCellsPtr{nullptr};
-
-std::atomic<int> g_drawReaders{0};
-std::vector<std::vector<std::uint16_t>> g_retiredCells;
-std::vector<std::vector<std::uint8_t>> g_retiredDiff;
-std::vector<std::vector<const void*>> g_retiredPalettes;
-std::atomic<std::size_t> g_drawCellsCount{0};
-std::atomic<const void* const*> g_drawPalettePtr{nullptr};
-std::atomic<std::size_t> g_drawPaletteCount{0};
 std::atomic<const void*> g_air{nullptr};
-std::int32_t g_lastMin[3] = {0, 0, 0};
-std::int32_t g_lastMax[3] = {0, 0, 0};
-std::atomic<unsigned long long> g_lastBoundsAt{0};
-constexpr unsigned long long kLastBoundsMs = 8000;
 std::atomic<unsigned long> g_simThread{0};
-
-std::atomic<unsigned long> g_meshThreads[kMeshThreadLimit] = {};
-std::atomic<std::size_t> g_meshThreadCount{0};
-
-bool waitForDrawReaders()
-{
-    for (int i = 0; i < 2000; ++i) {
-        if (g_drawReaders.load(std::memory_order_seq_cst) == 0) {
-            return true;
-        }
-        Sleep(0);
-        if ((i % 50) == 49) {
-            Sleep(1);
-        }
-    }
-    return false;
-}
-
-void retireDrawCells()
-{
-    const bool drained = waitForDrawReaders();
-    if (drained) {
-        g_retiredCells.clear();
-        g_retiredDiff.clear();
-        g_retiredPalettes.clear();
-        g_drawCells.clear();
-        g_drawCells2.clear();
-        g_diffCells.clear();
-        g_wantCells.clear();
-        g_wantCells2.clear();
-        g_drawCells.shrink_to_fit();
-        g_drawCells2.shrink_to_fit();
-        g_diffCells.shrink_to_fit();
-        g_wantCells.shrink_to_fit();
-        g_wantCells2.shrink_to_fit();
-        return;
-    }
-    notice::failOnce("BlockRegistry.retireCells",
-                     L"BlockRegistry: the renderer is still reading the marks; the old table is kept",
-                     "Schematica: an old drawing table is retained until its readers finish");
-    g_retiredCells.push_back(std::move(g_drawCells));
-    g_retiredCells.push_back(std::move(g_drawCells2));
-    g_retiredCells.push_back(std::move(g_wantCells));
-    g_retiredCells.push_back(std::move(g_wantCells2));
-    g_retiredDiff.push_back(std::move(g_diffCells));
-    g_drawCells = {};
-    g_drawCells2 = {};
-    g_wantCells = {};
-    g_wantCells2 = {};
-    g_diffCells = {};
-    if (g_retiredCells.size() > 16 && g_drawReaders.load(std::memory_order_seq_cst) == 0) {
-        g_retiredCells.clear();
-        g_retiredDiff.clear();
-        g_retiredPalettes.clear();
-    }
-}
-
-bool ghostCellIndex(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t& out)
-{
-    if (x < g_ghostMin[0] || x >= g_ghostMax[0] || y < g_ghostMin[1] || y >= g_ghostMax[1]
-        || z < g_ghostMin[2] || z >= g_ghostMax[2]) {
-        return false;
-    }
-    const std::uint64_t sy = static_cast<std::uint64_t>(g_ghostMax[1] - g_ghostMin[1]);
-    const std::uint64_t sz = static_cast<std::uint64_t>(g_ghostMax[2] - g_ghostMin[2]);
-    const std::uint64_t dx = static_cast<std::uint64_t>(x - g_ghostMin[0]);
-    const std::uint64_t dy = static_cast<std::uint64_t>(y - g_ghostMin[1]);
-    const std::uint64_t dz = static_cast<std::uint64_t>(z - g_ghostMin[2]);
-    const std::uint64_t at = (dx * sy + dy) * sz + dz;
-    if (at >= kGhostCellLimit) {
-        return false;
-    }
-    out = static_cast<std::size_t>(at);
-    return true;
-}
-
-}
-
-void setGhostRegion(std::int32_t x, std::int32_t y, std::int32_t z,
-                    std::int32_t sx, std::int32_t sy, std::int32_t sz, float alpha)
-{
-    g_ghostOn.store(false, std::memory_order_release);
-    g_ghostAlpha.store(alpha, std::memory_order_relaxed);
-    g_ghostMin[0] = x;  g_ghostMin[1] = y;  g_ghostMin[2] = z;
-    g_ghostMax[0] = x + sx;  g_ghostMax[1] = y + sy;  g_ghostMax[2] = z + sz;
-
-    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
-    g_diffCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_wantCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_wantCells2Ptr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCellsCount.store(0, std::memory_order_relaxed);
-    retireDrawCells();
-    const std::uint64_t cells = static_cast<std::uint64_t>(sx) * static_cast<std::uint64_t>(sy)
-                                * static_cast<std::uint64_t>(sz);
-    const bool usable = cells > 0 && cells <= kGhostCellLimit;
-    if (!usable && cells > 0) {
-        log().warn(L"Schematica: {} cells is over the limit of {}, so no ghost or "
-                   L"color box can be drawn for this schematic (and its collision is kept)",
-                   cells, kGhostCellLimit);
-    }
-
-    if (usable) {
-        g_drawCells.assign(static_cast<std::size_t>(cells), 0);
-        g_drawCells2.assign(static_cast<std::size_t>(cells), 0);
-        g_diffCells.assign(static_cast<std::size_t>(cells), 0);
-        g_wantCells.assign(static_cast<std::size_t>(cells), 0);
-        g_wantCells2.assign(static_cast<std::size_t>(cells), 0);
-        g_drawCellsCount.store(g_drawCells.size(), std::memory_order_relaxed);
-        g_drawCellsPtr.store(g_drawCells.data(), std::memory_order_seq_cst);
-        g_drawCells2Ptr.store(g_drawCells2.data(), std::memory_order_seq_cst);
-        g_diffCellsPtr.store(g_diffCells.data(), std::memory_order_seq_cst);
-        g_wantCellsPtr.store(g_wantCells.data(), std::memory_order_seq_cst);
-        g_wantCells2Ptr.store(g_wantCells2.data(), std::memory_order_seq_cst);
-    }
-
-    const bool valid = sx > 0 && sy > 0 && sz > 0;
-    g_ghostArmed.store(valid, std::memory_order_release);
-    if (valid) {
-        g_ghostOn.store(true, std::memory_order_release);
-    }
-}
-
-void clearGhostRegion()
-{
-    g_ghostOn.store(false, std::memory_order_release);
-    if (!g_ghostArmed.exchange(false, std::memory_order_acq_rel)) {
-        return;
-    }
-    for (int i = 0; i < 3; ++i) {
-        g_lastMin[i] = g_ghostMin[i];
-        g_lastMax[i] = g_ghostMax[i];
-    }
-    g_lastBoundsAt.store(GetTickCount64(), std::memory_order_release);
-
-    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
-    g_diffCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_wantCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_wantCells2Ptr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCellsCount.store(0, std::memory_order_relaxed);
-    retireDrawCells();
-}
-
-bool ghostOn() { return g_ghostOn.load(std::memory_order_acquire); }
-
-float ghostAlpha()
-{
-    return g_ghostAlpha.load(std::memory_order_relaxed);
-}
-
-bool lastGhostBounds(std::int32_t* mn, std::int32_t* mx)
-{
-    if (mn == nullptr || mx == nullptr) {
-        return false;
-    }
-    const unsigned long long at = g_lastBoundsAt.load(std::memory_order_acquire);
-    if (at == 0 || GetTickCount64() - at > kLastBoundsMs) {
-        return false;
-    }
-    for (int i = 0; i < 3; ++i) {
-        mn[i] = g_lastMin[i];
-        mx[i] = g_lastMax[i];
-    }
-    return true;
-}
-
-bool ghostBounds(std::int32_t* mn, std::int32_t* mx)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire) || mn == nullptr || mx == nullptr) {
-        return false;
-    }
-    for (int i = 0; i < 3; ++i) {
-        mn[i] = g_ghostMin[i];
-        mx[i] = g_ghostMax[i];
-    }
-    return true;
-}
-
-namespace {
-constexpr std::size_t kLayerSlots = 1024;
-constexpr std::uint8_t kNoLayer = 0xFF;
-struct LayerSlot {
-    std::atomic<const void*> key{nullptr};
-    std::atomic<std::uint8_t> layer{kNoLayer};
-};
-LayerSlot g_layers[kLayerSlots];
-
-LayerSlot* layerSlot(const void* block, bool insert)
-{
-    const std::size_t start = (reinterpret_cast<std::uintptr_t>(block) >> 4) % kLayerSlots;
-    for (std::size_t i = 0; i < kLayerSlots; ++i) {
-        LayerSlot& slot = g_layers[(start + i) % kLayerSlots];
-        const void* const have = slot.key.load(std::memory_order_acquire);
-        if (have == block) {
-            return &slot;
-        }
-        if (have == nullptr) {
-            if (!insert) {
-                return nullptr;
-            }
-            const void* expect = nullptr;
-            if (slot.key.compare_exchange_strong(expect, block, std::memory_order_acq_rel)) {
-                return &slot;
-            }
-            if (slot.key.load(std::memory_order_acquire) == block) {
-                return &slot;
-            }
-        }
-    }
-    return nullptr;
-}
-}
-
-void resetRealLayers()
-{
-    for (auto& slot : g_layers) {
-        slot.layer.store(kNoLayer, std::memory_order_relaxed);
-        slot.key.store(nullptr, std::memory_order_release);
-    }
-}
-
-void noteRealLayer(const void* block, int layer)
-{
-    if (block == nullptr || layer < 0 || layer >= 32) {
-        return;
-    }
-    LayerSlot* const slot = layerSlot(block, true);
-    if (slot == nullptr) {
-        return;
-    }
-    slot->layer.store(static_cast<std::uint8_t>(layer), std::memory_order_relaxed);
-}
-
-int realLayer(const void* block)
-{
-    if (block == nullptr) {
-        return -1;
-    }
-    const LayerSlot* const slot = layerSlot(block, false);
-    if (slot == nullptr) {
-        return -1;
-    }
-    const std::uint8_t layer = slot->layer.load(std::memory_order_relaxed);
-    return layer == kNoLayer ? -1 : static_cast<int>(layer);
 }
 
 bool hasBlockEntity(const void* block)
@@ -1307,387 +1198,6 @@ bool blockItemIdAux(const void* block, std::int32_t& out)
     return true;
 }
 
-void setGhostPalette(std::vector<const void*> blocks)
-{
-    resetRealLayers();
-
-    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawPaletteCount.store(0, std::memory_order_relaxed);
-    if (waitForDrawReaders()) {
-        g_retiredPalettes.clear();
-    } else if (!g_drawPalette.empty()) {
-        g_retiredPalettes.push_back(std::move(g_drawPalette));
-    }
-    g_drawPalette = std::move(blocks);
-    g_drawPaletteCount.store(g_drawPalette.size(), std::memory_order_relaxed);
-    g_drawPalettePtr.store(g_drawPalette.data(), std::memory_order_seq_cst);
-}
-
-void setGhostCellBlock(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
-                       int layer)
-{
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return;
-    }
-    if (entry + 1 > 0xFFFFu) {
-        return;
-    }
-    std::vector<std::uint16_t>& target = (layer == 1) ? g_drawCells2 : g_drawCells;
-    if (at >= target.size()) {
-        return;
-    }
-    target[at] = static_cast<std::uint16_t>(entry + 1);
-}
-
-bool dropGhostCell(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    bool dropped = false;
-    auto* const cells = const_cast<std::uint16_t*>(g_drawCellsPtr.load(std::memory_order_seq_cst));
-    auto* const cells2 = const_cast<std::uint16_t*>(g_drawCells2Ptr.load(std::memory_order_seq_cst));
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    std::size_t at = 0;
-    if (ghostCellIndex(x, y, z, at) && at < count) {
-        if (cells != nullptr && cells[at] != 0) {
-            cells[at] = 0;
-            dropped = true;
-        }
-        if (cells2 != nullptr && cells2[at] != 0) {
-            cells2[at] = 0;
-            dropped = true;
-        }
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return dropped;
-}
-
-void setGhostWantCell(std::int32_t x, std::int32_t y, std::int32_t z, std::size_t entry,
-                      int layer)
-{
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at) || entry + 1 >= kWantAirTag) {
-        return;
-    }
-    std::vector<std::uint16_t>& target = (layer == 1) ? g_wantCells2 : g_wantCells;
-    if (at >= target.size()) {
-        return;
-    }
-    target[at] = static_cast<std::uint16_t>(entry + 1);
-}
-
-void setGhostWantAir(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at) || at >= g_wantCells.size()) {
-        return;
-    }
-    g_wantCells[at] = kWantAirTag;
-}
-
-bool restoreGhostCellFromWant(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    bool back = false;
-    do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
-        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_seq_cst);
-        auto* const live =
-            const_cast<std::uint16_t*>(g_drawCellsPtr.load(std::memory_order_seq_cst));
-        auto* const live2 =
-            const_cast<std::uint16_t*>(g_drawCells2Ptr.load(std::memory_order_seq_cst));
-        const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-        std::size_t at = 0;
-        if (count == 0 || !ghostCellIndex(x, y, z, at) || at >= count) {
-            break;
-        }
-        if (want != nullptr && live != nullptr && want[at] != 0 && want[at] != kWantAirTag
-            && live[at] != want[at]) {
-            live[at] = want[at];
-            back = true;
-        }
-        if (want2 != nullptr && live2 != nullptr && want2[at] != 0 && live2[at] != want2[at]) {
-            live2[at] = want2[at];
-            back = true;
-        }
-    } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return back;
-}
-
-std::atomic<std::size_t> g_diffCellChanges{0};
-
-bool setDiffCell(std::int32_t x, std::int32_t y, std::int32_t z, DiffColor color)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    std::size_t at = 0;
-    bool changed = false;
-    if (cells != nullptr && count != 0 && ghostCellIndex(x, y, z, at) && at < count) {
-        const auto want = static_cast<std::uint8_t>(color);
-        if (cells[at] != want) {
-            cells[at] = want;
-            changed = true;
-            g_diffCellChanges.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return changed;
-}
-
-std::size_t takeDiffCellChanges()
-{
-    return g_diffCellChanges.exchange(0, std::memory_order_relaxed);
-}
-
-void setLayerFilter(bool on, int axis, std::int32_t lo, std::int32_t hi)
-{
-    if (lo > hi) {
-        std::swap(lo, hi);
-    }
-    g_layerAxis.store((axis >= 0 && axis <= 2) ? axis : 1, std::memory_order_relaxed);
-    g_layerLo.store(lo, std::memory_order_relaxed);
-    g_layerHi.store(hi, std::memory_order_relaxed);
-    g_layerOn.store(on, std::memory_order_release);
-}
-
-bool layerShows(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_layerOn.load(std::memory_order_acquire)) {
-        return true;
-    }
-    const int axis = g_layerAxis.load(std::memory_order_relaxed);
-    const std::int32_t v = (axis == 0) ? x : ((axis == 2) ? z : y);
-    return v >= g_layerLo.load(std::memory_order_relaxed)
-           && v <= g_layerHi.load(std::memory_order_relaxed);
-}
-
-DiffColor diffCellAt(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return DiffColor::None;
-    }
-    if (!layerShows(x, y, z)) {
-        return DiffColor::None;
-    }
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return DiffColor::None;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    DiffColor found = DiffColor::None;
-    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    if (cells != nullptr && count != 0 && at < count) {
-        const std::uint8_t raw = cells[at];
-        if (raw <= kDiffColorMax) {
-            found = static_cast<DiffColor>(raw);
-        }
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return found;
-}
-
-DiffKind diffKindOf(const void* real, const void* want, bool wantAir)
-{
-    if (real == nullptr) {
-        return DiffKind::UnknownWorld;
-    }
-    const void* const air = airBlock();
-    if (air == nullptr) {
-        return DiffKind::UnknownWorld;
-    }
-    if (wantAir) {
-        return real != air ? DiffKind::Extra : DiffKind::Match;
-    }
-    if (real == air) {
-        return DiffKind::Missing;
-    }
-    if (want == nullptr) {
-        return DiffKind::UnknownWant;
-    }
-    if (real == want) {
-        return DiffKind::Match;
-    }
-    const void* const legacyReal = legacyOfFast(real);
-    const void* const legacyWant = legacyOfFast(want);
-    if (legacyReal != nullptr && legacyReal == legacyWant) {
-        return DiffKind::State;
-    }
-    return DiffKind::Wrong;
-}
-
-DiffKind diffKindOf(const void* real, const void* want, bool wantAir,
-                    const void* realExtra, bool realExtraKnown, bool wantWater)
-{
-    const DiffKind base = diffKindOf(real, want, wantAir);
-    if (base != DiffKind::Match || wantAir || !realExtraKnown) {
-        return base;
-    }
-    const void* const air = airBlock();
-    const bool realWater = (realExtra != nullptr && realExtra != air);
-    return realWater == wantWater ? DiffKind::Match : DiffKind::State;
-}
-
-DiffColor colorOfDiffKind(DiffKind kind)
-{
-    switch (kind) {
-    case DiffKind::Missing:
-        return DiffColor::Missing;
-    case DiffKind::Wrong:
-        return DiffColor::Wrong;
-    case DiffKind::State:
-        return DiffColor::State;
-    case DiffKind::Extra:
-        return DiffColor::Extra;
-    case DiffKind::Match:
-    case DiffKind::UnknownWorld:
-    case DiffKind::UnknownWant:
-        break;
-    }
-    return DiffColor::None;
-}
-
-bool noteWorldBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, const void* real,
-                      const void* realExtra, bool realExtraKnown)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire) || real == nullptr) {
-        return false;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    bool changed = false;
-    do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
-        const std::uint16_t* const want2 = g_wantCells2Ptr.load(std::memory_order_seq_cst);
-        const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-        std::size_t at = 0;
-        if (want == nullptr || count == 0 || !ghostCellIndex(x, y, z, at) || at >= count) {
-            break;
-        }
-        const std::uint16_t tag = want[at];
-        if (tag == 0) {
-            break;
-        }
-        const void* wantBlock = nullptr;
-        if (tag != kWantAirTag) {
-            const void* const* const palette =
-                g_drawPalettePtr.load(std::memory_order_seq_cst);
-            const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
-            if (palette != nullptr && tag - 1u < size) {
-                wantBlock = palette[tag - 1u];
-            }
-            if (wantBlock == nullptr) {
-                break;
-            }
-        }
-        const bool wantWater = (want2 != nullptr && want2[at] != 0);
-        changed = setDiffCell(x, y, z,
-                              colorOfDiffKind(diffKindOf(real, wantBlock,
-                                                         tag == kWantAirTag, realExtra,
-                                                         realExtraKnown, wantWater)));
-    } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return changed;
-}
-
-std::size_t collectDiffBoxes(std::vector<DiffBox>& out)
-{
-    out.clear();
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return 0;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    const std::uint8_t* const cells = g_diffCellsPtr.load(std::memory_order_seq_cst);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    const std::int32_t minX = g_ghostMin[0];
-    const std::int32_t minY = g_ghostMin[1];
-    const std::int32_t minZ = g_ghostMin[2];
-    const std::size_t sy = static_cast<std::size_t>(g_ghostMax[1] - minY);
-    const std::size_t sz = static_cast<std::size_t>(g_ghostMax[2] - minZ);
-    const std::size_t plane = sy * sz;
-    const std::size_t sx = (cells != nullptr && plane != 0) ? count / plane : 0;
-    if (sx != 0) {
-        std::vector<std::uint8_t> showX(sx, 1);
-        std::vector<std::uint8_t> showY(sy, 1);
-        std::vector<std::uint8_t> showZ(sz, 1);
-        if (g_layerOn.load(std::memory_order_acquire)) {
-            const int layerAxis = g_layerAxis.load(std::memory_order_relaxed);
-            const std::int32_t layerLo = g_layerLo.load(std::memory_order_relaxed);
-            const std::int32_t layerHi = g_layerHi.load(std::memory_order_relaxed);
-            std::vector<std::uint8_t>& axis =
-                (layerAxis == 0) ? showX : ((layerAxis == 2) ? showZ : showY);
-            const std::int32_t base = (layerAxis == 0) ? minX : ((layerAxis == 2) ? minZ : minY);
-            for (std::size_t i = 0; i < axis.size(); ++i) {
-                const std::int32_t v = base + static_cast<std::int32_t>(i);
-                axis[i] = (v >= layerLo && v <= layerHi) ? 1 : 0;
-            }
-        }
-        const auto lit = [](std::uint8_t v) {
-            return static_cast<unsigned>(v) - 1u < static_cast<unsigned>(kDiffColorMax);
-        };
-        std::size_t litCount = 0;
-        for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
-            for (std::size_t dy = 0; dy < sy; ++dy) {
-                const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
-                for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
-                    litCount += (lit(cells[at]) && rowShown && showZ[dz] != 0) ? 1 : 0;
-                }
-            }
-        }
-        out.reserve(litCount);
-        for (std::size_t dx = 0, at = 0; dx < sx; ++dx) {
-            for (std::size_t dy = 0; dy < sy; ++dy) {
-                const bool rowShown = showX[dx] != 0 && showY[dy] != 0;
-                for (std::size_t dz = 0; dz < sz; ++dz, ++at) {
-                    const std::uint8_t raw = cells[at];
-                    if (!lit(raw) || !rowShown || showZ[dz] == 0) {
-                        continue;
-                    }
-                    std::uint8_t covered = 0;
-                    const bool columnShown = showX[dx] != 0 && showZ[dz] != 0;
-                    if (dy > 0 && lit(cells[at - sz]) && showY[dy - 1] != 0 && columnShown) {
-                        covered |= 0x01;
-                    }
-                    if (dy + 1 < sy && lit(cells[at + sz]) && showY[dy + 1] != 0 && columnShown) {
-                        covered |= 0x02;
-                    }
-                    if (dz > 0 && lit(cells[at - 1]) && showZ[dz - 1] != 0 && rowShown) {
-                        covered |= 0x04;
-                    }
-                    if (dz + 1 < sz && lit(cells[at + 1]) && showZ[dz + 1] != 0 && rowShown) {
-                        covered |= 0x08;
-                    }
-                    if (dx > 0 && lit(cells[at - plane]) && showX[dx - 1] != 0 && showY[dy] != 0
-                        && showZ[dz] != 0) {
-                        covered |= 0x10;
-                    }
-                    if (dx + 1 < sx && lit(cells[at + plane]) && showX[dx + 1] != 0
-                        && showY[dy] != 0 && showZ[dz] != 0) {
-                        covered |= 0x20;
-                    }
-                    DiffBox box;
-                    box.x = minX + static_cast<std::int32_t>(dx);
-                    box.y = minY + static_cast<std::int32_t>(dy);
-                    box.z = minZ + static_cast<std::int32_t>(dz);
-                    box.color = static_cast<DiffColor>(raw);
-                    box.covered = covered;
-                    box.hidden = covered == 0x3F;
-                    out.push_back(box);
-                }
-            }
-        }
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return out.size();
-}
-
 namespace {
 constexpr std::size_t kLegacyCacheSlots = 64;
 struct LegacyCacheSlot {
@@ -1697,6 +1207,18 @@ struct LegacyCacheSlot {
     std::atomic<std::uint64_t> version{0};
 };
 LegacyCacheSlot g_legacyCache[kLegacyCacheSlots];
+
+void forgetLegacyCache()
+{
+    for (auto& slot : g_legacyCache) {
+        while (slot.writing.test_and_set(std::memory_order_acquire)) {}
+        slot.version.fetch_add(1, std::memory_order_seq_cst);
+        slot.key.store(nullptr, std::memory_order_seq_cst);
+        slot.value.store(nullptr, std::memory_order_seq_cst);
+        slot.version.fetch_add(1, std::memory_order_seq_cst);
+        slot.writing.clear(std::memory_order_release);
+    }
+}
 }
 
 std::size_t appendStateVariants(const void* block, std::vector<const void*>& out)
@@ -1765,202 +1287,14 @@ const void* legacyOfFast(const void* block)
     return answer;
 }
 
-bool ghostSubChunkOccupied(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    const std::int32_t x0 = std::max(baseX, g_ghostMin[0]);
-    const std::int32_t y0 = std::max(baseY, g_ghostMin[1]);
-    const std::int32_t z0 = std::max(baseZ, g_ghostMin[2]);
-    const std::int32_t x1 = std::min(baseX + 16, g_ghostMax[0]);
-    const std::int32_t y1 = std::min(baseY + 16, g_ghostMax[1]);
-    const std::int32_t z1 = std::min(baseZ + 16, g_ghostMax[2]);
-    if (x0 >= x1 || y0 >= y1 || z0 >= z1) {
-        return false;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    bool found = false;
-    const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_seq_cst);
-    const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-    if (cells != nullptr && count != 0) {
-        for (std::int32_t x = x0; x < x1 && !found; ++x) {
-            for (std::int32_t y = y0; y < y1 && !found; ++y) {
-                for (std::int32_t z = z0; z < z1; ++z) {
-                    std::size_t at = 0;
-                    if (!ghostCellIndex(x, y, z, at) || at >= count) {
-                        continue;
-                    }
-                    if (cells[at] != 0) {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return found;
-}
-
-bool ghostBoxTouchesSubChunk(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    return baseX + 16 > g_ghostMin[0] && baseX < g_ghostMax[0]
-           && baseY + 16 > g_ghostMin[1] && baseY < g_ghostMax[1]
-           && baseZ + 16 > g_ghostMin[2] && baseZ < g_ghostMax[2];
-}
-
-bool ghostInside(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    std::size_t at = 0;
-    return ghostCellIndex(x, y, z, at);
-}
-
-const void* ghostBlockAt(std::int32_t x, std::int32_t y, std::int32_t z, int layer)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return nullptr;
-    }
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return nullptr;
-    }
-    if (!layerShows(x, y, z)) {
-        return nullptr;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    const void* found = nullptr;
-    do {
-        const std::uint16_t* const cells =
-            (layer == 1) ? g_drawCells2Ptr.load(std::memory_order_seq_cst)
-                         : g_drawCellsPtr.load(std::memory_order_seq_cst);
-        const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-        if (cells == nullptr || count == 0 || at >= count) {
-            break;
-        }
-        const std::uint16_t tag = cells[at];
-        if (tag == 0) {
-            break;
-        }
-        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_seq_cst);
-        const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
-        if (palette == nullptr || tag - 1u >= size) {
-            break;
-        }
-        found = palette[tag - 1u];
-    } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return found;
-}
-
-const void* wantBlockAt(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return nullptr;
-    }
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at) || !layerShows(x, y, z)) {
-        return nullptr;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    const void* found = nullptr;
-    do {
-        const std::uint16_t* const want = g_wantCellsPtr.load(std::memory_order_seq_cst);
-        const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-        if (want == nullptr || count == 0 || at >= count) {
-            break;
-        }
-        const std::uint16_t tag = want[at];
-        if (tag == 0 || tag == kWantAirTag) {
-            break;
-        }
-        const void* const* const palette = g_drawPalettePtr.load(std::memory_order_seq_cst);
-        const std::size_t size = g_drawPaletteCount.load(std::memory_order_relaxed);
-        if (palette == nullptr || tag - 1u >= size) {
-            break;
-        }
-        found = palette[tag - 1u];
-    } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return found;
-}
-
-namespace {
-std::atomic<bool> g_ghostOverMismatch{false};
-}
-
-void setGhostOverMismatch(bool on)
-{
-    g_ghostOverMismatch.store(on, std::memory_order_relaxed);
-}
-
-bool ghostOverMismatchOn()
-{
-    return g_ghostOverMismatch.load(std::memory_order_relaxed);
-}
-
-bool ghostCell(std::int32_t x, std::int32_t y, std::int32_t z)
-{
-    if (!g_ghostOn.load(std::memory_order_acquire)) {
-        return false;
-    }
-    std::size_t at = 0;
-    if (!ghostCellIndex(x, y, z, at)) {
-        return false;
-    }
-    g_drawReaders.fetch_add(1, std::memory_order_seq_cst);
-    bool found = false;
-    do {
-        const std::uint16_t* const cells = g_drawCellsPtr.load(std::memory_order_seq_cst);
-        const std::size_t count = g_drawCellsCount.load(std::memory_order_relaxed);
-        if (cells == nullptr || count == 0 || at >= count) {
-            break;
-        }
-        found = cells[at] != 0;
-    } while (false);
-    g_drawReaders.fetch_sub(1, std::memory_order_seq_cst);
-    return found;
-}
-
 void setAirBlock(const void* air)
 {
     g_air.store(air, std::memory_order_release);
 }
 
-void dropWorldBlocks()
-{
-    g_ghostOn.store(false, std::memory_order_release);
-    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawPaletteCount.store(0, std::memory_order_relaxed);
-    g_air.store(nullptr, std::memory_order_release);
-    g_worldDropped.store(true, std::memory_order_release);
-}
-
-bool takeWorldDropped()
-{
-    return g_worldDropped.exchange(false, std::memory_order_acq_rel);
-}
-
 const void* airBlock()
 {
     return g_air.load(std::memory_order_acquire);
-}
-
-void waitUntilIdle()
-{
-    g_ghostOn.store(false, std::memory_order_release);
-    g_drawCellsPtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCells2Ptr.store(nullptr, std::memory_order_seq_cst);
-    g_drawPalettePtr.store(nullptr, std::memory_order_seq_cst);
-    g_drawCellsCount.store(0, std::memory_order_relaxed);
-    waitForDrawReaders();
-    Sleep(50);
 }
 
 void setSimThread(unsigned long id)
@@ -1971,56 +1305,6 @@ void setSimThread(unsigned long id)
 unsigned long simThread()
 {
     return g_simThread.load(std::memory_order_relaxed);
-}
-
-static std::size_t meshSeatsTaken()
-{
-    const std::size_t taken = g_meshThreadCount.load(std::memory_order_acquire);
-    return taken > kMeshThreadLimit ? kMeshThreadLimit : taken;
-}
-
-bool isMeshThread(unsigned long id)
-{
-    if (id == 0) {
-        return false;
-    }
-    const std::size_t taken = meshSeatsTaken();
-    for (std::size_t i = 0; i < taken; ++i) {
-        if (g_meshThreads[i].load(std::memory_order_acquire) == id) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void noteMeshThread(unsigned long id)
-{
-    if (id == 0 || id == g_simThread.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (isMeshThread(id)) {
-        return;
-    }
-    if (g_meshThreadCount.load(std::memory_order_acquire) >= kMeshThreadLimit) {
-        return;
-    }
-    const std::size_t at = g_meshThreadCount.fetch_add(1, std::memory_order_acq_rel);
-    if (at >= kMeshThreadLimit) {
-        return;
-    }
-    g_meshThreads[at].store(id, std::memory_order_release);
-}
-
-std::size_t meshThreadCount()
-{
-    std::size_t live = 0;
-    const std::size_t taken = meshSeatsTaken();
-    for (std::size_t i = 0; i < taken; ++i) {
-        if (g_meshThreads[i].load(std::memory_order_acquire) != 0) {
-            ++live;
-        }
-    }
-    return live;
 }
 
 }

@@ -102,9 +102,23 @@ TkCommandSpec buildTkCommandSpec(std::uint32_t firstEnumIndex, std::optional<std
             spec.overloads.push_back({set[0], set[1], {"setting", settingIndex, false},
                                       {"binding", 0, false, ParamType::Json}});
         }
+        add(settings.text, "TsukuyomiTextSetting", "value", ParamType::String, nullptr, {});
         add(settings.action, "TsukuyomiActionSetting", "action", ParamType::Enum,
             "TsukuyomiRunValue", {"run"});
     }
+    const auto rejoinIndex = firstEnumIndex + static_cast<std::uint32_t>(spec.enums.size());
+    spec.enums.push_back({"TsukuyomiRejoin", {"rejoin"}});
+    spec.overloads.push_back({{"rejoin", rejoinIndex, false}});
+    const auto flyIndex = firstEnumIndex + static_cast<std::uint32_t>(spec.enums.size());
+    spec.enums.push_back({"TsukuyomiFlySpeed", {"flyspeed"}});
+    const auto resetIndex = firstEnumIndex + static_cast<std::uint32_t>(spec.enums.size());
+    spec.enums.push_back({"TsukuyomiFlySpeedReset", {"reset"}});
+    const CompletionParam fly{"flyspeed", flyIndex, false};
+    const CompletionParam player{"player", 0, false, ParamType::Player};
+    spec.overloads.push_back({fly, player});
+    spec.overloads.push_back({fly, player, {"horizontal", 0, false, ParamType::Float},
+                             {"vertical", 0, true, ParamType::Float}});
+    spec.overloads.push_back({fly, player, {"reset", resetIndex, false}});
     return spec;
 }
 

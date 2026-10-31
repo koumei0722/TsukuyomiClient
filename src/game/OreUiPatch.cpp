@@ -1,4 +1,5 @@
 #include "game/OreUiPatch.h"
+#include "game/OreUiBundlePatch.h"
 #include "config/WriteSwitches.h"
 
 #include <Windows.h>
@@ -54,10 +55,14 @@ const wchar_t* g_failure = nullptr;
 volatile bool g_done = false;
 
 constexpr const char* kOwnIds[] = {
-    "tk.k0",  "tk.k1",  "tk.k2",  "tk.k3",  "tk.k4",  "tk.k5",  "tk.k6",  "tk.k7",
-    "tk.k8",  "tk.k9",  "tk.k10", "tk.k11", "tk.k12", "tk.k13", "tk.k14", "tk.k15",
+    "tk.k0", "tk.k1", "tk.k2", "tk.k3", "tk.k4", "tk.k5", "tk.k6", "tk.k7",
+    "tk.k8", "tk.k9", "tk.k10", "tk.k11", "tk.k12", "tk.k13", "tk.k14", "tk.k15",
     "tk.k16", "tk.k17", "tk.k18", "tk.k19", "tk.k20", "tk.k21", "tk.k22", "tk.k23",
-    "tk.k24", "tk.k25", "tk.k26", "tk.k27", "tk.k28", "tk.k29", "tk.k30", "tk.k31"};
+    "tk.k24", "tk.k25", "tk.k26", "tk.k27", "tk.k28", "tk.k29", "tk.k30", "tk.k31",
+    "tk.k32", "tk.k33", "tk.k34", "tk.k35", "tk.k36", "tk.k37", "tk.k38", "tk.k39",
+    "tk.k40", "tk.k41", "tk.k42", "tk.k43", "tk.k44", "tk.k45", "tk.k46", "tk.k47",
+    "tk.k48", "tk.k49", "tk.k50", "tk.k51", "tk.k52", "tk.k53", "tk.k54", "tk.k55",
+    "tk.k56", "tk.k57", "tk.k58", "tk.k59", "tk.k60", "tk.k61", "tk.k62", "tk.k63"};
 constexpr int kOwnIdCount = static_cast<int>(sizeof(kOwnIds) / sizeof(kOwnIds[0]));
 
 constexpr char kAnchorHead[] = "\"keyboardAndMouse.inputGroup.standard\":";
@@ -766,6 +771,14 @@ bool buildPatchedBundle()
     made.insert(made.end(), body.begin(), body.end());
     made.insert(made.end(), blob.begin() + static_cast<std::ptrdiff_t>(at), blob.end());
     blob.swap(made);
+
+    std::string settingsBundle(blob.begin(), blob.end());
+    if (!patchSettingsTabs(settingsBundle)) {
+        note(L"[oreui] the settings tabs mapper has an unexpected shape");
+        g_failure = L"the settings tabs mapper has an unexpected shape";
+        return false;
+    }
+    blob.assign(settingsBundle.begin(), settingsBundle.end());
 
     const std::wstring outDir = root + L"\\Tsukuyomi\\hbui";
     CreateDirectoryW((root + L"\\Tsukuyomi").c_str(), nullptr);

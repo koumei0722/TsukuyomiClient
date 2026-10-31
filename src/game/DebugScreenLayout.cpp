@@ -235,9 +235,22 @@ std::string hideBindingJson(const char* vanillaVisible, const char* hideBind)
     return json::array({collectVanilla, collectHide, apply, alpha}).dump();
 }
 
-std::string chatHideBindingJson()
+std::string chatPanelControlsJson()
 {
-    return json::array({alwaysGlobalVisible(std::string("(not ") + kBindChatBottom + ")")}).dump();
+    const json factory = {{"name", "chat_item_factory"},
+                          {"max_children_size", 50},
+                          {"control_ids", {{"chat_item", "chat_item@hud.chat_grid_item"}}}};
+    const json rows = {{"type", "stack_panel"},
+                       {"anchor_from", "bottom_left"},
+                       {"anchor_to", "bottom_left"},
+                       {"factory", factory},
+                       {"bindings", json::array({alwaysGlobalVisible(kChatRowsVariable)})}};
+    return json::array({named("stack_panel", rows)}).dump();
+}
+
+std::string chatRowsDefaultJson()
+{
+    return json(kBindVanillaChat).dump();
 }
 
 std::string chatJson()
@@ -252,7 +265,8 @@ std::string chatJson()
                        {"anchor_to", "bottom_left"},
                        {"size", {"40%", "100%c"}},
                        {"offset", {0, kChatBottomOffsetY}},
-                       {"bindings", json::array({alwaysGlobalVisible(kBindChatBottom)})}};
+                       {"bindings", json::array({alwaysGlobalVisible(kBindChatBottom)})},
+                       {kChatRowsVariable, kBindChatBottom}};
     const json root = {{"type", "panel"},
                        {"size", {"100%", "100%"}},
                        {"layer", 1},

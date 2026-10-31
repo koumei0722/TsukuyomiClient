@@ -1,3 +1,4 @@
+#include "game/SchematicWorld.h"
 #include "hooks/Detours.h"
 
 #include "config/WriteSwitches.h"
@@ -7,6 +8,7 @@
 #include "core/Notice.h"
 #include "game/BlockRegistry.h"
 #include "game/BlockWrite.h"
+#include "game/InventoryResync.h"
 #include "game/ChatCommand.h"
 #include "game/AvailableCommandsPatch.h"
 #include "game/ContainerUi.h"
@@ -14,10 +16,15 @@
 #include "game/FmodStats.h"
 #include "game/TradeUi.h"
 #include "game/GameData.h"
+#include "game/WorldIdentity.h"
+#include "game/SessionTickLayout.h"
 #include "game/UiSound.h"
 #include "game/InventoryScreen.h"
 #include "game/ItemStackRequest.h"
 #include "game/UiProbe.h"
+#include "game/OreUiScript.h"
+#include "game/CustomGuiScale.h"
+#include "game/CraftAmount.h"
 #include "input/GameButtons.h"
 #include "hooks/HookManager.h"
 #include "input/GameInput.h"
@@ -27,19 +34,23 @@
 #include "modules/DebugScreen.h"
 #include "modules/DebugKeys.h"
 #include "game/GameModeState.h"
+#include "game/UiReload.h"
 #include "game/GameModeWheel.h"
 #include "game/PlayerContext.h"
+#include "modules/AngleSnap.h"
 #include "modules/AntiEffect.h"
 #include "modules/AutoTool.h"
 #include "modules/CreativeNoClip.h"
 #include "modules/FastBlockBreak.h"
 #include "modules/FastBlockPlacement.h"
 #include "modules/FastUseItem.h"
-#include "modules/FlySpeed.h"
+#include "game/FlySpeedCommand.h"
 #include "modules/HandRestock.h"
 #include "modules/OffhandSlot.h"
 #include "modules/PlayerList.h"
 #include "modules/DeathLogger.h"
+#include "bot/BotHooks.h"
+#include "bot/BotModule.h"
 #include "modules/AppleSkin.h"
 #include "modules/EffectTimer.h"
 #include "modules/ArmorHUD.h"
@@ -49,10 +60,19 @@
 #include "modules/FreeCamera.h"
 #include "modules/Fullbright.h"
 #include "modules/NoRender.h"
+#include "modules/OverworldSky.h"
 #include "modules/ToggleSneakSprint.h"
 #include "modules/Zoom.h"
 #include "modules/Scaffold.h"
 #include "modules/Schematica.h"
+#include "modules/FlexiblePlacement.h"
+#include "modules/IgnoreBlock.h"
+#include "modules/LightOverlay.h"
+#include "modules/LocatorBar.h"
+#include "modules/NameTags.h"
+#include "modules/Waypoints.h"
+#include "game/LookPlacement.h"
+#include "game/Rejoin.h"
 #include "modules/ShulkerPreview.h"
 #include "render/BoxRenderer.h"
 #include "render/Overlay.h"
@@ -63,15 +83,12 @@
 #include <intrin.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <format>
-#include <mutex>
-#include <unordered_map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -81,6 +98,8 @@ namespace tsukuyomi {
 namespace hooks {
 static void refreshHookGroups();
 }
+
+std::atomic<unsigned long long> g_lastLeadingViewAt{0};
 
 using SendCommandFn = void(__fastcall*)(void*, std::int32_t*, const void*, std::int32_t);
 SendCommandFn g_sendCommandRequest = nullptr;
@@ -130,11 +149,15 @@ void* tsukuyomiPlayerViewTrampoline = nullptr;
 void tsukuyomiPacketSendTrampolineEntry();
 void* tsukuyomiPacketSendTrampoline = nullptr;
 
+void tsukuyomiSessionTickFirstEntry();
+void tsukuyomiSessionTickCatchupEntry();
+void* tsukuyomiSessionTickFirstTrampoline = nullptr;
+void* tsukuyomiSessionTickCatchupTrampoline = nullptr;
+
 void tsukuyomiCameraHook(void* cameraBase, void* source, void* frame)
 {
     FreeCamera::instance().onCameraWrite(cameraBase, frame);
 
-    Zoom::instance().onCameraWrite(cameraBase, source);
     boxes::noteCamera(cameraBase, source);
 }
 
@@ -151,6 +174,77 @@ void* __fastcall detourViewVector(void* actor, float* out, float partial)
         FreeCamera::instance().freezeViewVector(out);
     }
     return result;
+}
+
+using CameraDirectLookTurnFn = void(__fastcall*)(void*, void*, float*, const float*);
+CameraDirectLookTurnFn g_cameraDirectLookTurn = nullptr;
+
+void __fastcall detourCameraDirectLookTurn(void* rcx, void* rdx, float* look, const float* delta)
+{
+    AngleSnap& snap = AngleSnap::instance();
+    float before[3]{};
+    const bool snapping = snap.active() && look != nullptr && memory::copyGuarded(look, before, sizeof(before));
+    g_cameraDirectLookTurn(rcx, rdx, look, delta);
+    if (snapping) {
+        snap.afterTurn(look, before);
+    }
+}
+
+using CameraOrbitTurnFn = void(__fastcall*)(void*, void*, float*, const float*);
+CameraOrbitTurnFn g_cameraOrbitTurn = nullptr;
+
+void __fastcall detourCameraOrbitTurn(void* rcx, void* rdx, float* orbit, const float* delta)
+{
+    AngleSnap& snap = AngleSnap::instance();
+    float before[2]{};
+    const bool snapping =
+        snap.active() && orbit != nullptr && memory::copyGuarded(orbit + 0x34 / sizeof(float), before, sizeof(before));
+    g_cameraOrbitTurn(rcx, rdx, orbit, delta);
+    if (snapping) {
+        snap.afterOrbitTurn(orbit, before);
+    }
+}
+
+using DismountButtonFn = void(__fastcall*)(void*);
+DismountButtonFn g_dismountButton = nullptr;
+
+void __fastcall detourDismountButton(void* client)
+{
+    if (FreeCamera::instance().blocksDismount()) {
+        return;
+    }
+    g_dismountButton(client);
+}
+
+using HotbarScrollButtonFn = void(__fastcall*)(void*, int);
+HotbarScrollButtonFn g_hotbarScrollButton = nullptr;
+
+void __fastcall detourHotbarScrollButton(void* client, int direction)
+{
+    if (FreeCamera::instance().blocksHotbarScroll()) {
+        return;
+    }
+    g_hotbarScrollButton(client, direction);
+}
+
+using HudHotbarScrollFn = std::uint32_t(__fastcall*)(void*, void*);
+HudHotbarScrollFn g_hudHotbarScrollNext = nullptr;
+HudHotbarScrollFn g_hudHotbarScrollPrev = nullptr;
+
+std::uint32_t __fastcall detourHudHotbarScrollNext(void* self, void* event)
+{
+    if (FreeCamera::instance().blocksHotbarScroll()) {
+        return 0;
+    }
+    return g_hudHotbarScrollNext(self, event);
+}
+
+std::uint32_t __fastcall detourHudHotbarScrollPrev(void* self, void* event)
+{
+    if (FreeCamera::instance().blocksHotbarScroll()) {
+        return 0;
+    }
+    return g_hudHotbarScrollPrev(self, event);
 }
 
 namespace {
@@ -207,6 +301,7 @@ void tsukuyomiPlayerViewHook(void* viewBase)
     }
 
     GameData::instance().setPlayerView(view);
+    g_lastLeadingViewAt.store(GetTickCount64(), std::memory_order_relaxed);
 
     static std::atomic<bool> announced{false};
     if (!announced.exchange(true)) {
@@ -215,18 +310,17 @@ void tsukuyomiPlayerViewHook(void* viewBase)
 
     AutoTool::instance().onPlayerViewUpdate();
 
-    FastBlockPlacement::instance().onPlayerViewUpdate();
-    Scaffold::instance().onPlayerViewUpdate();
-
     GameModeState::instance().onPlayerView(GetTickCount64());
 
     UiSound::instance().pump();
     ModuleManager::instance().pumpToggleNotices();
 
     ItemStackRequest::instance().onFrame();
+    InventoryResync::instance().onPlayerViewUpdate();
 
     chatcommand::pump();
     GameButtons::instance().pumpNotice();
+    uireload::pump();
     notice::pump();
     HandRestock::instance().onPlayerViewUpdate();
 
@@ -234,13 +328,25 @@ void tsukuyomiPlayerViewHook(void* viewBase)
 
     ItemScroller::instance().onPlayerViewUpdate();
 
+    static std::uint64_t placementGeneration = 0;
+    const auto generation = blockwrite::regionGeneration();
+    if (generation != placementGeneration) { placementGeneration = generation; lookplace::cancel(); }
+    lookplace::pump();
     Schematica::instance().onPlayerViewUpdate();
+    FlexiblePlacement::instance().onPlayerViewUpdate();
+    IgnoreBlock::instance().onPlayerViewUpdate();
+    LightOverlay::instance().onPlayerViewUpdate();
+    LocatorBar::instance().onPlayerViewUpdate();
+    Waypoints::instance().onPlayerViewUpdate();
+    FreeCamera::instance().onPlayerViewUpdate();
 
     DebugScreen::instance().onPlayerViewUpdate();
     PlayerList::instance().onPlayerViewUpdate();
     DeathLogger::instance().onPlayerViewUpdate();
+    Bot::instance().onPlayerViewUpdate();
     AppleSkin::instance().onPlayerViewUpdate();
     DebugKeys::instance().onPlayerViewUpdate();
+    NameTags::instance().onPlayerViewUpdate();
     ArmorHUD::instance().onPlayerViewUpdate();
 
     uiprobe::pumpMenuSelection();
@@ -261,15 +367,18 @@ void zeroAuthInputMove(void* packet)
     memory::writeGuarded(base + kFlagsAt, &kZeroFlags, sizeof(kZeroFlags));
 }
 
-void tsukuyomiOnPacketSend(void* packet)
+int tsukuyomiOnPacketSend(void* packet, void* sender)
 {
+    if (hooks::dryRunActive()) { hooks::noteDryPacket(); return 1; }
+    bot::onPacketSend(packet, sender);
+    lookplace::onPacketSend(packet);
     if (FreeCamera::instance().active()
         && ItemStackRequest::packetId(packet) == 0x90) {
         zeroAuthInputMove(packet);
     }
 
     ItemStackRequest::instance().observePacket(packet);
-
+    return 0;
 }
 
 }
@@ -278,19 +387,13 @@ void tsukuyomiOnPacketSend(void* packet)
 
 namespace tsukuyomi::hooks {
 
-static void armStorageFromSubChunk(void* subChunk);
-
-void noteChunkBuiltForRebuilds(const void* rec, std::uint64_t buildSeq);
-void noteChunkBoxTries(const void* rec, std::uint32_t tries,
-                       std::uint64_t buildSeq);
-
 namespace {
 
 using GetDestroySpeedFn = float(__fastcall*)(void*, void*, void*, void*);
 using SetSelectedSlotFn = void(__fastcall*)(void*, void*, void*, void*);
 using BuildBlockFn = bool(__fastcall*)(void*, void*, unsigned char, unsigned char, bool);
 using MobSwingFn = bool(__fastcall*)(void*, unsigned char, unsigned char);
-using AbilitiesAccessFn = bool(__fastcall*)(void*, void*, void*, void*);
+using AbilitiesAccessFn = std::byte*(__fastcall*)(void*);
 using PoseDecisionFn = void(__fastcall*)(void*, void*, void*, void*, void*, std::uint64_t*, void*, void*,
                                           void*, void*);
 
@@ -315,11 +418,13 @@ using ContainerOpenHandleFn = void(__fastcall*)(void*, void*, void*, void*);
 using InventoryContentReadFn = void*(__fastcall*)(void*, void*, void*, void*);
 
 using HandleItemStackResponseFn = void(__fastcall*)(void*, void*, void*, void*);
+using CraftFromOutputFn = void*(__fastcall*)(void*, void*, void*, void*, void*);
 
 using InventoryHoveredSlotFn = void*(__fastcall*)(void*, void*);
 
 using UiDefLookupFn = void*(__fastcall*)(void*, const void*, const void*);
 
+using SettingsGroupResolveFn = void*(__fastcall*)(void*, void*, const void*, void*);
 using SettingsGroupRegisterFn = void*(__fastcall*)(void*, const void*, void*, void*);
 
 using OpenHowToPlayScreenFn = void(__fastcall*)(void*);
@@ -339,8 +444,11 @@ using UiEventDispatchFn = int(__fastcall*)(void*, const void*, void*, void*);
 GetDestroySpeedFn g_getDestroySpeed = nullptr;
 SetSelectedSlotFn g_setSelectedSlot = nullptr;
 BuildBlockFn g_buildBlock = nullptr;
+std::uint8_t g_keptClickFlag = 0;
+std::uint8_t g_keptClickPoint = 0;
 MobSwingFn g_mobSwing = nullptr;
 thread_local bool t_suppressSwing = false;
+thread_local bool t_modBuild = false;
 using GameModeContinueDestroyBlockFn = bool(__fastcall*)(void*, const void*, std::uint8_t,
                                                           const void*, bool*);
 using GameModeDestroyBlockFn = bool(__fastcall*)(void*, const void*, std::uint8_t);
@@ -362,6 +470,7 @@ OpenInventoryScreenFn g_openInventoryScreen = nullptr;
 ContainerOpenHandleFn g_containerOpenHandle = nullptr;
 InventoryContentReadFn g_inventoryContentRead = nullptr;
 HandleItemStackResponseFn g_handleItemStackResponse = nullptr;
+CraftFromOutputFn g_craftFromOutput = nullptr;
 InventoryHoveredSlotFn g_inventoryHoveredSlot = nullptr;
 containerui::SmHandleFn g_containerSm = nullptr;
 using ContainerScreenDtorFn = void*(__fastcall*)(void*);
@@ -378,6 +487,10 @@ RenderCurrentFrameFn g_renderCurrentFrame = nullptr;
 
 using ServerLevelTickFn = void(__fastcall*)(void* level);
 ServerLevelTickFn g_serverLevelTick = nullptr;
+const void* g_sessionTickReturns[2]{};
+bool g_sessionTicksReady = false;
+thread_local int g_sessionTickBranch = 0;
+thread_local LONGLONG g_sessionTickStart = 0;
 
 using PacketCheckSizeFn = std::uint64_t(__fastcall*)(void* self, void* a2, void* a3,
                                                      unsigned int receiverIsServer);
@@ -413,15 +526,18 @@ TradeTierBoolFn g_tradeTierUnlocked = nullptr;
 TradeTierNameFn g_tradeTierName = nullptr;
 UiDefLookupFn g_uiDefLookup = nullptr;
 UiEventDispatchFn g_uiEventDispatch = nullptr;
+SettingsGroupResolveFn g_settingsGroupResolve = nullptr;
 SettingsGroupRegisterFn g_settingsGroupRegister = nullptr;
 OpenHowToPlayScreenFn g_openHowToPlayScreen = nullptr;
 
 std::atomic<void*> g_clientInstance{nullptr};
 SettingsProviderCallFn g_settingsProviderCall = nullptr;
 SettingsFindComponentFn g_settingsFindComponent = nullptr;
-GameAllocateFn g_gameAllocate = nullptr;
+void** g_gameAllocatorGlobal = nullptr;
+std::size_t g_gameAllocateSlot = 0;
 using FogSettingsFetchFn = void*(__fastcall*)(void*, void*, void*, void*);
 FogSettingsFetchFn g_fogSettingsFetch = nullptr;
+FogSettingsFetchFn g_fogColorFetch = nullptr;
 using LegacyParticleInsertFn = void(__fastcall*)(void* frameBuilder, void* description);
 LegacyParticleInsertFn g_legacyParticleInsert = nullptr;
 using LegacyParticleRenderFn = void*(__fastcall*)(void* engine, void* out, void* a3, void* a4, void* a5,
@@ -434,6 +550,9 @@ ItemHoverTextBuildFn g_itemHoverTextBuild = nullptr;
 using HoverRendererRenderFn = void(__fastcall*)(void* self, void* ctx, void* client, void* owner, int pass);
 HoverRendererRenderFn g_hoverRendererRender = nullptr;
 HoverRendererRenderFn g_mobEffectsRendererRender = nullptr;
+LocatorBar::RenderFn g_locatorBarRendererRender = nullptr;
+LocatorBar::IconFn g_locatorBarIcon = nullptr;
+NameTags::BuildTagFn g_nameTagBuild = nullptr;
 using MobEffectsLayoutFn = void(__fastcall*)(void* layout);
 MobEffectsLayoutFn g_mobEffectsLayout = nullptr;
 using HudRendererUpdateFn = std::uintptr_t(__fastcall*)(void* self, void* a, void* b, void* c);
@@ -463,10 +582,19 @@ void __fastcall detourSetSelectedSlot(void* rcx, void* rdx, void* r8, void* r9)
     if (Zoom::instance().suppressHotbar(returnAddress)) {
         return;
     }
+    if (FastBlockPlacement::instance().suppressHotbarSlot(static_cast<int>(reinterpret_cast<std::uintptr_t>(rdx) & 0xFFFFFFFFu))) {
+        return;
+    }
 
     HandRestock::instance().onSetSelectedSlot(rcx);
 
     AutoTool::instance().onSetSelectedSlot(rcx, rdx, r8, r9);
+}
+
+void* __fastcall detourCraftFromOutput(void* ctrl, void* out, void* collection, void* amount, void* results)
+{
+    craftamount::apply(amount);
+    return g_craftFromOutput(ctrl, out, collection, amount, results);
 }
 
 void __fastcall detourHandleItemStackResponse(void* rcx, void* rdx, void* r8, void* r9)
@@ -482,6 +610,15 @@ bool __fastcall detourBuildBlock(void* gameMode, void* blockPos, unsigned char f
                                  unsigned char extra, bool simTick)
 {
     GameData::instance().setGameMode(gameMode);
+    if (t_modBuild) return hooks::callBuildBlock(gameMode, blockPos, face, extra, simTick);
+    bool handled = false;
+    const bool ignoreResult = IgnoreBlock::instance().onBuildBlock(blockPos, handled);
+    if (handled) return ignoreResult;
+    const bool result = Schematica::instance().onBuildBlock(gameMode, blockPos, face, extra, simTick, handled);
+    if (handled) return result;
+
+    const bool flexibleResult = FlexiblePlacement::instance().onBuildBlock(gameMode, blockPos, face, extra, simTick, handled);
+    if (handled) return flexibleResult;
 
     return FastBlockPlacement::instance().onBuildBlock(gameMode, blockPos, face, extra, simTick);
 }
@@ -505,11 +642,11 @@ bool __fastcall detourGameModeDestroyBlock(void* gameMode, const void* pos, std:
     return FastBlockBreak::instance().onDestroyBlock(gameMode, pos, face);
 }
 
-bool __fastcall detourAbilitiesAccess(void* rcx, void* rdx, void* r8, void* r9)
+std::byte* __fastcall detourAbilitiesAccess(void* actor)
 {
-    CreativeNoClip::instance().onAbilitiesAccess(rdx);
-    FlySpeed::instance().onAbilitiesAccess(rdx);
-    return g_abilitiesAccess != nullptr ? g_abilitiesAccess(rcx, rdx, r8, r9) : false;
+    std::byte* const layered = g_abilitiesAccess != nullptr ? g_abilitiesAccess(actor) : nullptr;
+    CreativeNoClip::instance().onAbilitiesAccess(layered);
+    return layered;
 }
 
 void __fastcall detourPoseDecision(void* a1, void* input, void* gameType, void* room, void* flags,
@@ -526,6 +663,18 @@ void __fastcall detourPoseDecision(void* a1, void* input, void* gameType, void* 
 
 int __fastcall detourUseItem(void* gameMode, void* itemStack, int extra)
 {
+    if (!t_modBuild && gameMode != nullptr) {
+        void* owner = nullptr;
+        if (memory::copyGuarded(static_cast<const std::byte*>(gameMode) + 8, &owner, sizeof(owner))
+            && owner != nullptr && owner == GameData::instance().player()) {
+            GameData::instance().setGameMode(gameMode);
+        }
+    }
+    if (!t_modBuild) {
+        bool handled = false;
+        Schematica::instance().onUseItem(gameMode, handled);
+        if (handled) return 0;
+    }
     return FastUseItem::instance().onUseItem(gameMode, itemStack, extra);
 }
 
@@ -537,535 +686,28 @@ int __fastcall detourUseItemTransaction(void* gameMode, void* itemStack, int ext
 using SubChunkSetBlockFn = void(__fastcall*)(void*, unsigned int, unsigned int, const void*);
 SubChunkSetBlockFn g_subChunkSetBlock = nullptr;
 
-void __fastcall detourSubChunkSetBlock(void* self, unsigned int layer, unsigned int index,
-                                       const void* block)
+void __fastcall detourSubChunkSetBlock(void* self, unsigned int layer, unsigned int index, const void* block)
 {
-    armStorageFromSubChunk(self);
-
-    const void* const write = blockwrite::onSubChunkWrite(self, layer, index, block);
-    if (write == nullptr) {
-        return;
-    }
-
-    if (layer == 0 && blocks::ghostOn()) {
-        int at[3] = {0, 0, 0};
-        if (blockwrite::worldPosOfSubChunkWrite(self, index, at)) {
-            const bool mine = blockwrite::selfWriting();
-            if (write == blocks::airBlock()) {
-                blocks::restoreGhostCellFromWant(at[0], at[1], at[2]);
-            } else if (!mine) {
-                blocks::dropGhostCell(at[0], at[1], at[2]);
-            }
-            if (!mine) {
-                const void* extra = nullptr;
-                const bool extraKnown =
-                    blockwrite::readWorldExtraAt(at[0], at[1], at[2], extra);
-                blocks::noteWorldBlockAt(at[0], at[1], at[2], write, extra, extraKnown);
-            }
-        }
-    }
-    else if (layer == 1 && blocks::ghostOn() && !blockwrite::selfWriting()) {
-        int at[3] = {0, 0, 0};
-        if (blockwrite::worldPosOfSubChunkWrite(self, index, at)) {
-            if (const void* const real = blockwrite::readWorldAt(at[0], at[1], at[2]);
-                real != nullptr) {
-                blocks::noteWorldBlockAt(at[0], at[1], at[2], real, write, true);
-            }
-        }
-    }
-
-    if (g_subChunkSetBlock != nullptr) {
-        g_subChunkSetBlock(self, layer, index, write);
-    }
-}
-
-using StoragePredFn = bool(__fastcall*)(void*, const void*);
-
-constexpr std::size_t kStoragePredMax = 64;
-void* g_storagePredTarget[kStoragePredMax] = {};
-StoragePredFn g_storagePredOriginal[kStoragePredMax] = {};
-std::atomic<std::size_t> g_storagePredCount{0};
-
-constexpr std::size_t kGhostStorageSlots = 2048;
-
-struct GhostStorageSlot {
-    std::atomic<std::int32_t> baseX{0};
-    std::atomic<std::int32_t> baseY{0};
-    std::atomic<std::int32_t> baseZ{0};
-    std::atomic<bool> used{false};
-    std::atomic<void*> storage[2] = {};
-};
-
-GhostStorageSlot g_ghostSlots[kGhostStorageSlots];
-std::atomic<std::size_t> g_ghostSlotCount{0};
-
-bool isGhostStorage(const void* storage)
-{
-    if (storage == nullptr) {
-        return false;
-    }
-    const std::size_t used = std::min(g_ghostSlotCount.load(std::memory_order_acquire),
-                                      kGhostStorageSlots);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (!g_ghostSlots[i].used.load(std::memory_order_acquire)) {
-            continue;
-        }
-        if (g_ghostSlots[i].storage[0].load(std::memory_order_relaxed) == storage
-            || g_ghostSlots[i].storage[1].load(std::memory_order_relaxed) == storage) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::size_t findGhostSlot(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ)
-{
-    const std::size_t used = std::min(g_ghostSlotCount.load(std::memory_order_acquire),
-                                      kGhostStorageSlots);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_ghostSlots[i].baseX.load(std::memory_order_relaxed) == baseX
-            && g_ghostSlots[i].baseY.load(std::memory_order_relaxed) == baseY
-            && g_ghostSlots[i].baseZ.load(std::memory_order_relaxed) == baseZ) {
-            return i;
-        }
-    }
-    return kGhostStorageSlots;
-}
-
-void noteGhostStorage(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ, int layer,
-                      void* storage)
-{
-    std::size_t at = findGhostSlot(baseX, baseY, baseZ);
-    if (at >= kGhostStorageSlots) {
-        const std::size_t used = g_ghostSlotCount.load(std::memory_order_acquire);
-        if (used >= kGhostStorageSlots) {
-            static std::atomic<bool> told{false};
-            if (!told.exchange(true, std::memory_order_relaxed)) {
-                log().warn(L"Schematica: ran out of slots for remembered storage ({} chunks); "
-                           L"chunks past this will not show the ghost",
-                           kGhostStorageSlots);
-            }
-            return;
-        }
-        at = used;
-        g_ghostSlots[at].baseX.store(baseX, std::memory_order_relaxed);
-        g_ghostSlots[at].baseY.store(baseY, std::memory_order_relaxed);
-        g_ghostSlots[at].baseZ.store(baseZ, std::memory_order_relaxed);
-        g_ghostSlots[at].storage[0].store(nullptr, std::memory_order_relaxed);
-        g_ghostSlots[at].storage[1].store(nullptr, std::memory_order_relaxed);
-        g_ghostSlots[at].used.store(true, std::memory_order_release);
-        g_ghostSlotCount.store(at + 1, std::memory_order_release);
-    }
-    g_ghostSlots[at].storage[layer & 1].store(storage, std::memory_order_release);
-}
-
-void noteGhostStorageSeen(std::int32_t baseX, std::int32_t baseY, std::int32_t baseZ,
-                          void* storage)
-{
-    if (storage == nullptr) {
-        return;
-    }
-    const std::size_t at = findGhostSlot(baseX, baseY, baseZ);
-    if (at < kGhostStorageSlots) {
-        for (int layer = 0; layer < 2; ++layer) {
-            void* const held = g_ghostSlots[at].storage[layer].load(std::memory_order_relaxed);
-            if (held == storage) {
-                return;
-            }
-        }
-        for (int layer = 0; layer < 2; ++layer) {
-            if (g_ghostSlots[at].storage[layer].load(std::memory_order_relaxed) == nullptr) {
-                g_ghostSlots[at].storage[layer].store(storage, std::memory_order_release);
-                return;
-            }
-        }
-        g_ghostSlots[at].storage[0].store(g_ghostSlots[at].storage[1].load(
-                                              std::memory_order_relaxed),
-                                          std::memory_order_relaxed);
-        g_ghostSlots[at].storage[1].store(storage, std::memory_order_release);
-        return;
-    }
-    noteGhostStorage(baseX, baseY, baseZ, 0, storage);
-}
-
-constexpr std::size_t kStorageVtableMax = 32;
-std::atomic<void*> g_storageVtable[kStorageVtableMax] = {};
-std::atomic<std::size_t> g_storageVtableCount{0};
-
-bool seenStorageVtable(const void* vtable)
-{
-    const std::size_t used = std::min(g_storageVtableCount.load(std::memory_order_acquire),
-                                      kStorageVtableMax);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_storageVtable[i].load(std::memory_order_relaxed) == vtable) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void noteStorageVtable(void* vtable)
-{
-    const std::size_t used = g_storageVtableCount.load(std::memory_order_acquire);
-    if (used >= kStorageVtableMax || seenStorageVtable(vtable)) {
-        return;
-    }
-    g_storageVtable[used].store(vtable, std::memory_order_relaxed);
-    g_storageVtableCount.store(used + 1, std::memory_order_release);
-}
-
-constexpr std::size_t kPendingVtableMax = 32;
-std::atomic<void*> g_pendingVtable[kPendingVtableMax] = {};
-std::atomic<std::size_t> g_pendingWrite{0};
-std::atomic<std::size_t> g_pendingRead{0};
-
-void notePendingStorageVtable(void* vtable)
-{
-    const std::size_t at = g_pendingWrite.fetch_add(1, std::memory_order_acq_rel);
-    if (at >= kPendingVtableMax) {
-        return;
-    }
-    g_pendingVtable[at].store(vtable, std::memory_order_release);
-}
-
-bool takePendingStorageVtable(void** out)
-{
-    const std::size_t write = std::min(g_pendingWrite.load(std::memory_order_acquire),
-                                       kPendingVtableMax);
-    std::size_t read = g_pendingRead.load(std::memory_order_relaxed);
-    if (read < write) {
-        void* const one = g_pendingVtable[read].load(std::memory_order_acquire);
-        if (one == nullptr) {
-            return false;
-        }
-        g_pendingRead.store(read + 1, std::memory_order_relaxed);
-        *out = one;
-        return true;
-    }
-    return false;
-}
-
-__declspec(noinline) bool readStorageVtable(const void* storage, void** out)
-{
-    __try {
-        std::memcpy(out, storage, sizeof(*out));
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        *out = nullptr;
-        return false;
-    }
-}
-
-__declspec(noinline) bool readStoragePointers(const void* subChunk, void* out[2])
-{
-    __try {
-        const auto* const at = reinterpret_cast<void* const*>(
-            static_cast<const std::uint8_t*>(subChunk) + 0x20);
-        out[0] = at[0];
-        out[1] = at[1];
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        out[0] = nullptr;
-        out[1] = nullptr;
-        return false;
-    }
-}
-
-using ChunkVisibilityScanFn = void(__fastcall*)(void*, void*);
-ChunkVisibilityScanFn g_chunkVisibilityScan = nullptr;
-
-__declspec(noinline) bool readSharedOrigin(const void* chunk, std::int32_t out[3])
-{
-    __try {
-        const auto* const at = static_cast<const std::uint8_t*>(chunk);
-        std::int32_t x = 0;
-        std::int16_t y = 0;
-        std::int32_t z = 0;
-        std::memcpy(&x, at + 0x14, sizeof(x));
-        std::memcpy(&y, at + 0x18, sizeof(y));
-        std::memcpy(&z, at + 0x1c, sizeof(z));
-        out[0] = x;
-        out[1] = y;
-        out[2] = z;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) void clearSeeThroughFlag(void* shared)
-{
-    __try {
-        auto* const at = static_cast<volatile std::uint8_t*>(shared);
-        at[2] = 0;
-        at[0] = 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-    }
-}
-
-void __fastcall detourChunkVisibilityScan(void* shared, void* region)
-{
-    if (g_chunkVisibilityScan != nullptr) {
-        g_chunkVisibilityScan(shared, region);
-    }
-    if (shared == nullptr || !blocks::ghostOn()) {
-        return;
-    }
-    std::int32_t origin[3] = {0, 0, 0};
-    if (!readSharedOrigin(shared, origin)) {
-        return;
-    }
-    if (!blocks::ghostBoxTouchesSubChunk(origin[0] >> 4 << 4, origin[1] >> 4 << 4,
-                                         origin[2] >> 4 << 4)) {
-        return;
-    }
-    clearSeeThroughFlag(shared);
-}
-
-thread_local std::int32_t t_gateOrigin[3] = {0, 0, 0};
-thread_local bool t_gateValid = false;
-
-using VisibilityGateFn = void(__fastcall*)(void*, void*);
-VisibilityGateFn g_visibilityGate = nullptr;
-
-__declspec(noinline) bool readGateOrigin(const void* task, std::int32_t out[3])
-{
-    __try {
-        const auto* const shared = *reinterpret_cast<const std::uint8_t* const*>(task);
-        if (shared == nullptr) {
-            return false;
-        }
-        std::int32_t x = 0;
-        std::int16_t y = 0;
-        std::int32_t z = 0;
-        std::memcpy(&x, shared + 0x14, sizeof(x));
-        std::memcpy(&y, shared + 0x18, sizeof(y));
-        std::memcpy(&z, shared + 0x1c, sizeof(z));
-        out[0] = x >> 4 << 4;
-        out[1] = static_cast<std::int32_t>(y) >> 4 << 4;
-        out[2] = z >> 4 << 4;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-std::atomic<void*> g_visCoordinator{nullptr};
-
-void __fastcall detourVisibilityGate(void* self, void* task)
-{
-    if (self != nullptr) {
-        g_visCoordinator.store(self, std::memory_order_relaxed);
-    }
-    const bool had = t_gateValid;
-    std::int32_t saved[3] = {t_gateOrigin[0], t_gateOrigin[1], t_gateOrigin[2]};
-    t_gateValid = task != nullptr && readGateOrigin(task, t_gateOrigin);
-    if (g_visibilityGate != nullptr) {
-        g_visibilityGate(self, task);
-    }
-    t_gateValid = had;
-    t_gateOrigin[0] = saved[0];
-    t_gateOrigin[1] = saved[1];
-    t_gateOrigin[2] = saved[2];
-}
-
-using ChunkCoordinatorFrameFn = void(__fastcall*)(void*);
-ChunkCoordinatorFrameFn g_chunkCoordinatorFrame = nullptr;
-
-void __fastcall detourChunkCoordinatorFrame(void* self)
-{
-    if (self != nullptr) {
-        g_visCoordinator.store(self, std::memory_order_relaxed);
-    }
-    if (g_chunkCoordinatorFrame != nullptr) {
-        g_chunkCoordinatorFrame(self);
-    }
-}
-
-bool storagePredAnswer(std::size_t slot, void* self, const void* block)
-{
-    if (blocks::ghostOn()) {
-        if (t_gateValid) {
-            if (blocks::ghostBoxTouchesSubChunk(t_gateOrigin[0], t_gateOrigin[1],
-                                                t_gateOrigin[2])) {
-                noteGhostStorageSeen(t_gateOrigin[0], t_gateOrigin[1],
-                                     t_gateOrigin[2], self);
-                return false;
-            }
-        } else if (isGhostStorage(self)) {
-            return false;
-        }
-    }
-    const StoragePredFn original = g_storagePredOriginal[slot];
-    return original != nullptr ? original(self, block) : false;
-}
-
-template <std::size_t Slot>
-bool __fastcall detourStoragePred(void* self, const void* block)
-{
-    return storagePredAnswer(Slot, self, block);
-}
-
-template <std::size_t... Slots>
-constexpr std::array<void*, sizeof...(Slots)> makeStoragePredTable(
-    std::index_sequence<Slots...>)
-{
-    return {reinterpret_cast<void*>(&detourStoragePred<Slots>)...};
-}
-
-const std::array<void*, kStoragePredMax> kStoragePredDetours =
-    makeStoragePredTable(std::make_index_sequence<kStoragePredMax>{});
-
-bool storagePredKnown(const void* target)
-{
-    const std::size_t used = std::min(g_storagePredCount.load(std::memory_order_acquire),
-                                      kStoragePredMax);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_storagePredTarget[i] == target) {
-            return true;
-        }
-    }
-    return false;
-}
-
-bool queueStoragePred(void* target)
-{
-    if (target == nullptr) {
-        return false;
-    }
-    if (!writes::allowed(std::string_view("SubChunkStoragePredicate"))) {
-        return false;
-    }
-    const std::size_t used = std::min(g_storagePredCount.load(std::memory_order_acquire),
-                                      kStoragePredMax);
-    for (std::size_t i = 0; i < used; ++i) {
-        if (g_storagePredTarget[i] == target) {
-            return false;
-        }
-    }
-    if (used >= kStoragePredMax) {
-        static std::atomic<bool> told{false};
-        if (!told.exchange(true, std::memory_order_relaxed)) {
-            log().warn(L"Schematica: ran out of slots for the storage emptiness predicate "
-                       L"({}); wider chunks will not show the ghost",
-                       kStoragePredMax);
-        }
-        return false;
-    }
-    g_storagePredTarget[used] = target;
-    HookManager& hooks = HookManager::instance();
-    if (!hooks.create(target, kStoragePredDetours[used],
-                      reinterpret_cast<void**>(&g_storagePredOriginal[used]),
-                      L"SubChunkStoragePredicate", HookGroup::Ghost)) {
-        g_storagePredTarget[used] = nullptr;
-        return false;
-    }
-    g_storagePredCount.store(used + 1, std::memory_order_release);
-    return true;
-}
-
-int g_storageArmBatch = 0;
-bool g_storageArmQueued = false;
-struct DeferredStorageNote {
-    std::int32_t x = 0;
-    std::int32_t y = 0;
-    std::int32_t z = 0;
-    int layer = 0;
-    void* storage = nullptr;
-};
-std::vector<DeferredStorageNote> g_storageArmNotes;
-
-void flushStoragePreds()
-{
-    if (!g_storageArmQueued) {
-        return;
-    }
-    g_storageArmQueued = false;
-    HookManager::instance().applyQueued();
+    if (dryRunActive()) { noteDryWrite(self, layer, index, block); return; }
+    if (schematicworld::active()) schematicworld::onSubChunkWrite(self, layer, index);
+    if (g_subChunkSetBlock != nullptr) g_subChunkSetBlock(self, layer, index, block);
 }
 
 using BlockSourceGetBlockFn = const void*(__fastcall*)(void*, const void*);
 BlockSourceGetBlockFn g_blockSourceGetBlock = nullptr;
-
-constexpr int kOverlaySizeUnits = -8;
-
 using BlockSourceGetExtraFn = const void*(__fastcall*)(void*, const void*);
 BlockSourceGetExtraFn g_blockSourceGetExtra = nullptr;
 
-thread_local int t_meshBuildDepth = 0;
-
-struct MeshBuildWindow {
-    MeshBuildWindow() { ++t_meshBuildDepth; }
-    ~MeshBuildWindow() { --t_meshBuildDepth; }
-    MeshBuildWindow(const MeshBuildWindow&) = delete;
-    MeshBuildWindow& operator=(const MeshBuildWindow&) = delete;
-};
-
-bool drawingSide(unsigned long tid)
-{
-    return t_meshBuildDepth > 0 && blocks::isMeshThread(tid);
-}
-
-thread_local bool t_meshThreadAnnounced = false;
-
-inline void announceMeshThreadOnce()
-{
-    if (t_meshThreadAnnounced) {
-        return;
-    }
-    const unsigned long id = GetCurrentThreadId();
-    blocks::noteMeshThread(id);
-    t_meshThreadAnnounced = blocks::isMeshThread(id);
-}
-
 const void* __fastcall detourBlockSourceGetExtra(void* region, const void* pos)
 {
-    if (pos != nullptr && blocks::ghostOn() && drawingSide(GetCurrentThreadId())) {
-        const auto* const p = static_cast<const std::int32_t*>(pos);
-        if (const void* const ghost = blocks::ghostBlockAt(p[0], p[1], p[2], 1);
-            ghost != nullptr) {
-            return ghost;
-        }
-    }
+    const void* out = nullptr;
+    if (pos && schematicworld::answerForBuild(static_cast<const std::int32_t*>(pos), 1, out)) return out;
     return g_blockSourceGetExtra != nullptr ? g_blockSourceGetExtra(region, pos) : nullptr;
 }
-
-bool fromCollisionQuery(void* returnAddress)
-{
-    struct Range {
-        std::uintptr_t begin;
-        std::size_t size;
-    };
-    static const Range range = [] {
-        const Scanner& scanner = Scanner::instance();
-        if (!scanner.found(Target::BlockCollisionQuery)) {
-            return Range{0, 0};
-        }
-        void* const at = scanner.addressAs<void*>(Target::BlockCollisionQuery);
-        const std::size_t size = memory::functionSize(at);
-        if (size == 0) {
-            log().warn(L"Schematica: could not get the length of the collision function "
-                       L"(falling back to not lying)");
-        }
-        return Range{reinterpret_cast<std::uintptr_t>(at), size};
-    }();
-    if (range.begin == 0 || range.size == 0) {
-        return false;
-    }
-    const auto site = reinterpret_cast<std::uintptr_t>(returnAddress);
-    return site >= range.begin && site < range.begin + range.size;
-}
-
 constexpr std::size_t kHitSize = 0x85;
-constexpr std::size_t kHitBlockPos = 0x20;
-constexpr std::size_t kHitRefBegin = 0x38;
-constexpr std::size_t kHitRefEnd = 0x48;
 
 using HitAssignFn = void*(__fastcall*)(void*, const void*);
 HitAssignFn g_hitAssign = nullptr;
-
-std::atomic<bool> g_hitBlankReady{false};
-unsigned char g_hitBlank[kHitSize] = {};
 
 struct HitSeat {
     std::atomic<std::uintptr_t> site{0};
@@ -1138,35 +780,24 @@ void* __fastcall detourHitAssign(void* dst, const void* src)
 {
     void* const site = _ReturnAddress();
     void* const out = g_hitAssign != nullptr ? g_hitAssign(dst, src) : dst;
-    if (dst == nullptr) {
-        return out;
-    }
-    auto* const p = static_cast<unsigned char*>(dst);
-    std::int32_t cell[3] = {0, 0, 0};
-    std::memcpy(cell, p + kHitBlockPos, sizeof(cell));
-    constexpr std::size_t kHitKindAt = 0x18;
-    constexpr std::int32_t kHitKindBlockValue = 0;
-    constexpr std::int32_t kHitKindNothing = 3;
-    std::int32_t kind = -1;
-    std::memcpy(&kind, p + kHitKindAt, sizeof(kind));
-
-    if (kind == kHitKindNothing) {
-        if (!g_hitBlankReady.load(std::memory_order_relaxed)) {
-            std::memcpy(g_hitBlank, p, kHitSize);
-            g_hitBlankReady.store(true, std::memory_order_release);
-        }
-        publishHit(site, dst, p);
-        return out;
-    }
-    if (kind != kHitKindBlockValue || !blocks::ghostOn() || !g_hitBlankReady.load(std::memory_order_acquire)
-        || !blocks::ghostCell(cell[0], cell[1], cell[2])) {
-        publishHit(site, dst, p);
-        return out;
-    }
-    std::memcpy(p + 0x18, g_hitBlank + 0x18, kHitRefBegin - 0x18);
-    std::memcpy(p + kHitRefEnd, g_hitBlank + kHitRefEnd, kHitSize - kHitRefEnd);
-    publishHit(site, dst, p);
+    if (dst != nullptr) publishHit(site, dst, static_cast<const unsigned char*>(dst));
     return out;
+}
+
+using HitPickFn = void(__fastcall*)(void*, void*, void*, void*);
+HitPickFn g_hitPick = nullptr;
+struct PickArgs { void* self; void* frame; void* a3; void* a4; };
+thread_local const PickArgs* t_pickArgs = nullptr;
+
+void __fastcall detourHitPick(void* self, void* frame, void* a3, void* a4)
+{
+    if (g_hitPick != nullptr) g_hitPick(self, frame, a3, a4);
+    if (!FastBlockPlacement::instance().wantsPick()) return;
+    const PickArgs args{self, frame, a3, a4};
+    const PickArgs* const previous = t_pickArgs;
+    t_pickArgs = &args;
+    FastBlockPlacement::instance().onPicked();
+    t_pickArgs = previous;
 }
 
 using HitMoveAssignFn = void*(__fastcall*)(void*, void*);
@@ -1189,366 +820,9 @@ void* __fastcall detourHitMoveAssign(void* dst, void* src)
 
 const void* __fastcall detourBlockSourceGetBlock(void* region, const void* pos)
 {
-    if (pos != nullptr && blocks::ghostOn()) {
-        const auto* const p = static_cast<const std::int32_t*>(pos);
-        if (const void* const ghost = blocks::ghostBlockAt(p[0], p[1], p[2]);
-            ghost != nullptr) {
-            if (drawingSide(GetCurrentThreadId())) {
-                return ghost;
-            }
-        }
-    }
-
-    if (pos != nullptr && blocks::ghostOn()) {
-        const auto* const p = static_cast<const std::int32_t*>(pos);
-        if (blocks::ghostCell(p[0], p[1], p[2])
-            && fromCollisionQuery(_ReturnAddress())) {
-            const unsigned long sim = blocks::simThread();
-            if (sim != 0 && GetCurrentThreadId() == sim) {
-                if (const void* const air = blocks::airBlock(); air != nullptr) {
-                    return air;
-                }
-            }
-        }
-    }
+    const void* out = nullptr;
+    if (pos && schematicworld::answerForBuild(static_cast<const std::int32_t*>(pos), 0, out)) return out;
     return g_blockSourceGetBlock != nullptr ? g_blockSourceGetBlock(region, pos) : nullptr;
-}
-
-using BlockSourceSetBlockFn = bool(__fastcall*)(void*, const void*, const void*, unsigned int,
-                                                unsigned int, void*);
-BlockSourceSetBlockFn g_blockSourceSetBlock = nullptr;
-
-bool __fastcall detourBlockSourceSetBlock(void* region, const void* pos, const void* block,
-                                          unsigned int mode, unsigned int updateFlags,
-                                          void* actor)
-{
-    blockwrite::noteRegion(region, mode, updateFlags, actor);
-
-    blockwrite::noteWritePos(static_cast<const int*>(pos));
-
-    if (pos != nullptr && !blockwrite::selfWriting()) {
-        const auto* const p = static_cast<const std::int32_t*>(pos);
-        if (blocks::ghostInside(p[0], p[1], p[2])) {
-            const void* const air = blocks::airBlock();
-            if (air != nullptr && block == air) {
-                blocks::restoreGhostCellFromWant(p[0], p[1], p[2]);
-                Schematica::instance().noteGhostCellFreed(p[0], p[1], p[2]);
-            } else {
-                blocks::dropGhostCell(p[0], p[1], p[2]);
-            }
-        }
-    }
-
-    if (g_blockSourceSetBlock != nullptr) {
-        return g_blockSourceSetBlock(region, pos, block, mode, updateFlags, actor);
-    }
-    return false;
-}
-
-using BlockRenderLookupFn = void*(__fastcall*)(void*, void*, void*);
-BlockRenderLookupFn g_blockRenderLookup = nullptr;
-
-using BlockDrawFn = void(__fastcall*)(void*, void*, void*, void*, void*);
-BlockDrawFn g_blockTessellate = nullptr;
-
-thread_local std::uint32_t t_buildBoxTries = 0;
-
-inline std::uintptr_t realLayerByte(void* real)
-{
-    return reinterpret_cast<std::uintptr_t>(real) & 0xFF;
-}
-
-void* __fastcall detourBlockRenderLookup(void* block, void* context, void* pos)
-{
-    announceMeshThreadOnce();
-
-    void* const real =
-        g_blockRenderLookup != nullptr ? g_blockRenderLookup(block, context, pos) : nullptr;
-
-    if (pos != nullptr && blocks::ghostOn()) {
-        const auto* const p = static_cast<const std::int32_t*>(pos);
-        const void* const ghostHere = blocks::ghostBlockAt(p[0], p[1], p[2]);
-        const bool overlayOn = blocks::ghostOverMismatchOn();
-        const blocks::DiffColor pushColor = (ghostHere == nullptr && overlayOn)
-                                                ? blocks::diffCellAt(p[0], p[1], p[2])
-                                                : blocks::DiffColor::None;
-        const bool pushForOverlay =
-            overlayOn
-            && (pushColor == blocks::DiffColor::Wrong || pushColor == blocks::DiffColor::State)
-            && blocks::wantBlockAt(p[0], p[1], p[2]) != nullptr;
-        if (pushForOverlay) {
-            if (const auto value = realLayerByte(real); value < 32) {
-                blocks::noteRealLayer(block, static_cast<int>(value));
-            }
-            return reinterpret_cast<void*>(static_cast<std::uintptr_t>(blocks::kGhostLayer));
-        }
-        if (ghostHere != nullptr) {
-            if (const auto value = realLayerByte(real); value < 32) {
-                blocks::noteRealLayer(block, static_cast<int>(value));
-            }
-            return reinterpret_cast<void*>(
-                static_cast<std::uintptr_t>(blocks::kGhostLayer));
-        }
-    }
-    return real;
-}
-
-constexpr std::ptrdiff_t kVtxScanSanity = 1 << 20;
-
-std::ptrdiff_t tripleLength(const void* a, std::size_t at)
-{
-    const auto* const base = static_cast<const unsigned char*>(a);
-    unsigned char* begin = nullptr;
-    unsigned char* end = nullptr;
-    unsigned char* cap = nullptr;
-    std::memcpy(&begin, base + at, sizeof(begin));
-    std::memcpy(&end, base + at + 8, sizeof(end));
-    std::memcpy(&cap, base + at + 16, sizeof(cap));
-    if (begin == nullptr) {
-        return (end == nullptr && cap == nullptr) ? 0 : -1;
-    }
-    if (end < begin || cap < end) {
-        return -1;
-    }
-    const std::ptrdiff_t len = end - begin;
-    return len <= kVtxScanSanity ? len : -1;
-}
-
-constexpr std::size_t kVertexPosBegin = 0x10;
-constexpr std::size_t kVertexUv2Begin = 0xB8;
-
-bool tessellatorLayerWritable(const void* self)
-{
-    constexpr std::size_t kSlots = 64;
-    struct Slot {
-        std::atomic<const void*> key{nullptr};
-        std::atomic<bool> ok{false};
-    };
-    static Slot slots[kSlots];
-    const std::size_t at = (reinterpret_cast<std::uintptr_t>(self) >> 4) % kSlots;
-    if (slots[at].key.load(std::memory_order_acquire) == self) {
-        return slots[at].ok.load(std::memory_order_relaxed);
-    }
-    const bool ok = memory::isWritable(self, 0x84);
-    slots[at].ok.store(ok, std::memory_order_relaxed);
-    slots[at].key.store(self, std::memory_order_release);
-    return ok;
-}
-
-using ChunkMeshBuildFn = void*(__fastcall*)(void*, void*, void*, void*, void*, void*);
-ChunkMeshBuildFn g_chunkMeshBuild = nullptr;
-
-bool readChunkOrigin(const void* recV, std::int32_t* out)
-{
-    __try {
-        const auto* const rec = static_cast<const unsigned char*>(recV);
-        std::memcpy(&out[0], rec + 0x34, sizeof(std::int32_t));
-        std::memcpy(&out[1], rec + 0x38, sizeof(std::int32_t));
-        std::memcpy(&out[2], rec + 0x3c, sizeof(std::int32_t));
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void* __fastcall detourChunkMeshBuild(void* ctx, void* rec, void* a3, void* a4, void* a5,
-                                      void* a6)
-{
-    announceMeshThreadOnce();
-    t_buildBoxTries = 0;
-    const std::uint64_t buildSeq = nextBuildSeq();
-    void* ret = nullptr;
-    {
-        const MeshBuildWindow window;
-        ret = g_chunkMeshBuild != nullptr ? g_chunkMeshBuild(ctx, rec, a3, a4, a5, a6)
-                                          : nullptr;
-    }
-    noteChunkBoxTries(rec, t_buildBoxTries, buildSeq);
-    noteChunkBuiltForRebuilds(rec, buildSeq);
-    return ret;
-}
-
-void __fastcall detourBlockTessellate(void* self, void* a, void* graphics, void* record,
-                                      void* arg5)
-{
-    constexpr std::size_t kVertexColorBegin = 0x70;
-    constexpr std::size_t kVertexColorEnd = 0x78;
-    constexpr std::size_t kVertexColorSanity = 1u << 20;
-
-    announceMeshThreadOnce();
-
-    const void* overlayWant = nullptr;
-    if (record != nullptr && self != nullptr && a != nullptr && blocks::ghostOn()
-        && blocks::ghostOverMismatchOn()) {
-        const auto* const p = static_cast<const std::int32_t*>(record);
-        const blocks::DiffColor here = blocks::diffCellAt(p[0], p[1], p[2]);
-        if (here == blocks::DiffColor::Wrong || here == blocks::DiffColor::State) {
-            overlayWant = blocks::wantBlockAt(p[0], p[1], p[2]);
-        }
-    }
-
-    float ghostAlpha = 1.0F;
-    bool isGhost = false;
-    const void* ghostBlock = nullptr;
-    if (record != nullptr && self != nullptr && a != nullptr && blocks::ghostOn()) {
-        const auto* const p = static_cast<const std::int32_t*>(record);
-        ghostBlock = blocks::ghostBlockAt(p[0], p[1], p[2]);
-        if (ghostBlock != nullptr) {
-            ghostAlpha = blocks::ghostAlpha();
-            isGhost = true;
-        }
-    }
-
-    std::size_t colorBytesBefore = 0;
-    bool colorTracked = false;
-    if (isGhost && memory::isReadable(a, kVertexColorEnd + sizeof(void*))) {
-        const auto* const base = static_cast<const unsigned char*>(a);
-        unsigned char* begin = nullptr;
-        unsigned char* end = nullptr;
-        std::memcpy(&begin, base + kVertexColorBegin, sizeof(begin));
-        std::memcpy(&end, base + kVertexColorEnd, sizeof(end));
-        if (end >= begin) {
-            colorBytesBefore = static_cast<std::size_t>(end - begin);
-            colorTracked = true;
-        }
-    }
-
-    constexpr std::size_t kTessellatorLayer = 0x80;
-    std::uint32_t savedLayer = 0;
-    bool layerPatched = false;
-    bool layerKnown = false;
-    if ((isGhost || overlayWant != nullptr) && self != nullptr
-        && tessellatorLayerWritable(self)) {
-        std::memcpy(&savedLayer, static_cast<const unsigned char*>(self) + kTessellatorLayer,
-                    sizeof(savedLayer));
-        layerKnown = true;
-        if (savedLayer == static_cast<std::uint32_t>(blocks::kGhostLayer)) {
-            const int real = blocks::realLayer(graphics);
-            if (real >= 0 && real != blocks::kGhostLayer) {
-                const auto want = static_cast<std::uint32_t>(real);
-                std::memcpy(static_cast<unsigned char*>(self) + kTessellatorLayer, &want,
-                            sizeof(want));
-                layerPatched = true;
-            }
-        }
-    }
-
-    const bool ghostBucket =
-        !layerKnown || savedLayer == static_cast<std::uint32_t>(blocks::kGhostLayer);
-    const bool skipReal = isGhost && !ghostBucket;
-    if (overlayWant != nullptr && ghostBucket) {
-        ++t_buildBoxTries;
-    }
-
-    if (overlayWant != nullptr && ghostBucket && g_blockTessellate != nullptr
-        && memory::isReadable(a, kVertexUv2Begin + 24)) {
-        struct WantRecord {
-            std::int32_t x = 0;
-            std::int32_t y = 0;
-            std::int32_t z = 0;
-            std::int32_t pad = 0;
-            const void* block = nullptr;
-        };
-        static_assert(sizeof(WantRecord) == 24);
-        const auto* const p = static_cast<const std::int32_t*>(record);
-        WantRecord rec;
-        rec.x = p[0];
-        rec.y = p[1];
-        rec.z = p[2];
-        rec.block = overlayWant;
-        const std::ptrdiff_t colorBefore = tripleLength(a, kVertexColorBegin);
-        const std::ptrdiff_t posBefore = tripleLength(a, kVertexPosBegin);
-
-        std::uint32_t layerNow = 0;
-        bool layerSwapped = false;
-        if (layerKnown) {
-            std::memcpy(&layerNow, static_cast<const unsigned char*>(self) + kTessellatorLayer,
-                        sizeof(layerNow));
-            const int wantLayer = blocks::realLayer(overlayWant);
-            if (wantLayer >= 0 && static_cast<std::uint32_t>(wantLayer) != layerNow) {
-                const auto value = static_cast<std::uint32_t>(wantLayer);
-                std::memcpy(static_cast<unsigned char*>(self) + kTessellatorLayer, &value,
-                            sizeof(value));
-                layerSwapped = true;
-            }
-        }
-        g_blockTessellate(self, a, const_cast<void*>(overlayWant), &rec, arg5);
-        if (layerSwapped) {
-            std::memcpy(static_cast<unsigned char*>(self) + kTessellatorLayer, &layerNow,
-                        sizeof(layerNow));
-        }
-
-        const std::ptrdiff_t colorAfter = tripleLength(a, kVertexColorBegin);
-        const std::ptrdiff_t posAfter = tripleLength(a, kVertexPosBegin);
-        const bool grewColor = colorBefore >= 0 && colorAfter > colorBefore
-                               && colorAfter - colorBefore
-                                      <= static_cast<std::ptrdiff_t>(kVertexColorSanity);
-        const bool grewPos = posBefore >= 0 && posAfter > posBefore
-                             && posAfter - posBefore
-                                    <= static_cast<std::ptrdiff_t>(kVertexColorSanity);
-        if (grewColor) {
-            const auto* const base = static_cast<const unsigned char*>(a);
-            unsigned char* begin = nullptr;
-            std::memcpy(&begin, base + kVertexColorBegin, sizeof(begin));
-            if (begin != nullptr) {
-                const auto value = static_cast<unsigned char>(
-                    std::lround(std::clamp(blocks::ghostAlpha(), 0.0F, 1.0F) * 255.0F));
-                for (unsigned char* q = begin + colorBefore; q + 4 <= begin + colorAfter;
-                     q += 4) {
-                    q[3] = value;
-                }
-            }
-        }
-        if (grewPos) {
-            const auto* const base = static_cast<const unsigned char*>(a);
-            unsigned char* begin = nullptr;
-            std::memcpy(&begin, base + kVertexPosBegin, sizeof(begin));
-            if (begin != nullptr) {
-                const float center[3] = {static_cast<float>(p[0] & 15) + 0.5F,
-                                         static_cast<float>(p[1] & 15) + 0.5F,
-                                         static_cast<float>(p[2] & 15) + 0.5F};
-                const float kScale =
-                    1.0F + static_cast<float>(kOverlaySizeUnits) / 512.0F;
-                for (unsigned char* q = begin + posBefore; q + 12 <= begin + posAfter;
-                     q += 12) {
-                    for (int k = 0; k < 3; ++k) {
-                        float v = 0.0F;
-                        std::memcpy(&v, q + k * 4, sizeof(v));
-                        v = center[k] + (v - center[k]) * kScale;
-                        std::memcpy(q + k * 4, &v, sizeof(v));
-                    }
-                }
-            }
-        }
-    }
-
-    if (g_blockTessellate != nullptr && !skipReal) {
-        g_blockTessellate(self, a, graphics, record, arg5);
-    }
-
-    if (layerPatched) {
-        std::memcpy(static_cast<unsigned char*>(self) + kTessellatorLayer, &savedLayer,
-                    sizeof(savedLayer));
-    }
-
-    if (isGhost && colorTracked) {
-        const auto* const base = static_cast<const unsigned char*>(a);
-        unsigned char* begin = nullptr;
-        unsigned char* end = nullptr;
-        std::memcpy(&begin, base + kVertexColorBegin, sizeof(begin));
-        std::memcpy(&end, base + kVertexColorEnd, sizeof(end));
-        if (begin != nullptr && end > begin) {
-            auto now = static_cast<std::size_t>(end - begin);
-            if (now > colorBytesBefore && now - colorBytesBefore <= kVertexColorSanity) {
-                const auto value = static_cast<unsigned char>(
-                    std::lround(std::clamp(ghostAlpha, 0.0F, 1.0F) * 255.0F));
-                unsigned char* const stop = begin + now;
-                for (unsigned char* p = begin + colorBytesBefore; p + 4 <= stop; p += 4) {
-                    p[3] = value;
-                }
-            }
-        }
-    }
 }
 
 void __fastcall detourSetGameMode(void* self, int mode, int extra)
@@ -1564,6 +838,7 @@ void __fastcall detourSetGameMode(void* self, int mode, int extra)
 void __fastcall detourNotifyInventoryOpen(void* client, int which)
 {
     ItemStackRequest::instance().onNotifyInventoryOpen(client);
+    InventoryResync::instance().onInventoryOpening();
 
     if (g_notifyInventoryOpen != nullptr) {
         g_notifyInventoryOpen(client, which);
@@ -1645,6 +920,7 @@ void __fastcall detourContainerOpenHandle(void* packet, void* result, void* call
     if (watching) {
         requests.takeInventoryOpen(packet, result, shell);
     }
+    InventoryResync::instance().onContainerOpened();
 }
 
 void* __fastcall detourInventoryContentRead(void* packet, void* out, void* stream, void* network)
@@ -1676,10 +952,18 @@ void* __fastcall detourUiDefLookup(void* self, const void* space, const void* na
     return value;
 }
 
+void* __fastcall detourFogColorFetch(void* self, void* out, void* src, void* r9)
+{
+    void* const result = (g_fogColorFetch != nullptr) ? g_fogColorFetch(self, out, src, r9) : nullptr;
+    OverworldSky::instance().adjustFogColor(self, out);
+    return result;
+}
+
 void* __fastcall detourFogSettingsFetch(void* self, void* out, void* src, void* r9)
 {
     void* const result =
         (g_fogSettingsFetch != nullptr) ? g_fogSettingsFetch(self, out, src, r9) : nullptr;
+    OverworldSky::instance().adjustFog(self, out);
     if (out != nullptr && NoRender::instance().fogSuppressed()) {
         auto* const bytes = static_cast<unsigned char*>(out);
         if (bytes[0x1c] != 0) {
@@ -1716,6 +1000,25 @@ void __fastcall detourMobEffectsRendererRender(void* self, void* ctx, void* clie
         g_mobEffectsRendererRender(self, ctx, client, owner, pass);
     }
     EffectTimer::instance().onRendered(client, owner);
+}
+
+void __fastcall detourLocatorBarRendererRender(void* self, void* ctx, void* client, void* owner, int pass, void* area)
+{
+    LocatorBar::instance().onRender(g_locatorBarRendererRender, self, ctx, client, owner, pass, area);
+}
+
+void __fastcall detourLocatorBarIcon(void* a, void* mesh, void* texture, float x, float y, float u0, float v0, float u1,
+                                     float v1, float w, float h, float scale, float alpha, std::uint32_t color,
+                                     std::uint32_t tint, float s0, float s1)
+{
+    LocatorBar::instance().onIcon(g_locatorBarIcon, a, mesh, texture, x, y, u0, v0, u1, v1, w, h, scale, alpha, color,
+                                  tint, s0, s1);
+}
+
+void* __fastcall detourNameTagBuild(void* a1, void* out, void* a3, void* a4, void* actor, const void* text,
+                                    const float* position, float a8, const void* a9)
+{
+    return NameTags::instance().onBuildTag(g_nameTagBuild, a1, out, a3, a4, actor, text, position, a8, a9);
 }
 
 void __fastcall detourMobEffectsLayout(void* layout)
@@ -1940,6 +1243,12 @@ bool translateInto(void* out, const char* key)
     k.size = len;
     alignas(8) std::byte params[32]{};
     return translateGuarded(out, &k, params);
+}
+
+void* __fastcall detourSettingsGroupResolve(void* registry, void* out, const void* idView, void* r9)
+{
+    uiprobe::beforeSettingsGroupResolve(registry, idView);
+    return g_settingsGroupResolve != nullptr ? g_settingsGroupResolve(registry, out, idView, r9) : nullptr;
 }
 
 void* __fastcall detourSettingsGroupRegister(void* registry, const void* idView, void* provider,
@@ -2287,26 +1596,116 @@ void* __fastcall detourHudScreenCtor(void* self, void* a2, void* a3, void* a4)
     return result;
 }
 
+using SettingsGroupBuildFn = void*(__fastcall*)(void* self, void* out);
+SettingsGroupBuildFn g_accessibilitySettingsBuild = nullptr;
+SettingsGroupBuildFn g_videoSettingsBuild = nullptr;
+
+void* __fastcall detourAccessibilitySettingsBuild(void* self, void* out)
+{
+    void* const result = g_accessibilitySettingsBuild(self, out);
+    uiprobe::onGuiScaleGroupBuilt(out, 1);
+    return result;
+}
+
+void* __fastcall detourVideoSettingsBuild(void* self, void* out)
+{
+    void* const result = g_videoSettingsBuild(self, out);
+    uiprobe::onGuiScaleGroupBuilt(out, 0);
+    return result;
+}
+
 void __fastcall detourRenderCurrentFrame(void* self, float delta)
 {
+    customguiscale::onFrame();
     DebugScreen::onFrameRendered();
     if (g_renderCurrentFrame != nullptr) {
         g_renderCurrentFrame(self, delta);
     }
 }
 
+void runClientTick()
+{
+    constexpr unsigned long long kViewFreshMs = 1000;
+    const unsigned long long lastView = g_lastLeadingViewAt.load(std::memory_order_relaxed);
+    if (lastView == 0 || GetTickCount64() - lastView > kViewFreshMs) {
+        return;
+    }
+    const freezewatch::Scope freezeScope{"ClientTick (game thread)"};
+    flyspeed::onClientTick();
+    FastBlockPlacement::instance().onClientTick();
+    Scaffold::instance().onClientTick();
+}
+
 void __fastcall detourServerLevelTick(void* level)
 {
-    LARGE_INTEGER start{};
-    QueryPerformanceCounter(&start);
-    if (g_serverLevelTick != nullptr) {
-        g_serverLevelTick(level);
+    const void* const caller = _ReturnAddress();
+    if (g_sessionTicksReady && (caller == g_sessionTickReturns[0] || caller == g_sessionTickReturns[1])) {
+        LARGE_INTEGER start{};
+        QueryPerformanceCounter(&start);
+        g_sessionTickStart = start.QuadPart;
+        g_sessionTickBranch = caller == g_sessionTickReturns[0] ? 1 : 2;
     }
+    if (g_serverLevelTick != nullptr) {
+        __try {
+            g_serverLevelTick(level);
+        } __finally {
+            if (AbnormalTermination()) g_sessionTickBranch = 0;
+        }
+    }
+}
+
+void finishSessionTick(void* session, int branch)
+{
+    if (!g_sessionTicksReady || g_sessionTickBranch != branch) return;
+    g_sessionTickBranch = 0;
     LARGE_INTEGER end{};
     QueryPerformanceCounter(&end);
-    if (GameData::instance().onLevelTick(level, GetCurrentThreadId(), blocks::simThread())) {
-        DebugScreen::onServerTick(end.QuadPart - start.QuadPart);
+    const unsigned long thread = GetCurrentThreadId();
+    const unsigned long clientThread = blocks::simThread();
+    if (GameData::instance().onLevelTick(session, thread, clientThread)) {
+        DebugScreen::onServerTick(end.QuadPart - g_sessionTickStart);
+        flyspeed::onServerTick(session);
     }
+    if (clientThread != 0 && thread == clientThread) {
+        rejoin::noteClientSession(session);
+        runClientTick();
+    }
+}
+
+void installSessionTicks(HookManager& hooks, const Scanner& scanner)
+{
+    std::byte* const first = scanner.address(Target::ServerLevelTick);
+    if (!writes::allowed("ServerLevelTick") || first == nullptr || !memory::isReadable(first, 0x280)) return;
+    const ScanHit second = scanRange(std::span(first + 0x100, std::size_t{0x180}), kGameSessionCatchupTickShape);
+    std::uint8_t a[0x4C]{}, b[0x4C]{};
+    if (second.count != 1 || !memory::copyGuarded(first, a, sizeof(a))
+        || !memory::copyGuarded(second.address, b, sizeof(b))
+        || !sessiontick::siteLooksRight(a, false) || !sessiontick::siteLooksRight(b, true)) {
+        log().warn(L"ServerLevelTick: the two inlined session ticks did not match; leaving them alone");
+        return;
+    }
+    DWORD64 firstImage = 0, secondImage = 0;
+    const auto* const firstEntry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(first), &firstImage, nullptr);
+    const auto* const secondEntry = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(second.address), &secondImage, nullptr);
+    RUNTIME_FUNCTION entry{};
+    constexpr std::uint8_t kFrame[] = {0x55,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x56,0x57,0x53,
+                                      0x48,0x81,0xEC,0x38,0x01,0,0};
+    std::uint8_t frame[sizeof(kFrame)]{};
+    if (firstEntry == nullptr || firstEntry != secondEntry || firstImage != secondImage
+        || !memory::copyGuarded(firstEntry, &entry, sizeof(entry))
+        || !memory::copyGuarded(reinterpret_cast<const void*>(firstImage + entry.BeginAddress), frame, sizeof(frame))
+        || std::memcmp(frame, kFrame, sizeof(kFrame)) != 0) return;
+    void* const levelTick = memory::ripTarget(first, 5);
+    if (levelTick != memory::ripTarget(second.address, 5) || !memory::inGameModule(levelTick)
+        || !memory::isExecutable(levelTick, 1)) return;
+    g_sessionTickReturns[0] = first + sessiontick::kReturnOffset;
+    g_sessionTickReturns[1] = second.address + sessiontick::kReturnOffset;
+    bool ready = hooks.create(levelTick, &detourServerLevelTick, reinterpret_cast<void**>(&g_serverLevelTick), L"ServerLevelTick");
+    ready &= hooks.create(first + sessiontick::kFinishOffset, &tsukuyomiSessionTickFirstEntry,
+                          &tsukuyomiSessionTickFirstTrampoline, L"ServerLevelTick");
+    ready &= hooks.create(second.address + sessiontick::kFinishOffset, &tsukuyomiSessionTickCatchupEntry,
+                          &tsukuyomiSessionTickCatchupTrampoline, L"ServerLevelTick");
+    g_sessionTicksReady = ready;
 }
 
 void* __fastcall detourLegacyParticleRender(void* engine, void* out, void* a3, void* a4, void* a5, float a6)
@@ -2335,16 +1734,16 @@ int __fastcall detourFmodSystemUpdate(void* system)
     return result;
 }
 
-bool copyStartGameVersion(const void* packet, char out[32])
+bool copyStartGameString(const void* packet, std::size_t offset, char* out, std::size_t cap)
 {
-    if (packet == nullptr || !memory::isReadable(static_cast<const std::uint8_t*>(packet) + 0x648, 32)) {
+    if (cap == 0 || packet == nullptr || !memory::isReadable(static_cast<const std::uint8_t*>(packet) + offset, 32)) {
         return false;
     }
     __try {
-        const auto* const field = static_cast<const std::uint8_t*>(packet) + 0x648;
+        const auto* const field = static_cast<const std::uint8_t*>(packet) + offset;
         const std::size_t length = *reinterpret_cast<const std::size_t*>(field + 0x10);
         const std::size_t capacity = *reinterpret_cast<const std::size_t*>(field + 0x18);
-        if (length < 1 || length > 31 || capacity < length) return false;
+        if (length >= cap || capacity < length || (capacity <= 15 && length > 15)) return false;
         const char* const source = capacity > 15 ? *reinterpret_cast<const char* const*>(field)
                                                  : reinterpret_cast<const char*>(field);
         if (source == nullptr || !memory::isReadable(source, length)) return false;
@@ -2359,7 +1758,11 @@ bool copyStartGameVersion(const void* packet, char out[32])
 void __fastcall detourStartGameHandle(void* self, const void* identifier, const void* packet)
 {
     char version[32]{};
-    DebugScreen::onStartGame(copyStartGameVersion(packet, version) ? version : nullptr);
+    DebugScreen::onStartGame(copyStartGameString(packet, 0x648, version, sizeof(version)) ? version : nullptr);
+    char levelId[256]{}, worldName[256]{};
+    if (!copyStartGameString(packet, 0x598, levelId, sizeof(levelId))) levelId[0] = '\0';
+    if (!copyStartGameString(packet, 0x5b8, worldName, sizeof(worldName))) worldName[0] = '\0';
+    worldidentity::onStartGame(levelId, worldName);
     if (g_startGameHandle != nullptr) g_startGameHandle(self, identifier, packet);
 }
 
@@ -2409,6 +1812,7 @@ const void* __fastcall detourContainerGetItem(void* mc, const void* collectionNa
 bool __fastcall detourHudCollResolve(void* self, void* coll, std::uintptr_t collHash, std::uintptr_t index, void* name,
                                      std::uintptr_t nameHash, void* out1, void* out2)
 {
+    containerui::onHudResolving(self);
     if (g_hudCollBase != nullptr && containerui::hudForwardsToBase(static_cast<std::uint32_t>(nameHash))) {
         return g_hudCollBase(self, coll, collHash, index, name, nameHash, out1, out2);
     }
@@ -2438,10 +1842,27 @@ int __fastcall detourUiEventDispatch(void* self, const void* event, void* r8, vo
 
 }
 
+extern "C" void tsukuyomiSessionTickFinished(void* session, int branch)
+{
+    finishSessionTick(session, branch);
+}
+
 bool readHitResult(unsigned char out[kHitResultBytes])
 {
     static_assert(kHitSize == kHitResultBytes);
     return out != nullptr && readSeat(mainSeat(), out);
+}
+void* hitResultAddress()
+{
+    return mainSeat().dst.load(std::memory_order_acquire);
+}
+
+bool repickHitResult()
+{
+    const PickArgs* const args = t_pickArgs;
+    if (args == nullptr || g_hitPick == nullptr) return false;
+    g_hitPick(args->self, args->frame, args->a3, args->a4);
+    return true;
 }
 
 bool readLiquidHitResult(unsigned char out[kHitResultBytes])
@@ -2451,142 +1872,6 @@ bool readLiquidHitResult(unsigned char out[kHitResultBytes])
         return false;
     }
     return readSeat(liquidSeat(), out);
-}
-
-void clearStorageMarks()
-{
-
-    const std::size_t used = std::min(g_ghostSlotCount.load(std::memory_order_acquire),
-                                      kGhostStorageSlots);
-    g_ghostSlotCount.store(0, std::memory_order_release);
-    for (std::size_t i = 0; i < used; ++i) {
-        g_ghostSlots[i].used.store(false, std::memory_order_release);
-        g_ghostSlots[i].storage[0].store(nullptr, std::memory_order_relaxed);
-        g_ghostSlots[i].storage[1].store(nullptr, std::memory_order_relaxed);
-    }
-}
-
-void dropStorageMark(int baseX, int baseY, int baseZ)
-{
-    const std::size_t at = findGhostSlot(baseX, baseY, baseZ);
-    if (at >= kGhostStorageSlots) {
-        return;
-    }
-    g_ghostSlots[at].storage[0].store(nullptr, std::memory_order_release);
-    g_ghostSlots[at].storage[1].store(nullptr, std::memory_order_release);
-}
-
-static void armStorageFromSubChunk(void* subChunk)
-{
-    if (subChunk == nullptr) {
-        return;
-    }
-    void* current[2] = {nullptr, nullptr};
-    if (!readStoragePointers(subChunk, current)) {
-        return;
-    }
-    for (void* const storage : current) {
-        if (storage == nullptr) {
-            continue;
-        }
-        void* vtable = nullptr;
-        if (!readStorageVtable(storage, &vtable) || vtable == nullptr) {
-            continue;
-        }
-        if (seenStorageVtable(vtable)) {
-            continue;
-        }
-        notePendingStorageVtable(vtable);
-        noteStorageVtable(vtable);
-    }
-}
-
-void armPendingStoragePreds()
-{
-    void* vtable = nullptr;
-    while (takePendingStorageVtable(&vtable)) {
-        if (vtable == nullptr || !memory::isReadable(vtable, 8 * 4)) {
-            continue;
-        }
-        for (int slot = 1; slot <= 2; ++slot) {
-            void* fn = nullptr;
-            std::memcpy(&fn, static_cast<const std::uint8_t*>(vtable) + slot * 8,
-                        sizeof(fn));
-            if (fn != nullptr && memory::inGameModule(fn) && memory::isExecutable(fn, 16)
-                && queueStoragePred(fn)) {
-                g_storageArmQueued = true;
-            }
-        }
-    }
-    if (g_storageArmBatch == 0) {
-        flushStoragePreds();
-    }
-}
-
-void beginStorageArmBatch()
-{
-    ++g_storageArmBatch;
-}
-
-void endStorageArmBatch()
-{
-    if (g_storageArmBatch <= 0) {
-        return;
-    }
-    if (--g_storageArmBatch > 0) {
-        return;
-    }
-    flushStoragePreds();
-    for (const DeferredStorageNote& one : g_storageArmNotes) {
-        noteGhostStorage(one.x, one.y, one.z, one.layer, one.storage);
-    }
-    g_storageArmNotes.clear();
-}
-
-void armStorageHooks(void* subChunk, int baseX, int baseY, int baseZ)
-{
-    if (subChunk == nullptr) {
-        return;
-    }
-    void* current[2] = {nullptr, nullptr};
-    if (!readStoragePointers(subChunk, current)) {
-        return;
-    }
-    const std::size_t known = findGhostSlot(baseX, baseY, baseZ);
-    for (int layer = 0; layer < 2; ++layer) {
-        void* const storage = current[layer];
-        if (storage == nullptr) {
-            continue;
-        }
-        if (known < kGhostStorageSlots
-            && g_ghostSlots[known].storage[layer].load(std::memory_order_relaxed)
-                   == storage) {
-            continue;
-        }
-        void* vtable = nullptr;
-        if (!readStorageVtable(storage, &vtable) || vtable == nullptr
-            || !memory::inGameModule(vtable)
-            || !memory::inGameModule(static_cast<const std::uint8_t*>(vtable) + 8 * 4 - 1)) {
-            continue;
-        }
-        for (int slot = 1; slot <= 2; ++slot) {
-            void* fn = nullptr;
-            std::memcpy(&fn, static_cast<const std::uint8_t*>(vtable) + slot * 8,
-                        sizeof(fn));
-            if (fn == nullptr || !memory::inGameModule(fn) || storagePredKnown(fn)) {
-                continue;
-            }
-            if (memory::isExecutable(fn, 16) && queueStoragePred(fn)) {
-                g_storageArmQueued = true;
-            }
-        }
-        if (g_storageArmBatch > 0 && g_storageArmQueued) {
-            g_storageArmNotes.push_back(DeferredStorageNote{baseX, baseY, baseZ, layer, storage});
-            continue;
-        }
-        flushStoragePreds();
-        noteGhostStorage(baseX, baseY, baseZ, layer, storage);
-    }
 }
 
 namespace {
@@ -2628,9 +1913,14 @@ void* resolveI18nGet()
     return get;
 }
 
+void* blockSourceForVtable()
+{
+    return blockwrite::renderRegion();
+}
+
 void* resolveBlockSourceGetBlock()
 {
-    void* const region = blockwrite::region();
+    void* const region = blockSourceForVtable();
     if (region == nullptr || !memory::isReadable(region, sizeof(void*))) {
         return nullptr;
     }
@@ -2646,7 +1936,7 @@ void* resolveBlockSourceGetBlock()
 
 void* resolveBlockSourceGetExtra()
 {
-    void* const region = blockwrite::region();
+    void* const region = blockSourceForVtable();
     if (region == nullptr || !memory::isReadable(region, sizeof(void*))) {
         return nullptr;
     }
@@ -2667,7 +1957,7 @@ void __fastcall detourBeRenderLoop(void* renderer, void* ctx, unsigned int shado
 {
     void* source = nullptr;
     if (renderer != nullptr) {
-        auto* const at = static_cast<unsigned char*>(renderer) + 0x980;
+        auto* const at = static_cast<unsigned char*>(renderer) + 0x978;
         if (!memory::copyGuarded(at, &source, sizeof(source))) {
             source = nullptr;
         }
@@ -2707,6 +1997,12 @@ bool installLate()
                                reinterpret_cast<void**>(&g_blockSourceGetBlock),
                                L"BlockSourceGetBlock", HookGroup::Ghost);
             created = got || created;
+            if (got) {
+                const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+                log().info(L"Hooks: BlockSource::getBlock at RVA {:#x} (from the {} BlockSource)",
+                           reinterpret_cast<std::uintptr_t>(fn) - exe,
+                           L"rendering");
+            }
         }
         if (got) {
             if (void* const extra = resolveBlockSourceGetExtra(); extra != nullptr) {
@@ -2726,704 +2022,8 @@ bool installLate()
     return g_lateI18nSettled && g_lateBlockGetSettled;
 }
 
-using ChunkBuildLookupFn = void*(__fastcall*)(void*, const std::int32_t*);
-using ScheduleChunkBuildFn = std::uint64_t(__fastcall*)(void*, void*, void*, void*);
-
 using LevelBuildDispatchFn = void*(__fastcall*)(void*, void*, void*, void*);
-
-ChunkBuildLookupFn g_chunkBuildLookup = nullptr;
-ScheduleChunkBuildFn g_scheduleChunkBuild = nullptr;
 LevelBuildDispatchFn g_levelBuildDispatch = nullptr;
-
-std::atomic<bool> g_ghostBuildForced{false};
-std::atomic<unsigned long long> g_ghostBuildAskedAt{0};
-std::atomic<unsigned long long> g_ghostBuildWarnedAt{0};
-
-__declspec(noinline) bool readCameraPos(std::uint64_t at, float (&out)[3])
-{
-    if (at == 0) {
-        return false;
-    }
-    __try {
-        std::memcpy(out, reinterpret_cast<const void*>(at), sizeof(out));
-        return std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-struct BuilderFields {
-    std::uint64_t cameraPos = 0;
-    void** containerBegin = nullptr;
-    void** containerEnd = nullptr;
-};
-
-inline constexpr std::ptrdiff_t kContainerStride = 2;
-
-__declspec(noinline) bool readBuilderFields(void* lb, BuilderFields& out)
-{
-    __try {
-        auto* const b = static_cast<std::uint8_t*>(lb);
-        out.containerBegin = *reinterpret_cast<void***>(b + 0x130);
-        out.containerEnd = *reinterpret_cast<void***>(b + 0x138);
-        if (out.containerBegin == nullptr || out.containerEnd == nullptr
-            || out.containerEnd < out.containerBegin
-            || (out.containerEnd - out.containerBegin) % kContainerStride != 0) {
-            return false;
-        }
-        const std::size_t slots =
-            static_cast<std::size_t>(out.containerEnd - out.containerBegin);
-        constexpr std::size_t kMaxContainers = 64;
-        if (slots / kContainerStride > kMaxContainers
-            || !memory::isReadable(out.containerBegin, slots * sizeof(void*))) {
-            return false;
-        }
-        auto* const a = *reinterpret_cast<std::uint8_t**>(b + 0x128);
-        if (a == nullptr) {
-            return false;
-        }
-        auto* const camera = *reinterpret_cast<std::uint8_t**>(a + 0x468);
-        if (camera == nullptr) {
-            return false;
-        }
-        out.cameraPos = reinterpret_cast<std::uint64_t>(camera + 0x9cc);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) void* readLevelBuilder(void* params)
-{
-    __try {
-        return *reinterpret_cast<void**>(static_cast<std::uint8_t*>(params) + 8);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-std::atomic<bool> g_containerRefusedTold{false};
-
-__declspec(noinline) bool vtableLooksSane(void* object)
-{
-    if (object == nullptr) {
-        return false;
-    }
-    __try {
-        return memory::inGameModule(*reinterpret_cast<void**>(object));
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) bool containerLooksSane(void* container)
-{
-    if (container == nullptr) {
-        return false;
-    }
-    __try {
-        auto* const c = static_cast<std::uint8_t*>(container);
-        void* const vtable = *reinterpret_cast<void**>(c);
-        if (!memory::inGameModule(vtable)) {
-            return false;
-        }
-        auto* const inner = *reinterpret_cast<std::uint8_t**>(c + 0x5f0);
-        if (inner == nullptr) {
-            return true;
-        }
-        if (!memory::isReadable(inner, 0xf0)) {
-            return false;
-        }
-        std::uint64_t lock = 0;
-        std::memcpy(&lock, inner + 0xc0, sizeof(lock));
-        if (lock == 0xFFFFFFFFFFFFFFFFULL) {
-            return false;
-        }
-        std::int32_t count = 0;
-        std::int32_t low = 0;
-        std::int32_t high = 0;
-        std::memcpy(&count, inner + 0xec, sizeof(count));
-        std::memcpy(&low, inner + 0xc8, sizeof(low));
-        std::memcpy(&high, inner + 0xd4, sizeof(high));
-        constexpr std::int32_t kChunkLimit = 4000000;
-        const bool ok = count >= 0 && count <= 0x100000 && low <= high
-                        && low >= -kChunkLimit && high <= kChunkLimit;
-        return ok;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-void noteContainerRefused()
-{
-    if (!g_containerRefusedTold.exchange(true, std::memory_order_relaxed)) {
-        log().warn(L"Schematica: the chunk record owner looked broken, so it was not called");
-    }
-}
-
-__declspec(noinline) void* callChunkBuildLookup(void* container, const std::int32_t at[3])
-{
-    if (!containerLooksSane(container)) {
-        noteContainerRefused();
-        return nullptr;
-    }
-    __try {
-        return g_chunkBuildLookup(container, at);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-__declspec(noinline) std::uint64_t callScheduleChunkBuild(void* lb, void* rec,
-                                                         void* camPos, void* container)
-{
-    if (!containerLooksSane(container)) {
-        return 0;
-    }
-    __try {
-        return g_scheduleChunkBuild(lb, rec, camPos, container);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
-    }
-}
-
-__declspec(noinline) bool probeReadable(const void* at, std::size_t bytes)
-{
-    if (at == nullptr || bytes == 0) {
-        return false;
-    }
-    __try {
-        const auto* const p = static_cast<const volatile std::uint8_t*>(at);
-        (void)p[0];
-        (void)p[bytes - 1];
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) bool sharedIsReadable(void* rec)
-{
-    __try {
-        void* shared = nullptr;
-        std::memcpy(&shared, static_cast<std::uint8_t*>(rec) + 0x10, sizeof(shared));
-        return shared != nullptr && probeReadable(shared, 0x40);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-enum class RecordState { Usable, Empty, Broken };
-
-__declspec(noinline) RecordState recordState(void* rec)
-{
-    if (!probeReadable(rec, 0x40)) {
-        return RecordState::Broken;
-    }
-    __try {
-        void* shared = nullptr;
-        std::memcpy(&shared, static_cast<std::uint8_t*>(rec) + 0x10, sizeof(shared));
-        if (shared == nullptr) {
-            void* held = nullptr;
-            std::memcpy(&held, static_cast<std::uint8_t*>(rec) + 0x20, sizeof(held));
-            return held == nullptr ? RecordState::Empty : RecordState::Broken;
-        }
-        return probeReadable(shared, 0x40) ? RecordState::Usable : RecordState::Broken;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return RecordState::Broken;
-    }
-}
-
-__declspec(noinline) bool readScheduleJob(void* rec, std::uint64_t& job, std::uint64_t& head)
-{
-    __try {
-        auto* const shared = *reinterpret_cast<std::uint8_t**>(static_cast<std::uint8_t*>(rec) + 0x10);
-        if (shared == nullptr) {
-            return true;
-        }
-        auto* const jobPtr = *reinterpret_cast<std::uint8_t**>(shared + 0x28);
-        job = reinterpret_cast<std::uint64_t>(jobPtr);
-        head = jobPtr != nullptr ? *reinterpret_cast<std::uint64_t*>(jobPtr) : 0;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) bool resetEmptyJobStampRaw(std::uint8_t* job)
-{
-    __try {
-        auto* const stamp = reinterpret_cast<volatile LONG64*>(job);
-        if (stamp[1] != -1) {
-            return false;
-        }
-        return InterlockedCompareExchange64(stamp, 0, -1) == -1;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) std::uint8_t* readJobPointer(void* rec)
-{
-    __try {
-        auto* const r = static_cast<std::uint8_t*>(rec);
-        auto* const shared = *reinterpret_cast<std::uint8_t**>(r + 0x10);
-        if (shared == nullptr) {
-            return nullptr;
-        }
-        return *reinterpret_cast<std::uint8_t**>(shared + 0x28);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return nullptr;
-    }
-}
-
-bool resetEmptyJobStamp(void* rec)
-{
-    std::uint8_t* const job = readJobPointer(rec);
-    if (job == nullptr || !memory::isWritable(job, 16)) {
-        return false;
-    }
-    return resetEmptyJobStampRaw(job);
-}
-
-__declspec(noinline) bool recordHasGeometry(void* rec)
-{
-    __try {
-        void* held = nullptr;
-        std::memcpy(&held, static_cast<std::uint8_t*>(rec) + 0x20, sizeof(held));
-        return held != nullptr;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) bool clearSharedEmptyFlag(void* rec)
-{
-    __try {
-        auto* const r = static_cast<std::uint8_t*>(rec);
-        auto* const shared = *reinterpret_cast<std::uint8_t**>(r + 0x10);
-        if (shared == nullptr) {
-            return false;
-        }
-        *reinterpret_cast<volatile std::uint8_t*>(shared) = 0;
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-__declspec(noinline) bool askVisibilityRebuild(void* rec)
-{
-    void* const coordinator = g_visCoordinator.load(std::memory_order_relaxed);
-    if (coordinator == nullptr || rec == nullptr || g_visibilityGate == nullptr) {
-        return false;
-    }
-    if (!vtableLooksSane(coordinator)) {
-        noteContainerRefused();
-        return false;
-    }
-    __try {
-        detourVisibilityGate(coordinator, static_cast<std::uint8_t*>(rec) + 0x10);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-constexpr std::int64_t kAskPerFrame = 96;
-struct AskSweep {
-    bool active = false;
-    bool everything = false;
-    bool afterOff = false;
-    std::int32_t low[3] = {0, 0, 0};
-    std::int32_t high[3] = {0, 0, 0};
-    std::int64_t next = 0;
-    std::int64_t total = 0;
-    std::size_t wanted = 0;
-    std::size_t asked = 0;
-    std::size_t missed = 0;
-};
-AskSweep g_askSweep;
-
-bool beginAskSweep()
-{
-    AskSweep sweep;
-    if (!blocks::ghostBounds(sweep.low, sweep.high)) {
-        if (!blocks::lastGhostBounds(sweep.low, sweep.high)) {
-            return false;
-        }
-        sweep.afterOff = true;
-    }
-    sweep.everything = g_ghostBuildForced.exchange(false, std::memory_order_relaxed) || sweep.afterOff;
-    const std::int64_t ny = (sweep.high[1] >> 4) - (sweep.low[1] >> 4) + 1;
-    const std::int64_t nx = (sweep.high[0] >> 4) - (sweep.low[0] >> 4) + 1;
-    const std::int64_t nz = (sweep.high[2] >> 4) - (sweep.low[2] >> 4) + 1;
-    if (ny <= 0 || nx <= 0 || nz <= 0) {
-        return false;
-    }
-    sweep.total = ny * nx * nz;
-    sweep.active = true;
-    g_askSweep = sweep;
-    return true;
-}
-
-bool askSweepActive()
-{
-    return g_askSweep.active;
-}
-
-void askGhostChunkBuilds(void* params)
-{
-    if (g_chunkBuildLookup == nullptr || g_scheduleChunkBuild == nullptr ||
-        params == nullptr) {
-        return;
-    }
-    void* const lb = readLevelBuilder(params);
-    if (lb == nullptr) {
-        return;
-    }
-    BuilderFields fields;
-    if (!readBuilderFields(lb, fields) || fields.cameraPos == 0 ||
-        fields.containerBegin == nullptr || fields.containerEnd == nullptr) {
-        return;
-    }
-    AskSweep& sweep = g_askSweep;
-    if (!sweep.active) {
-        return;
-    }
-    const bool afterOff = sweep.afterOff;
-    const bool everything = sweep.everything;
-    std::size_t& wanted = sweep.wanted;
-    std::size_t& asked = sweep.asked;
-    const std::int64_t nx = (sweep.high[0] >> 4) - (sweep.low[0] >> 4) + 1;
-    const std::int64_t nz = (sweep.high[2] >> 4) - (sweep.low[2] >> 4) + 1;
-    const std::int64_t perFrame = afterOff ? sweep.total : kAskPerFrame;
-    const std::int64_t stop = std::min(sweep.total, sweep.next + perFrame);
-    for (; sweep.next < stop; ++sweep.next) {
-        const std::int64_t index = sweep.next;
-        const auto cy = static_cast<std::int32_t>((sweep.low[1] >> 4) + index / (nx * nz));
-        const auto cx = static_cast<std::int32_t>((sweep.low[0] >> 4) + (index / nz) % nx);
-        const auto cz = static_cast<std::int32_t>((sweep.low[2] >> 4) + index % nz);
-        if (!afterOff && !blocks::ghostSubChunkOccupied(cx << 4, cy << 4, cz << 4)) {
-            continue;
-        }
-        ++wanted;
-        const std::int32_t at[3] = {cx, cy, cz};
-        bool got = false;
-        bool broken = false;
-        for (void** it = fields.containerBegin; it < fields.containerEnd; it += kContainerStride) {
-            void* const rec = callChunkBuildLookup(*it, at);
-            if (rec == nullptr) {
-                continue;
-            }
-            const RecordState state = recordState(rec);
-            if (state != RecordState::Usable) {
-                broken = broken || state == RecordState::Broken;
-                continue;
-            }
-            got = true;
-            ++asked;
-            if (!everything && recordHasGeometry(rec)) {
-                break;
-            }
-            clearSharedEmptyFlag(rec);
-            askVisibilityRebuild(rec);
-            callScheduleChunkBuild(lb, rec, reinterpret_cast<void*>(fields.cameraPos),
-                                   *it);
-            break;
-        }
-        if (!got && broken) {
-            ++sweep.missed;
-        }
-
-    }
-    if (sweep.next < sweep.total) {
-        return;
-    }
-    sweep.active = false;
-
-    if (sweep.missed != 0 && asked == 0) {
-        const unsigned long long now = GetTickCount64();
-        unsigned long long was = g_ghostBuildWarnedAt.load(std::memory_order_relaxed);
-        if (now - was >= 30000 &&
-            g_ghostBuildWarnedAt.compare_exchange_strong(was, now)) {
-            log().warn(L"Schematica: could not ask for {} of {} chunk(s) to be rebuilt (their "
-                       L"records cannot be read)",
-                       sweep.missed, wanted);
-        }
-    }
-}
-
-thread_local void* t_dispatchParams = nullptr;
-
-std::atomic<std::uint64_t> g_buildSeq{0};
-
-std::uint64_t nextBuildSeq()
-{
-    return g_buildSeq.fetch_add(1, std::memory_order_seq_cst) + 1;
-}
-
-struct IncomingRebuild {
-    std::int32_t c[3] = {0, 0, 0};
-    std::uint64_t seq = 0;
-};
-struct PendingRebuild {
-    std::int32_t c[3] = {0, 0, 0};
-    std::uint64_t sinceSeq = 0;
-    unsigned long long since = 0;
-    unsigned long long firstTry = 0;
-    unsigned long long lastTry = 0;
-    std::uint32_t tries = 0;
-};
-std::mutex g_rebuildMutex;
-std::vector<IncomingRebuild> g_rebuildIncoming;
-std::atomic<bool> g_rebuildHasIncoming{false};
-std::atomic<bool> g_rebuildClear{false};
-std::vector<PendingRebuild> g_rebuildPending;
-struct BuiltChunk {
-    std::int32_t c[3] = {0, 0, 0};
-    std::uint64_t startSeq = 0;
-};
-std::mutex g_builtMutex;
-std::vector<BuiltChunk> g_builtIncoming;
-std::atomic<bool> g_rebuildWatching{false};
-constexpr std::size_t kRebuildPerFrame = 8;
-constexpr unsigned long long kRebuildGapMs = 500;
-constexpr unsigned long long kRebuildGiveUpMs = 15000;
-constexpr unsigned long long kRebuildNeverTriedMs = 60000;
-constexpr std::size_t kRebuildPendingMax = 8192;
-
-std::uint64_t rebuildKey(const std::int32_t c[3]);
-
-struct ChunkBoxTries {
-    std::uint32_t tries = 0;
-    std::uint64_t startSeq = 0;
-};
-std::mutex g_chunkBoxTriesMutex;
-std::unordered_map<std::uint64_t, ChunkBoxTries> g_chunkBoxTries;
-
-void noteChunkBoxTries(const void* rec, std::uint32_t tries,
-                       std::uint64_t buildSeq)
-{
-    if (rec == nullptr || !blocks::ghostOn()) {
-        return;
-    }
-    std::int32_t org[3] = {};
-    if (!readChunkOrigin(rec, org)
-        || !blocks::ghostBoxTouchesSubChunk(org[0], org[1], org[2])) {
-        return;
-    }
-    const std::int32_t c[3] = {org[0] >> 4, org[1] >> 4, org[2] >> 4};
-    std::lock_guard<std::mutex> lock(g_chunkBoxTriesMutex);
-    if (g_chunkBoxTries.size() > 65536) {
-        g_chunkBoxTries.clear();
-    }
-    ChunkBoxTries& one = g_chunkBoxTries[rebuildKey(c)];
-    one.tries = tries;
-    one.startSeq = buildSeq;
-}
-
-void noteChunkBuiltForRebuilds(const void* rec, std::uint64_t buildSeq)
-{
-    if (!g_rebuildWatching.load(std::memory_order_acquire) || rec == nullptr) {
-        return;
-    }
-    std::int32_t org[3] = {};
-    if (!readChunkOrigin(rec, org)) {
-        return;
-    }
-    if (!blocks::ghostBoxTouchesSubChunk(org[0], org[1], org[2])) {
-        return;
-    }
-    BuiltChunk one;
-    one.c[0] = org[0] >> 4;
-    one.c[1] = org[1] >> 4;
-    one.c[2] = org[2] >> 4;
-    one.startSeq = buildSeq;
-    std::lock_guard<std::mutex> lock(g_builtMutex);
-    if (g_builtIncoming.size() < kRebuildPendingMax) {
-        g_builtIncoming.push_back(one);
-    }
-}
-
-std::uint64_t rebuildKey(const std::int32_t c[3])
-{
-    const std::uint64_t ux = static_cast<std::uint32_t>(c[0]) & 0x1FFFFFu;
-    const std::uint64_t uy = static_cast<std::uint32_t>(c[1]) & 0x1FFFFFu;
-    const std::uint64_t uz = static_cast<std::uint32_t>(c[2]) & 0x1FFFFFu;
-    return (ux << 42) | (uy << 21) | uz;
-}
-
-void processChunkRebuilds(void* params)
-{
-    if (g_rebuildClear.exchange(false, std::memory_order_acq_rel)) {
-        g_rebuildPending.clear();
-        {
-            std::lock_guard<std::mutex> lock(g_rebuildMutex);
-            g_rebuildIncoming.clear();
-            g_rebuildHasIncoming.store(false, std::memory_order_relaxed);
-        }
-        std::lock_guard<std::mutex> lock(g_builtMutex);
-        g_builtIncoming.clear();
-    }
-    const unsigned long long now = GetTickCount64();
-    if (g_rebuildHasIncoming.exchange(false, std::memory_order_acq_rel)) {
-        std::vector<IncomingRebuild> incoming;
-        {
-            std::lock_guard<std::mutex> lock(g_rebuildMutex);
-            incoming.swap(g_rebuildIncoming);
-        }
-        std::unordered_map<std::uint64_t, std::size_t> at;
-        at.reserve(g_rebuildPending.size() + incoming.size());
-        for (std::size_t i = 0; i < g_rebuildPending.size(); ++i) {
-            at.emplace(rebuildKey(g_rebuildPending[i].c), i);
-        }
-        for (const IncomingRebuild& in : incoming) {
-            const auto found = at.find(rebuildKey(in.c));
-            if (found != at.end()) {
-                PendingRebuild& again = g_rebuildPending[found->second];
-                again.sinceSeq = std::max(again.sinceSeq, in.seq);
-                again.since = now;
-                again.firstTry = 0;
-                again.lastTry = 0;
-                again.tries = 0;
-                continue;
-            }
-            if (g_rebuildPending.size() >= kRebuildPendingMax) {
-                continue;
-            }
-            PendingRebuild one;
-            one.c[0] = in.c[0];
-            one.c[1] = in.c[1];
-            one.c[2] = in.c[2];
-            one.sinceSeq = in.seq;
-            one.since = now;
-            at.emplace(rebuildKey(in.c), g_rebuildPending.size());
-            g_rebuildPending.push_back(one);
-        }
-    }
-    if (g_rebuildPending.empty() && !g_rebuildWatching.load(std::memory_order_acquire)) {
-        return;
-    }
-    {
-        std::vector<BuiltChunk> built;
-        {
-            std::lock_guard<std::mutex> lock(g_builtMutex);
-            built.swap(g_builtIncoming);
-        }
-        if (!built.empty() && !g_rebuildPending.empty()) {
-            std::unordered_map<std::uint64_t, std::uint64_t> latest;
-            latest.reserve(built.size());
-            for (const BuiltChunk& one : built) {
-                auto& slot = latest[rebuildKey(one.c)];
-                slot = std::max(slot, one.startSeq);
-            }
-            std::size_t keep = 0;
-            for (std::size_t i = 0; i < g_rebuildPending.size(); ++i) {
-                const auto found = latest.find(rebuildKey(g_rebuildPending[i].c));
-                if (found != latest.end() && found->second > g_rebuildPending[i].sinceSeq) {
-                    continue;
-                }
-                g_rebuildPending[keep++] = g_rebuildPending[i];
-            }
-            g_rebuildPending.resize(keep);
-        }
-    }
-    {
-        std::size_t keep = 0;
-        for (std::size_t i = 0; i < g_rebuildPending.size(); ++i) {
-            const PendingRebuild& one = g_rebuildPending[i];
-            const bool triedLongEnough =
-                one.firstTry != 0 && now - one.firstTry >= kRebuildGiveUpMs;
-            const bool waitedTooLong = now - one.since >= kRebuildNeverTriedMs;
-            if (triedLongEnough || waitedTooLong) {
-                continue;
-            }
-            g_rebuildPending[keep++] = g_rebuildPending[i];
-        }
-        g_rebuildPending.resize(keep);
-    }
-    g_rebuildWatching.store(!g_rebuildPending.empty(), std::memory_order_release);
-    if (g_rebuildPending.empty()) {
-        return;
-    }
-    if (!blocks::ghostOn() || g_chunkBuildLookup == nullptr || g_scheduleChunkBuild == nullptr
-        || params == nullptr) {
-        g_rebuildPending.clear();
-        g_rebuildWatching.store(false, std::memory_order_release);
-        return;
-    }
-    void* const lb = readLevelBuilder(params);
-    if (lb == nullptr) {
-        return;
-    }
-    BuilderFields fields;
-    if (!readBuilderFields(lb, fields) || fields.cameraPos == 0 || fields.containerBegin == nullptr
-        || fields.containerEnd == nullptr) {
-        return;
-    }
-    float camera[3] = {0.0F, 0.0F, 0.0F};
-    const bool haveCamera = readCameraPos(fields.cameraPos, camera);
-    const auto distance2 = [&](const PendingRebuild& one) {
-        if (!haveCamera) {
-            return 0.0F;
-        }
-        const float dx = static_cast<float>((one.c[0] << 4) + 8) - camera[0];
-        const float dy = static_cast<float>((one.c[1] << 4) + 8) - camera[1];
-        const float dz = static_cast<float>((one.c[2] << 4) + 8) - camera[2];
-        return dx * dx + dy * dy + dz * dz;
-    };
-    const auto ready = [&](const PendingRebuild& one) {
-        return one.lastTry == 0 || now - one.lastTry >= kRebuildGapMs;
-    };
-    const auto split = std::partition(g_rebuildPending.begin(), g_rebuildPending.end(), ready);
-    const std::size_t readyCount = static_cast<std::size_t>(split - g_rebuildPending.begin());
-    const std::size_t take = std::min(kRebuildPerFrame, readyCount);
-    if (take == 0) {
-        return;
-    }
-    std::partial_sort(g_rebuildPending.begin(),
-                      g_rebuildPending.begin() + static_cast<std::ptrdiff_t>(take), split,
-                      [&](const PendingRebuild& a, const PendingRebuild& b) {
-                          if (a.lastTry != b.lastTry) {
-                              return a.lastTry < b.lastTry;
-                          }
-                          return distance2(a) < distance2(b);
-                      });
-    for (std::size_t i = 0; i < take; ++i) {
-        PendingRebuild& one = g_rebuildPending[i];
-        one.lastTry = now;
-        void* rec = nullptr;
-        void* owner = nullptr;
-        for (void** it = fields.containerBegin; it < fields.containerEnd; it += kContainerStride) {
-            void* const got = callChunkBuildLookup(*it, one.c);
-            if (got != nullptr) {
-                rec = got;
-                owner = *it;
-                break;
-            }
-        }
-        if (rec == nullptr || !probeReadable(rec, 0x40) || !sharedIsReadable(rec)) {
-            continue;
-        }
-        clearSharedEmptyFlag(rec);
-        askVisibilityRebuild(rec);
-        float center[3] = {static_cast<float>((one.c[0] << 4) + 8),
-                           static_cast<float>((one.c[1] << 4) + 8),
-                           static_cast<float>((one.c[2] << 4) + 8)};
-        std::uint64_t gateJob = 0;
-        std::uint64_t gateHead = 0;
-        const bool gateRead = readScheduleJob(rec, gateJob, gateHead);
-        if (gateRead && gateJob != 0 && gateHead == ~std::uint64_t{0}) {
-            resetEmptyJobStamp(rec);
-        }
-        callScheduleChunkBuild(lb, rec, center, owner);
-        if (one.tries == 0) {
-            one.firstTry = now;
-        }
-        ++one.tries;
-    }
-}
 
 bool readBuilderStats(void* params, int& pending, int& freeBuffers)
 {
@@ -3450,11 +2050,8 @@ bool readBuilderStats(void* params, int& pending, int& freeBuffers)
     }
 }
 
-void* __fastcall detourLevelBuildDispatch(void* ret, void* params, void* third,
-                                          void* fourth)
+void* __fastcall detourLevelBuildDispatch(void* ret, void* params, void* third, void* fourth)
 {
-    const freezewatch::Scope freezeScope{"LevelBuildDispatch"};
-    t_dispatchParams = params;
     if (DebugScreen::wantsChunkRender()) {
         int pending = 0;
         int freeBuffers = 0;
@@ -3462,131 +2059,13 @@ void* __fastcall detourLevelBuildDispatch(void* ret, void* params, void* third,
             DebugScreen::onBuilderStats(pending, freeBuffers);
         }
     }
-    if (blocks::ghostOn()) {
-        Schematica::instance().earlyLearnFrame();
-    }
-    std::int32_t lastLow[3] = {0, 0, 0};
-    std::int32_t lastHigh[3] = {0, 0, 0};
-    if (blocks::ghostOn() || blocks::lastGhostBounds(lastLow, lastHigh)) {
-        const unsigned long long now = GetTickCount64();
-        if (!blocks::ghostOn() && askSweepActive() && !g_askSweep.afterOff) {
-            g_askSweep.active = false;
-            g_ghostBuildAskedAt.store(0, std::memory_order_relaxed);
-        }
-        if (askSweepActive()
-            || (now - g_ghostBuildAskedAt.load(std::memory_order_relaxed) >= 1000 && beginAskSweep())) {
-            askGhostChunkBuilds(params);
-            if (!askSweepActive()) {
-                g_ghostBuildAskedAt.store(now, std::memory_order_relaxed);
-            }
-        }
-    } else if (askSweepActive()) {
-        g_askSweep.active = false;
-    }
-    processChunkRebuilds(params);
-    void* const result =
-        (g_levelBuildDispatch != nullptr) ? g_levelBuildDispatch(ret, params, third, fourth) : ret;
-    if (blocks::ghostOn()) {
-        Schematica::instance().earlyLearnFrame();
-    }
-    t_dispatchParams = nullptr;
-    return result;
-}
-
-bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
-                            std::uint32_t& tries, std::uint64_t* startSeq)
-{
-    const std::int32_t c[3] = {cx, cy, cz};
-    std::lock_guard<std::mutex> lock(g_chunkBoxTriesMutex);
-    const auto found = g_chunkBoxTries.find(rebuildKey(c));
-    if (found == g_chunkBoxTries.end()) {
-        return false;
-    }
-    tries = found->second.tries;
-    if (startSeq != nullptr) {
-        *startSeq = found->second.startSeq;
-    }
-
-    return true;
-}
-
-void clearChunkBoxTries()
-{
-    std::lock_guard<std::mutex> lock(g_chunkBoxTriesMutex);
-    g_chunkBoxTries.clear();
-}
-
-bool chunkHasGeometryNow(std::int32_t cx, std::int32_t cy, std::int32_t cz)
-{
-    void* const params = t_dispatchParams;
-    if (params == nullptr || g_chunkBuildLookup == nullptr) {
-        return false;
-    }
-    void* const lb = readLevelBuilder(params);
-    if (lb == nullptr) {
-        return false;
-    }
-    BuilderFields fields;
-    if (!readBuilderFields(lb, fields) || fields.containerBegin == nullptr
-        || fields.containerEnd == nullptr) {
-        return false;
-    }
-    const std::int32_t at[3] = {cx, cy, cz};
-    for (void** it = fields.containerBegin; it < fields.containerEnd; it += kContainerStride) {
-        void* const rec = callChunkBuildLookup(*it, at);
-        if (rec == nullptr) {
-            continue;
-        }
-        if (!memory::isReadable(rec, 0x40)) {
-            return false;
-        }
-        return recordHasGeometry(rec);
-    }
-    return false;
-}
-
-void requestGhostChunkBuild()
-{
-    g_ghostBuildForced.store(true, std::memory_order_relaxed);
-}
-
-std::uint64_t requestChunkRebuilds(const std::vector<std::array<std::int32_t, 3>>& chunks)
-{
-    if (chunks.empty()) {
-        return 0;
-    }
-    const std::uint64_t seq = nextBuildSeq();
-    std::lock_guard<std::mutex> lock(g_rebuildMutex);
-    for (const auto& one : chunks) {
-        if (g_rebuildIncoming.size() >= kRebuildPendingMax) {
-            continue;
-        }
-        IncomingRebuild in;
-        in.c[0] = one[0];
-        in.c[1] = one[1];
-        in.c[2] = one[2];
-        in.seq = seq;
-        g_rebuildIncoming.push_back(in);
-    }
-    g_rebuildHasIncoming.store(true, std::memory_order_release);
-    return seq;
-}
-
-void clearChunkRebuilds()
-{
-    g_rebuildClear.store(true, std::memory_order_release);
+    return g_levelBuildDispatch != nullptr ? g_levelBuildDispatch(ret, params, third, fourth) : ret;
 }
 
 void installGhostChunkBuilder()
 {
-    const Scanner& scanner = Scanner::instance();
-    HookManager& hooks = HookManager::instance();
-    g_chunkBuildLookup =
-        reinterpret_cast<ChunkBuildLookupFn>(scanner.address(Target::ChunkBuildLookup));
-    g_scheduleChunkBuild = reinterpret_cast<ScheduleChunkBuildFn>(
-        scanner.address(Target::ScheduleChunkBuild));
-    hooks.create(scanner.address(Target::LevelBuildDispatch), &detourLevelBuildDispatch,
-                 reinterpret_cast<void**>(&g_levelBuildDispatch), L"LevelBuildDispatch");
+    HookManager::instance().create(Scanner::instance().address(Target::LevelBuildDispatch),
+        &detourLevelBuildDispatch, reinterpret_cast<void**>(&g_levelBuildDispatch), L"LevelBuildDispatch");
 }
 
 std::atomic<bool> g_groupsFrozen{false};
@@ -3610,12 +2089,12 @@ static void refreshHookGroups()
         HookGroup group;
         bool on;
     } wants[] = {
-        {HookGroup::Ghost, Schematica::instance().wantsGhostHooks() || blocks::ghostOn()},
+        {HookGroup::Ghost, Schematica::instance().wantsGhostHooks() || schematicworld::active()},
         {HookGroup::Fullbright, Fullbright::instance().enabled() || AntiEffect::instance().enabled()},
         {HookGroup::Ability,
-         CreativeNoClip::instance().enabled() || FlySpeed::instance().enabled()},
+         CreativeNoClip::instance().enabled()},
         {HookGroup::Tool, AutoTool::instance().enabled()},
-        {HookGroup::Fog, NoRender::instance().fogSuppressed()},
+        {HookGroup::Fog, NoRender::instance().fogSuppressed() || OverworldSky::instance().wantsFogHook()},
         {HookGroup::Particles, NoRender::instance().particlesSuppressed()},
     };
     const unsigned long long at = GetTickCount64();
@@ -3647,6 +2126,22 @@ void installAll()
 {
     const Scanner& scanner = Scanner::instance();
     HookManager& hooks = HookManager::instance();
+    if (customguiscale::prepareHooks()) {
+        const bool compute = hooks.create(scanner.address(Target::GuiScaleCompute), &customguiscale::detourCompute,
+            reinterpret_cast<void**>(&customguiscale::originalCompute), L"GuiScaleCompute");
+        const bool list = hooks.create(customguiscale::providerFunction(3), &customguiscale::detourList,
+            reinterpret_cast<void**>(&customguiscale::originalList), L"GuiScaleOptionList");
+        const bool get = hooks.create(customguiscale::providerFunction(4), &customguiscale::detourGet,
+            reinterpret_cast<void**>(&customguiscale::originalGet), L"GuiScaleOptionGet");
+        const bool set = hooks.create(customguiscale::providerFunction(5), &customguiscale::detourSet,
+            reinterpret_cast<void**>(&customguiscale::originalSet), L"GuiScaleOptionSet");
+        const bool accessibility = hooks.create(scanner.address(Target::AccessibilitySettingsBuild),
+            &detourAccessibilitySettingsBuild, reinterpret_cast<void**>(&g_accessibilitySettingsBuild),
+            L"AccessibilitySettingsBuild");
+        const bool video = hooks.create(scanner.address(Target::VideoSettingsBuild), &detourVideoSettingsBuild,
+            reinterpret_cast<void**>(&g_videoSettingsBuild), L"VideoSettingsBuild");
+        customguiscale::setHooksReady(compute && list && get && set && accessibility && video);
+    }
 
     hooks.create(scanner.address(Target::CommandAutoComplete), &detourCommandAutoComplete,
                  reinterpret_cast<void**>(&g_commandAutoComplete), L"CommandAutoComplete");
@@ -3668,40 +2163,46 @@ void installAll()
 
     installGhostChunkBuilder();
 
-    hooks.create(scanner.address(Target::ChunkVisibilityScan), &detourChunkVisibilityScan,
-                 reinterpret_cast<void**>(&g_chunkVisibilityScan), L"ChunkVisibilityScan", HookGroup::Ghost);
-
-    hooks.create(scanner.address(Target::VisibilityGate), &detourVisibilityGate,
-                 reinterpret_cast<void**>(&g_visibilityGate), L"VisibilityGate", HookGroup::Ghost);
-
-    hooks.create(scanner.address(Target::ChunkCoordinatorFrame), &detourChunkCoordinatorFrame,
-                 reinterpret_cast<void**>(&g_chunkCoordinatorFrame), L"ChunkCoordinatorFrame");
-
-    hooks.create(scanner.address(Target::BlockRenderLookup), &detourBlockRenderLookup,
-                 reinterpret_cast<void**>(&g_blockRenderLookup), L"BlockRenderLookup", HookGroup::Ghost);
-    hooks.create(scanner.address(Target::BlockTessellate), &detourBlockTessellate,
-                 reinterpret_cast<void**>(&g_blockTessellate), L"BlockTessellate", HookGroup::Ghost);
-
-    if (!hooks.create(scanner.address(Target::ChunkMeshBuild), &detourChunkMeshBuild,
-                      reinterpret_cast<void**>(&g_chunkMeshBuild), L"ChunkMeshBuild",
-                      HookGroup::Ghost)) {
-        log().warn(L"Schematica: the chunk mesh build could not be hooked, so schematic blocks "
-                   L"will not be drawn (they are only answered while a chunk mesh is being built)");
-    }
-
     hooks.create(scanner.address(Target::HitResultAssign), &detourHitAssign,
                  reinterpret_cast<void**>(&g_hitAssign), L"HitResultAssign");
     hooks.create(scanner.address(Target::HitResultMoveAssign), &detourHitMoveAssign,
                  reinterpret_cast<void**>(&g_hitMoveAssign), L"HitResultMoveAssign");
+    hooks.create(scanner.address(Target::HitResultPick), &detourHitPick,
+                 reinterpret_cast<void**>(&g_hitPick), L"HitResultPick");
 
     hooks.create(scanner.address(Target::BeRenderLoop), &detourBeRenderLoop,
                  reinterpret_cast<void**>(&g_beRenderLoop), L"BeRenderLoop");
 
-    hooks.create(scanner.address(Target::BlockSourceSetBlock), &detourBlockSourceSetBlock,
-                 reinterpret_cast<void**>(&g_blockSourceSetBlock), L"BlockSourceSetBlock");
-
     hooks.create(scanner.address(Target::BuildBlock), &detourBuildBlock,
                  reinterpret_cast<void**>(&g_buildBlock), L"buildBlock");
+    if (scanner.found(Target::BuildBlockKeptClickSite)) {
+        const auto* const site = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::BuildBlockKeptClickSite));
+        std::uint8_t bytes[25]{};
+        if (memory::copyGuarded(site, bytes, sizeof(bytes)) && bytes[17] == 0x80 && bytes[21] == 0x48 && bytes[23] == 0x47) {
+            g_keptClickFlag = bytes[19]; g_keptClickPoint = bytes[24];
+            log().info(L"buildBlock: kept click point at game mode +{:#x} (flag +{:#x})", g_keptClickPoint, g_keptClickFlag);
+        } else {
+            log().warn(L"buildBlock: the kept click point fields could not be read; placements while holding may reuse the first click");
+        }
+    } else {
+        log().warn(L"buildBlock: BuildBlockKeptClickSite was not found; placements while holding may reuse the first click");
+    }
+    {
+        std::int32_t readDisp = 0;
+        std::int32_t writeDisp = 0;
+        const auto* const site = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::PlayerGameModeSite));
+        if (site != nullptr && memory::copyGuarded(site + 3, &readDisp, sizeof(readDisp))
+            && memory::copyGuarded(site + 17, &writeDisp, sizeof(writeDisp)) && readDisp == writeDisp && readDisp > 8
+            && readDisp < 0x4000) {
+            GameData::instance().setPlayerGameModeOffset(static_cast<std::size_t>(readDisp));
+            log().info(L"buildBlock: the player's game mode is at player +{:#x}", readDisp);
+        } else {
+            notice::failOnce("Detours.playerGameMode",
+                             L"buildBlock: the player's game mode field could not be read (PlayerGameModeSite); Scaffold, "
+                             L"FastBlockPlacement and Easy Place do not place blocks",
+                             "Scaffold, FastBlockPlacement and Easy Place are off: the player's game mode could not be found");
+        }
+    }
     hooks.create(scanner.address(Target::MobSwing), &detourMobSwing,
                  reinterpret_cast<void**>(&g_mobSwing), L"MobSwing");
 
@@ -3715,8 +2216,24 @@ void installAll()
     hooks.create(scanner.address(Target::ViewVector), &detourViewVector,
                  reinterpret_cast<void**>(&g_viewVector), L"ViewVector");
 
-    hooks.create(scanner.address(Target::AbilitiesAccess), &detourAbilitiesAccess,
-                 reinterpret_cast<void**>(&g_abilitiesAccess), L"AbilitiesAccess", HookGroup::Ability);
+    hooks.create(scanner.address(Target::CameraDirectLookTurn), &detourCameraDirectLookTurn,
+                 reinterpret_cast<void**>(&g_cameraDirectLookTurn), L"CameraDirectLookTurn");
+    hooks.create(scanner.address(Target::CameraOrbitTurn), &detourCameraOrbitTurn,
+                 reinterpret_cast<void**>(&g_cameraOrbitTurn), L"CameraOrbitTurn");
+    hooks.create(scanner.address(Target::DismountButton), &detourDismountButton,
+                 reinterpret_cast<void**>(&g_dismountButton), L"DismountButton");
+    hooks.create(scanner.address(Target::HotbarScrollButton), &detourHotbarScrollButton,
+                 reinterpret_cast<void**>(&g_hotbarScrollButton), L"HotbarScrollButton");
+    hooks.create(scanner.address(Target::HudHotbarScrollNext), &detourHudHotbarScrollNext,
+                 reinterpret_cast<void**>(&g_hudHotbarScrollNext), L"HudHotbarScrollNext");
+    hooks.create(scanner.address(Target::HudHotbarScrollPrev), &detourHudHotbarScrollPrev,
+                 reinterpret_cast<void**>(&g_hudHotbarScrollPrev), L"HudHotbarScrollPrev");
+
+    if (const std::byte* const abilitySite = scanner.address(Target::AbilitiesAccess);
+        abilitySite != nullptr && memory::isReadable(abilitySite, 8)) {
+        hooks.create(directCallTarget(abilitySite + 3), &detourAbilitiesAccess,
+                     reinterpret_cast<void**>(&g_abilitiesAccess), L"AbilitiesAccess", HookGroup::Ability);
+    }
     hooks.create(scanner.address(Target::PoseDecision), &detourPoseDecision,
                  reinterpret_cast<void**>(&g_poseDecision), L"PoseDecision", HookGroup::Ability);
 
@@ -3740,10 +2257,10 @@ void installAll()
         const auto* const site = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::InputGatherKeyCallSite));
         const auto* const gather = reinterpret_cast<const std::uint8_t*>(scanner.address(Target::InputGather));
         const void* keyReturn = nullptr;
-        if (site != nullptr && gather != nullptr && memory::isReadable(site, 0x17) && site[0x12] == 0xE8) {
+        if (site != nullptr && gather != nullptr && memory::isReadable(site, 0x16) && site[0x11] == 0xE8) {
             std::int32_t rel = 0;
-            std::memcpy(&rel, site + 0x13, sizeof(rel));
-            if (site + 0x17 + rel == gather) keyReturn = site + 0x17;
+            std::memcpy(&rel, site + 0x12, sizeof(rel));
+            if (site + 0x16 + rel == gather) keyReturn = site + 0x16;
         }
         ToggleSneakSprint::instance().setKeyCallReturn(keyReturn);
         if (keyReturn == nullptr) {
@@ -3793,6 +2310,10 @@ void installAll()
                  &detourHandleItemStackResponse,
                  reinterpret_cast<void**>(&g_handleItemStackResponse),
                  L"HandleItemStackResponse");
+    if (hooks.create(scanner.address(Target::CraftFromOutput), &detourCraftFromOutput,
+                     reinterpret_cast<void**>(&g_craftFromOutput), L"CraftFromOutput")) {
+        craftamount::markAvailable();
+    }
 
     if (hooks.create(scanner.address(Target::ContainerSmHandle), &detourContainerSm,
                      reinterpret_cast<void**>(&g_containerSm), L"ContainerSm")) {
@@ -3837,8 +2358,7 @@ void installAll()
     }
     hooks.create(scanner.address(Target::RenderCurrentFrame), &detourRenderCurrentFrame,
                  reinterpret_cast<void**>(&g_renderCurrentFrame), L"RenderCurrentFrame");
-    hooks.create(scanner.address(Target::ServerLevelTick), &detourServerLevelTick,
-                 reinterpret_cast<void**>(&g_serverLevelTick), L"ServerLevelTick");
+    installSessionTicks(hooks, scanner);
     hooks.create(scanner.address(Target::PacketCheckSize), &detourPacketCheckSize,
                  reinterpret_cast<void**>(&g_packetCheckSize), L"PacketCheckSize");
     hooks.create(scanner.address(Target::NetworkSend), &detourNetworkSend,
@@ -3846,7 +2366,7 @@ void installAll()
     hooks.create(scanner.address(Target::StartGameHandle), &detourStartGameHandle,
                  reinterpret_cast<void**>(&g_startGameHandle), L"StartGameHandle");
     if (std::byte* const site = scanner.address(Target::LevelChunkTickCall);
-        site != nullptr && site[37] == std::byte{0xE8}) {
+        site != nullptr && memory::isReadable(site, 42) && site[37] == std::byte{0xE8}) {
         void* const target = memory::ripTarget(site, 38);
         if (memory::inGameModule(target) && memory::isExecutable(target, 1)) {
             if (hooks.create(target, &detourLevelChunkTick, reinterpret_cast<void**>(&g_levelChunkTick),
@@ -3926,6 +2446,8 @@ void installAll()
     hooks.create(scanner.address(Target::UiDefLookup), &detourUiDefLookup,
                  reinterpret_cast<void**>(&g_uiDefLookup), L"UiDefLookup");
 
+    hooks.create(scanner.address(Target::SettingsGroupResolve), &detourSettingsGroupResolve,
+                 reinterpret_cast<void**>(&g_settingsGroupResolve), L"SettingsGroupResolve");
     hooks.create(scanner.address(Target::SettingsGroupRegister), &detourSettingsGroupRegister,
                  reinterpret_cast<void**>(&g_settingsGroupRegister), L"SettingsGroupRegister");
     g_openHowToPlayScreen = reinterpret_cast<OpenHowToPlayScreenFn>(
@@ -3937,7 +2459,17 @@ void installAll()
     hooks.create(scanner.address(Target::SettingsFindComponent), &detourSettingsFindComponent,
                  reinterpret_cast<void**>(&g_settingsFindComponent), L"SettingsFindComponent");
 
-    g_gameAllocate = scanner.addressAs<GameAllocateFn>(Target::GameAllocate);
+    const auto* allocatorSite = scanner.address(Target::GameAllocate);
+    unsigned char allocatorCode[14]{};
+    if (allocatorSite && memory::copyGuarded(allocatorSite, allocatorCode, sizeof(allocatorCode))
+        && allocatorCode[0] == 0x48 && allocatorCode[1] == 0x8b && allocatorCode[2] == 0x0d
+        && std::memcmp(allocatorCode + 7, "\x48\x8b\x01\x48\x8b\x40\x08", 7) == 0) {
+        auto* global = static_cast<void**>(memory::ripTarget(allocatorSite, 3));
+        if (memory::inGameModule(global) && memory::isReadable(global, sizeof(void*))) {
+            g_gameAllocatorGlobal = global;
+            g_gameAllocateSlot = allocatorCode[13];
+        }
+    }
 
     hooks.create(scanner.address(Target::UiEventDispatch), &detourUiEventDispatch,
                  reinterpret_cast<void**>(&g_uiEventDispatch), L"UiEventDispatch");
@@ -3948,6 +2480,8 @@ void installAll()
 
     hooks.create(scanner.address(Target::FogSettingsFetch), &detourFogSettingsFetch,
                  reinterpret_cast<void**>(&g_fogSettingsFetch), L"FogSettingsFetch", HookGroup::Fog);
+    hooks.create(scanner.address(Target::FogColorFetch), &detourFogColorFetch,
+                 reinterpret_cast<void**>(&g_fogColorFetch), L"FogColorFetch", HookGroup::Fog);
     hooks.create(scanner.address(Target::ItemHoverTextBuild), &detourItemHoverTextBuild,
                  reinterpret_cast<void**>(&g_itemHoverTextBuild), L"ItemHoverTextBuild");
     hooks.create(scanner.address(Target::HoverRendererRender), &detourHoverRendererRender,
@@ -3956,6 +2490,14 @@ void installAll()
                  reinterpret_cast<void**>(&g_mobEffectsRendererRender), L"MobEffectsRendererRender");
     hooks.create(scanner.address(Target::MobEffectsLayout), &detourMobEffectsLayout,
                  reinterpret_cast<void**>(&g_mobEffectsLayout), L"MobEffectsLayout");
+    hooks.create(scanner.address(Target::LocatorBarRendererRender), &detourLocatorBarRendererRender,
+                 reinterpret_cast<void**>(&g_locatorBarRendererRender), L"LocatorBarRendererRender");
+    if (const std::byte* const iconCall = scanner.address(Target::LocatorBarIconCall)) {
+        hooks.create(memory::ripTarget(iconCall, 85), &detourLocatorBarIcon,
+                     reinterpret_cast<void**>(&g_locatorBarIcon), L"LocatorBarIcon");
+    }
+    NameTags::instance().setBuildHooked(hooks.create(scanner.address(Target::NameTagBuild), &detourNameTagBuild,
+                                                     reinterpret_cast<void**>(&g_nameTagBuild), L"NameTagBuild"));
     hooks.create(scanner.address(Target::HungerRendererUpdate), &detourHungerRendererUpdate,
                  reinterpret_cast<void**>(&g_hungerRendererUpdate), L"HungerRendererUpdate");
     hooks.create(scanner.address(Target::HeartRendererUpdate), &detourHeartRendererUpdate,
@@ -3971,6 +2513,10 @@ void installAll()
 
     hooks.create(scanner.address(Target::OreKeyRowsBuild), &detourOreKeyRowsBuild,
                  reinterpret_cast<void**>(&g_oreKeyRowsBuild), L"OreKeyRowsBuild");
+
+    if (void* const advance = oreuiscript::advanceAddress(); advance != nullptr) {
+        hooks.create(advance, oreuiscript::advanceDetour(), oreuiscript::advanceOriginal(), L"OreUiViewAdvance");
+    }
 
     hooks.create(ItemStackRequest::findContainerOpenHandle(), &detourContainerOpenHandle,
                  reinterpret_cast<void**>(&g_containerOpenHandle), L"ContainerOpenHandle");
@@ -3988,9 +2534,10 @@ void installAll()
                  reinterpret_cast<void*>(&tsukuyomiPlayerViewTrampolineEntry),
                  &tsukuyomiPlayerViewTrampoline, L"PlayerView");
 
-    hooks.create(scanner.address(Target::PacketSend),
+    const bool packetSendHooked = hooks.create(scanner.address(Target::PacketSend),
                  reinterpret_cast<void*>(&tsukuyomiPacketSendTrampolineEntry),
                  &tsukuyomiPacketSendTrampoline, L"PacketSend");
+    bot::installHooks(hooks, packetSendHooked);
 
     render::installOverlayHooks();
 
@@ -4065,6 +2612,44 @@ bool callBuildBlockGuarded(BuildBlockFn fn, void* gameMode, void* blockPos, unsi
     }
 }
 
+bool redirectBuildRaw(BuildBlockFn fn, void* gameMode, std::int32_t* pos, unsigned char face,
+                      const float* click, unsigned char extra, bool simTick, void* hit, bool& out)
+{
+    auto* const fields = static_cast<unsigned char*>(hit) + 0x18;
+    unsigned char saved[0x20]{};
+    if (!memory::isWritable(fields, sizeof(saved)) || !memory::copyGuarded(fields, saved, sizeof(saved))) return false;
+    unsigned char* kept = nullptr;
+    unsigned char* keptFlag = nullptr;
+    unsigned char keptSaved[12]{};
+    unsigned char keptFlagSaved = 0;
+    if (g_keptClickFlag != 0 && g_keptClickPoint != 0) {
+        auto* const base = static_cast<unsigned char*>(gameMode);
+        if (memory::isWritable(base + g_keptClickFlag, 1) && memory::isWritable(base + g_keptClickPoint, sizeof(keptSaved))
+            && memory::copyGuarded(base + g_keptClickFlag, &keptFlagSaved, 1)
+            && memory::copyGuarded(base + g_keptClickPoint, keptSaved, sizeof(keptSaved))) {
+            kept = base + g_keptClickPoint; keptFlag = base + g_keptClickFlag;
+        }
+    }
+    const bool previous = t_modBuild;
+    __try {
+        __try {
+            t_modBuild = true;
+            const int type = 0, side = face;
+            float point[3]{};
+            for (int a = 0; a < 3; ++a) point[a] = static_cast<float>(pos[a]) + click[a];
+            std::memcpy(fields, &type, 4); std::memcpy(fields + 4, &side, 4);
+            std::memcpy(fields + 8, pos, 12); std::memcpy(fields + 20, point, 12);
+            if (kept) std::memcpy(kept, point, sizeof(point));
+            out = fn(gameMode, pos, face, extra, simTick);
+        } __finally {
+            std::memcpy(fields, saved, sizeof(saved));
+            if (kept) { std::memcpy(kept, keptSaved, sizeof(keptSaved)); *keptFlag = keptFlagSaved; }
+            t_modBuild = previous;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { t_modBuild = previous; return false; }
+}
+
 }
 
 bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra,
@@ -4075,7 +2660,11 @@ bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned
     }
 
     bool placed = false;
-    if (callBuildBlockGuarded(g_buildBlock, gameMode, blockPos, face, extra, simTick, placed)) {
+    const bool previous = t_modBuild;
+    t_modBuild = true;
+    const bool called = callBuildBlockGuarded(g_buildBlock, gameMode, blockPos, face, extra, simTick, placed);
+    t_modBuild = previous;
+    if (called) {
         return placed;
     }
 
@@ -4085,14 +2674,96 @@ bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned
     return false;
 }
 
-bool callBuildBlockWithoutSwing(void* gameMode, void* blockPos, unsigned char face,
-                                unsigned char extra, bool simTick)
+bool callOriginalBuildBlock(void* gameMode, std::int32_t blockPos[3], unsigned char face,
+                            const float click[3], unsigned char extra, bool simTick)
 {
+    void* const hit = hitResultAddress();
+    if (!g_buildBlock || !gameMode || !hit || !blockPos || !click || face > 5) return false;
+    bool placed = false;
+    if (!redirectBuildRaw(g_buildBlock, gameMode, blockPos, face, click, extra, simTick, hit, placed)) {
+        notice::failOnce("EasyPlace.hitResult", L"Easy Place: redirecting the hit position or the placement call failed.",
+                         "Easy Place: could not redirect the placement hit result.");
+        return false;
+    }
+    return placed;
+}
+
+namespace {
+std::atomic<unsigned long> g_dryThread{0};
+DryRun* g_dry = nullptr;
+}
+
+bool dryRunActive()
+{
+    const auto thread = g_dryThread.load(std::memory_order_relaxed);
+    return thread != 0 && thread == GetCurrentThreadId();
+}
+
+void noteDryPacket()
+{
+    if (g_dry) ++g_dry->m_dropped;
+}
+
+void noteDryWrite(void* subChunk, unsigned layer, unsigned index, const void* block)
+{
+    if (!g_dry) return;
+    DryWrite write;
+    write.subChunk = subChunk; write.layer = layer; write.index = index; write.block = block;
+    write.before = blockwrite::readBlockOf(subChunk, layer, index);
+    g_dry->m_writes.push_back(write);
+    if (g_dry->m_apply && write.before && g_subChunkSetBlock) {
+        g_subChunkSetBlock(subChunk, layer, index, block);
+        blockwrite::noteLiveSubChunk(subChunk);
+    }
+}
+
+DryRun::DryRun(bool apply) : m_apply(apply)
+{
+    unsigned long expected = 0;
+    if (!g_dryThread.compare_exchange_strong(expected, GetCurrentThreadId())) return;
+    g_dry = this; m_ok = true;
+}
+
+DryRun::~DryRun()
+{
+    if (!m_ok) return;
+    if (m_apply && g_subChunkSetBlock)
+        for (auto it = m_writes.rbegin(); it != m_writes.rend(); ++it)
+            if (it->before) {
+                g_subChunkSetBlock(it->subChunk, it->layer, it->index, it->before);
+                blockwrite::noteLiveSubChunk(it->subChunk);
+            }
+    g_dry = nullptr;
+    g_dryThread.store(0, std::memory_order_relaxed);
+}
+
+bool DryRun::click(void* gameMode, std::int32_t blockPos[3], unsigned char face, const float click[3], bool& used)
+{
+    used = false;
+    if (!m_ok) return false;
     const bool previous = t_suppressSwing;
     t_suppressSwing = true;
-    const bool placed = callBuildBlock(gameMode, blockPos, face, extra, simTick);
+    used = callOriginalBuildBlock(gameMode, blockPos, face, click, 0, false);
     t_suppressSwing = previous;
-    return placed;
+    return true;
+}
+
+bool callBuildBlockAimedWithoutSwing(void* gameMode, std::int32_t blockPos[3], unsigned char face,
+                                     const float click[3], unsigned char extra, bool simTick)
+{
+    void* const hit = hitResultAddress();
+    if (!g_buildBlock || !gameMode || !hit || !blockPos || !click || face > 5) return false;
+    const bool previous = t_suppressSwing;
+    t_suppressSwing = true;
+    bool placed = false;
+    const bool called = redirectBuildRaw(g_buildBlock, gameMode, blockPos, face, click, extra, simTick, hit, placed);
+    t_suppressSwing = previous;
+    if (called) return placed;
+
+    log().error(L"buildBlock (aimed) faulted for game mode {:#x}, dropping it",
+                reinterpret_cast<std::uintptr_t>(gameMode));
+    GameData::instance().setGameMode(nullptr);
+    return false;
 }
 
 void callNotifyInventoryOpen(void* client)
@@ -4139,7 +2810,7 @@ bool translateWith(void* out, const void* key, const void* params)
 
 namespace {
 
-constexpr std::size_t kScreenContextSlot = 0x728;
+constexpr std::size_t kScreenContextSlot = 0x718;
 constexpr std::size_t kScreenStackBegin = 0x60;
 constexpr std::size_t kScreenStackEnd = 0x68;
 
@@ -4195,6 +2866,91 @@ bool callOpenHowToPlayScreen()
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+namespace {
+std::ptrdiff_t g_getSceneStackSlot = -1;
+std::ptrdiff_t g_popScreenSlot = -1;
+
+bool resolvePopSlots()
+{
+    if (g_getSceneStackSlot > 0 && g_popScreenSlot > 0) {
+        return true;
+    }
+    const auto* open = reinterpret_cast<const std::uint8_t*>(Scanner::instance().address(Target::OpenHowToPlayScreen));
+    const auto* pop = reinterpret_cast<const std::uint8_t*>(Scanner::instance().address(Target::ScenePopCall));
+    if (open == nullptr || pop == nullptr || !memory::isReadable(open, 40) || !memory::isReadable(pop, 16)) {
+        return false;
+    }
+    if (open[30] != 0x48 || open[31] != 0x8B || open[32] != 0x80 || pop[7] != 0x48 || pop[8] != 0x8B || pop[9] != 0x80) {
+        return false;
+    }
+    std::int32_t a = 0;
+    std::int32_t b = 0;
+    std::memcpy(&a, open + 33, 4);
+    std::memcpy(&b, pop + 10, 4);
+    if (a <= 0 || a > 0x2000 || (a % 8) != 0 || b <= 0 || b > 0x400 || (b % 8) != 0) {
+        return false;
+    }
+    g_getSceneStackSlot = a;
+    g_popScreenSlot = b;
+    return true;
+}
+
+struct alignas(8) SceneStackRef {
+    void* alive = nullptr;
+    void* counts = nullptr;
+    void* stack = nullptr;
+};
+
+using GetSceneStackFn = SceneStackRef*(__fastcall*)(void* client, SceneStackRef* out);
+using PopScreenFn = void(__fastcall*)(void* stack, int count);
+using CountsReleaseFn = void(__fastcall*)(void* counts);
+
+bool popTopScreenGuarded(void* client)
+{
+    __try {
+        void* const* vt = *static_cast<void* const* const*>(client);
+        const auto get = reinterpret_cast<GetSceneStackFn>(vt[g_getSceneStackSlot / 8]);
+        SceneStackRef ref;
+        get(client, &ref);
+        bool ok = false;
+        if (ref.alive != nullptr && *static_cast<const volatile std::uint8_t*>(ref.alive) != 0 && ref.stack != nullptr) {
+            void* const* svt = *static_cast<void* const* const*>(ref.stack);
+            reinterpret_cast<PopScreenFn>(svt[g_popScreenSlot / 8])(ref.stack, 1);
+            ok = true;
+        }
+        if (ref.counts != nullptr) {
+            auto* const c = static_cast<std::uint8_t*>(ref.counts);
+            void* const* cvt = *reinterpret_cast<void* const* const*>(c);
+            if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 8)) == 0) {
+                reinterpret_cast<CountsReleaseFn>(cvt[0])(c);
+                if (_InterlockedDecrement(reinterpret_cast<volatile long*>(c + 0xc)) == 0) {
+                    reinterpret_cast<CountsReleaseFn>(cvt[1])(c);
+                }
+            }
+        }
+        return ok;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+}
+
+bool popTopScreen()
+{
+    void* const client = g_clientInstance.load(std::memory_order_relaxed);
+    if (client == nullptr || !resolvePopSlots()) {
+        return false;
+    }
+    const bool ok = popTopScreenGuarded(client);
+    static int said = 0;
+    if (said < 4) {
+        ++said;
+        log().info(L"Hooks: popped the top screen {} (scene stack slots +{:#x} / +{:#x})", ok ? L"ok" : L"FAILED",
+                   g_getSceneStackSlot, g_popScreenSlot);
+    }
+    return ok;
 }
 
 bool offstackScreenHeld()
@@ -4257,15 +3013,65 @@ bool callSettingsGroupRegister(void* registry, const void* idView, void* provide
     }
 }
 
+bool callClientRefreshScreenSize(void* client)
+{
+    using Fn = void(__fastcall*)(void*);
+    const auto fn = Scanner::instance().addressAs<Fn>(Target::ClientRefreshScreenSize);
+    if (fn == nullptr || client == nullptr) return false;
+    __try {
+        fn(client);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static bool executableGameFunction(const void* fn, std::atomic<const void*>& checked)
+{
+    if (fn == checked.load(std::memory_order_relaxed)) return true;
+    if (!memory::inGameModule(fn) || !memory::isExecutable(fn, 1)) return false;
+    checked.store(fn, std::memory_order_relaxed);
+    return true;
+}
+static std::atomic<const void*> g_checkedAllocate{nullptr};
+static std::atomic<const void*> g_checkedFree{nullptr};
+
 void* callGameAllocate(size_t size)
 {
-    if (g_gameAllocate == nullptr || size == 0 || size > 0x10000) {
+    constexpr size_t kMaxGameAllocation = 64u << 20;
+    if (g_gameAllocatorGlobal == nullptr || size == 0 || size > kMaxGameAllocation) {
         return nullptr;
     }
     __try {
-        return g_gameAllocate(nullptr, size);
+        void* allocator = *g_gameAllocatorGlobal;
+        if (!allocator) return nullptr;
+        auto* vtable = *static_cast<unsigned char**>(allocator);
+        if (!memory::inGameModule(vtable)) return nullptr;
+        const auto fn = *reinterpret_cast<GameAllocateFn*>(vtable + g_gameAllocateSlot);
+        if (!executableGameFunction(reinterpret_cast<void*>(fn), g_checkedAllocate)) return nullptr;
+        return fn(allocator, size);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return nullptr;
+    }
+}
+
+bool callGameFree(void* data)
+{
+    if (!data) return true;
+    if (!g_gameAllocatorGlobal) return false;
+    constexpr std::size_t kFreeSlot = 0x10;
+    using FreeFn = void(__fastcall*)(void*, void*);
+    __try {
+        void* allocator = *g_gameAllocatorGlobal;
+        if (!allocator) return false;
+        auto* vtable = *static_cast<unsigned char**>(allocator);
+        if (!memory::inGameModule(vtable)) return false;
+        const auto fn = *reinterpret_cast<FreeFn*>(vtable + kFreeSlot);
+        if (!executableGameFunction(reinterpret_cast<void*>(fn), g_checkedFree)) return false;
+        fn(allocator, data);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
     }
 }
 

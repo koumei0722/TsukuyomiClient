@@ -45,6 +45,8 @@ public:
 
     bool apply(void* player, const Change& a, const Change& b);
 
+    bool requestResync(void* player);
+
 private:
     LegacyTransaction() = default;
 
@@ -75,12 +77,19 @@ private:
 
     static constexpr std::uint32_t kNormalTransaction = 0;
 
+    static constexpr std::uint32_t kItemReleaseTransaction = 4;
+    static constexpr std::ptrdiff_t kTransactionTypeOffset = 0x08;
+    static constexpr std::ptrdiff_t kReleaseActionOffset = 0x68;
+    static constexpr std::ptrdiff_t kReleaseSlotOffset = 0x6c;
+    static constexpr std::int32_t kReleaseAction = 0;
+    static constexpr std::int32_t kMismatchedSlot = -1;
+
     static constexpr std::int32_t kSourceContainer = 0;
 
     static constexpr std::int32_t kOffhandSlot = 0;
 
     static constexpr std::ptrdiff_t kSendVtableOffset = 0x720;
-    static constexpr std::ptrdiff_t kNetManagerOffset = 0x1D8;
+    static constexpr std::ptrdiff_t kNetManagerOffset = 0x200;
     static constexpr std::ptrdiff_t kBeginRequestVtableOffset = 0x9E8;
 
     MakeTransactionFn m_makeTransaction = nullptr;

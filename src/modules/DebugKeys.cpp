@@ -3,12 +3,14 @@
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
 #include "core/Logger.h"
+#include "core/Notice.h"
 #include "game/ClientChat.h"
 #include "game/DebugKeysCommands.h"
 #include "game/DebugScreenWorld.h"
 #include "game/GameModeIds.h"
 #include "game/GameModeWheel.h"
 #include "game/AdvancedTooltipText.h"
+#include "game/ChunkResend.h"
 #include "game/ContainerUi.h"
 #include "game/GameData.h"
 #include "game/GameString.h"
@@ -19,6 +21,7 @@
 #include "memory/Scanner.h"
 #include "modules/DebugScreen.h"
 #include "game/GameModeState.h"
+#include "game/GameCommand.h"
 #include "render/WorldMesh.h"
 
 #include <windows.h>
@@ -47,20 +50,6 @@ constexpr unsigned kGameMode = 1024u;
 constexpr unsigned kSpectator = 2048u;
 
 using ClearMessagesFn = void(__fastcall*)(void*);
-using ChatCommandFn = bool(__fastcall*)(const std::string*, const void*);
-
-bool runChatCommandRaw(void* ci, ChatCommandFn fn, const std::string* text, bool& handled)
-{
-    __try {
-        void* control = *reinterpret_cast<void**>(static_cast<std::byte*>(ci) + 8);
-        if (control == nullptr || *static_cast<unsigned char*>(control) != 1) return false;
-        void* reference[3] = {control, nullptr, ci};
-        handled = fn(text, reference);
-        return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
 using GamePauseFn = void(__fastcall*)(void*, bool);
 
 bool clearChatRaw(void* ci, std::int32_t offset, ClearMessagesFn fn)
@@ -277,20 +266,17 @@ void DebugKeys::onScansReady()
             m_maxDamageSlot = 0;
         }
     }
-    if (site != nullptr && memory::isReadable(site, 42)) {
+    if (site != nullptr && memory::isReadable(site, 44)) {
         std::memcpy(&m_clientOptionsSlot, site + 10, sizeof(m_clientOptionsSlot));
-        std::memcpy(&m_optionLookupSlot, site + 26, sizeof(m_optionLookupSlot));
-        std::memcpy(&m_pauseOptionId, site + 38, sizeof(m_pauseOptionId));
+        std::memcpy(&m_optionLookupSlot, site + 27, sizeof(m_optionLookupSlot));
+        std::memcpy(&m_pauseOptionId, site + 40, sizeof(m_pauseOptionId));
     }
-    const std::byte* const smooth = scanner.address(Target::SmoothLightingGetter);
-    if (smooth != nullptr && memory::isReadable(smooth + 33, sizeof(m_smoothLightingId))) {
-        std::memcpy(&m_smoothLightingId, smooth + 33, sizeof(m_smoothLightingId));
-    }
+    chunkresend::resolve();
     std::byte* const attachPos = scanner.address(Target::ActorAttachPos);
     std::int32_t rotationField = 0;
-    if (attachPos != nullptr && memory::isReadable(attachPos + 0x3A6, 7) && attachPos[0x3A6] == std::byte{0x4C}
-        && attachPos[0x3A7] == std::byte{0x8B} && attachPos[0x3A8] == std::byte{0x81}) {
-        std::memcpy(&rotationField, attachPos + 0x3A9, sizeof(rotationField));
+    if (attachPos != nullptr && memory::isReadable(attachPos + 0x376, 7) && attachPos[0x376] == std::byte{0x4C}
+        && attachPos[0x377] == std::byte{0x8B} && attachPos[0x378] == std::byte{0x91}) {
+        std::memcpy(&rotationField, attachPos + 0x379, sizeof(rotationField));
         if (rotationField <= 0 || rotationField > 0x1000 || rotationField % 8 != 0) rotationField = 0;
     }
     debugworld::setActorFunctions(attachPos, scanner.address(Target::ViewVector), rotationField);
@@ -314,11 +300,6 @@ void DebugKeys::onScansReady()
             || !memory::isExecutable(m_pauseGameA, 1) || !memory::isExecutable(m_pauseGameB, 1)) {
             m_pauseGameA = m_pauseGameB = nullptr;
         }
-    }
-    const std::byte* const commandSite = scanner.address(Target::ChatCommandRunSite);
-    if (commandSite != nullptr && memory::isReadable(commandSite, 0x32) && commandSite[0x2D] == std::byte{0xE8}) {
-        m_chatCommand = memory::ripTarget(commandSite, 0x2E);
-        if (!memory::inGameModule(m_chatCommand) || !memory::isExecutable(m_chatCommand, 1)) m_chatCommand = nullptr;
     }
     m_scansReady.store(true, std::memory_order_release);
 }
@@ -387,6 +368,7 @@ void DebugKeys::onPlayerViewUpdate()
         m_hitBoxTrack.clear();
     }
     m_lastViewAt = viewNow;
+    chunkresend::pump();
     void* const player = GameData::instance().player();
     if (player != m_lastPlayer) {
         m_hitBoxTrack.clear();
@@ -418,7 +400,7 @@ void DebugKeys::onPlayerViewUpdate()
         m_samplePending.store(0, std::memory_order_relaxed);
         DebugScreen::instance().takeKeySampleFlags();
         if (m_linesPublished) {
-            worldmesh::setDebugLines({});
+            worldmesh::setDebugLines(worldmesh::LineSource::DebugKeys, {});
             m_linesPublished = false;
         }
         return;
@@ -496,7 +478,7 @@ void DebugKeys::updateDebugLines()
     const bool borders = m_chunkBordersShown.load(std::memory_order_acquire);
     if (!hitboxes && !borders) {
         if (m_linesPublished) {
-            worldmesh::setDebugLines({});
+            worldmesh::setDebugLines(worldmesh::LineSource::DebugKeys, {});
             m_linesPublished = false;
         }
         return;
@@ -524,7 +506,7 @@ void DebugKeys::updateDebugLines()
                 debuglines::chunkBorderLines(section(x), section(y), section(z), minY, maxY, lines);
         }
     }
-    worldmesh::setDebugLines(std::move(lines));
+    worldmesh::setDebugLines(worldmesh::LineSource::DebugKeys, std::move(lines));
     m_linesPublished = true;
 }
 
@@ -575,11 +557,9 @@ void DebugKeys::pauseWithScreen()
 void DebugKeys::changeMode(int mode)
 {
     if (!gamemode::isSelectable(mode) || mode == GameModeState::instance().currentMode()) return;
-    void* const ci = hooks::gameClientInstance();
     const std::string text = gamemode::command(mode);
     bool handled = false;
-    if (ci == nullptr || m_chatCommand == nullptr
-        || !runChatCommandRaw(ci, reinterpret_cast<ChatCommandFn>(m_chatCommand), &text, handled)) {
+    if (!gamecommand::run(text, handled)) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true)) log().warn(L"DebugKeys: could not run the game mode command");
     }
@@ -689,9 +669,16 @@ void DebugKeys::applyReloadKey()
 
 void DebugKeys::reloadChunks()
 {
-    bool changed = false;
-    if (m_smoothLightingId != 0 && flipOptionAndBack(m_smoothLightingId, changed) && changed)
-        debugMessage("Reloading all chunks");
+    if (!chunkresend::ready()) {
+        notice::failOnce("DebugKeys.F3A", L"DebugKeys: F3+A cannot ask the server for the chunks (SubChunkRequestSite unreadable)",
+                         "F3+A is unavailable: asking the server for the chunks is not supported here");
+        return;
+    }
+    if (!chunkresend::start()) {
+        log().warn(L"DebugKeys: F3+A could not reach the player or the client's chunks; nothing was asked");
+        return;
+    }
+    debugMessage("Reloading all chunks");
 }
 
 bool DebugKeys::flipOptionAndBack(std::int32_t optionId, bool& changed)
@@ -720,7 +707,7 @@ void DebugKeys::onEnabledChanged(bool on)
         m_actions.store(0, std::memory_order_relaxed);
         m_samplePending.store(0, std::memory_order_relaxed);
         m_selectedMode.store(-1, std::memory_order_relaxed);
-        worldmesh::setDebugLines({});
+        worldmesh::setDebugLines(worldmesh::LineSource::DebugKeys, {});
     }
 }
 
@@ -731,7 +718,7 @@ void DebugKeys::shutdown()
         for (int i = 0; i < 50 && m_pausedByKey.load(std::memory_order_acquire); ++i) Sleep(10);
         if (m_pausedByKey.load(std::memory_order_acquire)) log().warn(L"DebugKeys: game is still paused at unload");
     }
-    worldmesh::setDebugLines({});
+    worldmesh::setDebugLines(worldmesh::LineSource::DebugKeys, {});
     m_selectedMode.store(-1, std::memory_order_relaxed);
     m_stopped.store(true, std::memory_order_release);
     m_actions.store(0, std::memory_order_relaxed);

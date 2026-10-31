@@ -21,7 +21,7 @@ struct Result {
     bool error = false;
 };
 Result run(const std::vector<MenuItem>& tree, const std::vector<std::string>& args);
-struct SettingInfo { std::string name; std::vector<std::string> values; MenuItemKind kind; };
+struct SettingInfo { std::string name; std::vector<std::string> values; MenuItemKind kind; TextInputKind textInput = TextInputKind::Integer; };
 struct ModuleInfo { std::string name; std::vector<SettingInfo> settings; };
 std::vector<ModuleInfo> buildIndex(const std::vector<MenuItem>& tree);
 chatcommand::SettingsCompletion completionOf(const std::vector<ModuleInfo>& index);

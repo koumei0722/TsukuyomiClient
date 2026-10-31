@@ -104,7 +104,7 @@ unsigned char* Arena::takeRecord()
     return at;
 }
 
-const char* Arena::takeText(const char* utf8)
+const char* Arena::takeText(const char* utf8, bool preserve)
 {
     if (utf8 == nullptr) {
         utf8 = "";
@@ -115,6 +115,11 @@ const char* Arena::takeText(const char* utf8)
         return nullptr;
     }
     char* const at = m_text + m_textAt;
+    if (preserve) {
+        std::memcpy(at, utf8, length + 1);
+        m_textAt += length + 1;
+        return at;
+    }
     for (std::size_t i = 0; i < length; ++i) {
         const unsigned char ch = static_cast<unsigned char>(utf8[i]);
         if (ch == 0xC2 && i + 1 < length
@@ -123,6 +128,18 @@ const char* Arena::takeText(const char* utf8)
             at[i + 1] = static_cast<char>(0xA7);
             ++i;
             continue;
+        }
+        if (ch >= 0xC2 && ch <= 0xF4) {
+            const std::size_t need = ch >= 0xF0 ? 4 : ch >= 0xE0 ? 3 : 2;
+            bool whole = i + need <= length;
+            for (std::size_t k = 1; whole && k < need; ++k) {
+                whole = (static_cast<unsigned char>(utf8[i + k]) & 0xC0) == 0x80;
+            }
+            if (whole) {
+                std::memcpy(at + i, utf8 + i, need);
+                i += need - 1;
+                continue;
+            }
         }
         at[i] = (ch >= 0x20 && ch <= 0x7E) ? static_cast<char>(ch) : '?';
     }
@@ -164,7 +181,9 @@ std::uintptr_t* Arena::makeMap(KeyValue* items, std::size_t count)
             return nullptr;
         }
         for (std::size_t i = 0; i < kept; ++i) {
-            body[i].key = reinterpret_cast<std::uintptr_t>(items[i].key);
+            const char* const key = takeText(items[i].key, true);
+            if (key == nullptr) return nullptr;
+            body[i].key = reinterpret_cast<std::uintptr_t>(key);
             body[i].value = items[i].value;
             body[i].tag = items[i].tag;
             body[i].seq = items[i].seq;

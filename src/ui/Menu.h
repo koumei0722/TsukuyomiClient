@@ -16,6 +16,8 @@ enum class MenuItemKind {
     Text,
 };
 
+enum class TextInputKind { Integer, FreeText };
+
 struct MenuItem {
     MenuItemKind kind = MenuItemKind::Action;
 
@@ -23,6 +25,7 @@ struct MenuItem {
     std::function<std::wstring()> value;
     std::function<bool()> available;
     std::function<bool()> isOn;
+    std::function<bool()> isFavorite;
     std::function<void()> activate;
 
     std::function<std::vector<int>()> getKeys;
@@ -38,11 +41,13 @@ struct MenuItem {
 
     float numberMin = 0.0f;
     float numberMax = 0.0f;
+    std::function<bool(float&, float&)> numberRange;
 
     std::vector<std::wstring> choices;
     std::function<int()> getChoice;
     std::function<void(int)> setChoice;
 
+    TextInputKind textInput = TextInputKind::Integer;
     std::function<std::wstring()> getText;
     std::function<void(std::wstring)> setText;
     bool textOnCommit = false;
@@ -79,7 +84,7 @@ MenuItem keybind(std::wstring title, std::function<std::vector<int>()> get,
 MenuItem number(std::wstring title, std::function<float()> get, std::function<void(float)> set,
                 bool integer, float min = 0.0f, float max = 0.0f);
 MenuItem text(std::wstring title, std::function<std::wstring()> get,
-              std::function<void(std::wstring)> set);
+              std::function<void(std::wstring)> set, TextInputKind input = TextInputKind::Integer);
 
 }
 

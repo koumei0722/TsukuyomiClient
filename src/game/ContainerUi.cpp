@@ -3,13 +3,16 @@
 
 #include "game/BlockRegistry.h"
 #include "game/GameCallable.h"
+#include "game/UiReload.h"
 
 #include "hooks/Detours.h"
 
 #include "core/Logger.h"
+#include "core/ShutdownGate.h"
 #include "core/Strings.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
+#include "render/MeshKit.h"
 
 #include <Windows.h>
 
@@ -97,6 +100,8 @@ using CompoundGetFn = const void*(__fastcall*)(const void* tag, const std::strin
 StorageInfoFn g_storageInfo = nullptr;
 CompoundGetFn g_compoundGet = nullptr;
 std::ptrdiff_t g_stackUserDataOffset = -1;
+int g_componentBasedSlot = -1;
+int g_getComponentSlot = -1;
 using TagHashFn = std::uint64_t(__fastcall*)(const void* tag);
 TagHashFn g_tagHash = nullptr;
 constexpr std::size_t kTagHashSlot = 0x50 / 8;
@@ -429,6 +434,8 @@ BindRegFn g_bindFloat = nullptr;
 constexpr int kMaxHudObservers = 8;
 std::atomic<HudCreatedFn> g_hudObservers[kMaxHudObservers]{};
 std::atomic<int> g_hudObserverCount{0};
+std::atomic<void*> g_hudServed{nullptr};
+std::atomic<bool> g_hudCatchUpArmed{false};
 ClickRegFn g_regClick = nullptr;
 EventRegFn g_regEvent = nullptr;
 std::ptrdiff_t g_idAuxSlot = -1;
@@ -593,12 +600,14 @@ void resolveBinders(const std::byte* ctor)
             opsBeforeImmediate(ctor, kCtorBytes, buttonId("#inventory_selected_item")))) {
         if (memory::isReadable(ops, 24) && memory::inGameModule(ops)) {
             const auto* invoke = reinterpret_cast<const std::uint8_t*>(ops[2]);
-            constexpr std::uint8_t kPat[] = {0x41, 0x0F, 0xB7, 0x12, 0x48,
+            constexpr std::uint8_t kPat[] = {0x41, 0x0F, 0xB7, 0x10, 0x48,
                                              0x8B, 0x01, 0x48, 0x8B, 0x80};
             if (invoke != nullptr && memory::inGameModule(invoke)
                 && memory::isReadable(invoke, 0x200)) {
                 for (std::size_t i = 0; i + sizeof(kPat) + 4 <= 0x200; ++i) {
-                    if (std::memcmp(invoke + i, kPat, sizeof(kPat)) == 0) {
+                    const std::uint8_t modrm = invoke[i + 3];
+                    if (std::memcmp(invoke + i, kPat, 3) == 0 && (modrm & 0xF8) == 0x10 && modrm != 0x14 && modrm != 0x15
+                        && std::memcmp(invoke + i + 4, kPat + 4, sizeof(kPat) - 4) == 0) {
                         std::int32_t disp = 0;
                         std::memcpy(&disp, invoke + i + sizeof(kPat), 4);
                         if (disp > 0 && disp < 0x1000 && disp % 8 == 0) {
@@ -779,6 +788,17 @@ void onScansReady()
         }
     }
     g_storageInfo = scanner.addressAs<StorageInfoFn>(Target::ItemStorageInfo);
+    if (const std::byte* site = scanner.address(Target::ItemStorageComponentSite); site && memory::isReadable(site, 0x58)) {
+        std::int32_t slot = 0;
+        std::memcpy(&slot, site + 77, 4);
+        const int based = static_cast<std::uint8_t>(site[31]);
+        if (based > 0 && based % 8 == 0 && slot > 0 && slot < 0x1000 && slot % 8 == 0) {
+            g_componentBasedSlot = based;
+            g_getComponentSlot = slot;
+        } else {
+            log().warn(L"ContainerUi: unexpected item component slots {:#x} / {:#x}", based, slot);
+        }
+    }
     g_compoundGet = scanner.addressAs<CompoundGetFn>(Target::CompoundTagGet);
     g_tagHash = scanner.addressAs<TagHashFn>(Target::CompoundTagHash);
     if (const std::byte* fn = reinterpret_cast<const std::byte*>(g_storageInfo);
@@ -1008,12 +1028,36 @@ void onHudConstructed(void* ctrl)
     if (ctrl == nullptr || !g_bindReady) {
         return;
     }
+    if (g_hudCatchUpArmed.load(std::memory_order_acquire)) {
+        g_hudServed.store(ctrl, std::memory_order_relaxed);
+    }
     const int n = g_hudObserverCount.load(std::memory_order_acquire);
     for (int i = 0; i < n; ++i) {
         if (const HudCreatedFn fn = g_hudObservers[i].load(std::memory_order_relaxed)) {
             fn(ctrl);
         }
     }
+}
+
+void armHudCatchUp()
+{
+    g_hudCatchUpArmed.store(true, std::memory_order_release);
+}
+
+void onHudResolving(void* ctrl)
+{
+    if (ctrl == nullptr || g_hudServed.load(std::memory_order_relaxed) == ctrl
+        || !g_hudCatchUpArmed.load(std::memory_order_acquire) || !g_bindReady) {
+        return;
+    }
+    g_hudServed.store(ctrl, std::memory_order_relaxed);
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4) {
+        log().info(L"ContainerUi: the HUD controller was built before injection; binding the HUD values now "
+                   L"(the UI definitions are reloaded once so that the added parts appear)");
+    }
+    onHudConstructed(ctrl);
+    uireload::request();
 }
 
 void onScreenConstructed(void* ctrl)
@@ -1122,6 +1166,7 @@ PersistentCode* g_persistCode = nullptr;
 PersistentValues* g_persistValues = nullptr;
 PersistentText* g_persistText = nullptr;
 std::once_flag g_persistOnce;
+ShutdownGate g_textBindings;
 std::atomic<int> g_textInside{0};
 std::atomic<int> g_collInside{0};
 
@@ -1333,6 +1378,8 @@ bool writePersistentText(int slot, const char* text, std::size_t length)
 
 bool bindPersistentText(void* ctrl, const char* name, int slot)
 {
+    const ShutdownGate::Guard binding(g_textBindings);
+    if (!binding) return false;
     TextSlot* const s = textSlot(slot);
     if (s == nullptr) {
         return false;
@@ -1356,6 +1403,7 @@ static void waitPersistentCallers(const std::atomic<int>& inside, const wchar_t*
 
 void detachPersistentText()
 {
+    g_textBindings.close();
     if (g_persistText == nullptr || g_persistCode == nullptr) {
         return;
     }
@@ -1931,6 +1979,38 @@ int creativeCategoryOf(const void* stack)
         return -1;
     }
     return value <= 6 ? value : -1;
+}
+
+namespace {
+using ItemBoolFn = bool(__fastcall*)(const void* item);
+using ItemComponentFn = const void*(__fastcall*)(const void* item, const void* name);
+
+__declspec(noinline) int hasComponentGuarded(const void* item, int basedSlot, int getSlot, const void* name) noexcept
+{
+    __try {
+        void* const* const vt = *static_cast<void* const* const*>(item);
+        if (!reinterpret_cast<ItemBoolFn>(vt[basedSlot / 8])(item)) return 0;
+        return reinterpret_cast<ItemComponentFn>(vt[getSlot / 8])(item, name) != nullptr ? 1 : 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -1;
+    }
+}
+}
+
+int isStorageItem(const void* stack)
+{
+    static char longName[32]{};
+    static meshkit::HashedStringBuf name{};
+    static const bool made = [] { meshkit::makeHashed("minecraft:storage_item", longName, sizeof(longName), name); return true; }();
+    (void)made;
+    if (g_componentBasedSlot < 0 || g_getComponentSlot < 0) return -1;
+    if (isEmpty(stack)) return 0;
+    const void* const item = reinterpret_cast<const void*>(itemKey(stack));
+    void* vt = nullptr;
+    if (item == nullptr || !readPointer(item, vt) || vt == nullptr || !memory::inGameModule(vt)) return -1;
+    const int has = hasComponentGuarded(item, g_componentBasedSlot, g_getComponentSlot, &name);
+    if (has < 0) noteFault(L"item storage component");
+    return has;
 }
 
 bool storageFill(const void* stack, int& current, int& capacity)

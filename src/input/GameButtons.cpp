@@ -8,8 +8,9 @@
 #include "memory/Scanner.h"
 #include "game/ClientChat.h"
 
+#include <algorithm>
 #include <array>
-#include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <string>
 #include <typeinfo>
@@ -17,7 +18,6 @@
 namespace tsukuyomi {
 namespace {
 
-using ActionNameFn = void* (__fastcall*)(void*, int);
 using FindKeymapFn = void* (__fastcall*)(void*, const void*);
 using BindActionFn = void (__fastcall*)(void*, void*, void*, const void*, int, bool);
 using PadBindFn = void (__fastcall*)(void*, void*, const void*, int);
@@ -26,7 +26,6 @@ using InputUpdateFn = void (__fastcall*)(void*, void*, void*, void*, std::uint64
 using RebuildFn = void (__fastcall*)(void*);
 using MappingFactoryFn = void* (__fastcall*)(void*);
 
-ActionNameFn g_actionName = nullptr;
 FindKeymapFn g_findKeymap = nullptr;
 BindActionFn g_bindAction = nullptr;
 PadBindFn g_padBind = nullptr;
@@ -39,6 +38,7 @@ std::size_t g_templateTable = 0;
 std::size_t g_activeTable = 0;
 std::size_t g_chordField = 0;
 std::size_t g_factoryField = 0;
+std::string_view g_lookupName;
 
 struct KeymapRow {
     std::string name;
@@ -48,6 +48,7 @@ struct KeymapRow {
     std::uint64_t reserved = 0;
 };
 static_assert(sizeof(KeymapRow) == 0x40);
+static_assert(offsetof(KeymapRow, begin) == 0x20 && offsetof(KeymapRow, end) == 0x28);
 struct ChordString { unsigned char bytes[32]{}; };
 struct ChordEntry {
     ChordString output;
@@ -84,15 +85,24 @@ void freeChordString(ChordString& value)
     if (capacity >= 16) {
         void* data = nullptr;
         std::memcpy(&data, value.bytes, sizeof(data));
-        std::free(data);
+        hooks::callGameFree(data);
     }
 }
+
+struct GameStringCopy {
+    ChordString value{};
+    bool ready;
+    explicit GameStringCopy(const std::string& text) : ready(makeChordString(value, text)) {}
+    ~GameStringCopy() { freeChordString(value); }
+    GameStringCopy(const GameStringCopy&) = delete;
+    GameStringCopy& operator=(const GameStringCopy&) = delete;
+};
 
 void freeNewChord(ChordEntry& entry)
 {
     freeChordString(entry.output);
     for (ChordString* it = entry.begin; it && it < entry.end; ++it) freeChordString(*it);
-    std::free(entry.begin);
+    hooks::callGameFree(entry.begin);
 }
 
 bool callMappingFactory(void* client, void*& factory)
@@ -109,9 +119,9 @@ bool callMappingFactory(void* client, void*& factory)
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
-    return owner != nullptr
-        && memory::copyGuarded(static_cast<const unsigned char*>(owner) + g_factoryField, &factory, sizeof(factory))
-        && memory::plausiblePointer(factory);
+    if (!owner) { factory = nullptr; return true; }
+    return memory::copyGuarded(static_cast<const unsigned char*>(owner) + g_factoryField, &factory, sizeof(factory))
+        && (!factory || memory::plausiblePointer(factory));
 }
 
 bool readChordString(const ChordString& value, std::string& out)
@@ -281,13 +291,13 @@ bool writeChordTable(ChordTable& table, const std::vector<gamebuttonlogic::Chord
     if (okay) okay = memory::writeGuarded(table.vector, &replacement, sizeof(replacement));
     if (!okay) {
         for (std::size_t i = 0; i < made; ++i) freeNewChord(fresh[retained + i]);
-        std::free(fresh);
+        hooks::callGameFree(fresh);
         return false;
     }
     for (std::size_t i = 0; i < table.entries.size(); ++i) {
         if (table.specs[i].ours()) freeNewChord(table.entries[i]);
     }
-    std::free(table.old.begin);
+    hooks::callGameFree(table.old.begin);
     return true;
 }
 std::array<KeymapRow, gamebuttonlogic::kMaxSlots> g_rows;
@@ -298,15 +308,12 @@ std::array<KeymapRow, gamebuttonlogic::kMaxInputRows> g_inputRows;
 std::array<int, gamebuttonlogic::kMaxInputRows> g_inputKeys{};
 std::array<int, gamebuttonlogic::kMaxInputRows> g_inputVk{};
 std::array<std::string, gamebuttonlogic::kMaxInputRows> g_inputButtonNames;
-std::array<std::array<char, 16>, gamebuttonlogic::kMaxInputRows> g_inputKeyNames{};
 
 std::array<KeymapRow, gamebuttonlogic::kMaxSlots> g_padRows;
 std::array<int, gamebuttonlogic::kMaxSlots> g_padRowKeys{};
-std::array<std::array<char, 16>, gamebuttonlogic::kMaxSlots> g_padKeyNames{};
 std::array<KeymapRow, gamebuttonlogic::kMaxPadInputRows> g_padInputRows;
 std::array<int, gamebuttonlogic::kMaxPadInputRows> g_padInputKeys{};
 std::array<std::string, gamebuttonlogic::kMaxPadInputRows> g_padInputButtonNames;
-std::array<std::array<char, 16>, gamebuttonlogic::kMaxPadInputRows> g_padInputKeyNames{};
 
 constexpr char kKeyPrefix[] = "key.tk.hk";
 constexpr char kButtonPrefix[] = "button.tk.hk";
@@ -321,7 +328,8 @@ constexpr char kPadMarker[] = "button.chat";
 std::string slotName(const char* prefix, int slot)
 {
     std::string out(prefix);
-    out.push_back(static_cast<char>('0' + slot / 10));
+    if (slot >= 100) out.push_back(static_cast<char>('0' + slot / 100));
+    out.push_back(static_cast<char>('0' + slot / 10 % 10));
     out.push_back(static_cast<char>('0' + slot % 10));
     return out;
 }
@@ -343,22 +351,22 @@ bool gameStringEquals(const void* object, const char* expected, std::size_t leng
     return std::memcmp(buffer, expected, length) == 0;
 }
 
-std::array<std::array<char, 16>, gamebuttonlogic::kMaxSlots> g_keyNames{};
-
-int keySlot(const void* object, const char* prefix, int limit)
+bool bindNamedAction(void* owner, void* table, void* mouse, const std::string& name, KeymapRow& row)
 {
-    constexpr std::size_t kPrefix = sizeof(kKeyPrefix) - 1;
-    constexpr std::size_t kLength = kPrefix + 2;
-    struct Head { char text[16]; std::size_t size; std::size_t capacity; } head{};
-    if (!object || !memory::copyGuarded(object, &head, sizeof(head)) || head.size != kLength || head.capacity >= 16) {
-        return -1;
-    }
-    if (std::memcmp(head.text, prefix, kPrefix) != 0) return -1;
-    const char tens = head.text[kPrefix];
-    const char ones = head.text[kPrefix + 1];
-    if (tens < '0' || tens > '9' || ones < '0' || ones > '9') return -1;
-    const int slot = (tens - '0') * 10 + (ones - '0');
-    return slot < limit ? slot : -1;
+    GameStringCopy copy(name);
+    if (!copy.ready) return false;
+    const gamebuttonlogic::ScopedKeymapRow lookup(g_lookupName, &row);
+    g_bindAction(owner, table, mouse, &copy.value, 0, false);
+    return lookup.used();
+}
+
+bool bindNamedPad(void* mapping, void* layout, const std::string& name, KeymapRow& row)
+{
+    GameStringCopy copy(name);
+    if (!copy.ready) return false;
+    const gamebuttonlogic::ScopedKeymapRow lookup(g_lookupName, &row);
+    g_padBind(mapping, layout, &copy.value, 0);
+    return lookup.used();
 }
 
 bool mouseKey(int key)
@@ -366,7 +374,7 @@ bool mouseKey(int key)
     return key == 0;
 }
 
-bool callRegister(RegisterDownFn target, void* handler, const std::string* name, const void* callback)
+bool callRegister(RegisterDownFn target, void* handler, const void* name, const void* callback)
 {
     __try {
         target(handler, name, callback, false);
@@ -438,7 +446,8 @@ int GameButtons::attach(std::vector<int> combo, const char* output)
     const int slot = m_allocator.attach();
     if (slot < 0) {
         static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) fail(L"all 96 hotkey slots are in use");
+        static_assert(gamebuttonlogic::kMaxSlots == 128);
+        if (!warned.exchange(true)) fail(L"all 128 hotkey slots are in use");
         return -1;
     }
     Slot& state = m_slots[slot];
@@ -464,7 +473,7 @@ int GameButtons::watchKey(int vk)
     const int slot = m_allocator.attach();
     if (slot < 0) {
         static std::atomic<bool> warned{false};
-        if (!warned.exchange(true)) log().error(L"GameButtons: all 96 key slots are in use");
+        if (!warned.exchange(true)) log().error(L"GameButtons: all {} key slots are in use", gamebuttonlogic::kMaxSlots);
         return -1;
     }
     m_keyWatch[slot] = true;
@@ -801,6 +810,7 @@ bool GameButtons::syncChordTables(void* client)
         fail(L"the input mapping factory could not be read or called");
         return false;
     }
+    if (!factory) return false;
     void* factoryVptr = nullptr;
     if (!memory::copyGuarded(factory, &factoryVptr, sizeof(factoryVptr)) || !memory::inGameModule(factoryVptr)) {
         fail(L"the input mapping factory vtable is outside the game");
@@ -848,6 +858,7 @@ bool GameButtons::syncChordTables(void* client)
 
 void GameButtons::onInputUpdate(void* self)
 {
+    if (m_failure.load(std::memory_order_acquire)) return;
     static bool toldFirst = false;
     if (!toldFirst) {
         toldFirst = true;
@@ -875,8 +886,8 @@ void GameButtons::onInputUpdate(void* self)
                 std::memcpy(callback + 8, &value, sizeof(value));
                 const void* body = callback;
                 std::memcpy(callback + 0x38, &body, sizeof(body));
-                const std::string copy = name;
-                return callRegister(target, handler, &copy, callback);
+                GameStringCopy copy(name);
+                return copy.ready && callRegister(target, handler, &copy.value, callback);
             };
             return add(g_registerDown, downValue) && add(g_registerUp, upValue);
         };
@@ -959,11 +970,13 @@ void GameButtons::onInputUpdate(void* self)
         m_appliedRevision.store(revisionBeforeApply, std::memory_order_release);
     }
 
-    constexpr int kRebuildAttempts = 3;
-    static int s_rebuildFailures = 0;
+    if (!m_registeredHandler) {
+        m_rebuildAttempts.record(m_revision.load(std::memory_order_acquire), false, false);
+        return;
+    }
     const std::uint64_t now = GetTickCount64();
     if (m_revision.load(std::memory_order_acquire) != m_builtRevision.load(std::memory_order_acquire) && g_rebuild
-        && s_rebuildFailures < kRebuildAttempts && now - m_lastRebuildMs >= 500) {
+        && now - m_lastRebuildMs >= 500) {
         void* client = hooks::gameClientInstance();
         if (memory::plausiblePointer(client)) {
             const std::uint64_t revision = m_revision.load(std::memory_order_acquire);
@@ -973,21 +986,28 @@ void GameButtons::onInputUpdate(void* self)
                 && !hasChords() && !m_hadChords.load(std::memory_order_acquire))
                 || syncChordTables(client);
             m_chordsSynced.store(synced, std::memory_order_release);
+            if (!synced) {
+                m_rebuildAttempts.record(revision, false, false);
+                return;
+            }
             const bool called = synced && callRebuild(client);
             static int s_toldRebuild = 0;
             if (s_toldRebuild++ < 3) {
                 log().info(L"GameButtons: rebuilt the input mappings ({}, rows {})", called ? L"returned" : L"FAULTED",
                            m_rowsSeen.load(std::memory_order_acquire) ? L"added" : L"missing");
             }
-            if (called && m_rowsSeen.load(std::memory_order_acquire)
-                && revision == m_appliedRevision.load(std::memory_order_acquire)
-                && revision == m_revision.load(std::memory_order_acquire)
-                && (!hasChords() || m_chordsSynced.load(std::memory_order_acquire))) {
+            const bool stable = revision == m_appliedRevision.load(std::memory_order_acquire)
+                && revision == m_revision.load(std::memory_order_acquire);
+            const bool succeeded = called && m_rowsSeen.load(std::memory_order_acquire)
+                && (!hasChords() || m_chordsSynced.load(std::memory_order_acquire));
+            if (stable && succeeded) {
                 m_builtRevision.store(revision, std::memory_order_release);
-                s_rebuildFailures = 0;
-            } else if (++s_rebuildFailures >= kRebuildAttempts) {
-                fail(L"rebuilding the input mappings failed 3 times in a row");
             }
+            if (m_rebuildAttempts.record(revision, stable, succeeded)) {
+                fail(L"rebuilding the input mappings failed three consecutive times");
+            }
+        } else {
+            m_rebuildAttempts.record(m_revision.load(std::memory_order_acquire), false, false);
         }
     }
 }
@@ -995,13 +1015,14 @@ void GameButtons::onInputUpdate(void* self)
 void GameButtons::install()
 {
     const Scanner& scan = Scanner::instance();
-    const Target targets[] = {Target::GameButtonActionName, Target::GameButtonFindKeymap,
+    const Target targets[] = {Target::GameButtonActionTableSite, Target::GameButtonFindKeymap,
         Target::GameButtonBindAction, Target::GameButtonRegisterDownSite, Target::GameButtonRegisterUpSite,
         Target::GameButtonInputUpdate, Target::GameButtonRebuild,
-        Target::InputMappingFactoryDtorSite, Target::InputMappingChordsField, Target::InputMappingFactoryPtrSite};
-    const wchar_t* labels[] = {L"GameButtonActionName", L"GameButtonFindKeymap",
+        Target::InputMappingFactoryDtorSite, Target::InputMappingChordsField, Target::InputMappingFactoryPtrSite,
+        Target::GameAllocate};
+    const wchar_t* labels[] = {L"GameButtonActionTableSite", L"GameButtonFindKeymap",
         L"GameButtonBindAction", L"GameButtonRegisterDownSite", L"GameButtonRegisterUpSite", L"GameButtonInputUpdate", L"GameButtonRebuild",
-        L"InputMappingFactoryDtorSite", L"InputMappingChordsField", L"InputMappingFactoryPtrSite"};
+        L"InputMappingFactoryDtorSite", L"InputMappingChordsField", L"InputMappingFactoryPtrSite", L"GameAllocate"};
     static_assert(std::size(targets) == std::size(labels));
     for (std::size_t i = 0; i < std::size(targets); ++i) {
         if (!scan.found(targets[i])) {
@@ -1011,6 +1032,18 @@ void GameButtons::install()
             return;
         }
     }
+    const auto* actionSite = scan.address(Target::GameButtonActionTableSite);
+    const auto* actionTable = static_cast<const unsigned char*>(memory::ripTarget(actionSite + 0xb, 3));
+    struct ActionEntry { std::uint64_t id; const char* name; std::size_t length; } entry{};
+    static_assert(sizeof(ActionEntry) == 24);
+    if (!memory::inGameModule(actionTable) || !memory::isReadable(actionTable, sizeof(entry))
+        || !memory::copyGuarded(actionTable, &entry, sizeof(entry)) || entry.id != 0
+        || entry.length == 0 || entry.length > 200 || !memory::inGameModule(entry.name)
+        || !memory::isReadable(entry.name, entry.length)) {
+        fail(L"the input action table has no valid first entry");
+        return;
+    }
+    g_lookupName = std::string_view(entry.name, entry.length);
     const auto* site = scan.address(Target::GameButtonRegisterDownSite);
     unsigned char call[5]{};
     if (!memory::copyGuarded(site + 20, call, sizeof(call)) || call[0] != 0xE8) {
@@ -1041,7 +1074,7 @@ void GameButtons::install()
         || !memory::isExecutable(reinterpret_cast<void*>(g_registerUp), 1)
         || !memory::isExecutable(reinterpret_cast<void*>(g_registerDown), 1)
         || !memory::copyGuarded(update + 0x3E, field, sizeof(field))
-        || field[0] != 0x4C || field[1] != 0x8B || field[2] != 0x7F) {
+        || field[0] != 0x48 || field[1] != 0x8B || field[2] != 0x4F) {
         fail(L"the input update layout changed");
         return;
     }
@@ -1084,12 +1117,10 @@ void GameButtons::install()
     g_factorySlot = static_cast<std::size_t>(factorySlot);
     for (int i = 0; i < gamebuttonlogic::kMaxSlots; ++i) {
         g_rows[i].name = slotName(kKeyPrefix, i);
-        std::memcpy(g_keyNames[i].data(), g_rows[i].name.c_str(), g_rows[i].name.size() + 1);
         g_rows[i].begin = &g_rowKeys[i];
         g_rows[i].end = &g_rowKeys[i];
         g_rows[i].cap = &g_rowKeys[i] + 1;
         g_padRows[i].name = slotName(kPadKeyPrefix, i);
-        std::memcpy(g_padKeyNames[i].data(), g_padRows[i].name.c_str(), g_padRows[i].name.size() + 1);
         g_padRows[i].begin = &g_padRowKeys[i];
         g_padRows[i].end = &g_padRowKeys[i];
         g_padRows[i].cap = &g_padRowKeys[i] + 1;
@@ -1097,7 +1128,6 @@ void GameButtons::install()
     }
     for (int i = 0; i < gamebuttonlogic::kMaxInputRows; ++i) {
         g_inputRows[i].name = slotName(kInputKeyPrefix, i);
-        std::memcpy(g_inputKeyNames[i].data(), g_inputRows[i].name.c_str(), g_inputRows[i].name.size() + 1);
         g_inputRows[i].begin = &g_inputKeys[i];
         g_inputRows[i].end = &g_inputKeys[i];
         g_inputRows[i].cap = &g_inputKeys[i] + 1;
@@ -1105,7 +1135,6 @@ void GameButtons::install()
     }
     for (int i = 0; i < gamebuttonlogic::kMaxPadInputRows; ++i) {
         g_padInputRows[i].name = slotName(kPadInputKeyPrefix, i);
-        std::memcpy(g_padInputKeyNames[i].data(), g_padInputRows[i].name.c_str(), g_padInputRows[i].name.size() + 1);
         g_padInputRows[i].begin = &g_padInputKeys[i];
         g_padInputRows[i].end = &g_padInputKeys[i];
         g_padInputRows[i].cap = &g_padInputKeys[i] + 1;
@@ -1116,15 +1145,13 @@ void GameButtons::install()
         return;
     }
     HookManager& hooks = HookManager::instance();
-    const bool action = hooks.create(scan.address(Target::GameButtonActionName), &gameButtonActionName,
-                                     reinterpret_cast<void**>(&g_actionName), L"GameButtonActionName");
     const bool find = hooks.create(scan.address(Target::GameButtonFindKeymap), &gameButtonFindKeymap,
                                    reinterpret_cast<void**>(&g_findKeymap), L"GameButtonFindKeymap");
     const bool bind = hooks.create(scan.address(Target::GameButtonBindAction), &gameButtonBindAction,
                                    reinterpret_cast<void**>(&g_bindAction), L"GameButtonBindAction");
     const bool input = hooks.create(update, &gameButtonInputUpdate,
                                     reinterpret_cast<void**>(&g_inputUpdate), L"GameButtonInputUpdate");
-    if (!(action && find && bind && input)) {
+    if (!(find && bind && input)) {
         fail(L"a required hook could not be created");
         return;
     }
@@ -1185,53 +1212,11 @@ void __fastcall onGameButton(void*, int packed, const void*, void*)
     GameButtons::instance().onCallback(packed);
 }
 
-void* __fastcall gameButtonActionName(void* out, int action)
-{
-    const int slot = action - 0x4000;
-    const int input = action - 0x4100;
-    const int pad = action - 0x4200;
-    const int padInput = action - 0x4300;
-    if (((slot >= 0 && slot < gamebuttonlogic::kMaxSlots)
-        || (input >= 0 && input < gamebuttonlogic::kMaxInputRows)
-        || (pad >= 0 && pad < gamebuttonlogic::kMaxSlots)
-        || (padInput >= 0 && padInput < gamebuttonlogic::kMaxPadInputRows)) && out) {
-        unsigned char value[32]{};
-        const char* keyName = slot >= 0 && slot < gamebuttonlogic::kMaxSlots ? g_keyNames[slot].data()
-            : input >= 0 && input < gamebuttonlogic::kMaxInputRows ? g_inputKeyNames[input].data()
-            : pad >= 0 && pad < gamebuttonlogic::kMaxSlots ? g_padKeyNames[pad].data()
-            : g_padInputKeyNames[padInput].data();
-        std::memcpy(value, keyName, 11);
-        const std::size_t length = 11;
-        const std::size_t capacity = 15;
-        std::memcpy(value + 0x10, &length, 8);
-        std::memcpy(value + 0x18, &capacity, 8);
-        memory::writeGuarded(out, value, sizeof(value));
-        return out;
-    }
-    return g_actionName ? g_actionName(out, action) : out;
-}
-
 void* __fastcall gameButtonFindKeymap(void* layout, const void* name)
 {
-    const int slot = keySlot(name, kKeyPrefix, gamebuttonlogic::kMaxSlots);
-    if (slot >= 0) {
-        g_rows[slot].name.assign(g_keyNames[slot].data());
-        return &g_rows[slot];
-    }
-    const int input = keySlot(name, kInputKeyPrefix, gamebuttonlogic::kMaxInputRows);
-    if (input >= 0) {
-        g_inputRows[input].name.assign(g_inputKeyNames[input].data());
-        return &g_inputRows[input];
-    }
-    const int pad = keySlot(name, kPadKeyPrefix, gamebuttonlogic::kMaxSlots);
-    if (pad >= 0) {
-        g_padRows[pad].name.assign(g_padKeyNames[pad].data());
-        return &g_padRows[pad];
-    }
-    const int padInput = keySlot(name, kPadInputKeyPrefix, gamebuttonlogic::kMaxPadInputRows);
-    if (padInput >= 0) {
-        g_padInputRows[padInput].name.assign(g_padInputKeyNames[padInput].data());
-        return &g_padInputRows[padInput];
+    struct View { const char* data; std::size_t size; } view{};
+    if (memory::copyGuarded(name, &view, sizeof(view))) {
+        if (void* row = gamebuttonlogic::ScopedKeymapRow::take(std::string_view(view.data, view.size))) return row;
     }
     return g_findKeymap ? g_findKeymap(layout, name) : nullptr;
 }
@@ -1267,12 +1252,16 @@ void __fastcall gameButtonBindAction(void* owner, void* table, void* mouse,
         g_inputVk[i] = 0;
     }
     for (int i = 0; i < count; ++i) {
-        std::string buttonName = g_buttonNames[i];
-        g_bindAction(owner, table, mouse, &buttonName, 0x4000 + i, false);
+        if (!bindNamedAction(owner, table, mouse, g_buttonNames[i], g_rows[i])) {
+            buttons.fail(L"the named keyboard row was not requested");
+            return;
+        }
     }
     for (int i = 0; i < static_cast<int>(inputs.keys().size()); ++i) {
-        std::string buttonName = g_inputButtonNames[i];
-        g_bindAction(owner, table, mouse, &buttonName, 0x4100 + i, false);
+        if (!bindNamedAction(owner, table, mouse, g_inputButtonNames[i], g_inputRows[i])) {
+            buttons.fail(L"the named chord input row was not requested");
+            return;
+        }
     }
     if (count != 0) buttons.onRowAdded();
 }
@@ -1308,13 +1297,17 @@ void __fastcall gameButtonPadBind(void* mapping, void* layout, const void* name,
     }
     int added = 0;
     for (int i : singles) {
-        std::string copy = g_buttonNames[i];
-        g_padBind(mapping, layout, &copy, 0x4200 + i);
+        if (!bindNamedPad(mapping, layout, g_buttonNames[i], g_padRows[i])) {
+            buttons.fail(L"the named controller row was not requested");
+            return;
+        }
         ++added;
     }
     for (int j = 0; j < static_cast<int>(inputs.keys().size()); ++j) {
-        std::string copy = g_padInputButtonNames[j];
-        g_padBind(mapping, layout, &copy, 0x4300 + j);
+        if (!bindNamedPad(mapping, layout, g_padInputButtonNames[j], g_padInputRows[j])) {
+            buttons.fail(L"the named controller chord input row was not requested");
+            return;
+        }
         ++added;
     }
     if (added) {

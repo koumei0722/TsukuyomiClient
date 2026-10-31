@@ -1,4 +1,5 @@
 #include "game/PlayerListMemory.h"
+#include "game/JsonValueMemory.h"
 #include "memory/Memory.h"
 
 #include <algorithm>
@@ -15,8 +16,15 @@ constexpr std::size_t kDisplayKey = 0x10, kDisplayObjective = 0x30;
 constexpr std::size_t kIdHead = 0x58, kIdCount = 0x60, kIdKey = 0x10, kIdValue = 0x18;
 constexpr std::size_t kScoreHead = 0x20, kScoreCount = 0x28, kScoreKey = 0x10, kScoreValue = 0x20;
 constexpr std::size_t kStringLength = 0x10, kStringCapacity = 0x18, kMaxString = 256;
-constexpr std::size_t kPlayerSkin = 0xA0, kSkinImage = 0xA0;
+constexpr std::size_t kPlayerSkin = 0xC0, kSkinImage = 0x80;
+constexpr std::size_t kPlayerPlatform = 0xB8;
+constexpr std::size_t kPlayerUuid = 0x28;
 constexpr std::size_t kImageWidth = 0x04, kImageHeight = 0x08, kImageData = 0x20, kImageSize = 0x28;
+constexpr std::size_t kSkinGeometry = 0xF8;
+constexpr std::uint32_t kMaxGeometries = 16, kMaxBones = 256, kMaxPolys = 4096;
+constexpr std::size_t kAnimatedBegin = 0xE0, kAnimatedEnd = 0xE8, kAnimatedStride = 0x40;
+constexpr std::size_t kAnimatedType = 0x00, kAnimatedImage = 0x08;
+constexpr std::uint32_t kAnimatedTypeFace = 1;
 constexpr std::size_t kAttrIdsBegin = 0x00, kAttrIdsEnd = 0x08, kAttrInstances = 0x18;
 constexpr std::size_t kAttrStride = 0x88, kAttrMaximum = 0x78;
 constexpr std::size_t kMaxAttributes = 512;
@@ -78,6 +86,28 @@ bool readString(const void* base, std::size_t offset, char (&out)[kMaxString + 1
 }
 }
 
+bool decodeLevelFetch(std::span<const std::uint8_t> code)
+{
+    constexpr std::uint8_t kHead[] = {0x48, 0x83, 0xEC, 0x78, 0x48, 0x8B, 0x81};
+    constexpr std::uint8_t kId[] = {0x48, 0x89, 0x54, 0x24, 0x30, 0x48, 0x83, 0xFA, 0xFF};
+    constexpr std::uint8_t kRemoved[] = {0x44, 0x88, 0x44, 0x24, 0x50};
+    constexpr std::uint8_t kResult[] = {0x48, 0x8B, 0x44, 0x24, 0x28};
+    std::int32_t field = 0;
+    if (code.size() < 0x74 || std::memcmp(code.data(), kHead, sizeof(kHead)) != 0
+        || std::memcmp(code.data() + 0x0B, kId, sizeof(kId)) != 0
+        || std::memcmp(code.data() + 0x5B, kRemoved, sizeof(kRemoved)) != 0
+        || std::memcmp(code.data() + 0x6F, kResult, sizeof(kResult)) != 0) return false;
+    std::memcpy(&field, code.data() + 7, sizeof(field));
+    return field > 0 && field < 0x10000;
+}
+
+bool levelFetchLooksRight(const void* function)
+{
+    std::uint8_t code[0x74]{};
+    return memory::inGameModule(function) && memory::copyGuarded(function, code, sizeof(code))
+        && decodeLevelFetch(code);
+}
+
 int readPlayerMap(const void* map, RawPlayer* out, int cap)
 {
     if (cap < 0 || (cap > 0 && out == nullptr)) return -1;
@@ -97,6 +127,10 @@ int readPlayerMap(const void* map, RawPlayer* out, int cap)
         out[used].nameLength = static_cast<std::uint32_t>(copied);
         const void* skin = nullptr;
         out[used].skin = read(node, kPlayerSkin, skin) && memory::plausiblePointer(skin) ? skin : nullptr;
+        std::int32_t platform = -1;
+        out[used].platform = read(node, kPlayerPlatform, platform) ? platform : -1;
+        if (!memory::copyGuarded(static_cast<const char*>(node) + kPlayerUuid, out[used].uuid, sizeof(out[used].uuid)))
+            std::memset(out[used].uuid, 0, sizeof(out[used].uuid));
         ++used;
         return true;
     });
@@ -156,6 +190,134 @@ bool readScores(const void* scoreboard, const void* objective, const std::int64_
     return true;
 }
 
+namespace {
+bool readAnimatedFace(const void* skin, std::vector<std::uint8_t>& out, std::uint32_t& width, std::uint32_t& height)
+{
+    const char* begin = nullptr;
+    const char* end = nullptr;
+    if (!read(skin, kAnimatedBegin, begin) || !read(skin, kAnimatedEnd, end) || begin == nullptr || end < begin
+        || (end - begin) % kAnimatedStride != 0 || (end - begin) / kAnimatedStride > 16) return false;
+    for (const char* at = begin; at < end; at += kAnimatedStride) {
+        std::uint32_t type = 0;
+        const std::uint8_t* data = nullptr;
+        std::uint64_t size = 0;
+        if (!read(at, kAnimatedType, type) || type != kAnimatedTypeFace || !read(at + kAnimatedImage, kImageWidth, width)
+            || !read(at + kAnimatedImage, kImageHeight, height) || !read(at + kAnimatedImage, kImageData, data)
+            || !read(at + kAnimatedImage, kImageSize, size) || data == nullptr || width == 0 || height == 0
+            || width > 1024 || height > 4096 || size != std::uint64_t(width) * height * 4) continue;
+        out.resize(static_cast<std::size_t>(size));
+        return memory::copyGuarded(data, out.data(), out.size());
+    }
+    return false;
+}
+
+bool personaFace(const void* skin, const std::uint8_t* data, std::uint32_t width, std::uint32_t height,
+                 std::uint64_t size, std::uint8_t* out, int maxSide, int& side)
+{
+    std::vector<std::vector<skinface::Quad>> perGeometry;
+    if (!readPersonaQuads(skin, perGeometry) || perGeometry.empty()) return false;
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size));
+    if (!memory::copyGuarded(data, pixels.data(), pixels.size())) return false;
+    std::vector<skinface::Texture> textures(1);
+    textures[0].width = static_cast<int>(width);
+    textures[0].height = static_cast<int>(height);
+    textures[0].sample = [&pixels, width, height](int x, int y, std::uint8_t* rgba) {
+        if (x < 0 || y < 0 || static_cast<std::uint32_t>(x) >= width || static_cast<std::uint32_t>(y) >= height) return false;
+        std::memcpy(rgba, &pixels[(static_cast<std::size_t>(y) * width + static_cast<std::size_t>(x)) * 4], 4);
+        return true;
+    };
+    std::vector<std::uint8_t> facePixels;
+    std::uint32_t faceWidth = 0, faceHeight = 0;
+    if (readAnimatedFace(skin, facePixels, faceWidth, faceHeight)) {
+        skinface::Texture& face = textures.emplace_back();
+        face.width = static_cast<int>(faceWidth);
+        face.height = static_cast<int>(faceHeight);
+        face.sample = [&facePixels, faceWidth, faceHeight](int x, int y, std::uint8_t* rgba) {
+            if (x < 0 || y < 0 || static_cast<std::uint32_t>(x) >= faceWidth || static_cast<std::uint32_t>(y) >= faceHeight) {
+                return false;
+            }
+            std::memcpy(rgba, &facePixels[(static_cast<std::size_t>(y) * faceWidth + static_cast<std::size_t>(x)) * 4], 4);
+            return true;
+        };
+    }
+    int full = 8 * static_cast<int>(std::max<std::uint32_t>(width / 64, 1));
+    while (full > maxSide) full /= 2;
+    std::size_t main = 0;
+    for (std::size_t i = 1; i < perGeometry.size(); ++i) {
+        if (perGeometry[i].size() > perGeometry[main].size()) main = i;
+    }
+    std::vector<skinface::Quad> quads;
+    for (std::size_t i = 0; i < perGeometry.size(); ++i) {
+        for (skinface::Quad quad : perGeometry[i]) {
+            quad.texture = i == main || textures.size() < 2 ? 0 : 1;
+            quads.push_back(quad);
+        }
+    }
+    if (!skinface::personaFace(quads, textures, full, out)) return false;
+    side = full;
+    return true;
+}
+
+bool readVector(jsonmem::Value value, float* out, std::uint32_t n)
+{
+    std::uint32_t have = 0;
+    if (!jsonmem::count(value, have) || have != n) return false;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        double v = 0;
+        if (!jsonmem::asNumber(jsonmem::element(value, i), v)) return false;
+        out[i] = static_cast<float>(v);
+    }
+    return true;
+}
+}
+
+bool readPersonaQuads(const void* skin, std::vector<std::vector<skinface::Quad>>& perGeometry)
+{
+    perGeometry.clear();
+    if (skin == nullptr) return false;
+    const jsonmem::Value geometries = jsonmem::member(static_cast<const char*>(skin) + kSkinGeometry, "minecraft:geometry");
+    std::uint32_t geometryCount = 0;
+    if (geometries == nullptr || !jsonmem::count(geometries, geometryCount) || geometryCount > kMaxGeometries) return false;
+    for (std::uint32_t g = 0; g < geometryCount; ++g) {
+        std::vector<skinface::Quad>& quads = perGeometry.emplace_back();
+        const jsonmem::Value bones = jsonmem::member(jsonmem::element(geometries, g), "bones");
+        std::uint32_t boneCount = 0;
+        if (bones == nullptr || !jsonmem::count(bones, boneCount) || boneCount > kMaxBones) continue;
+        for (std::uint32_t b = 0; b < boneCount; ++b) {
+            const jsonmem::Value mesh = jsonmem::member(jsonmem::element(bones, b), "poly_mesh");
+            if (mesh == nullptr) continue;
+            jsonmem::Type type{};
+            const jsonmem::Value normalized = jsonmem::member(mesh, "normalized_uvs");
+            std::uint8_t flag = 0;
+            if (normalized == nullptr || !jsonmem::typeOf(normalized, type) || type != jsonmem::Type::Bool
+                || !read(normalized, 0, flag) || flag == 0) continue;
+            const jsonmem::Value positions = jsonmem::member(mesh, "positions");
+            const jsonmem::Value normals = jsonmem::member(mesh, "normals");
+            const jsonmem::Value uvs = jsonmem::member(mesh, "uvs");
+            const jsonmem::Value polys = jsonmem::member(mesh, "polys");
+            std::uint32_t polyCount = 0;
+            if (positions == nullptr || normals == nullptr || uvs == nullptr || !jsonmem::count(polys, polyCount)
+                || polyCount > kMaxPolys) continue;
+            for (std::uint32_t p = 0; p < polyCount; ++p) {
+                const jsonmem::Value poly = jsonmem::element(polys, p);
+                std::uint32_t corners = 0;
+                if (!jsonmem::count(poly, corners) || corners != 4) continue;
+                skinface::Quad quad;
+                bool ok = true;
+                for (std::uint32_t c = 0; c < 4 && ok; ++c) {
+                    float index[3]{};
+                    ok = readVector(jsonmem::element(poly, c), index, 3) && index[0] >= 0 && index[1] >= 0 && index[2] >= 0
+                         && readVector(jsonmem::element(positions, static_cast<std::uint32_t>(index[0])), quad.position[c], 3)
+                         && readVector(jsonmem::element(uvs, static_cast<std::uint32_t>(index[2])), quad.uv[c], 2)
+                         && (c != 0 || readVector(jsonmem::element(normals, static_cast<std::uint32_t>(index[1])), quad.normal, 3));
+                }
+                if (ok) quads.push_back(quad);
+            }
+        }
+    }
+    return true;
+}
+
 bool readFace(const void* skin, std::uint8_t* out, int maxSide, int& side)
 {
     side = 0;
@@ -168,6 +330,7 @@ bool readFace(const void* skin, std::uint8_t* out, int maxSide, int& side)
         || !read(image, kImageSize, size) || data == nullptr) return false;
     if (width < 64 || width > 1024 || width % 64 != 0 || (height != width && height * 2 != width)
         || size != std::uint64_t(width) * height * 4) return false;
+    if (personaFace(skin, data, width, height, size, out, maxSide, side)) return true;
     const int scale = static_cast<int>(width / 64);
     const int full = 8 * scale;
     int step = 1;

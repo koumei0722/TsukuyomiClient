@@ -32,8 +32,8 @@ void writeBool(int slot, bool value)
 std::atomic<int> g_bindLogs{0};
 constexpr int kMaxBindLogs = 4;
 
-constexpr std::ptrdiff_t kOffhandOffset = 0xD90;
-constexpr std::ptrdiff_t kMainhandOffset = 0xE28;
+constexpr std::ptrdiff_t kOffhandOffset = 0xDB8;
+constexpr std::ptrdiff_t kMainhandOffset = 0xE50;
 constexpr std::ptrdiff_t kStackItemOffset = 0x08;
 constexpr std::ptrdiff_t kStackCountOffset = 0x22;
 

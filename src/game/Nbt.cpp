@@ -53,6 +53,15 @@ public:
         return value;
     }
 
+    void ints(std::int32_t count, std::vector<std::int32_t>& out)
+    {
+        if (!canHold(count, sizeof(std::int32_t))) return;
+        out.resize(static_cast<std::size_t>(count));
+        const std::size_t bytes = out.size() * sizeof(std::int32_t);
+        if (bytes != 0) std::memcpy(out.data(), m_bytes + m_at, bytes);
+        m_at += bytes;
+    }
+
     std::string text()
     {
         const auto length = static_cast<std::uint16_t>(fixed<std::uint16_t>());
@@ -125,7 +134,6 @@ void readNumbers(Reader& reader, Value& out, std::size_t itemSize)
     for (std::int32_t i = 0; i < count && reader.ok(); ++i) {
         switch (itemSize) {
         case 1: out.numbers.push_back(reader.fixed<std::int8_t>()); break;
-        case 4: out.numbers.push_back(reader.fixed<std::int32_t>()); break;
         default: out.numbers.push_back(reader.fixed<std::int64_t>()); break;
         }
     }
@@ -153,7 +161,7 @@ ValuePtr readPayload(Reader& reader, Tag tag, int depth)
     case Tag::Double: value->real = reader.fixed<double>(); break;
     case Tag::String: value->text = reader.text(); break;
     case Tag::ByteArray: readNumbers(reader, *value, 1); break;
-    case Tag::IntArray: readNumbers(reader, *value, 4); break;
+    case Tag::IntArray: reader.ints(reader.fixed<std::int32_t>(), value->ints); break;
     case Tag::LongArray: readNumbers(reader, *value, 8); break;
 
     case Tag::List: {
@@ -170,7 +178,11 @@ ValuePtr readPayload(Reader& reader, Tag tag, int depth)
             return nullptr;
         }
         value->listItem = itemTag;
-        if (itemTag == Tag::Byte || itemTag == Tag::Short || itemTag == Tag::Int
+        if (itemTag == Tag::Int) {
+            reader.ints(count, value->ints);
+            break;
+        }
+        if (itemTag == Tag::Byte || itemTag == Tag::Short
             || itemTag == Tag::Long) {
             value->numbers.reserve(static_cast<std::size_t>(count));
             for (std::int32_t i = 0; i < count && reader.ok(); ++i) {
@@ -180,9 +192,6 @@ ValuePtr readPayload(Reader& reader, Tag tag, int depth)
                     break;
                 case Tag::Short:
                     value->numbers.push_back(reader.fixed<std::int16_t>());
-                    break;
-                case Tag::Int:
-                    value->numbers.push_back(reader.fixed<std::int32_t>());
                     break;
                 default:
                     value->numbers.push_back(reader.fixed<std::int64_t>());

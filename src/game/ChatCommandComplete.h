@@ -13,7 +13,7 @@ struct CompletionEnum {
     std::vector<std::string> values;
 };
 
-enum class ParamType { Enum, Json, Int, Float, String };
+enum class ParamType { Enum, Json, Int, Float, String, Player, SoftEnum, Position, BlockPosition };
 
 struct CompletionParam {
     std::string name;
@@ -24,12 +24,13 @@ struct CompletionParam {
 
 struct TkCommandSpec {
     std::vector<CompletionEnum> enums;
+    std::vector<CompletionEnum> softEnums;
     std::vector<std::vector<CompletionParam>> overloads;
 };
 
 struct SettingsCompletion {
     std::vector<std::string> modules, settings;
-    std::vector<std::string> toggle, number, integer, choice, key, action;
+    std::vector<std::string> toggle, number, integer, choice, key, action, text;
     std::vector<std::string> choiceValues, keyValues;
 };
 

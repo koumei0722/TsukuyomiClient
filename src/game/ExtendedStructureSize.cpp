@@ -22,10 +22,22 @@ namespace {
 constexpr char kSection[] = "ExtendedStructureSize";
 constexpr std::int32_t kLimit = 0x7fffffff;
 
-constexpr char kScreenPattern[] = "45 39 D0 45 0F 4C D0 29 D0 83 F9 40";
-constexpr std::size_t kScreenCmpOffset = 9;
+constexpr const char* kScreenPatterns[] = {
+    "83 F9 40 BA 40 00 00 00 0F 4D CA 83 F8 02 41 0F 4C C0 44 8B 8F 48 0E 00 "
+    "00 41 83 F9 02 45 0F 4D C1 41 83 F8 40 44 0F 4D C2 44 89 87 48 0E 00 00 "
+    "89 87 4C 0E 00 00 89 8F 50 0E 00 00",
+    "83 F9 40 41 B9 40 00 00 00 41 0F 4D C9 83 F8 02 41 0F 4C C0 8B 97 48 0E "
+    "00 00 83 FA 02 44 0F 4D C2 48 8D 97 78 0D 00 00 41 83 F8 40 45 0F 4D C1 "
+    "44 89 87 48 0E 00 00 89 87 4C 0E 00 00 89 8F 50 0E 00 00 FF C9",
+    "83 F9 40 41 B8 40 00 00 00 41 0F 4D C8 83 F8 02 0F 4C C2 44 8B 8B 48 0E "
+    "00 00 41 83 F9 02 41 0F 4D D1 83 FA 40 41 0F 4D D0 89 93 48 0E 00 00 89 "
+    "83 4C 0E 00 00 89 8B 50 0E 00 00",
+    "83 F9 40 BA 40 00 00 00 0F 4D CA 83 F8 02 0F 4C C7 44 8B 83 48 0E 00 00 "
+    "41 83 F8 02 44 0F 4C C7 41 83 F8 40 44 0F 4D C2 44 89 83 48 0E 00 00 89 "
+    "83 4C 0E 00 00 89 8B 50 0E 00 00",
+};
 constexpr std::size_t kScreenSites = 4;
-constexpr std::size_t kServerCmpOffset = 3;
+constexpr std::size_t kServerCmpOffset = 0;
 
 constexpr std::size_t kSecondSearch = 32;
 constexpr std::size_t kReadSpan = 64;
@@ -137,8 +149,8 @@ bool buildSite(std::byte* site, const char* name, std::vector<Patch>& out)
     for (std::size_t at = from; at < from + kSecondSearch && secondLen == 0; ++at) {
         int reg = 0;
         std::size_t len = 0;
-        if (parseCmp40(code.data() + at, reg, len) && parseCmov(code.data() + at + len, 0x4C, dst, src, cmovLen)
-            && dst == bound && src == reg) {
+        if (parseCmp40(code.data() + at, reg, len) && parseCmov(code.data() + at + len, 0x4D, dst, src, cmovLen)
+            && dst == reg && src == bound) {
             secondAt = at;
             secondLen = len;
             other = reg;
@@ -163,21 +175,23 @@ bool buildSite(std::byte* site, const char* name, std::vector<Patch>& out)
 std::vector<std::byte*> findScreenSites()
 {
     std::vector<std::byte*> sites;
-    const auto parsed = hat::parse_signature(kScreenPattern);
-    if (!parsed.has_value()) {
-        return sites;
-    }
-    const hat::signature_view view{parsed.value()};
     const auto text = hat::process::get_process_module().get_section_data(".text");
-    std::byte* at = text.data();
-    std::byte* const end = text.data() + text.size();
-    while (at < end) {
-        const auto hit = hat::find_pattern(at, end, view);
-        if (!hit.has_result()) {
-            break;
+    for (const char* pattern : kScreenPatterns) {
+        const auto parsed = hat::parse_signature(pattern);
+        if (!parsed.has_value()) return {};
+        const hat::signature_view view{parsed.value()};
+        std::byte* at = text.data();
+        std::byte* const end = text.data() + text.size();
+        std::byte* found = nullptr;
+        while (at < end) {
+            const auto hit = hat::find_pattern(at, end, view);
+            if (!hit.has_result()) break;
+            if (found != nullptr) return {};
+            found = hit.get();
+            at = found + 1;
         }
-        sites.push_back(hit.get() + kScreenCmpOffset);
-        at = hit.get() + 1;
+        if (found == nullptr) return {};
+        sites.push_back(found);
     }
     return sites;
 }

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(Tsukuyomi
-    VERSION 2.2.3
+    VERSION 2.3.0
     LANGUAGES CXX)
 
 if(NOT MSVC)
@@ -65,7 +65,12 @@ target_link_libraries(Tsukuyomi PRIVATE
 
     dxgi
     pdh
-    psapi)
+    psapi
+
+    winhttp
+    bcrypt
+    crypt32
+    windowscodecs)
 
 target_compile_options(Tsukuyomi PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8>

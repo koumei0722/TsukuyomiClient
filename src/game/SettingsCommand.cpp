@@ -22,6 +22,7 @@ struct Extra {
     std::function<std::vector<MenuItem>()> factory;
 };
 std::vector<Extra> g_extras;
+std::mutex g_extrasMutex;
 std::mutex g_indexMutex;
 std::vector<ModuleInfo> g_index;
 std::atomic<bool> g_padDirty{false};
@@ -35,9 +36,14 @@ std::string sectionName(const MenuItem& item, std::size_t index)
 
 std::vector<MenuItem> buildTree()
 {
+    std::vector<Extra> extras;
+    {
+        std::lock_guard lock(g_extrasMutex);
+        extras = g_extras;
+    }
     auto tree = ModuleManager::instance().buildMenuItems();
     for (auto& module : tree) {
-        for (const auto& extra : g_extras) {
+        for (const auto& extra : extras) {
             if (module.labelText() != extra.label) continue;
             auto children = extra.factory();
             module.children.insert(module.children.end(), std::make_move_iterator(children.begin()),
@@ -57,6 +63,7 @@ void cacheIndex(std::vector<ModuleInfo> index)
 
 void addExtra(std::wstring moduleLabel, std::function<std::vector<MenuItem>()> factory)
 {
+    std::lock_guard lock(g_extrasMutex);
     g_extras.push_back({std::move(moduleLabel), std::move(factory)});
 }
 

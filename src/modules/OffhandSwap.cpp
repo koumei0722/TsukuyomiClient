@@ -9,6 +9,7 @@
 #include "config/Config.h"
 #include "core/Logger.h"
 #include "core/Notice.h"
+#include "game/InventoryResync.h"
 #include "game/ItemStackOps.h"
 #include "game/ItemStackRequest.h"
 #include "game/LegacyTransaction.h"
@@ -123,8 +124,7 @@ OffhandSwap& OffhandSwap::instance()
 
 bool OffhandSwap::available() const
 {
-    return Scanner::instance().found(Target::SetSelectedSlot)
-           && ItemStackRequest::instance().available();
+    return Scanner::instance().found(Target::SetSelectedSlot);
 }
 
 void OffhandSwap::onScansReady()
@@ -152,18 +152,9 @@ void OffhandSwap::onUpdate()
 void OffhandSwap::onPlayerViewUpdate()
 {
     if (!enabled()) {
-        if (m_pending.active) {
-            ItemStackOps::instance().discard();
-        }
-        m_pending = Pending{};
-        m_netIdFix = NetIdFix{};
         m_requestedSlot.store(kNoRequest, std::memory_order_release);
         return;
     }
-
-    servePending();
-
-    serveNetIdFix();
 
     const int slot = m_requestedSlot.load(std::memory_order_acquire);
     if (slot == kNoRequest) {
@@ -182,16 +173,6 @@ void OffhandSwap::onPlayerViewUpdate()
         return;
     }
 
-    if (m_pending.active || m_netIdFix.active) {
-        if (GetTickCount64() < m_requestedAtMs.load(std::memory_order_relaxed) + kQueueWaitMs) {
-            return;
-        }
-        m_requestedSlot.store(kNoRequest, std::memory_order_release);
-        log().warn(L"OffhandSwap: dropped a swap, the previous one is still waiting for the "
-                   L"server");
-        return;
-    }
-
     int expected = slot;
     if (!m_requestedSlot.compare_exchange_strong(expected, kNoRequest, std::memory_order_acq_rel,
                                                  std::memory_order_acquire)) {
@@ -200,265 +181,16 @@ void OffhandSwap::onPlayerViewUpdate()
     apply();
 }
 
-void OffhandSwap::servePending()
-{
-    if (!m_pending.active) {
-        return;
-    }
-
-    int result = 0;
-    if (!ItemStackRequest::instance().takeResponse(m_pending.requestId, result)) {
-        if (GetTickCount64() >= m_pending.giveUpAtMs) {
-            log().warn(L"OffhandSwap: the server did not answer request {}, "
-                       L"the hotbar and the server may disagree",
-                       m_pending.requestId);
-            ItemStackOps::instance().discard();
-            m_pending = Pending{};
-        }
-        return;
-    }
-
-    if (result == ItemStackRequest::kResultSuccess) {
-        ItemStackOps::instance().discard();
-        m_pending = Pending{};
-        return;
-    }
-
-    StackView current;
-    if (!m_pending.haveHand || HandRestock::instance().ownClientHolder() != m_pending.holder
-        || !readStack(m_pending.hand[0], current) || current.item != m_pending.handItem
-        || current.netValue != m_pending.handValue || current.count != m_pending.handCount) {
-        log().warn(L"OffhandSwap: the server refused the swap (result {}) but slot {} no longer holds what was "
-                   L"swapped in, so it is not put back",
-                   result, m_pending.selected);
-        ItemStackOps::instance().discard();
-        m_pending = Pending{};
-        return;
-    }
-    const bool restored = ItemStackOps::instance().restore(m_pending.hand[0]);
-
-    m_pending = Pending{};
-
-    if (!restored) {
-        log().error(L"OffhandSwap: the server refused the swap (result {}) and the hotbar could "
-                    L"not be put back, it may disagree with the server",
-                    result);
-        return;
-    }
-    log().warn(L"OffhandSwap: the server refused the swap (result {}), put the hotbar back",
-               result);
-}
-
 void OffhandSwap::onInventoryContent(const void* payload)
 {
     if (payload == nullptr || !memory::isReadable(payload, kPacketMinSize)) {
         return;
     }
-
     const auto* const base = static_cast<const std::byte*>(payload);
     const int containerId =
         static_cast<int>(*reinterpret_cast<const std::int8_t*>(base + kPacketContainerIdOffset));
     ItemStackRequest::instance().noteInventoryContent(containerId);
-    if (containerId != kOffhandContainerId) {
-        return;
-    }
-
-    std::uint64_t range[2]{};
-    std::memcpy(range, base + kPacketSlotsOffset, sizeof(range));
-    if (range[0] == 0 || range[1] < range[0] + kEntrySize) {
-        return;
-    }
-
-    const auto* const entry = reinterpret_cast<const std::byte*>(range[0]);
-    if (!memory::isReadable(entry, kEntrySize)) {
-        return;
-    }
-    const void* item = nullptr;
-    std::int32_t netId = 0;
-    std::memcpy(&item, entry + kEntryItemOffset, sizeof(item));
-    std::memcpy(&netId, entry + kEntryNetIdOffset, sizeof(netId));
-    if (item == nullptr || netId <= 0) {
-        if (m_loggedOffhandNetId.exchange(0, std::memory_order_relaxed) != 0) {
-            log().info(L"OffhandSwap: the server sent an empty offhand");
-        }
-        return;
-    }
-
-    unsigned int serial = 0;
-    {
-        const std::lock_guard<std::mutex> lock(m_offhandLock);
-        m_offhand.netId = netId;
-        m_offhand.atMs = GetTickCount64();
-        serial = ++m_offhand.serial;
-        if (m_offhandWatch.armed && m_offhandWatch.first.serial == 0) {
-            m_offhandWatch.first = m_offhand;
-        }
-    }
-
-    if (m_loggedOffhandNetId.exchange(netId, std::memory_order_relaxed) != netId) {
-        log().info(L"OffhandSwap: the server sent the offhand (net id {}, packet {})", netId, serial);
-    }
-}
-
-void OffhandSwap::beginNetIdFix(const Hands& hands, int slot)
-{
-    if (m_netIdFix.active || slot < 0 || slot >= kSlotCount) {
-        return;
-    }
-
-    std::byte* const hand = hands.slots + kSlotStride * slot;
-
-    m_netIdFix = NetIdFix{};
-
-    StackView handView;
-    if (readStack(hand, handView) && handView.item != nullptr) {
-        m_netIdFix.hand = hand;
-        if (slot == hands.selected && hands.offhand != nullptr) {
-            m_netIdFix.mainhand = hands.offhand + (kMainhandOffset - kOffhandOffset);
-        }
-    }
-    m_netIdFix.slot = slot;
-    m_netIdFix.offhand = hands.offhand;
-    {
-        const std::lock_guard<std::mutex> lock(m_offhandLock);
-        m_offhandWatch = OffhandWatch{};
-        m_offhandWatch.armed = true;
-    }
-    m_netIdFix.giveUpAtMs = GetTickCount64() + kNetIdWaitMs;
-    m_netIdFix.active = true;
-
-    StackView offhandView;
-    readStack(hands.offhand, offhandView);
-    m_netIdFix.handValue = handView.netValue;
-    m_netIdFix.offhandValue = offhandView.netValue;
-    m_netIdFix.handItem = handView.item;
-    m_netIdFix.offhandItem = offhandView.item;
-    m_netIdFix.holder = hands.holder;
-
-}
-
-OffhandSwap::OffhandArrival OffhandSwap::latestOffhand() const
-{
-    const std::lock_guard<std::mutex> lock(m_offhandLock);
-    return m_offhand;
-}
-
-OffhandSwap::OffhandArrival OffhandSwap::firstOffhandSinceArmed() const
-{
-    const std::lock_guard<std::mutex> lock(m_offhandLock);
-    return m_offhandWatch.first;
-}
-
-void OffhandSwap::serveNetIdFix()
-{
-    if (!m_netIdFix.active) {
-        return;
-    }
-
-    const OffhandArrival first = firstOffhandSinceArmed();
-    const OffhandArrival arrival = latestOffhand();
-    if (first.serial == 0) {
-        if (GetTickCount64() >= m_netIdFix.giveUpAtMs) {
-            if (m_netIdFix.hand == nullptr) {
-                log().warn(L"OffhandSwap: the server did not send the offhand back after "
-                           L"slot {} was moved into it, the next swap may be refused",
-                           m_netIdFix.slot);
-            } else {
-                log().warn(L"OffhandSwap: the server did not send the offhand back, "
-                           L"slot {} keeps its old net id and may not be movable in the "
-                           L"inventory screen until you use or move it",
-                           m_netIdFix.slot);
-            }
-            m_netIdFix = NetIdFix{};
-        }
-        return;
-    }
-
-    const std::int32_t offhandNetId = arrival.netId;
-
-    if (const unsigned long long arrivedAt = first.atMs; arrivedAt > m_netIdFix.giveUpAtMs) {
-        log().warn(L"OffhandSwap: the offhand arrived {} ms after the wait for slot {} ran out (the world may have "
-                   L"changed, or the server was late); not lining anything up",
-                   arrivedAt - m_netIdFix.giveUpAtMs, m_netIdFix.slot);
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-    if (HandRestock::instance().ownClientHolder() != m_netIdFix.holder) {
-        log().warn(L"OffhandSwap: your inventory is not the one slot {} was swapped in (the world may have changed); "
-                   L"not lining anything up",
-                   m_netIdFix.slot);
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-
-    const bool serverHeldNetIds = (offhandNetId == m_netIdFix.handValue);
-    const bool serverMovedNetIds = (offhandNetId == m_netIdFix.offhandValue);
-
-    const std::int32_t offhandWanted = serverHeldNetIds ? m_netIdFix.handValue : offhandNetId;
-
-    StackView offhandView;
-    if (readStack(m_netIdFix.offhand, offhandView) && offhandView.item != nullptr
-        && offhandView.item == m_netIdFix.offhandItem && offhandView.netValue == m_netIdFix.offhandValue
-        && offhandView.netValue != offhandWanted
-        && ItemStackOps::instance().setNetIdValue(m_netIdFix.offhand, offhandWanted)) {
-        log().info(L"OffhandSwap: lined the offhand up with the server (net id {} -> {})",
-                   offhandView.netValue, offhandWanted);
-    }
-
-    if (m_netIdFix.hand == nullptr) {
-        log().info(L"OffhandSwap: the offhand came back (net id {}), the gate for slot {} is open",
-                   offhandNetId, m_netIdFix.slot);
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-
-    if (serverMovedNetIds) {
-        log().info(L"OffhandSwap: the server moved the net ids too, slot {} is already right",
-                   m_netIdFix.slot);
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-
-    StackView handView;
-    if (!readStack(m_netIdFix.hand, handView) || handView.item == nullptr) {
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-    if (handView.item != m_netIdFix.handItem || handView.netValue != m_netIdFix.handValue) {
-        log().info(L"OffhandSwap: slot {} no longer holds what was swapped in (net id {} -> {}), leaving it alone",
-                   m_netIdFix.slot, m_netIdFix.handValue, handView.netValue);
-        m_netIdFix = NetIdFix{};
-        return;
-    }
-
-    std::int32_t wanted = 0;
-    if (serverHeldNetIds) {
-        wanted = m_netIdFix.offhandValue;
-    } else {
-        wanted = offhandNetId - 1;
-        if (wanted <= handView.netValue) {
-            log().warn(L"OffhandSwap: the offhand came back with net id {} but slot {} holds {} "
-                       L"(before: {} / {}), leaving it alone",
-                       offhandNetId, m_netIdFix.slot, handView.netValue, m_netIdFix.handValue,
-                       m_netIdFix.offhandValue);
-            m_netIdFix = NetIdFix{};
-            return;
-        }
-    }
-
-    if (wanted != handView.netValue
-        && ItemStackOps::instance().setNetIdValue(m_netIdFix.hand, wanted)) {
-        log().success(L"OffhandSwap: lined slot {} up with the server (net id {} -> {}, {})",
-                      m_netIdFix.slot, handView.netValue, wanted,
-                      serverHeldNetIds ? L"the server kept them in place" : L"newly issued");
-    }
-
-    StackView mirrorView;
-    if (m_netIdFix.mainhand != nullptr && readStack(m_netIdFix.mainhand, mirrorView)
-        && mirrorView.item == handView.item && mirrorView.netValue == handView.netValue) {
-        ItemStackOps::instance().setNetIdValue(m_netIdFix.mainhand, wanted);
-    }
-    m_netIdFix = NetIdFix{};
+    InventoryResync::instance().onInventoryContent(containerId, payload);
 }
 
 bool OffhandSwap::readStack(const std::byte* stack, StackView& out) const
@@ -585,31 +317,12 @@ bool OffhandSwap::apply()
 {
     constexpr int slot = kHeldSlot;
 
-    Hands hands[2];
-    int count = 0;
     void* holders[2] = {};
     HandRestock::instance().ownHolders(holders[0], holders[1]);
-    for (void* const holder : holders) {
-        Hands resolved;
-        if (!resolve(holder, resolved)) {
-            continue;
-        }
-        bool duplicate = false;
-        for (int i = 0; i < count; ++i) {
-            duplicate = duplicate || hands[i].container == resolved.container;
-        }
-        if (duplicate) {
-            continue;
-        }
-        hands[count] = resolved;
-        ++count;
-    }
-
-    if (count == 0) {
-        log().info(L"OffhandSwap: could not reach the hands for slot {} "
-                   L"(holders {:#x} / {:#x})",
-                   slot, reinterpret_cast<std::uintptr_t>(holders[0]),
-                   reinterpret_cast<std::uintptr_t>(holders[1]));
+    Hands hands[1];
+    if (!resolve(holders[0], hands[0])) {
+        log().info(L"OffhandSwap: could not reach the hands for slot {} (holder {:#x})", slot,
+                   reinterpret_cast<std::uintptr_t>(holders[0]));
         const unsigned long long now = GetTickCount64();
         if (now >= m_nextWarnMs.load(std::memory_order_acquire)) {
             m_nextWarnMs.store(now + kWarnIntervalMs, std::memory_order_release);
@@ -622,122 +335,45 @@ bool OffhandSwap::apply()
 
     HandRestock::instance().noteDeliberateMove();
 
-    const bool serverAuthoritative = count <= 1;
+    const int firstSlot = targetSlot(hands[0], slot);
+    std::byte* const firstStack = hands[0].slots + kSlotStride * firstSlot;
 
-    if (serverAuthoritative) {
-        const int firstSlot = targetSlot(hands[0], slot);
-        std::byte* const firstStack = hands[0].slots + kSlotStride * firstSlot;
+    StackView handView;
+    StackView offhandView;
+    const bool bothRead = readStack(firstStack, handView) && readStack(hands[0].offhand, offhandView);
 
-        StackView handView;
-        StackView offhandView;
-        const bool bothRead =
-            readStack(firstStack, handView) && readStack(hands[0].offhand, offhandView);
-
-        if (bothRead && handView.item == nullptr && offhandView.item == nullptr) {
-            log().info(L"OffhandSwap: slot {} and the offhand are both empty, nothing to "
-                       L"swap (the server may still be writing the offhand back)",
-                       firstSlot);
-            return false;
-        }
-
-        const bool takeOutOnly =
-            bothRead && handView.item == nullptr && offhandView.item != nullptr;
-
-        const bool useRequestPath = takeOutOnly;
-
-        if (!useRequestPath && LegacyTransaction::instance().swap(
-                hands[0].player, LegacyTransaction::inventorySlot(firstSlot, firstStack),
-                LegacyTransaction::offhand(hands[0].offhand))) {
-            const int applied = swapWithOffhand(hands, count, slot);
-            if (applied == 0) {
-                log().warn(L"OffhandSwap: the server was told to swap but the client side "
-                           L"could not follow, the view may be stale until you reopen it");
-                return false;
-            }
-
-            beginNetIdFix(hands[0], firstSlot);
-
-            static int logs1 = 0;
-            if (logs1 < 200) {
-                ++logs1;
-                log().success(L"OffhandSwap: swapped slot {} with the offhand through the "
-                              L"legacy path ({} target{})",
-                              firstSlot, applied, (applied == 1) ? L"" : L"s");
-            }
-            return true;
-        }
-
-        if (!useRequestPath) {
-            if (!LegacyTransaction::instance().available()) {
-                notice::failOnce("OffhandSwap.legacy",
-                                 L"OffhandSwap: the legacy inventory path is unavailable, so moving items into the "
-                                 L"offhand on a server is off",
-                                 "OffhandSwap cannot move items into the offhand on this server: the legacy "
-                                 "inventory path is unavailable");
-            }
-            log().warn(L"OffhandSwap: the legacy swap for slot {} could not be sent; nothing changed", firstSlot);
-            return false;
-        }
-
-        const ItemStackRequest::SlotRef hand =
-            ItemStackRequest::inventorySlot(hands[0].slots, firstSlot);
-        const ItemStackRequest::SlotRef offhand =
-            ItemStackRequest::offhandSlot(hands[0].offhand);
-        if (!ItemStackRequest::instance().requestSwap(hand, offhand)) {
-            log().warn(L"OffhandSwap: the swap request for slot {} could not be sent "
-                       L"(server thinks the screen is {})",
-                       firstSlot,
-                       ItemStackRequest::instance().serverInventoryOpen() ? L"open" : L"closed");
-            return false;
-        }
-
-        ItemStackOps::instance().stash(firstStack);
-
-        const int applied = swapWithOffhand(hands, count, slot);
-
-        m_pending = Pending{};
-        m_pending.active = true;
-        m_pending.requestId = ItemStackRequest::instance().lastRequestId();
-        m_pending.selected = firstSlot;
-        for (int i = 0; i < count; ++i) {
-            m_pending.hand[i] = hands[i].slots + kSlotStride * targetSlot(hands[i], slot);
-        }
-        m_pending.giveUpAtMs = GetTickCount64() + kResponseWaitMs;
-        if (StackView placed; count > 0 && readStack(m_pending.hand[0], placed)) {
-            m_pending.haveHand = true;
-            m_pending.handItem = placed.item;
-            m_pending.handValue = placed.netValue;
-            m_pending.handCount = placed.count;
-            m_pending.holder = hands[0].holder;
-        }
-
-        if (applied == 0) {
-            log().warn(L"OffhandSwap: the request went out but the client side could not be "
-                       L"updated, your hotbar may look stale until you use the item");
-            return false;
-        }
-
-        static int logs2 = 0;
-        if (logs2 < 200) {
-            ++logs2;
-            log().success(L"OffhandSwap: swapped slot {} with the offhand ({} target{})", firstSlot,
-                          applied, (applied == 1) ? L"" : L"s");
-        }
-        return true;
-    }
-
-    const int applied = swapWithOffhand(hands, count, slot);
-
-    if (applied == 0) {
-        log().warn(L"OffhandSwap: could not swap the stacks, nothing changed");
+    if (bothRead && handView.item == nullptr && offhandView.item == nullptr) {
+        log().info(L"OffhandSwap: slot {} and the offhand are both empty, nothing to "
+                   L"swap (the server may still be writing the offhand back)",
+                   firstSlot);
         return false;
     }
 
-    static int logs3 = 0;
-    if (logs3 < 200) {
-        ++logs3;
-        log().success(L"OffhandSwap: swapped slot {} with the offhand ({} targets)",
-                      targetSlot(hands[0], slot), applied);
+    if (!LegacyTransaction::instance().swap(
+            hands[0].player, LegacyTransaction::inventorySlot(firstSlot, firstStack),
+            LegacyTransaction::offhand(hands[0].offhand))) {
+        if (!LegacyTransaction::instance().available()) {
+            notice::failOnce("OffhandSwap.legacy",
+                             L"OffhandSwap: the legacy inventory path is unavailable, so swapping with the "
+                             L"offhand is off",
+                             "OffhandSwap cannot swap with the offhand: the legacy inventory path is unavailable");
+        }
+        log().warn(L"OffhandSwap: the legacy swap for slot {} could not be sent; nothing changed", firstSlot);
+        return false;
+    }
+
+    const int applied = swapWithOffhand(hands, 1, slot);
+    if (applied == 0) {
+        log().warn(L"OffhandSwap: the server was told to swap but the client side "
+                   L"could not follow, the view may be stale until you reopen it");
+        return false;
+    }
+    InventoryResync::instance().markStale();
+
+    static int logs1 = 0;
+    if (logs1 < 200) {
+        ++logs1;
+        log().success(L"OffhandSwap: swapped slot {} with the offhand through the legacy path", firstSlot);
     }
     return true;
 }

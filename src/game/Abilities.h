@@ -11,15 +11,16 @@ inline constexpr ptrdiff_t kStride = 0x0C;
 inline constexpr int kCount = 20;
 inline constexpr ptrdiff_t kLayerStride = kStride * kCount;
 
-inline constexpr int kLayerCount = 2;
+inline constexpr int kLayerCount = 6;
 
 inline constexpr int kPlayerLayer = 1;
 
 inline constexpr ptrdiff_t kTypeOffset = 0x0;
 inline constexpr ptrdiff_t kValueOffset = 0x4;
 
-inline constexpr int kTypeBool = 2;
-inline constexpr int kTypeFloat = 3;
+inline constexpr std::uint8_t kTypeUnset = 1;
+inline constexpr std::uint8_t kTypeBool = 2;
+inline constexpr std::uint8_t kTypeFloat = 3;
 
 inline constexpr int kFlying = 9;
 inline constexpr int kMayFly = 10;
@@ -28,19 +29,17 @@ inline constexpr int kWalkSpeed = 14;
 inline constexpr int kNoClip = 17;
 inline constexpr int kVerticalFlySpeed = 19;
 
-inline constexpr float kDefaultFlySpeed = 0.05f;
-inline constexpr float kDefaultVerticalFlySpeed = 1.0f;
-
-std::byte* fromContext(void* context);
-
 bool looksValid(std::byte* layered);
 
 std::byte* at(std::byte* layered, int layer, int index);
 
 std::byte* slotOf(std::byte* layered, int index);
 
-bool readInt(const void* address, int& value);
-bool writeInt(void* address, int value);
+bool readBool(std::byte* layered, int index);
+bool setBool(std::byte* layered, int index, bool wanted);
+
+bool readByte(const void* address, std::uint8_t& value);
+bool writeByte(void* address, std::uint8_t value);
 bool readFloat(const void* address, float& value);
 bool writeFloat(void* address, float value);
 

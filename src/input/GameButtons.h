@@ -9,6 +9,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "input/Keys.h"
@@ -16,14 +17,35 @@
 namespace tsukuyomi {
 
 void __fastcall onGameButton(void*, int, const void*, void*);
-void* __fastcall gameButtonActionName(void*, int);
 void* __fastcall gameButtonFindKeymap(void*, const void*);
 void __fastcall gameButtonBindAction(void*, void*, void*, const void*, int, bool);
 void __fastcall gameButtonPadBind(void*, void*, const void*, int);
 void __fastcall gameButtonInputUpdate(void*, void*, void*, void*, std::uint64_t);
 
 namespace gamebuttonlogic {
-constexpr int kMaxSlots = 96;
+class ScopedKeymapRow {
+public:
+    ScopedKeymapRow(std::string_view name, void* row)
+        : m_name(name), m_row(row), m_previous(s_current) { s_current = this; }
+    ~ScopedKeymapRow() { s_current = m_previous; }
+    ScopedKeymapRow(const ScopedKeymapRow&) = delete;
+    ScopedKeymapRow& operator=(const ScopedKeymapRow&) = delete;
+    bool used() const { return m_used; }
+    static void* take(std::string_view name)
+    {
+        if (!s_current || s_current->m_used || name.data() != s_current->m_name.data()
+            || name.size() != s_current->m_name.size()) return nullptr;
+        s_current->m_used = true;
+        return s_current->m_row;
+    }
+private:
+    std::string_view m_name;
+    void* m_row;
+    ScopedKeymapRow* m_previous;
+    bool m_used = false;
+    inline static thread_local ScopedKeymapRow* s_current = nullptr;
+};
+constexpr int kMaxSlots = 128;
 constexpr int kMaxWatchedButtons = 32;
 constexpr int kMaxInputRows = 32;
 constexpr int kMaxPadInputRows = 16;
@@ -43,6 +65,7 @@ inline constexpr char left[] = "button.left";
 inline constexpr char right[] = "button.right";
 inline constexpr char jump[] = "button.jump";
 inline constexpr char sneak[] = "button.sneak";
+inline constexpr char dismount[] = "button.dismount";
 inline constexpr char sprint[] = "button.sprint";
 inline constexpr char shift[] = "button.shift";
 inline constexpr char control[] = "button.control";
@@ -196,6 +219,20 @@ inline bool freshPress(std::uint64_t now, std::uint64_t pressedAt)
     return pressedAt != 0 && now >= pressedAt && now - pressedAt <= kPressLifetimeMs;
 }
 
+class RebuildAttempts {
+public:
+    bool record(std::uint64_t revision, bool ready, bool succeeded)
+    {
+        if (revision != m_revision || !ready || succeeded) m_failures = 0;
+        m_revision = revision;
+        if (!ready || succeeded) return false;
+        return ++m_failures >= 3;
+    }
+private:
+    std::uint64_t m_revision = 0;
+    unsigned m_failures = 0;
+};
+
 class SlotAllocator {
 public:
     int attach()
@@ -230,6 +267,7 @@ public:
     bool keyHeld(int slot) const { return held(slot); }
     std::uint64_t keyPressSeq(int slot) const { return pressSeq(slot); }
     bool buttonHeld(int index) const;
+    bool comboKeyHeld(int vk) const { return keyHeldForChord(vk); }
     std::uint64_t buttonPressSeq(int index) const;
     std::uint64_t buttonLastPressMs(int index) const;
     std::uint64_t buttonLastReleaseMs(int index) const;
@@ -287,6 +325,7 @@ private:
     bool padChordPartsHeld(int pad) const;
     void* m_registeredHandler = nullptr;
     std::uint64_t m_lastRebuildMs = 0;
+    gamebuttonlogic::RebuildAttempts m_rebuildAttempts;
     unsigned char m_handlerOffset = 0;
     void* m_callbackPage = nullptr;
 
@@ -300,7 +339,6 @@ private:
     bool syncChordTables(void* client);
     bool hasChords() const;
     friend void __fastcall onGameButton(void*, int, const void*, void*);
-    friend void* __fastcall gameButtonActionName(void*, int);
     friend void* __fastcall gameButtonFindKeymap(void*, const void*);
     friend void __fastcall gameButtonBindAction(void*, void*, void*, const void*, int, bool);
     friend void __fastcall gameButtonPadBind(void*, void*, const void*, int);

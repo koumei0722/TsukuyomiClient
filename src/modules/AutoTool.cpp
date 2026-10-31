@@ -655,9 +655,9 @@ void AutoTool::resolveAttack()
         return static_cast<std::ptrdiff_t>(v);
     };
     if (const std::byte* site = scanner.address(Target::AnnouncedSlotSite);
-        site != nullptr && memory::isReadable(site, 59)) {
+        site != nullptr && memory::isReadable(site, 56)) {
         api.inventory = disp32(site + 3);
-        api.announced = disp32(site + 55);
+        api.announced = disp32(site + 52);
     }
     if (const std::byte* site = scanner.address(Target::TargetCategorySite);
         site != nullptr && memory::isReadable(site, 12)) {
@@ -667,7 +667,7 @@ void AutoTool::resolveAttack()
         api.localPlayerVtable = memory::ripTarget(ref, 3);
     }
     if (std::byte* site = scanner.address(Target::ArmorStandVtableSite)) {
-        api.armorStandVtable = memory::ripTarget(site, 0x18);
+        api.armorStandVtable = memory::ripTarget(site, 3);
     }
     const bool fieldsOk = api.inventory > 0 && api.inventory < 0x4000 && api.inventory % 8 == 0
                           && api.announced > 0 && api.announced < 0x4000 && api.category > 0
@@ -914,6 +914,29 @@ bool AutoTool::applySlot(void* owner, void* twin, int slot)
         }
     }
     return wrote;
+}
+
+int AutoTool::selectedSlotAnnounced() const
+{
+    if (m_attack.inventory <= 0 || m_attack.announced <= 0) return -1;
+    auto* const player = static_cast<std::byte*>(GameData::instance().player());
+    void* inventory = nullptr;
+    int announced = -1, selected = -1;
+    if (player == nullptr || !readPointerGuarded(player + m_attack.inventory, inventory) || inventory == nullptr
+        || !readIntGuarded(player + m_attack.announced, announced)
+        || !readIntGuarded(static_cast<std::byte*>(inventory) + kSelectedSlotOffset, selected)) return -1;
+    return announced == selected ? 1 : 0;
+}
+
+bool AutoTool::selectHotbarSlot(int slot)
+{
+    if (slot < 0 || slot >= kSlotCount) return false;
+    restoreSlot();
+    void* client = nullptr; void* server = nullptr;
+    HandRestock::instance().ownHolders(client, server);
+    if (!client) return false;
+    HandRestock::instance().noteDeliberateMove();
+    return applySlot(client, server, slot);
 }
 
 void AutoTool::restoreSlot()

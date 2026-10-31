@@ -14,9 +14,9 @@ inline constexpr std::uint32_t kSprint = 1u << 8;
 
 class ToggleInput {
 public:
-    std::uint32_t apply(std::uint32_t raw, bool sneakOn, bool sprintOn)
+    std::uint32_t apply(std::uint32_t raw, bool sneakOn, bool sprintOn, bool forceSneak = false)
     {
-        return applySprint(applySneak(raw, sneakOn), raw, sprintOn);
+        return applySprint(applySneak(raw, sneakOn, forceSneak), raw, sprintOn);
     }
 
     void passThrough(std::uint32_t raw)
@@ -29,7 +29,7 @@ public:
     bool sprintLatched() const { return m_sprintLatched; }
 
 private:
-    std::uint32_t applySneak(std::uint32_t raw, bool on)
+    std::uint32_t applySneak(std::uint32_t raw, bool on, bool force)
     {
         const bool pressed = (raw & kSneakPress) != 0;
         const bool held = (raw & kSneakHeld) != 0;
@@ -47,7 +47,7 @@ private:
                 m_sneakLatched = true;
             }
         }
-        const bool show = m_sneakLatched || (held && !m_sneakSwallow);
+        const bool show = m_sneakLatched || (held && !m_sneakSwallow) || force;
         std::uint32_t out = raw & ~kSneakAllBits;
         if (show) {
             out |= kSneakHeldBits;

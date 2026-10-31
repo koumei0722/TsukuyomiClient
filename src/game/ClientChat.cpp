@@ -26,8 +26,28 @@ struct GuiHandle { void* block = nullptr; std::byte* ctrl = nullptr; void* gui =
 static_assert(sizeof(GuiHandle) == 0x18);
 using GetGui = void*(__fastcall*)(void*, void*);
 using Display = void(__fastcall*)(void*, const StdString*, const OptionalString*, const StdString*, std::int32_t);
+using SetActionBar = void(__fastcall*)(void*, const StdString*, const OptionalString*);
 bool g_failed = false;
 bool g_reported = false;
+bool g_actionBarFailed = false;
+bool g_actionBarReported = false;
+
+struct Request {
+    Display display = nullptr;
+    SetActionBar setActionBar = nullptr;
+    const StdString* message = nullptr;
+    const OptionalString* filtered = nullptr;
+    const StdString* extra = nullptr;
+};
+
+void invoke(void* gui, const Request& request)
+{
+    if (request.setActionBar != nullptr) {
+        request.setActionBar(gui, request.message, request.filtered);
+    } else {
+        request.display(gui, request.message, request.filtered, request.extra, 4);
+    }
+}
 
 void release(GuiHandle& handle)
 {
@@ -53,8 +73,7 @@ bool releaseGuarded(GuiHandle& handle)
     }
 }
 
-bool callGuarded(void* client, std::ptrdiff_t slot, Display display, const StdString* message,
-                 const OptionalString* filtered, const StdString* extra)
+bool callGuarded(void* client, std::ptrdiff_t slot, const Request& request, bool& failed)
 {
     GuiHandle handle{};
     volatile bool shown = false;
@@ -65,17 +84,17 @@ bool callGuarded(void* client, std::ptrdiff_t slot, Display display, const StdSt
         got = true;
         if (handle.block != nullptr && *static_cast<const std::uint8_t*>(handle.block) != 0
             && handle.gui != nullptr) {
-            display(handle.gui, message, filtered, extra, 4);
+            invoke(handle.gui, request);
             shown = true;
         }
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
                     || GetExceptionCode() == EXCEPTION_IN_PAGE_ERROR
                     ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
-        g_failed = true;
+        failed = true;
         shown = false;
     }
     if (got && !releaseGuarded(handle)) {
-        g_failed = true;
+        failed = true;
     }
     return shown;
 }
@@ -92,27 +111,60 @@ StdString wrap(const std::string& value)
     }
     return result;
 }
+
+std::int32_t guiDataSlot(void*& client)
+{
+    const auto* site = Scanner::instance().address(Target::ClientGetGuiDataSite);
+    client = hooks::gameClientInstance();
+    if (site == nullptr || client == nullptr || !memory::isReadable(site + 10, 4)
+        || !memory::isReadable(client, sizeof(void*))) return 0;
+    std::int32_t slot = 0;
+    std::memcpy(&slot, site + 10, sizeof(slot));
+    if (slot < 0x100 || slot >= 0x2000 || slot % 8 != 0) return 0;
+    return slot;
+}
 }
 
 bool printLocal(const std::string& utf8)
 {
     if (g_failed) return false;
-    const Scanner& scanner = Scanner::instance();
-    const auto* site = scanner.address(Target::ClientGetGuiDataSite);
-    const auto display = scanner.addressAs<Display>(Target::GuiDataDisplayClientMessage);
-    void* client = hooks::gameClientInstance();
-    if (site == nullptr || display == nullptr || client == nullptr || !memory::isReadable(site + 10, 4)
-        || !memory::isReadable(client, sizeof(void*))) return false;
-    std::int32_t slot = 0;
-    std::memcpy(&slot, site + 10, sizeof(slot));
-    if (slot < 0x100 || slot >= 0x2000 || slot % 8 != 0) return false;
+    const auto display = Scanner::instance().addressAs<Display>(Target::GuiDataDisplayClientMessage);
+    void* client = nullptr;
+    const std::int32_t slot = guiDataSlot(client);
+    if (display == nullptr || slot == 0) return false;
     const StdString message = wrap(utf8);
     const OptionalString filtered{};
     const StdString extra{};
-    const bool shown = callGuarded(client, slot, display, &message, &filtered, &extra);
+    Request request;
+    request.display = display;
+    request.message = &message;
+    request.filtered = &filtered;
+    request.extra = &extra;
+    const bool shown = callGuarded(client, slot, request, g_failed);
     if (g_failed && !g_reported) {
         g_reported = true;
         log().warn(L"ClientChat: displaying a local message faulted; further messages are disabled");
+    }
+    return shown;
+}
+
+bool showActionBar(const std::string& utf8)
+{
+    if (g_actionBarFailed) return false;
+    const auto setActionBar = Scanner::instance().addressAs<SetActionBar>(Target::GuiDataSetActionBar);
+    void* client = nullptr;
+    const std::int32_t slot = guiDataSlot(client);
+    if (setActionBar == nullptr || slot == 0) return false;
+    const StdString message = wrap(utf8);
+    const OptionalString filtered{};
+    Request request;
+    request.setActionBar = setActionBar;
+    request.message = &message;
+    request.filtered = &filtered;
+    const bool shown = callGuarded(client, slot, request, g_actionBarFailed);
+    if (g_actionBarFailed && !g_actionBarReported) {
+        g_actionBarReported = true;
+        log().warn(L"ClientChat: showing an actionbar message faulted; further actionbar messages are disabled");
     }
     return shown;
 }

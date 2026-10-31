@@ -21,7 +21,7 @@ public:
     void saveConfig(nlohmann::json& section) const override;
     void shutdown() override;
 
-    void onAbilitiesAccess(void* context);
+    void onAbilitiesAccess(std::byte* layered);
 
     bool beforePoseDecision(void* room);
     void afterPoseDecision(void* room);
@@ -35,8 +35,6 @@ private:
     CreativeNoClip() = default;
 
     static constexpr long long kFlyingLeadMs = 250;
-
-    static bool readBoolAbility(std::byte* layered, int index);
 
     std::atomic<bool> m_onlyWhileFlying{true};
 

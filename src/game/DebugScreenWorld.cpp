@@ -15,6 +15,7 @@
 #include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <cstdio>
 #include <cstring>
 #include <type_traits>
@@ -166,8 +167,8 @@ void* subChunkAt(void* region, int x, int y, int z)
         if (y < minY || y > maxY) {
             return nullptr;
         }
-        auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x140);
-        auto* const tableEnd = *reinterpret_cast<std::uint8_t**>(chunk + 0x148);
+        auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x1c8);
+        auto* const tableEnd = *reinterpret_cast<std::uint8_t**>(chunk + 0x1d0);
         const std::ptrdiff_t index = (y >> 4) - (minY >> 4);
         if (table == nullptr || tableEnd < table || index < 0 || index >= (tableEnd - table) / 0x68) {
             return nullptr;
@@ -191,16 +192,15 @@ const void* blockAt(void* region, int x, int y, int z, int layer = 0)
 }
 
 Sample g_sample{};
-std::atomic<std::uint64_t> g_generation{0};
-
-static_assert(std::is_trivially_copyable_v<Sample>);
+std::mutex g_sampleMutex;
+bool g_hasSample = false;
 
 void publish(const Sample& in)
 {
 
-    g_generation.fetch_add(1, std::memory_order_acq_rel);
+    std::lock_guard lock(g_sampleMutex);
     g_sample = in;
-    g_generation.fetch_add(1, std::memory_order_acq_rel);
+    g_hasSample = true;
 }
 
 constexpr std::ptrdiff_t kBlockSourceLevel = 0x20;
@@ -861,8 +861,8 @@ void collectFluid(void* region, Sample& out)
     }
 }
 
-constexpr std::ptrdiff_t kLevelChunkBiomesBegin = 0x358;
-constexpr std::ptrdiff_t kLevelChunkBiomesEnd = 0x360;
+constexpr std::ptrdiff_t kLevelChunkBiomesBegin = 0x3e0;
+constexpr std::ptrdiff_t kLevelChunkBiomesEnd = 0x3e8;
 constexpr std::ptrdiff_t kBiomeName = 0x198;
 
 void collectBiome(void* region, int x, int y, int z, Sample& out)
@@ -907,7 +907,7 @@ void collectBiome(void* region, int x, int y, int z, Sample& out)
     std::snprintf(out.biome, sizeof(out.biome), "%s", name);
 }
 
-constexpr std::ptrdiff_t kLevelChunkSubChunks = 0x140;
+constexpr std::ptrdiff_t kLevelChunkSubChunks = 0x1c8;
 constexpr std::ptrdiff_t kSubChunkBytes = 0x68;
 constexpr std::ptrdiff_t kSubChunkStorage = 0x20;
 constexpr unsigned char kUniformGet[] = {0x48, 0x8B, 0x41, 0x08, 0xC3};
@@ -993,7 +993,7 @@ void collectSections(void* region, Sample& out)
     out.sectionsTotal = total;
 }
 
-constexpr std::ptrdiff_t kActorDimension = 0x1c8;
+constexpr std::ptrdiff_t kActorDimension = 0x1f0;
 constexpr std::ptrdiff_t kDimensionBlockSource = 0xf0;
 constexpr std::ptrdiff_t kServerChunkMapHead = 0x78;
 constexpr std::ptrdiff_t kServerChunkMapSize = 0x80;
@@ -1461,12 +1461,15 @@ constexpr std::ptrdiff_t kDimensionMaxY = 0xca;
 constexpr double kGridBudgetMs = 4.0;
 constexpr int kMaxVtableSlots = 96;
 
-using ColumnSampleFn = float*(__fastcall*)(void* sampler, float* out3, const std::int32_t* quartPos);
+using SurfaceLevelFn = void*(__fastcall*)(void* subObject, void* out, std::uint64_t packedQuart);
+
+constexpr std::ptrdiff_t kSurfaceSlot = 1;
+
+constexpr std::ptrdiff_t kSurfaceSiteMaxDistance = 0x1000;
 using DensityGridFn = float*(__fastcall*)(void* generator, float* out, const std::int32_t* chunkPos);
 
 struct SurfaceTargets {
-    ColumnSampleFn column = nullptr;
-    std::int32_t samplerFromSub = 0;
+    const std::uint8_t* site = nullptr;
     std::int32_t factoryFromSub = 0;
     std::int32_t noBlendFlag = 0;
     const void* densityGrid = nullptr;
@@ -1489,18 +1492,16 @@ struct SurfaceProbe {
     int maxY = 0;
 };
 
-int sampleSurfaceColumn(const std::uint8_t* chunkSource, const void* level, const void* dimension, int feetX, int feetZ,
-                        float out3[3], SurfaceProbe& probe)
+bool blendTableCovers(const std::uint8_t* factory, int chunkX, int chunkZ);
+
+int sampleSurfaceLevel(const std::uint8_t* chunkSource, const void* level, const void* dimension, int feetX, int feetZ,
+                       int& surface, SurfaceProbe& probe)
 {
     __try {
         const std::uint8_t* gen = nullptr;
         const std::uint8_t* sampler = nullptr;
         if (const int reason = findSampler(chunkSource, level, dimension, gen, sampler); reason != 0) {
             return reason;
-        }
-
-        if (sampler != gen + kGeneratorSubObject + g_surface.samplerFromSub) {
-            return 10;
         }
 
         int budget = 512;
@@ -1513,13 +1514,33 @@ int sampleSurfaceColumn(const std::uint8_t* chunkSource, const void* level, cons
         if (!(maxY > minY && minY >= -512 && minY <= 0 && maxY > 0 && maxY <= 1024)) {
             return 12;
         }
-        const std::int32_t quart[2] = {feetX >> 2, feetZ >> 2};
-        g_surface.column(const_cast<std::uint8_t*>(sampler), out3, quart);
+
+        const auto* const sub = gen + kGeneratorSubObject;
+        const auto* const* const subVtable = *reinterpret_cast<const void* const* const*>(sub);
+        const auto* const fn = static_cast<const std::uint8_t*>(subVtable[kSurfaceSlot]);
+        if (!memory::inGameModule(fn) || fn >= g_surface.site || g_surface.site - fn > kSurfaceSiteMaxDistance) {
+            return 10;
+        }
+
+        const auto* const factory = *reinterpret_cast<const std::uint8_t* const*>(sub + g_surface.factoryFromSub);
+        if (factory == nullptr
+            || (factory[g_surface.noBlendFlag] != 1 && !blendTableCovers(factory, feetX >> 4, feetZ >> 4))) {
+            return 20;
+        }
+
+        const std::uint64_t quart = static_cast<std::uint32_t>(feetX >> 2)
+                                    | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(feetZ >> 2)) << 32);
+        alignas(8) std::uint8_t out[8] = {0xff, 0x7f, 0, 0, 0, 0, 0, 0};
+        reinterpret_cast<SurfaceLevelFn>(const_cast<std::uint8_t*>(fn))(const_cast<std::uint8_t*>(sub), out, quart);
+        if (out[2] != 1) {
+            return 13;
+        }
+        surface = *reinterpret_cast<const std::int16_t*>(out);
         probe.minY = minY;
         probe.maxY = maxY;
         return 0;
     } __except (accessFilter(GetExceptionCode())) {
-        return 13;
+        return 14;
     }
 }
 
@@ -1603,17 +1624,12 @@ void collectSurfaceLevel(const ServerView& view, int feetX, int feetY, int feetZ
         noteSurfaceMiss(1, nullptr);
         return;
     }
-    alignas(8) float out3[3] = {};
+    int surface = 0;
     SurfaceProbe probe{};
-    const int reason = sampleSurfaceColumn(static_cast<const std::uint8_t*>(view.chunkSource), view.level,
-                                           view.dimension, feetX, feetZ, out3, probe);
+    const int reason = sampleSurfaceLevel(static_cast<const std::uint8_t*>(view.chunkSource), view.level,
+                                          view.dimension, feetX, feetZ, surface, probe);
     if (reason != 0) {
         noteSurfaceMiss(reason, view.chunkSource);
-        return;
-    }
-
-    if (out3[2] != 0.0f || !(out3[0] > -64.0f && out3[0] < 64.0f) || !(out3[1] > -4096.0f && out3[1] < 4096.0f)) {
-        noteSurfaceMiss(8, nullptr);
         return;
     }
     int cellMin = 0;
@@ -1623,10 +1639,15 @@ void collectSurfaceLevel(const ServerView& view, int feetX, int feetY, int feetZ
         noteSurfaceMiss(9, nullptr);
         return;
     }
-    int y = 0;
+
+    const bool found = surface != 0x7fff;
+    if (found && (surface < probe.minY || surface > probe.maxY)) {
+        noteSurfaceMiss(8, nullptr);
+        return;
+    }
     out.hasSurfaceLevel = true;
-    out.surfaceLevelFound = dbgsurface::findTopSurface(g_surface.k, out3[0], out3[1], cellMin, count, y);
-    out.surfaceLevel = y;
+    out.surfaceLevelFound = found;
+    out.surfaceLevel = found ? surface : 0;
 
     static float grid[dbgsurface::kGridCells];
     static const void* gridSource = nullptr;
@@ -1766,6 +1787,12 @@ void collectServer(void* clientRegion, const Wanted& wanted, int feetX, int feet
 
 }
 
+const void* worldBlockAt(const std::int32_t pos[3])
+{
+    void* const region = blockwrite::renderRegion();
+    return region && pos ? blockAt(region, pos[0], pos[1], pos[2]) : nullptr;
+}
+
 bool worldHeightAt(int x, int z, int& minY, int& maxYExclusive)
 {
     void* const region = blockwrite::renderRegion();
@@ -1794,6 +1821,99 @@ bool worldHeightAt(int x, int z, int& minY, int& maxYExclusive)
     minY = low;
     maxYExclusive = high + 1;
     return true;
+}
+
+namespace {
+
+void* subChunkInChunk(std::uint8_t* chunk, int y, bool& aboveTop)
+{
+    aboveTop = false;
+    __try {
+        const std::int32_t minY = *reinterpret_cast<const std::int32_t*>(chunk + kLevelChunkMinY);
+        const std::int32_t maxY = *reinterpret_cast<const std::int32_t*>(chunk + kLevelChunkMaxY);
+        if (y < minY || y > maxY) {
+            return nullptr;
+        }
+        auto* const table = *reinterpret_cast<std::uint8_t**>(chunk + 0x1c8);
+        auto* const tableEnd = *reinterpret_cast<std::uint8_t**>(chunk + 0x1d0);
+        const std::ptrdiff_t index = (y >> 4) - (minY >> 4);
+        if (table == nullptr || tableEnd < table || index < 0) {
+            return nullptr;
+        }
+        if (index >= (tableEnd - table) / 0x68) {
+            aboveTop = true;
+            return nullptr;
+        }
+        return table + index * 0x68;
+    } __except (accessFilter(GetExceptionCode())) {
+        return nullptr;
+    }
+}
+
+}
+
+bool readColumn(int x, int z, int yBottom, int count, ColumnCell* out)
+{
+    for (int i = 0; i < count; ++i) out[i] = ColumnCell{};
+    void* const region = blockwrite::renderRegion();
+    if (region == nullptr || !blockwrite::regionIsAlive(region) || count <= 0) return false;
+    static void* lastRegion = nullptr;
+    static void* lastSource = nullptr;
+    static std::uint64_t settleUntil = 0;
+    void* source = nullptr;
+    readPointer(static_cast<std::uint8_t*>(region) + kBlockSourceChunkSource, source);
+    const std::uint64_t now = GetTickCount64();
+    if (region != lastRegion || source != lastSource) {
+        lastRegion = region;
+        lastSource = source;
+        settleUntil = now + 1000;
+    }
+    if (now < settleUntil) return false;
+    auto* const chunk = static_cast<std::uint8_t*>(gridChunkAt(region, x, z));
+    if (chunk == nullptr || !memory::plausiblePointer(chunk)) return false;
+    bool any = false;
+    int subY = INT32_MIN;
+    void* sub = nullptr;
+    bool aboveTop = false;
+    void* storage[2] = {};
+    for (int i = 0; i < count; ++i) {
+        const int y = yBottom + i;
+        if ((y >> 4) != subY) {
+            subY = y >> 4;
+            sub = subChunkInChunk(chunk, y, aboveTop);
+            storage[0] = storage[1] = nullptr;
+            for (int layer = 0; sub != nullptr && layer < 2; ++layer) {
+                void* candidate = nullptr;
+                if (readPointer(static_cast<std::uint8_t*>(sub) + 0x20 + layer * 8, candidate)
+                    && looksLikeGameObject(candidate)) {
+                    storage[layer] = candidate;
+                }
+            }
+        }
+        if (aboveTop) {
+            out[i].aboveTop = true;
+            out[i].skyLight = 15;
+            out[i].ok = true;
+            any = true;
+            continue;
+        }
+        if (sub == nullptr || storage[0] == nullptr) continue;
+        const unsigned int index = ((x & 15) << 8) | ((z & 15) << 4) | (y & 15);
+        ColumnCell& cell = out[i];
+        cell.block = storageGet(storage[0], index);
+        cell.extra = storage[1] != nullptr ? storageGet(storage[1], index) : nullptr;
+        int sky = 0;
+        int light = 0;
+        if (cell.block == nullptr || !readLightNibble(sub, kSubChunkSkyLight, static_cast<int>(index), sky)
+            || !readLightNibble(sub, kSubChunkBlockLight, static_cast<int>(index), light)) {
+            continue;
+        }
+        cell.skyLight = static_cast<std::uint8_t>(sky);
+        cell.blockLight = static_cast<std::uint8_t>(light);
+        cell.ok = true;
+        any = true;
+    }
+    return any;
 }
 
 using AttachPosFn = float*(__fastcall*)(void* actor, float* out, int location, float alpha);
@@ -2093,7 +2213,7 @@ bool collect(int feetX, int feetY, int feetZ, const Wanted& wanted, bool force)
 
 namespace {
 
-constexpr std::ptrdiff_t kParticleMaps = 0x9f8;
+constexpr std::ptrdiff_t kParticleMaps = 0xa10;
 constexpr std::ptrdiff_t kParticleMapBytes = 0x40;
 constexpr int kParticleKinds = 3;
 constexpr std::ptrdiff_t kMapHead = 0x08;
@@ -2151,11 +2271,11 @@ bool countLegacyParticles(const void* engine, int& out)
 
 namespace {
 
-constexpr std::ptrdiff_t kFrameArgToThis = 0x660;
-constexpr std::ptrdiff_t kThisParticleOwner = 0x1188;
-constexpr std::ptrdiff_t kOwnerLegacyEngine = 0x3a8;
-constexpr std::ptrdiff_t kOwnerSystemControl = 0x3b0;
-constexpr std::ptrdiff_t kOwnerSystemEngine = 0x3c0;
+constexpr std::ptrdiff_t kFrameArgToThis = 0x658;
+constexpr std::ptrdiff_t kThisParticleOwner = 0x1180;
+constexpr std::ptrdiff_t kOwnerLegacyEngine = 0x3b8;
+constexpr std::ptrdiff_t kOwnerSystemControl = 0x3c0;
+constexpr std::ptrdiff_t kOwnerSystemEngine = 0x3d0;
 constexpr std::ptrdiff_t kSystemEffects = 0x18;
 constexpr std::ptrdiff_t kSystemEffectCount = 0x28;
 constexpr std::ptrdiff_t kEffectParticlesBegin = 0x50;
@@ -2241,13 +2361,11 @@ void setSurfaceTargets(const SurfaceTargetsIn& targets, const SurfaceConstantsIn
         log().warn(L"DebugScreen: the preliminary surface loop constants changed; PS is not shown");
         return;
     }
-    if (!memory::inGameModule(targets.columnFunction) || targets.samplerFromSubObject <= 0x100
-        || targets.samplerFromSubObject >= 0x4000 || targets.factoryFromSubObject <= 0x100
+    if (!memory::inGameModule(targets.surfaceSite) || targets.factoryFromSubObject <= 0x100
         || targets.factoryFromSubObject >= 0x4000 || targets.factoryNoBlendFlag <= 0 || targets.factoryNoBlendFlag >= 0x60) {
         return;
     }
-    g_surface.column = reinterpret_cast<ColumnSampleFn>(targets.columnFunction);
-    g_surface.samplerFromSub = targets.samplerFromSubObject;
+    g_surface.site = static_cast<const std::uint8_t*>(targets.surfaceSite);
     g_surface.factoryFromSub = targets.factoryFromSubObject;
     g_surface.noBlendFlag = targets.factoryNoBlendFlag;
     g_surface.densityGrid = memory::inGameModule(targets.densityGrid) ? targets.densityGrid : nullptr;
@@ -2292,19 +2410,9 @@ void setClimateTargets(void* sampleFunction, const void* generatorVtable, std::i
 
 bool read(Sample& out)
 {
-    for (int attempt = 0; attempt < 4; ++attempt) {
-        const std::uint64_t before = g_generation.load(std::memory_order_acquire);
-        if ((before & 1) != 0) {
-            continue;
-        }
-        out = g_sample;
-
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (g_generation.load(std::memory_order_relaxed) == before) {
-            return before != 0;
-        }
-    }
-    return false;
+    std::lock_guard lock(g_sampleMutex);
+    out = g_sample;
+    return g_hasSample;
 }
 
 }

@@ -1,3 +1,4 @@
+#include "game/SchematicWorld.h"
 #include "core/Client.h"
 
 #include "game/UiSound.h"
@@ -12,11 +13,13 @@
 #include "game/UiProbe.h"
 #include "game/OreUiPatch.h"
 #include "game/SettingsCommand.h"
+#include "game/Rejoin.h"
 #include "hooks/Detours.h"
-#include "game/BlockRegistry.h"
 #include "game/AllowDuplicateKeys.h"
+#include "game/ContainerUi.h"
 #include "game/ExtendedEnchantLevel.h"
 #include "game/ExtendedFov.h"
+#include "game/CustomGuiScale.h"
 #include "game/ExtendedStructureSize.h"
 #include "game/GameData.h"
 #include "hooks/HookManager.h"
@@ -30,13 +33,24 @@
 #include "modules/FastBlockPlacement.h"
 #include "modules/FastInventory.h"
 #include "modules/FastUseItem.h"
-#include "modules/FlySpeed.h"
+#include "game/FlySpeedCommand.h"
 #include "modules/FreeCamera.h"
 #include "modules/Fullbright.h"
 #include "modules/HandRestock.h"
 #include "modules/ModuleManager.h"
 #include "game/ItemStackRequest.h"
+#include "modules/FlexiblePlacement.h"
+#include "modules/LightOverlay.h"
+#include "modules/LocatorBar.h"
+#include "modules/Waypoints.h"
+#include "modules/NameTags.h"
+#include "modules/AngleSnap.h"
+#include "bot/BotModule.h"
+#include "bot/PlayerInventoryModule.h"
+#include "modules/ShowInvisible.h"
+#include "modules/IgnoreBlock.h"
 #include "modules/NoBlockAnimation.h"
+#include "modules/OverworldSky.h"
 #include "modules/NoRender.h"
 #include "modules/OffhandSwap.h"
 #include "modules/Scaffold.h"
@@ -81,7 +95,6 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&AutoTool::instance());
     ModuleManager::instance().registerModule(&Scaffold::instance());
     ModuleManager::instance().registerModule(&CreativeNoClip::instance());
-    ModuleManager::instance().registerModule(&FlySpeed::instance());
     ModuleManager::instance().registerModule(&FastUseItem::instance());
     ModuleManager::instance().registerModule(&HandRestock::instance());
     ModuleManager::instance().registerModule(&OffhandSwap::instance());
@@ -101,6 +114,17 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&ToggleSneakSprint::instance());
     ModuleManager::instance().registerModule(&EffectTimer::instance());
     ModuleManager::instance().registerModule(&NoBlockAnimation::instance());
+    ModuleManager::instance().registerModule(&FlexiblePlacement::instance());
+    ModuleManager::instance().registerModule(&LightOverlay::instance());
+    ModuleManager::instance().registerModule(&ShowInvisible::instance());
+    ModuleManager::instance().registerModule(&IgnoreBlock::instance());
+    ModuleManager::instance().registerModule(&LocatorBar::instance());
+    ModuleManager::instance().registerModule(&NameTags::instance());
+    ModuleManager::instance().registerModule(&Waypoints::instance());
+    ModuleManager::instance().registerModule(&OverworldSky::instance());
+    ModuleManager::instance().registerModule(&AngleSnap::instance());
+    ModuleManager::instance().registerModule(&Bot::instance());
+    ModuleManager::instance().registerModule(&PlayerInventory::instance());
 }
 
 void Client::startup()
@@ -123,6 +147,7 @@ void Client::startup()
     Scanner::instance().scanAll();
 
     GameData::instance().onScansReady();
+    flyspeed::onScansReady();
 
     registerModules();
     ModuleManager::instance().loadConfig();
@@ -139,10 +164,14 @@ void Client::startup()
     hooks::installAll();
 
     ModuleManager::instance().onScansReady();
+    containerui::armHudCatchUp();
     settingscommand::registerCommand();
+    rejoin::registerCommand();
+    flyspeed::registerCommand();
     settingscommand::loadPadKeys();
 
     extendedfov::start();
+    customguiscale::start();
 
     extendedstructuresize::start();
 
@@ -185,6 +214,7 @@ void Client::mainLoop()
 
         ModuleManager::instance().update();
         extendedfov::update();
+        customguiscale::update();
         uiprobe::pumpSettingsToggle();
 
         if (uiprobe::takeSettingsDirty()) {
@@ -230,6 +260,7 @@ void Client::shutdown()
 
     freezewatch::stop();
     extendedfov::shutdown();
+    customguiscale::shutdown();
     extendedstructuresize::shutdown();
 
     hooks::freezeHookGroups();
@@ -238,7 +269,7 @@ void Client::shutdown()
 
     ItemStackRequest::instance().waitPendingClose(4000);
 
-    blocks::waitUntilIdle();
+    schematicworld::waitUntilIdle();
 
     render::shutdownOverlay();
 

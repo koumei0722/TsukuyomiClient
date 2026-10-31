@@ -149,7 +149,7 @@ bool notifyGuarded(void (*fn)(void*), void* client, const void** faultPc,
     }
 }
 
-constexpr std::size_t kSenderVtableOffset = 0x928;
+constexpr std::size_t kSenderVtableOffset = 0x910;
 constexpr std::size_t kSendVtableIndex = 2;
 
 bool sendPacketGuarded(void* client, void* packet, const std::byte* moduleBase,

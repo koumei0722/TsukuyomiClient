@@ -50,6 +50,7 @@ private:
     bool m_faceWriteLogged = false;
     std::atomic<const void*> m_healthAttribute{nullptr};
     Hotkey m_listKey{{9}};
+    std::atomic<bool> m_showPlatform{true};
     std::atomic<bool> m_definitionRegistered{false}, m_shuttingDown{false}, m_wantSample{false};
     bool m_enabledWasInConfig = false;
     std::mutex m_sampleMutex;

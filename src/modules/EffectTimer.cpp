@@ -38,19 +38,16 @@ constexpr std::size_t kMaxRecords = 0x100;
 constexpr const char* kInfiniteKey = "effect.duration.infinite";
 
 constexpr std::size_t kOwnerSiteSlot = 7;
-constexpr std::size_t kOwnerSiteDirty = 25;
-constexpr std::size_t kOwnerSiteX = 41;
+constexpr std::size_t kOwnerSiteDirty = 26;
+constexpr std::size_t kOwnerSiteX = 43;
 constexpr std::size_t kLoopRecords = 6;
 constexpr std::size_t kLoopRecordsEnd = 10;
-constexpr std::size_t kBackgroundRect = 8;
-constexpr std::size_t kPositionStoreX = 14;
-constexpr std::size_t kPositionStoreY = 19;
-constexpr std::size_t kPositionStoreDirty = 22;
+constexpr std::size_t kBackgroundRect = 3;
+constexpr std::size_t kPositionStoreX = 3;
+constexpr std::size_t kPositionStoreDirty = 6;
 constexpr std::size_t kGuiDataFieldDisp = 3;
-constexpr std::size_t kRectsBackgroundX0 = 4;
-constexpr std::size_t kRectsBackgroundY0 = 14;
-constexpr std::size_t kRectsIconX0 = 73;
-constexpr std::size_t kRectsIconY0 = 83;
+constexpr std::size_t kRectsBackgroundX0 = 3;
+constexpr std::size_t kRectsIconX0 = 56;
 constexpr std::size_t kLayoutBoundsMinX = 0x08;
 
 using GuiScaleFn = float(__fastcall*)(void* guiData);
@@ -130,10 +127,11 @@ void EffectTimer::onScansReady()
                  && readByte(owner + kOwnerSiteDirty, ownerDirty) && readByte(owner + kOwnerSiteX, ownerX)
                  && readByte(loop + kLoopRecords, m_recordsField) && readByte(loop + kLoopRecordsEnd, recordsEnd)
                  && readByte(background + kBackgroundRect, m_backgroundField)
-                 && readByte(store + kPositionStoreX, m_positionX) && readByte(store + kPositionStoreY, m_positionY)
+                 && readByte(store + kPositionStoreX, m_positionX)
                  && readByte(store + kPositionStoreDirty, m_dirtyField)
                  && memory::copyGuarded(realGui + kGuiDataFieldDisp, &m_realGuiField, sizeof(m_realGuiField));
     }
+    m_positionY = static_cast<std::uint8_t>(m_positionX + sizeof(float));
     fields = fields && m_guiDataSlot > 0 && m_guiDataSlot < 0x2000 && m_guiDataSlot % 8 == 0
              && recordsEnd == m_recordsField + 8 && ownerX == m_positionX && m_positionY == m_positionX + 4
              && ownerDirty == m_dirtyField && m_backgroundField + 16 <= kRecordSize && m_realGuiField > 0
@@ -148,11 +146,9 @@ void EffectTimer::onScansReady()
     if (const std::byte* const rects = scanner.address(Target::MobEffectsLayoutRects);
         rects != nullptr && scanner.found(Target::MobEffectsLayout)) {
         std::uint8_t bgX0 = 0;
-        std::uint8_t bgY0 = 0;
-        std::uint8_t iconY0 = 0;
-        m_columnsReady = readByte(rects + kRectsBackgroundX0, bgX0) && readByte(rects + kRectsBackgroundY0, bgY0)
-                         && readByte(rects + kRectsIconX0, m_iconField) && readByte(rects + kRectsIconY0, iconY0)
-                         && bgX0 == m_backgroundField && bgY0 == bgX0 + 8 && iconY0 == m_iconField + 8
+        m_columnsReady = readByte(rects + kRectsBackgroundX0, bgX0)
+                         && readByte(rects + kRectsIconX0, m_iconField)
+                         && bgX0 == m_backgroundField
                          && m_iconField + 16 <= kRecordSize;
     }
     if (!m_columnsReady) {

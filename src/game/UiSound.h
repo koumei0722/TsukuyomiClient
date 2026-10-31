@@ -21,9 +21,9 @@ public:
 private:
     UiSound() = default;
 
-    static constexpr std::ptrdiff_t kControlBlock = 0x1190;
-    static constexpr std::ptrdiff_t kSoundPlayer = 0x11a0;
-    static constexpr std::ptrdiff_t kListener = 0x11b8;
+    static constexpr std::ptrdiff_t kControlBlock = 0x1188;
+    static constexpr std::ptrdiff_t kSoundPlayer = 0x1198;
+    static constexpr std::ptrdiff_t kListener = 0x11b0;
     static constexpr std::size_t kSelfSize = 0x1310;
 
     static bool selfIsAlive(const void* self);

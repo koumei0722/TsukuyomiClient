@@ -17,6 +17,7 @@ struct Cell {
     std::int32_t z = 0;
     std::uint8_t color = 0;
     std::uint8_t covered = 0;
+    std::uint32_t nearMask = 0;
 };
 
 enum Dir : std::uint8_t {
@@ -27,6 +28,23 @@ enum Dir : std::uint8_t {
     kWest = 4,
     kEast = 5,
 };
+
+struct NearOffset { std::int32_t x, y, z; };
+inline constexpr NearOffset kNearOffsets[18] = {
+    {0,-1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {-1,0,0}, {1,0,0},
+    {-1,-1,0}, {-1,1,0}, {1,-1,0}, {1,1,0},
+    {-1,0,-1}, {-1,0,1}, {1,0,-1}, {1,0,1},
+    {0,-1,-1}, {0,-1,1}, {0,1,-1}, {0,1,1},
+};
+inline constexpr std::uint32_t kNearAll = (1u << 18) - 1;
+inline constexpr std::uint32_t nearBit(std::int32_t dx, std::int32_t dy, std::int32_t dz)
+{
+    for (std::uint32_t i = 0; i < 18; ++i) {
+        const auto& n = kNearOffsets[i];
+        if (n.x == dx && n.y == dy && n.z == dz) return 1u << i;
+    }
+    return 0;
+}
 
 struct Quad {
     std::uint8_t dir = 0;
@@ -115,9 +133,11 @@ struct RegionEntry {
     std::uint64_t generation = 0;
     std::shared_ptr<const RegionGeometry> geometry;
 };
+struct RegionChange { RegionKey key; std::vector<Cell> cells; };
 class RegionSet {
 public:
     std::size_t update(const std::vector<Cell>& cells, bool xray);
+    std::size_t apply(const std::vector<RegionChange>& changes, bool reset, bool xray);
     const std::unordered_map<RegionKey, RegionEntry, RegionKeyHash>& entries() const
     {
         return entries_;
@@ -125,6 +145,7 @@ public:
 
 private:
     std::unordered_map<RegionKey, RegionEntry, RegionKeyHash> entries_;
+    std::unordered_map<RegionKey, std::vector<Cell>, RegionKeyHash> own_;
     bool xray_ = false;
 };
 

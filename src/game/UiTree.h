@@ -51,7 +51,7 @@ public:
     TreeNode* takeNodes(std::size_t count);
     std::uintptr_t* takeWords(std::size_t count);
     unsigned char* takeRecord();
-    const char* takeText(const char* utf8);
+    const char* takeText(const char* utf8, bool preserve = false);
 
     bool overflowed() const { return m_overflowed; }
 

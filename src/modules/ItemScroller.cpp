@@ -154,11 +154,6 @@ bool isShulkerName(const std::string& name)
     return nameContains(name, "shulker_box");
 }
 
-bool isBundleName(const std::string& name)
-{
-    return nameContains(name, "bundle");
-}
-
 }
 
 struct ItemScroller::StackRef {
@@ -1255,7 +1250,7 @@ bool ItemScroller::tryMoveItemsByScroll(const Slot& slot, bool scrollingUp)
     if (isEmptySlot(slot)) {
         return false;
     }
-    if (isBundleName(cui::itemName(stackOf(slot)))) {
+    if (cui::isStorageItem(stackOf(slot)) == 1) {
         return false;
     }
 
@@ -1746,7 +1741,7 @@ ItemScroller::SortExtra ItemScroller::sortExtraOf(const void* stack) const
         if (cui::nbtContents(stack, used, total)) {
             x.boxSlots = used;
         }
-    } else if (isBundleName(name)) {
+    } else if (cui::isStorageItem(stack) == 1) {
         int current = 0;
         int capacity = 0;
         if (cui::storageFill(stack, current, capacity)) {
@@ -1764,7 +1759,7 @@ int ItemScroller::compareStacks(const void* a, const void* b, const SortExtra& x
         if (key.empty) return key;
         key.name = cui::itemName(stack);
         key.box = isShulkerName(key.name);
-        key.bundle = isBundleName(key.name);
+        key.bundle = cui::isStorageItem(stack) == 1;
         key.priority = customPriority(stack);
         key.category = categoryIndex(stack);
         key.count = cui::countOf(stack);
@@ -1889,7 +1884,7 @@ void ItemScroller::sortInventory(const Slot& focused)
                 if (found == 0) {
                     reps.push_back(static_cast<int>(i));
                     found = static_cast<int>(reps.size());
-                    s.clsIsBundle.push_back(isBundleName(cui::itemName(item)));
+                    s.clsIsBundle.push_back(cui::isStorageItem(item) == 1);
                 }
                 s.cls[i] = found;
             }

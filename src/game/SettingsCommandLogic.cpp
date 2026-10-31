@@ -212,7 +212,7 @@ std::string lower(std::string value)
     return value;
 }
 
-bool choiceValue(const std::string& value, std::string& decoded, bool& quoted)
+bool choiceValue(const std::string& value, std::string& decoded, bool& quoted, bool foldCase = true)
 {
     quoted = !value.empty() && value.front() == '"';
     if (!quoted) {
@@ -229,7 +229,7 @@ bool choiceValue(const std::string& value, std::string& decoded, bool& quoted)
         } else if (c == '"') return false;
         decoded += c;
     }
-    decoded = lower(decoded);
+    if (foldCase) decoded = lower(decoded);
     return true;
 }
 
@@ -261,7 +261,7 @@ std::string hint(const MenuItem& item)
     case MenuItemKind::Number:
         return std::string(item.numberIsInteger ? " (whole number" : " (number")
                + (item.numberMin < item.numberMax ? " " + range(item) : "") + ")";
-    case MenuItemKind::Text: return " (int)";
+    case MenuItemKind::Text: return item.textInput == TextInputKind::FreeText ? " (text)" : " (int)";
     case MenuItemKind::Keybind:
         return " (f6, pad_lb, none, default, pad_none or {\"key\":[\"ctrl\",\"r\"],\"pad\":[\"lb\",\"x\"]})";
     case MenuItemKind::Action: return " (action: run)";
@@ -429,16 +429,25 @@ Result run(const std::vector<MenuItem>& tree, const std::vector<std::string>& ar
         break;
     }
     case MenuItemKind::Text: {
-        std::string_view numberText = value;
-        if (numberText.starts_with('+')) numberText.remove_prefix(1);
-        int number = 0;
-        const auto parsed = std::from_chars(numberText.data(), numberText.data() + numberText.size(), number);
-        if (numberText.empty() || (value.starts_with('+') && numberText.starts_with('-'))
-            || parsed.ec != std::errc{} || parsed.ptr != numberText.data() + numberText.size()) {
-            result.lines.push_back("Unknown integer: " + value); return result;
+        if (item.textInput == TextInputKind::Integer) {
+            std::string_view numberText = value;
+            if (numberText.starts_with('+')) numberText.remove_prefix(1);
+            int number = 0;
+            const auto parsed = std::from_chars(numberText.data(), numberText.data() + numberText.size(), number);
+            if (numberText.empty() || (value.starts_with('+') && numberText.starts_with('-'))
+                || parsed.ec != std::errc{} || parsed.ptr != numberText.data() + numberText.size()) {
+                result.lines.push_back("Unknown integer: " + value); return result;
+            }
+        }
+        std::string text = value;
+        if (item.textInput == TextInputKind::FreeText && value.starts_with('"')) {
+            bool quoted = false;
+            if (!choiceValue(value, text, quoted, false)) {
+                result.lines.push_back("Unknown text: " + value); return result;
+            }
         }
         const auto previous = item.getText();
-        const auto typed = toUtf16(value);
+        const auto typed = toUtf16(text);
         item.setText(typed);
         const auto current = item.getText();
         if (current == previous && current != typed) {
@@ -534,7 +543,7 @@ std::vector<ModuleInfo> buildIndex(const std::vector<MenuItem>& tree)
         if (module.hidden) continue;
         ModuleInfo info{slug(module.labelText()), {}};
         for (const auto& ref : settingsOf(module)) {
-            SettingInfo setting{ref.name, {}, ref.item->kind};
+            SettingInfo setting{ref.name, {}, ref.item->kind, ref.item->textInput};
             switch (ref.item->kind) {
             case MenuItemKind::Toggle: setting.values = {"true", "false", "toggle"}; break;
             case MenuItemKind::Keybind:
@@ -574,7 +583,9 @@ chatcommand::SettingsCompletion completionOf(const std::vector<ModuleInfo>& inde
             switch (setting.kind) {
             case MenuItemKind::Toggle: result.toggle.push_back(setting.name); break;
             case MenuItemKind::Number: result.number.push_back(setting.name); break;
-            case MenuItemKind::Text: result.integer.push_back(setting.name); break;
+            case MenuItemKind::Text:
+                (setting.textInput == TextInputKind::FreeText ? result.text : result.integer).push_back(setting.name);
+                break;
             case MenuItemKind::Cycle:
                 result.choice.push_back(setting.name);
                 result.choiceValues.insert(result.choiceValues.end(), setting.values.begin(), setting.values.end());
@@ -590,7 +601,7 @@ chatcommand::SettingsCompletion completionOf(const std::vector<ModuleInfo>& inde
         result.keyValues.insert(result.keyValues.end(), {"none", "default", "pad_none"});
         for (const auto& button : padkeys::kButtons) result.keyValues.push_back("pad_" + lower(std::string(button.name)));
     }
-    for (auto* values : {&result.settings, &result.toggle, &result.number, &result.integer,
+    for (auto* values : {&result.settings, &result.toggle, &result.number, &result.integer, &result.text,
                         &result.choice, &result.key, &result.action, &result.choiceValues, &result.keyValues}) {
         std::sort(values->begin(), values->end());
         values->erase(std::unique(values->begin(), values->end()), values->end());

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -20,8 +19,37 @@ bool callSendComplexTx(void* player, void** transaction);
 bool attackHooksInstalled();
 bool callBuildBlock(void* gameMode, void* blockPos, unsigned char face, unsigned char extra,
                     bool simTick);
-bool callBuildBlockWithoutSwing(void* gameMode, void* blockPos, unsigned char face,
-                                unsigned char extra, bool simTick);
+bool callOriginalBuildBlock(void* gameMode, std::int32_t blockPos[3], unsigned char face,
+                            const float click[3], unsigned char extra, bool simTick);
+bool callBuildBlockAimedWithoutSwing(void* gameMode, std::int32_t blockPos[3], unsigned char face,
+                                     const float click[3], unsigned char extra, bool simTick);
+
+struct DryWrite {
+    void* subChunk = nullptr;
+    unsigned layer = 0, index = 0;
+    const void* before = nullptr;
+    const void* block = nullptr;
+};
+class DryRun {
+public:
+    explicit DryRun(bool apply);
+    ~DryRun();
+    DryRun(const DryRun&) = delete;
+    DryRun& operator=(const DryRun&) = delete;
+    bool ok() const { return m_ok; }
+    bool click(void* gameMode, std::int32_t blockPos[3], unsigned char face, const float click[3], bool& used);
+    const std::vector<DryWrite>& writes() const { return m_writes; }
+    unsigned dropped() const { return m_dropped; }
+private:
+    friend void noteDryWrite(void*, unsigned, unsigned, const void*);
+    friend void noteDryPacket();
+    std::vector<DryWrite> m_writes;
+    unsigned m_dropped = 0;
+    bool m_apply = false, m_ok = false;
+};
+bool dryRunActive();
+void noteDryWrite(void* subChunk, unsigned layer, unsigned index, const void* block);
+void noteDryPacket();
 
 bool callGameModeContinueDestroyBlock(void* gameMode, const void* pos, std::uint8_t face,
                                       const void* playerPos, bool* out);
@@ -44,14 +72,18 @@ bool setUiBagNumber(void* holder, const char* name, unsigned long long size, flo
 bool callSettingsGroupRegister(void* registry, const void* idView, void* provider);
 
 void* gameClientInstance();
+bool callClientRefreshScreenSize(void* client);
 
 bool callOpenHowToPlayScreen();
+
+bool popTopScreen();
 
 bool offstackScreenHeld();
 bool tickOffstackScreen();
 void releaseOffstackScreen(const wchar_t* why);
 
 void* callGameAllocate(size_t size);
+bool callGameFree(void* data);
 
 bool translate(void* out, const char* key);
 bool translateWith(void* out, const void* key, const void* params);
@@ -70,27 +102,8 @@ bool hasNotifyInventoryOpen();
 
 inline constexpr std::size_t kHitResultBytes = 0x85;
 bool readHitResult(unsigned char out[kHitResultBytes]);
+void* hitResultAddress();
 bool readLiquidHitResult(unsigned char out[kHitResultBytes]);
-
-void requestGhostChunkBuild();
-
-std::uint64_t requestChunkRebuilds(const std::vector<std::array<std::int32_t, 3>>& chunks);
-void clearChunkRebuilds();
-bool chunkHasGeometryNow(std::int32_t cx, std::int32_t cy, std::int32_t cz);
-bool chunkLastBuildBoxTries(std::int32_t cx, std::int32_t cy, std::int32_t cz,
-                            std::uint32_t& tries, std::uint64_t* startSeq = nullptr);
-std::uint64_t nextBuildSeq();
-void clearChunkBoxTries();
-
-void armStorageHooks(void* subChunk, int baseX, int baseY, int baseZ);
-
-void armPendingStoragePreds();
-
-void beginStorageArmBatch();
-void endStorageArmBatch();
-
-void dropStorageMark(int baseX, int baseY, int baseZ);
-
-void clearStorageMarks();
+bool repickHitResult();
 
 }

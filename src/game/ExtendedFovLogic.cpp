@@ -17,22 +17,26 @@ float floatAt(std::span<const std::byte> code, std::size_t at)
 
 }
 
-bool readRegistration(std::span<const std::byte> code, Registered& out)
+bool readRegistration(std::span<const std::byte> code, std::span<const std::byte> values, Registered& out)
 {
     out = {};
-    if (code.size() < 0x40) {
+    if (code.size() < kRegistrationBytes || values.size() != 4 * sizeof(float)) {
         return false;
     }
     const auto at = [&](std::size_t i) { return std::to_integer<unsigned char>(code[i]); };
-    if (at(0x1D) != 0x48 || at(0x1E) != 0xB8 || at(0x2B) != 0xC7 || at(0x2C) != 0x43 || at(0x2D) != 0x20
-        || at(0x32) != 0x48 || at(0x33) != 0xB8) {
+    if (at(0) != 0xBA || at(1) != 0x2F || at(2) != 0 || at(3) != 0 || at(4) != 0
+        || at(0x14) != 0x48 || at(0x15) != 0x8D || at(0x16) != 0x05
+        || at(0x1B) != 0x48 || at(0x1C) != 0x89 || at(0x1D) != 0x03
+        || at(0x1E) != 0xC7 || at(0x1F) != 0x43 || at(0x20) != 0x20
+        || at(0x25) != 0x0F || at(0x26) != 0x28 || at(0x27) != 0x05
+        || at(0x2C) != 0x0F || at(0x2D) != 0x11 || at(0x2E) != 0x43 || at(0x2F) != 0x10) {
         return false;
     }
-    out.min = floatAt(code, 0x1F);
-    out.max = floatAt(code, 0x23);
-    out.delta = floatAt(code, 0x2E);
-    out.defaultValue = floatAt(code, 0x38);
-    const float initial = floatAt(code, 0x34);
+    out.min = floatAt(values, 0);
+    out.max = floatAt(values, 4);
+    out.delta = floatAt(code, 0x21);
+    out.defaultValue = floatAt(values, 12);
+    const float initial = floatAt(values, 8);
     return std::isfinite(out.min) && std::isfinite(out.max) && out.min > 0.0f && out.min < out.max
         && out.max < kExtendedMax && out.defaultValue >= out.min && out.defaultValue <= out.max
         && initial == out.defaultValue && out.delta > 0.0f && out.delta < 1.0f;

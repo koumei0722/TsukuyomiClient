@@ -22,7 +22,7 @@ namespace {
 constexpr std::uint32_t kAttributesComponent = 0xFD3B0613u;
 constexpr std::size_t kAttributesSize = 0x50;
 constexpr std::size_t kAttributeId = 4;
-constexpr std::size_t kActorDimension = 0x1c8;
+constexpr std::size_t kActorDimension = 0x1f0;
 constexpr std::size_t kDimensionName = 0x20;
 
 bool readPointer(const void* base, std::size_t offset, const void*& out)
@@ -112,7 +112,7 @@ void DeathLogger::saveConfig(nlohmann::json& section) const
 void DeathLogger::onScansReady()
 {
     if (std::byte* const site = Scanner::instance().address(Target::HealthAttributeLoad)) {
-        m_healthAttribute.store(memory::ripTarget(site, 8), std::memory_order_relaxed);
+        m_healthAttribute.store(memory::ripTarget(site, 3), std::memory_order_relaxed);
     }
     if (m_healthAttribute.load(std::memory_order_relaxed) == nullptr) {
         log().warn(L"DeathLogger: NOT usable (the health attribute was not found)");
@@ -140,6 +140,8 @@ std::string DeathLogger::resolveDimension()
 
 void DeathLogger::onPlayerViewUpdate()
 {
+    const ShutdownGate::Guard detection(m_detection);
+    if (!detection) return;
     if (!enabled()) {
         m_lastHealth = -1.0f;
         return;
@@ -194,6 +196,17 @@ void DeathLogger::onPlayerViewUpdate()
     if (m_writeToFile.load(std::memory_order_relaxed)) {
         std::lock_guard lock(m_pendingMutex);
         if (m_pending.size() < 64) m_pending.push_back(timestamp() + "\t" + dimension + "\t" + coords);
+    }
+}
+
+void DeathLogger::shutdown()
+{
+    m_detection.close();
+    if (m_writeToFile.load(std::memory_order_relaxed)) {
+        onUpdate();
+    } else {
+        std::lock_guard lock(m_pendingMutex);
+        m_pending.clear();
     }
 }
 

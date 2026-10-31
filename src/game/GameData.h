@@ -20,6 +20,7 @@ struct PlayerView {
 class GameData {
 public:
     static GameData& instance();
+    static void* componentAddress(const void* actor, std::uint32_t typeId, std::size_t stride);
     static bool copyComponent(const void* actor, std::uint32_t typeId, std::size_t stride, void* out);
 
     void setPlayerView(const PlayerView& view);
@@ -30,6 +31,7 @@ public:
 
     void setGameMode(void* gameMode);
     void* gameMode() const;
+    void setPlayerGameModeOffset(std::size_t offset);
 
     void setPlayer(void* player);
     void* player() const;
@@ -68,8 +70,8 @@ public:
 
     bool isPlayerEntity(const void* entityContext) const;
 
-    static constexpr std::ptrdiff_t kPlayerPositionOffset = 0x594;
-    static constexpr std::ptrdiff_t kPlayerPreviousPositionOffset = 0x588;
+    static constexpr std::ptrdiff_t kPlayerPositionOffset = 0x5BC;
+    static constexpr std::ptrdiff_t kPlayerPreviousPositionOffset = 0x5B0;
 
 private:
     GameData() = default;
@@ -79,6 +81,8 @@ private:
     bool m_valid = false;
 
     std::atomic<void*> m_gameMode{nullptr};
+    std::atomic<void*> m_droppedGameMode{nullptr};
+    std::atomic<std::size_t> m_playerGameModeOffset{0};
 
     std::atomic<void*> m_player{nullptr};
     mutable std::atomic<void*> m_playerAlt{nullptr};
@@ -90,6 +94,7 @@ private:
     std::atomic<unsigned long long> m_viewAt{0};
     std::atomic<const void*> m_tickLevels[2]{};
     std::atomic<unsigned long long> m_tickLevelAt[2]{};
+    std::atomic<unsigned long long> m_tickLevelSince[2]{};
     std::atomic<int> m_tickLevelLogs{0};
 };
 

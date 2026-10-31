@@ -49,6 +49,9 @@ public:
 
     const Hotkey& toggleKey() const { return m_toggleKey; }
 
+    bool favorite() const { return m_favorite.load(std::memory_order_acquire); }
+    void setFavorite(bool value) { m_favorite.store(value, std::memory_order_release); }
+
     void setParent(Module* parent) { m_parent = parent; }
     void parentEnabledChanged();
 
@@ -66,6 +69,7 @@ protected:
 
 private:
     std::atomic<bool> m_enabled{false};
+    std::atomic<bool> m_favorite{false};
     bool m_writeBlocked = false;
     Module* m_parent = nullptr;
 

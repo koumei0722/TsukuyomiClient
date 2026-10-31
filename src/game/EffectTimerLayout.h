@@ -6,7 +6,7 @@
 namespace tsukuyomi::efxtimer {
 
 inline constexpr int kFirstId = 1;
-inline constexpr int kMaxId = 0x25;
+inline constexpr int kMaxId = 0x26;
 inline constexpr int kRows = kMaxId - kFirstId + 1;
 inline constexpr int rowOf(int id) { return id - kFirstId; }
 

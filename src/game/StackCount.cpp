@@ -4,47 +4,6 @@
 
 namespace tsukuyomi::stackcount {
 
-namespace {
-
-std::string_view bare(std::string_view name)
-{
-    const std::size_t colon = name.rfind(':');
-    return (colon == std::string_view::npos) ? name : name.substr(colon + 1);
-}
-
-bool endsWith(std::string_view text, std::string_view tail)
-{
-    return text.size() >= tail.size() && text.compare(text.size() - tail.size(), tail.size(), tail) == 0;
-}
-
-bool contains(std::string_view text, std::string_view part)
-{
-    return text.find(part) != std::string_view::npos;
-}
-
-}
-
-int maxStackSize(std::string_view name)
-{
-    const std::string_view body = bare(name);
-    if (body.empty()) {
-        return 64;
-    }
-    if (body == "bed" || endsWith(body, "_bed")) {
-        return 1;
-    }
-    if (contains(body, "shulker_box")) {
-        return 1;
-    }
-    if (contains(body, "sign")) {
-        return 16;
-    }
-    if (contains(body, "banner")) {
-        return 16;
-    }
-    return 64;
-}
-
 std::string formatStacks(std::size_t count, int stackSize)
 {
     if (stackSize < 1) {

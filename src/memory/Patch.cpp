@@ -9,7 +9,9 @@
 #include <TlHelp32.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -465,6 +467,14 @@ Patch makeStubPatch(void* function, std::span<const std::byte> stub, const char*
         }
         run = runEnd;
     }
+    if (place == nullptr && (reinterpret_cast<std::uintptr_t>(head) & 15) == 0) {
+        const std::size_t before = stub.size() + 4;
+        const auto* const padding = head - before;
+        if (memory::isReadable(padding, before)
+            && std::all_of(padding, padding + before, [](std::byte b) { return b == std::byte{0xCC}; })) {
+            place = head - stub.size();
+        }
+    }
     if (place == nullptr) {
         return Patch();
     }
@@ -499,6 +509,85 @@ Patch makeAtomicPatch(void* address, std::vector<std::byte> bytes, const char* n
     Patch patch(address, std::move(bytes), name);
     patch.m_lockFree = patch.valid();
     return patch;
+}
+
+Patch makeIndirectCallPatch(void* callInstruction, const void* replacement, const char* name)
+{
+    auto* const call = static_cast<unsigned char*>(callInstruction);
+    if (call == nullptr || replacement == nullptr || !memory::isReadable(call, 6) || call[0] != 0xFF
+        || call[1] != 0x15) {
+        return Patch();
+    }
+    static std::mutex lock;
+    static unsigned char* page = nullptr;
+    static std::size_t used = 0;
+    constexpr std::size_t kPageBytes = 4096;
+    const auto reaches = [call](const unsigned char* cell) {
+        const std::int64_t distance = cell - (call + 6);
+        return distance >= INT32_MIN && distance <= INT32_MAX;
+    };
+    unsigned char* cell = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (page == nullptr || used + 8 > kPageBytes || !reaches(page + used)) {
+            page = static_cast<unsigned char*>(memory::allocateNear(call));
+            used = 0;
+        }
+        if (page == nullptr || !reaches(page)) {
+            return Patch();
+        }
+        cell = page + used;
+        used += 8;
+    }
+    std::memcpy(cell, &replacement, sizeof(replacement));
+    const auto disp = static_cast<std::int32_t>(cell - (call + 6));
+    std::vector<std::byte> bytes(4);
+    std::memcpy(bytes.data(), &disp, sizeof(disp));
+    return makeAtomicPatch(call + 2, std::move(bytes), name);
+}
+
+Patch makeDirectCallPatch(void* callInstruction, const void* replacement, void** originalOut, const char* name)
+{
+    auto* const call = static_cast<unsigned char*>(callInstruction);
+    if (call == nullptr || replacement == nullptr || !memory::isReadable(call, 5) || call[0] != 0xE8) {
+        return Patch();
+    }
+    std::int32_t rel = 0;
+    std::memcpy(&rel, call + 1, sizeof(rel));
+    if (originalOut != nullptr) {
+        *originalOut = call + 5 + rel;
+    }
+    static std::mutex lock;
+    static unsigned char* page = nullptr;
+    static std::size_t used = 0;
+    constexpr std::size_t kPageBytes = 4096;
+    constexpr std::size_t kStubBytes = 16;
+    const auto reaches = [call](const unsigned char* stub) {
+        const std::int64_t distance = stub - (call + 5);
+        return distance >= INT32_MIN && distance <= INT32_MAX;
+    };
+    unsigned char* stub = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(lock);
+        if (page == nullptr || used + kStubBytes > kPageBytes || !reaches(page + used)) {
+            page = static_cast<unsigned char*>(memory::allocateNear(call, true));
+            used = 0;
+        }
+        if (page == nullptr || !reaches(page)) {
+            return Patch();
+        }
+        stub = page + used;
+        used += kStubBytes;
+    }
+    static constexpr unsigned char kJump[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    std::memcpy(stub, kJump, sizeof(kJump));
+    std::memcpy(stub + sizeof(kJump), &replacement, sizeof(replacement));
+    std::memset(stub + sizeof(kJump) + sizeof(replacement), 0xCC, kStubBytes - sizeof(kJump) - sizeof(replacement));
+    FlushInstructionCache(GetCurrentProcess(), stub, kStubBytes);
+    const auto newRel = static_cast<std::int32_t>(stub - (call + 5));
+    std::vector<std::byte> bytes(4);
+    std::memcpy(bytes.data(), &newRel, sizeof(newRel));
+    return makeAtomicPatch(call + 1, std::move(bytes), name);
 }
 
 Patch makeSkipPatch(void* address, size_t size, const char* name)

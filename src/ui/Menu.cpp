@@ -126,10 +126,11 @@ MenuItem number(std::wstring title, std::function<float()> get, std::function<vo
 }
 
 MenuItem text(std::wstring title, std::function<std::wstring()> get,
-              std::function<void(std::wstring)> set)
+              std::function<void(std::wstring)> set, TextInputKind input)
 {
     MenuItem item;
     item.kind = MenuItemKind::Text;
+    item.textInput = input;
     item.label = constant(std::move(title));
     item.getText = std::move(get);
     item.setText = std::move(set);

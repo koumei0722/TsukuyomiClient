@@ -17,14 +17,14 @@ namespace tsukuyomi::mobeffects {
 
 namespace {
 
-constexpr std::size_t kInstanceSize = 0x90;
+constexpr std::size_t kInstanceSize = 0xa8;
 constexpr std::size_t kDuration = 0x04;
 constexpr std::size_t kAmplifier = 0x20;
-constexpr std::size_t kAmbient = 0x26;
+constexpr std::size_t kAmbient = 0x42;
 constexpr std::size_t kEffectHidden = 0xa0;
 constexpr std::size_t kEffectColor = 0x10;
-constexpr std::size_t kLoopSkipIdDisp = 0x0D;
-constexpr std::size_t kNameTableDisp = 0x69;
+constexpr std::size_t kLoopSkipIdDisp = 0x0C;
+constexpr std::size_t kNameTableDisp = 0x6c;
 
 constexpr std::uint32_t fnv1a(const char* s)
 {

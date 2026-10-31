@@ -1,6 +1,7 @@
 #include "game/GameOptions.h"
 
 #include <charconv>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -15,6 +16,7 @@ namespace {
 std::mutex g_mutex;
 Options g_options;
 bool g_loaded = false;
+std::uint64_t g_readAt = 0;
 
 std::string_view trimmed(std::string_view value)
 {
@@ -143,11 +145,19 @@ bool reload()
     std::lock_guard lock(g_mutex);
     g_options = std::move(parsed);
     g_loaded = success;
+    g_readAt = GetTickCount64();
     return success;
 }
 
 bool getInt(const char* key, int& out)
 {
+    {
+        std::lock_guard lock(g_mutex);
+        const auto now = GetTickCount64();
+        if (g_readAt != 0 && now - g_readAt < 30000) return g_loaded && g_options.getInt(key, out);
+        g_readAt = now;
+    }
+    reload();
     std::lock_guard lock(g_mutex);
     return g_loaded && g_options.getInt(key, out);
 }

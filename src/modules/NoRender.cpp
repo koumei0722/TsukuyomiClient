@@ -374,9 +374,8 @@ void NoRender::resolveOptions()
         };
         const Site sites[] = {
 
-            {clamp + 0x0C, 0x51, clamp + 0x0C + 6, clamp + 0x34 + 6, {0x41, 0xC7, 0x84, 0x24}},
-
-            {colorClamp + 0x0A, 0x48, colorClamp + 0x12 + 4, colorClamp + 0x2A + 4, {0xC7, 0x86}},
+            {clamp + 0x0A, 0x45, clamp + 0x0A + 4, clamp + 0x2A + 4, {0xC7, 0x86}},
+            {colorClamp + 0x0A, 0x48, colorClamp + 0x0A + 4, colorClamp + 0x2A + 4, {0xC7, 0x86}},
         };
         for (const Site& site : sites) {
             std::vector<std::byte> bytes(site.size, std::byte{0x90});
@@ -620,7 +619,7 @@ void NoRender::applyStages()
     std::vector<Patch*> apply;
     std::vector<Patch*> remove;
     for (std::size_t i = 0; i < kStageCount; ++i) {
-        const bool want = on && m_off[i] && !m_stageBlocked[i];
+        const bool want = on && m_off[i].load(std::memory_order_relaxed) && !m_stageBlocked[i];
         for (Patch& patch : m_patches[i]) {
             (want ? apply : remove).push_back(&patch);
         }
@@ -653,13 +652,14 @@ MenuItem NoRender::buildMenu()
     for (std::size_t i = 0; i < kStageCount; ++i) {
         const StageDef& def = kStages[i];
         MenuItem item = menu::toggle(
-            def.label, [this, i] { return m_off[i]; },
+            def.label, [this, i] { return m_off[i].load(std::memory_order_relaxed); },
             [this, i] {
-                m_off[i] = !m_off[i];
+                const bool value = !m_off[i].load(std::memory_order_relaxed);
+                m_off[i].store(value, std::memory_order_relaxed);
                 applyStages();
                 log().info(L"NoRender: {} is {}",
                            kStages[i].label,
-                           m_off[i] ? L"hidden" : L"shown");
+                           value ? L"hidden" : L"shown");
             });
 
         item.available = [this, i] { return !m_patches[i].empty() || m_byOption[i]; };
@@ -704,7 +704,7 @@ void NoRender::loadConfig(const nlohmann::json& section)
 {
     Module::loadConfig(section);
     for (std::size_t i = 0; i < kStageCount; ++i) {
-        m_off[i] = Config::getBool(section, kStages[i].key, false);
+        m_off[i].store(Config::getBool(section, kStages[i].key, false), std::memory_order_relaxed);
     }
 }
 
@@ -712,7 +712,7 @@ void NoRender::saveConfig(nlohmann::json& section) const
 {
     Module::saveConfig(section);
     for (std::size_t i = 0; i < kStageCount; ++i) {
-        section[kStages[i].key] = m_off[i];
+        section[kStages[i].key] = m_off[i].load(std::memory_order_relaxed);
     }
 }
 
