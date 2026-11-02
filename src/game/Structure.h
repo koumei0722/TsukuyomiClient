@@ -57,14 +57,13 @@ struct Structure {
 
     std::size_t indexOf(std::int32_t x, std::int32_t y, std::int32_t z) const;
 
-    const std::string& nameAt(std::int32_t x, std::int32_t y, std::int32_t z) const;
-
 };
 
 struct LoadResult {
     Structure value;
     std::uint64_t requiredMemory = 0, availableMemory = 0;
     const char* why = nullptr;
+    std::string note;
     bool ok() const { return why == nullptr; }
 };
 

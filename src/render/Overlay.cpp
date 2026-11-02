@@ -1,6 +1,5 @@
 #include "render/Overlay.h"
 
-#include "core/FreezeWatch.h"
 #include "core/Logger.h"
 #include "hooks/HookManager.h"
 
@@ -111,7 +110,6 @@ void logSwapChain(IDXGISwapChain* swapChain)
 
 HRESULT __stdcall detourPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags)
 {
-    freezewatch::notePresent();
     logSwapChain(swapChain);
 
     if ((flags & DXGI_PRESENT_TEST) == 0) {

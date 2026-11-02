@@ -94,6 +94,14 @@ bool Options::getInt(const char* key, int& out) const
     return true;
 }
 
+bool Options::getString(const char* key, std::string& out) const
+{
+    const auto* value = find(key);
+    if (!value) return false;
+    out = std::string(trimmed(*value));
+    return true;
+}
+
 bool parseOptions(const char* text, std::size_t length, Options& out)
 {
     if (!text && length != 0) return false;
@@ -160,6 +168,19 @@ bool getInt(const char* key, int& out)
     reload();
     std::lock_guard lock(g_mutex);
     return g_loaded && g_options.getInt(key, out);
+}
+
+bool getString(const char* key, std::string& out)
+{
+    {
+        std::lock_guard lock(g_mutex);
+        const auto now = GetTickCount64();
+        if (g_readAt != 0 && now - g_readAt < 30000) return g_loaded && g_options.getString(key, out);
+        g_readAt = now;
+    }
+    reload();
+    std::lock_guard lock(g_mutex);
+    return g_loaded && g_options.getString(key, out);
 }
 
 }

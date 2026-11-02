@@ -659,24 +659,16 @@ void AutoTool::resolveAttack()
         api.inventory = disp32(site + 3);
         api.announced = disp32(site + 52);
     }
-    if (const std::byte* site = scanner.address(Target::TargetCategorySite);
-        site != nullptr && memory::isReadable(site, 12)) {
-        api.category = disp32(site + 8);
-    }
     if (std::byte* ref = scanner.address(Target::PlayerVtableRef)) {
         api.localPlayerVtable = memory::ripTarget(ref, 3);
     }
-    if (std::byte* site = scanner.address(Target::ArmorStandVtableSite)) {
-        api.armorStandVtable = memory::ripTarget(site, 3);
-    }
     const bool fieldsOk = api.inventory > 0 && api.inventory < 0x4000 && api.inventory % 8 == 0
-                          && api.announced > 0 && api.announced < 0x4000 && api.category > 0
-                          && api.category < 0x2000;
+                          && api.announced > 0 && api.announced < 0x4000;
     api.ready = api.damageCalc != nullptr && fieldsOk && api.localPlayerVtable != nullptr
                 && hooks::attackHooksInstalled() && !writes::blocked("AutoTool:attack");
     m_attack = api;
-    log().info(L"AutoTool: attack switching {} (inventory +{:#x}, announced slot +{:#x}, category +{:#x})",
-               api.ready ? L"ready" : L"NOT usable", api.inventory, api.announced, api.category);
+    log().info(L"AutoTool: attack switching {} (inventory +{:#x}, announced slot +{:#x})",
+               api.ready ? L"ready" : L"NOT usable", api.inventory, api.announced);
 }
 
 bool AutoTool::onAttack(void* gameMode, void* target, bool direct, const void* hitPos)
@@ -696,13 +688,6 @@ bool AutoTool::onAttack(void* gameMode, void* target, bool direct, const void* h
     }
     auto* const inv = static_cast<std::byte*>(inventory);
     if (!direct || !attackSwitch()) {
-        return callAttackHoldingIfUnannounced(gameMode, target, direct, hitPos, player, inv);
-    }
-    unsigned char category = 0;
-    void* targetVt = nullptr;
-    if (!readByteGuarded(static_cast<std::byte*>(target) + m_attack.category, category) || (category & 0x3) == 0
-        || (m_attack.armorStandVtable != nullptr && readPointerGuarded(target, targetVt)
-            && targetVt == m_attack.armorStandVtable)) {
         return callAttackHoldingIfUnannounced(gameMode, target, direct, hitPos, player, inv);
     }
     int current = -1;

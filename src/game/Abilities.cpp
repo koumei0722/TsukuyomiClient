@@ -35,26 +35,6 @@ bool writeByte(void* address, std::uint8_t value)
     }
 }
 
-bool readFloat(const void* address, float& value)
-{
-    __try {
-        value = *static_cast<const float*>(address);
-        return true;
-    } __except (accessViolationFilter(GetExceptionCode())) {
-        return false;
-    }
-}
-
-bool writeFloat(void* address, float value)
-{
-    __try {
-        *static_cast<float*>(address) = value;
-        return true;
-    } __except (accessViolationFilter(GetExceptionCode())) {
-        return false;
-    }
-}
-
 std::byte* at(std::byte* layered, int layer, int index)
 {
     if (layered == nullptr || layer < 0 || layer >= kLayerCount || index < 0 || index >= kCount) {

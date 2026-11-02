@@ -42,6 +42,8 @@ enum class Target {
     EndRequest,
 
     CraftFromOutput,
+
+    ContainerTransfer,
     NotifyInventoryOpen,
     ContainerOpenGetId,
     InventoryContentGetId,
@@ -139,7 +141,6 @@ enum class Target {
     GetActorEffect,
 
     FogColorNightVisionSite,
-    CameraFovStore,
     OpenInventoryScreen,
     MoveIntentFromInput,
     InputGather,
@@ -214,7 +215,6 @@ enum class Target {
     AttackDamageCalc,
     TargetCategorySite,
     AnnouncedSlotSite,
-    ArmorStandVtableSite,
 
     CompoundTagHash,
 
@@ -687,6 +687,11 @@ inline constexpr TargetInfo kTargets[] = {
      "29 B5 D0 03 00 00 48 C7 85 C8 03 00 00 FE FF FF FF 4C 89 CB 4C 89 C6 48 89 95 88 03 "
      "00 00 48 89 CF"},
 
+    {Target::ContainerTransfer, L"containerTransfer", L"move items between the cursor and a slot (ItemScroller grid fill)",
+     "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC F8 02 00 00 48 8D AC 24 80 00 00 00 48 C7 85 70 02 "
+     "00 00 FE FF FF FF 4C 89 CE 4C 89 C3 41 89 D6 48 89 CF 4C 89 C9 4C 89 C2 E8 ? ? ? ? 84 C0 74 08 "
+     "45 31 E4 E9"},
+
     {Target::NotifyInventoryOpen, L"notifyInventoryOpen",
      L"tell the server the inventory opened (ItemStackRequest)",
      "55 41 56 56 57 53 48 81 EC 90 00 00 00 48 8D AC 24 80 00 00 00 48 C7 45 08 FE FF FF "
@@ -1061,10 +1066,6 @@ inline constexpr TargetInfo kTargets[] = {
      "55 41 57 41 56 41 55 41 54 56 57 53 48 81 EC 88 01 00 00 48 8D AC 24 80 00 00 00 48 "
      "C7 85 00 01 00 00 FE FF FF FF 48 89 CF 4C 8D 35 ? ? ? ? 4C 89 F1 E8 ? ? ? ?"},
 
-    {Target::CameraFovStore, L"camera fov store", L"the other write of the field of view (Zoom)",
-     "80 7D 24 01 75 ? F3 0F 10 45 20 F3 41 0F 11 45 50 49 8B 04 24 48 8B 88 "
-     "E0 01 00 00"},
-
     {Target::InputGather, L"input gather",
      L"builds the held-input bits and move amounts (FreeCamera takes them)",
      "0F B7 41 02 84 C0 0F 88 ? ? ? ? A9 00 01 00 00 0F 85 ? ? ? ? A9 "
@@ -1328,9 +1329,6 @@ inline constexpr TargetInfo kTargets[] = {
     {Target::AnnouncedSlotSite, L"AnnouncedSlotSite", L"the hotbar slot last announced to the server (AutoTool)",
      "48 8B 86 E0 05 00 00 44 0F B6 B0 B0 00 00 00 8B 58 10 0F B6 86 72 0E 00 00 41 3A 47 22 75 ? 48 "
      "8D 8E 50 0E 00 00 4C 89 FA E8 ? ? ? ? 84 C0 74 ? 39 9E E8 0E 00 00 0F 85 ? ? ? ?"},
-
-    {Target::ArmorStandVtableSite, L"ArmorStandVtableSite", L"the armor stand vtable (AutoTool)",
-     "48 8D 05 ? ? ? ? 48 89 07 48 C7 87 90 04 00 00 00 00 00 00 C7 87 98 04 00 00 00 00 00 00"},
 
     {Target::CompoundTagHash, L"CompoundTagHash", L"CompoundTag::hash (ShulkerPreview)",
      "41 57 41 56 41 55 41 54 56 57 55 53 48 83 EC 28 48 8B 79 08 4C 8B 27 49 39 FC 0F 84 ? ? ? ? "

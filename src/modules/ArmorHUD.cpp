@@ -31,7 +31,11 @@ constexpr int kSlotFirstForm = 235;
 constexpr int kSlotBar = 239;
 constexpr int kSlotFirstFloat = 64;
 constexpr int kSlotFirstText = 338;
+constexpr int kSlotFirstShown = 240;
+constexpr int kSlotFirstMidShift = kSlotFirstShown + ah::kItems;
+constexpr int kSlotFirstEndShift = kSlotFirstMidShift + ah::kHiddenSteps;
 static_assert(kSlotFirstForm + ah::kForms <= 239);
+static_assert(kSlotFirstEndShift + ah::kHiddenSteps <= 256);
 static_assert(kSlotFirstFloat + ah::kForms * 2 <= cui::kPersistentSlots);
 static_assert(kSlotFirstText + ah::kItems <= cui::kPersistentTextSlots);
 
@@ -207,7 +211,19 @@ void ArmorHUD::publish()
 {
     const invhud::Placement place = invhud::placementOf(anchor());
     const int form = ah::formOf(orientation(), textMode());
-    writeBool(kSlotVisible, wanted());
+    int hidden = 0;
+    for (int i = 0; i < ah::kItems; ++i) {
+        writeBool(kSlotFirstShown + i, shown(i));
+        hidden += shown(i) ? 0 : 1;
+    }
+    const bool vertical = orientation() == ah::kVertical;
+    const bool midShift = vertical ? place.vMid : place.hMid;
+    const bool endShift = vertical ? place.vBottom : place.hRight;
+    for (int h = 1; h <= ah::kHiddenSteps; ++h) {
+        writeBool(kSlotFirstMidShift + h - 1, h == hidden && midShift);
+        writeBool(kSlotFirstEndShift + h - 1, h == hidden && endShift);
+    }
+    writeBool(kSlotVisible, wanted() && hidden < ah::kItems);
     writeBool(kSlotVMid, place.vMid);
     writeBool(kSlotVBottom, place.vBottom);
     writeBool(kSlotHMid, place.hMid);
@@ -346,7 +362,7 @@ void ArmorHUD::onPlayerViewUpdate()
     const bool textForm = wanted() && mode != ah::kNoText && m_maxDamageSlot != 0 && m_damageValue != nullptr;
     for (int i = 0; i < ah::kItems; ++i) {
         std::string text;
-        if (textForm) {
+        if (textForm && shown(i)) {
             if (const void* const stack = stackOf(i)) {
                 int max = 0;
                 int damage = 0;
@@ -402,8 +418,13 @@ void ArmorHUD::onHudCreated(void* ctrl)
     }
     for (int i = 0; i < ah::kItems; ++i) {
         ok += cui::bindPersistentText(ctrl, ah::textBinding(i).c_str(), kSlotFirstText + i) ? 1 : 0;
+        ok += cui::bindPersistentBool(ctrl, ah::shownBinding(i).c_str(), kSlotFirstShown + i) ? 1 : 0;
     }
-    constexpr int kWanted = 6 + ah::kForms * 3 + ah::kItems;
+    for (int h = 1; h <= ah::kHiddenSteps; ++h) {
+        ok += cui::bindPersistentBool(ctrl, ah::midShiftBinding(h).c_str(), kSlotFirstMidShift + h - 1) ? 1 : 0;
+        ok += cui::bindPersistentBool(ctrl, ah::endShiftBinding(h).c_str(), kSlotFirstEndShift + h - 1) ? 1 : 0;
+    }
+    constexpr int kWanted = 6 + ah::kForms * 3 + ah::kItems * 2 + ah::kHiddenSteps * 2;
     if (g_bindLogs.fetch_add(1, std::memory_order_relaxed) < kMaxBindLogs) {
         if (ok == kWanted) {
             log().info(L"ArmorHUD: bound {} values to the HUD controller", ok);
@@ -422,6 +443,11 @@ MenuItem ArmorHUD::buildMenu()
     children.push_back(enabledItem());
     children.push_back(toggleKeyItem());
 
+    for (int i = 0; i < ah::kItems; ++i) {
+        children.push_back(menu::toggle(
+            ah::itemLabel(i), [this, i] { return shown(i); },
+            [this, i] { m_shown[i].store(!shown(i), std::memory_order_relaxed); }));
+    }
     {
         std::vector<std::wstring> labels;
         for (int i = 0; i < ah::kOrientationCount; ++i) {
@@ -493,6 +519,9 @@ void ArmorHUD::loadConfig(const nlohmann::json& section)
                     std::memory_order_relaxed);
     m_offsetY.store(ah::clampOffset(Config::getInt(section, "offsetY", ah::kDefaultOffsetY)),
                     std::memory_order_relaxed);
+    for (int i = 0; i < ah::kItems; ++i) {
+        m_shown[i].store(Config::getBool(section, ah::itemConfigKey(i), ah::kDefaultShown), std::memory_order_relaxed);
+    }
 }
 
 void ArmorHUD::saveConfig(nlohmann::json& section) const
@@ -504,6 +533,9 @@ void ArmorHUD::saveConfig(nlohmann::json& section) const
     section["anchor"] = anchor();
     section["offsetX"] = offsetX();
     section["offsetY"] = offsetY();
+    for (int i = 0; i < ah::kItems; ++i) {
+        section[ah::itemConfigKey(i)] = shown(i);
+    }
 }
 
 }

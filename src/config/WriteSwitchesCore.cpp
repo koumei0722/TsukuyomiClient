@@ -33,6 +33,7 @@ const std::vector<Entry> kTable = {
     {"ContainerScreenDtor", Kind::Hook, "InventoryEffects,ItemScroller,Schematica:collect,ShulkerPreview", "", ""},
     {"ContainerScreenTick", Kind::Hook, "InventoryEffects,ItemScroller,Schematica:collect,ShulkerPreview", "", ""},
     {"ContainerSm", Kind::Hook, "ItemScroller,Schematica:collect", "", ""},
+    {"ContainerTransfer", Kind::Hook, "", "ItemScroller", ""},
     {"CraftFromOutput", Kind::Hook, "", "ItemScroller", ""},
     {"DismountButton", Kind::Hook, "", "FreeCamera", ""},
     {"FogSettingsFetch", Kind::Hook, "NoRender:fog,OverworldSky", "", ""},

@@ -27,12 +27,6 @@ public:
 
     bool assignFrom(void* dst, const void* src);
 
-    bool stash(const void* src);
-
-    bool restore(void* dst);
-
-    void discard();
-
 private:
     ItemStackOps() = default;
 
@@ -54,9 +48,6 @@ private:
     AssignFn m_assign = nullptr;
     DtorFn m_dtor = nullptr;
     NetIdAssignFn m_netIdAssign = nullptr;
-
-    std::byte m_stash[kStackSize]{};
-    bool m_hasStash = false;
 
     bool m_scansReady = false;
     bool m_warnedMissing = false;

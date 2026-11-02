@@ -360,11 +360,6 @@ bool EffectTimer::render(void* client, void* owner)
         writeFloat(et::kXSlot + row, x);
         writeFloat(et::kYSlot + row, y);
         shown[row] = true;
-        if (!m_loggedFrame) {
-            m_loggedFrame = true;
-            log().info(L"EffectTimer: effect {} duration {} background ({}, {})-({}, {}) px, scale {}, control ({}, {}) -> anchor ({}, {})",
-                       e.id, e.duration, bg.x0, bg.y0, bg.x1, bg.y1, scale, ownerX, ownerY, x, y);
-        }
     }
     int width = 0;
     for (int r = 0; r < et::kRows; ++r) {

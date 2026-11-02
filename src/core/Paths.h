@@ -11,5 +11,6 @@ std::filesystem::path logFile();
 std::filesystem::path hooksFile();
 
 std::filesystem::path schematicsDir();
+std::filesystem::path replaysDir();
 
 }

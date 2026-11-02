@@ -110,13 +110,11 @@ std::vector<std::filesystem::path> skinGeometryRoots()
 }
 std::atomic<void*> g_completionConnection{nullptr};
 std::atomic<int> g_announceLogs{0};
-int g_fedLogs = 0;
 constexpr std::int32_t kNearChunks = 4, kFedChunkRadius = 4;
 constexpr std::uint64_t kFedWaitMs = 60000;
 constexpr std::int32_t kSubChunksDown = 4, kSubChunksUp = 3;
 constexpr std::uint64_t kAskAgainMs = 3000, kTerrainIdleMs = 10000;
 constexpr std::uint64_t kLiquidCheckMs = 100;
-int g_liquidLogs = 0;
 void announceAccounts(const std::vector<StoredAccount>& accounts)
 {
     void* const connection = net::mainConnection();
@@ -432,7 +430,7 @@ chatcommand::Reply BotManager::joinSub(std::string name, std::uint8_t sub)
         return {{"Bot: seat " + std::to_string(sub) + " of " + hostLabel + " is the bot you are controlling (" + possessed_ + ")"}, true};
     if (botCount() == 0 && !possessing_) {
         markMainPlayer();
-        dropped_ = 0; receivedIds_ = {}; sentIds_ = {}; loggedReceived_ = 0; loggedSent_ = 0;
+        dropped_ = 0;
     }
     if (!possessing_ && !net::mainStartGame()) if (const auto local = readLocalPlayerIds()) net::setKeeperSelf(0, local->runtimeId);
     auto& slot = slots_[sub];
@@ -1261,7 +1259,6 @@ void BotManager::servePaths()
             for (const auto& own : net::keeperChunksOf(0, mx, mz, *mine, 1))
                 if (const auto blobs = codec ? codec->readLevelChunkBlobs(protocol::bytes(own)) : std::nullopt; blobs && blobs->size() == 1)
                     cached.push_back(blobs->front());
-        std::size_t handed = 0, substituted = 0, present = 0, replaced = 0;
         const auto radius = net::gameRadius();
         const auto mainDimension = gamepath::playerDimension();
         const auto mainSees = [&](std::int32_t x, std::int32_t z) {
@@ -1275,8 +1272,7 @@ void BotManager::servePaths()
             const auto x = r.varInt32(), z = r.varInt32();
             if (!x || !z) continue;
             if (gameterrain::hasChunk(*x, *z)) {
-                if (mainSees(*x, *z) || terrainHanded_.contains({*x, *z})) { ++present; continue; }
-                ++replaced;
+                if (mainSees(*x, *z) || terrainHanded_.contains({*x, *z})) continue;
             }
             const auto blobs = codec ? codec->readLevelChunkBlobs(protocol::bytes(chunk)) : std::nullopt;
             const bool unknown = blobs && blobs->size() == 1 && std::find(cached.begin(), cached.end(), blobs->front()) == cached.end();
@@ -1285,15 +1281,8 @@ void BotManager::servePaths()
             const auto packet = gamecodec::levelChunkToProxy(protocol::bytes(chunk), blob);
             if (const auto head = packet.empty() ? std::nullopt : protocol::readHeader(protocol::bytes(packet))) {
                 ok = gameterrain::handLevelChunk(protocol::bytes(packet).subspan(head->bodyOffset));
-                if (ok && blob) ++substituted;
             } else if (!blob) ok = gameterrain::handLevelChunk(protocol::bytes(chunk));
-            if (ok) { ++handed; terrainHanded_.insert({*x, *z}); }
-        }
-        if (g_fedLogs < 32) {
-            ++g_fedLogs;
-            log().info(L"Bot: handed {} chunk(s) around {} ({}, {}) in dimension {} to the borrowed chunk receiver ({} with a blob the game has, {} already there, "
-                       L"{} replaced outside your view; main player at chunk {}, {} with radius {}; {} blob(s) known)",
-                handed, std::wstring(slot.name.begin(), slot.name.end()), cx, cz, dimension, substituted, present, replaced, mx, mz, radius, cached.size());
+            if (ok) terrainHanded_.insert({*x, *z});
         }
     };
     const auto serve = [&](Slot& slot, const auto& chunksNear, int routeSub) {
@@ -1313,11 +1302,6 @@ void BotManager::servePaths()
             if (!otherDimension && !isDistant(feet)) liquid = gamepath::inLiquid(feet);
             else if (gameterrain::owner() == &slot.session)
                 if (const auto world = gameterrain::world()) liquid = gamepath::inLiquidIn(world->level, world->dimension, world->source, feet);
-            if (liquid.value_or(false) != slot.session.inLiquid() && g_liquidLogs < 32) {
-                ++g_liquidLogs;
-                log().info(L"Bot: {} is {} liquid at ({:.2f}, {:.2f}, {:.2f})", std::wstring(slot.name.begin(), slot.name.end()),
-                    liquid.value_or(false) ? L"in" : L"out of", feet.x, feet.y, feet.z);
-            }
             slot.session.setInLiquid(liquid);
         }
         const auto request = slot.session.pathRequest();
@@ -1359,22 +1343,10 @@ void BotManager::servePaths()
             const bool finished = feet && feet->chunks == 9 && feet->finished == feet->chunks;
             const bool ready = finished && feet->waiting == 0 && feet->loading == 0;
             if (finished && !ready && feet->waiting > 0 && (!slot.askedAt || now - slot.askedAt >= kAskAgainMs)) {
-                const bool sent = slot.session.requestSubChunks(dimension, kFedChunkRadius, kSubChunksDown, kSubChunksUp);
+                slot.session.requestSubChunks(dimension, kFedChunkRadius, kSubChunksDown, kSubChunksUp);
                 slot.askedAt = now;
-                if (g_fedLogs < 32) {
-                    ++g_fedLogs;
-                    log().info(L"Bot: {} asked for the sub-chunks around it in dimension {} ({} waiting) {} ms after handing chunks{}",
-                        std::wstring(slot.name.begin(), slot.name.end()), dimension, feet->waiting, now - slot.fedAt, sent ? L"" : L" (could not send)");
-                }
             }
             if (!ready && now - slot.fedAt < kFedWaitMs) return;
-            if (g_fedLogs < 32) {
-                ++g_fedLogs;
-                const auto around = gameterrain::status(cx, cz, kFedChunkRadius, cy - kSubChunksDown, cy + kSubChunksUp);
-                log().info(L"Bot: {} the bot's terrain {} ms after handing chunks ({} of {} chunk(s) finished, sub-chunks {} loaded / {} loading / {} waiting)",
-                    ready ? L"filled" : L"gave up waiting for", now - slot.fedAt, around ? around->finished : -1, around ? around->chunks : -1,
-                    around ? around->loaded : -1, around ? around->loading : -1, around ? around->waiting : -1);
-            }
             slot.fedAt = 0;
         }
         const auto world = gameterrain::owner() == &slot.session ? gameterrain::world() : std::nullopt;
@@ -1407,12 +1379,6 @@ void BotManager::pump()
     if (std::none_of(slots_.begin(), slots_.end(), [](const Slot& slot) { return occupied(slot); })) return;
     auto incoming = net::takeIncoming();
     dropped_ += incoming.dropped;
-    for (std::size_t id = 0; id < incoming.ids.size(); ++id) {
-        const auto& receipt = incoming.ids[id];
-        if (!receipt.count || receivedIds_[id]) continue;
-        receivedIds_[id] = true;
-        if (loggedReceived_ < 64) { ++loggedReceived_; log().info(L"Bot: received id {} ({} bytes)", id, receipt.size); }
-    }
     for (std::uint8_t sub = 0; sub < net::kSubCount; ++sub) slots_[sub].received += incoming.perSub[sub];
     for (const auto& packet : incoming.packets)
         if (packet.recipient < net::kSubCount) slots_[packet.recipient].session.onPacket(packet.id, protocol::bytes(packet.body));
@@ -1422,11 +1388,6 @@ void BotManager::pump()
         if (online(slot)) slot.session.onTick(now);
         for (const auto& packet : slot.session.takeOutgoing()) {
             if (!net::sendRaw(packet)) { slot.session.fail("send failed"); break; }
-            const auto header = protocol::readHeader(protocol::bytes(packet));
-            if (header && !sentIds_[header->id]) {
-                sentIds_[header->id] = true;
-                if (loggedSent_ < 64) { ++loggedSent_; log().info(L"Bot: sent id {} ({} bytes)", header->id, packet.size()); }
-            }
         }
     }
     for (std::uint8_t sub = 0; sub < net::kSubCount; ++sub) {
@@ -1607,7 +1568,7 @@ void BotManager::relogTick(std::uint64_t nowMs)
     if (!relog_.joinAt) { relog_.joinAt = nowMs + kRelogRejoinBotDelayMs; return; }
     if (nowMs < relog_.joinAt) return;
     markMainPlayer();
-    dropped_ = 0; receivedIds_ = {}; sentIds_ = {}; loggedReceived_ = 0; loggedSent_ = 0;
+    dropped_ = 0;
     clientchat::printLocal("[Tsukuyomi] Bot: you are back on your account");
     rejoinMembers();
     relog_ = {};

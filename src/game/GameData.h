@@ -28,6 +28,8 @@ public:
     bool hasPlayerView() const;
 
     unsigned long long msSinceView() const;
+    void noteClientSession();
+    unsigned long long msSinceClientSession() const;
 
     void setGameMode(void* gameMode);
     void* gameMode() const;
@@ -92,6 +94,7 @@ private:
     std::atomic<unsigned long long> m_playerSerial{0};
     std::atomic<unsigned long long> m_adoptAt{0};
     std::atomic<unsigned long long> m_viewAt{0};
+    std::atomic<unsigned long long> m_clientSessionAt{0};
     std::atomic<const void*> m_tickLevels[2]{};
     std::atomic<unsigned long long> m_tickLevelAt[2]{};
     std::atomic<unsigned long long> m_tickLevelSince[2]{};

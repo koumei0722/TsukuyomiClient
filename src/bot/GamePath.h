@@ -10,7 +10,6 @@ bool available();
 struct Found {
     std::vector<PathNode> nodes;
     bool complete = false;
-    double ms = 0;
 };
 std::optional<Found> find(protocol::Vec3 feet, PathNode target, float radius, bool inLiquid, std::string& error);
 std::optional<Found> findIn(void* level, void* dimension, void* source, protocol::Vec3 feet, PathNode target, float radius, bool inLiquid,

@@ -279,7 +279,6 @@ std::optional<ServerId> serverId(void* mainPeer)
     if ((remote.type != 1 && remote.type != 2) || (remote.id == 0 && (remote.type == 1 || remote.extra == 0))) return std::nullopt;
     return ServerId{remote.id, remote.type == 2 ? remote.extra : 0, remote.type};
 }
-std::int32_t protocolVersion() { return g_protocol; }
 
 Link::Link() = default;
 Link::~Link() { close(); }
@@ -443,8 +442,6 @@ void Link::onEvent(int slot, std::uint64_t a2, std::uint64_t a3, std::uint64_t a
         { std::lock_guard lock(mutex_); closeReason_ = "the NetherNet session closed (" + std::to_string(a4) + ")"; }
         state_.store(State::Closed, std::memory_order_release);
     }
-    static std::atomic<int> logged{0};
-    if (logged.fetch_add(1) < 24) log().info(L"Bot: extra connection callback {} ({:#x}, {:#x}, {:#x})", slot, a2, a3, a4);
 }
 
 std::optional<std::string> Link::makeAssertion(const std::string& fingerprints) const

@@ -12,6 +12,7 @@ void* target();
 void* onGetInteraction(GetInteractionFn original, void* self, void* out, void* player, void* position, std::uintptr_t fifth);
 void readLayout();
 bool available();
+bool layoutReady();
 void setEnabled(bool enabled);
 
 struct Request {

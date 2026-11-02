@@ -190,15 +190,6 @@ LONG withSwap(OBJECT_ATTRIBUTES* attrs, Call call)
     attrs->ObjectName = saved;
     attrs->RootDirectory = savedRoot;
     if (result >= 0) {
-        static volatile LONG told = 0;
-        static volatile LONG toldTitle = 0;
-        if (swapTo == &g_startScreenNtPath) {
-            if (InterlockedIncrement(&toldTitle) <= 3) {
-                note(L"[oreui] redirected the title JSON to our own copy");
-            }
-        } else if (InterlockedIncrement(&told) <= 4) {
-            note(L"[oreui] redirected the bundle open to our own copy");
-        }
         return result;
     }
     {

@@ -53,6 +53,7 @@ struct Loaded {
     std::size_t solid = 0;
     std::vector<std::size_t> paletteCounts;
     std::uint64_t requiredMemory = 0, availableMemory = 0;
+    std::string note;
     bool ok() const { return data != nullptr; }
 };
 Loaded loadBlueprint(const std::filesystem::path& path);

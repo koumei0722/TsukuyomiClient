@@ -136,7 +136,6 @@ struct RegionEntry {
 struct RegionChange { RegionKey key; std::vector<Cell> cells; };
 class RegionSet {
 public:
-    std::size_t update(const std::vector<Cell>& cells, bool xray);
     std::size_t apply(const std::vector<RegionChange>& changes, bool reset, bool xray);
     const std::unordered_map<RegionKey, RegionEntry, RegionKeyHash>& entries() const
     {

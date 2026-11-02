@@ -282,10 +282,6 @@ int ShulkerPreview::miniIconHud(void* ctrl, const std::string& coll, int index, 
         return 0;
     }
     const int value = self.miniIconOf(cui::hudStackOf(ctrl, coll, index), false);
-    if (value != 0 && !self.m_loggedHudMini) {
-        self.m_loggedHudMini = true;
-        log().info(L"ShulkerPreview: the HUD cell {} #{} gets the corner icon", toUtf16(coll), index);
-    }
     return value;
 }
 
@@ -350,11 +346,6 @@ int ShulkerPreview::miniIconOf(const void* stack, bool useCache)
         value = idAuxOf(slots[static_cast<std::size_t>(at)].name, slots[static_cast<std::size_t>(at)].aux);
         if (value != 0 && allEnchanted) {
             value |= cui::kGlintBit;
-        }
-        if (!m_loggedMini) {
-            m_loggedMini = true;
-            log().info(L"ShulkerPreview: a full shulker box of {} (27 x {}) gets the corner icon",
-                       toUtf16(slots.front().name), maxStackOfName(slots.front().name));
         }
     }
     if (!useCache) {

@@ -538,10 +538,6 @@ private:
     std::atomic<int> m_layerMax{0};
     static constexpr unsigned long long kLayerTypeSettleMs = 400;
     std::atomic<unsigned long long> m_layerTypedAt{0};
-    bool m_layerAppliedOn = false;
-    int m_layerAppliedAxis = 1;
-    int m_layerAppliedLo = 0;
-    int m_layerAppliedHi = 0;
     static int clampLayerValue(int axis, int value);
     void applyLayerFilter();
     schematic::LayerFilter m_layerFilter;

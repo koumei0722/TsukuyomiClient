@@ -136,6 +136,34 @@ __declspec(noinline) bool markChunk(const Layout& layout, std::uint8_t* chunk, v
     }
 }
 
+__declspec(noinline) bool askChunk(const Layout& layout, std::uint8_t* chunk, void* owner, void* list,
+                                   std::int32_t dimension, std::int32_t chunkX, std::int32_t chunkZ, int room,
+                                   int& pending, int& queued)
+{
+    pending = queued = 0;
+    __try {
+        auto* const begin = *reinterpret_cast<std::uint8_t**>(chunk + layout.tableBegin);
+        auto* const end = *reinterpret_cast<std::uint8_t**>(chunk + layout.tableEnd);
+        if (begin == nullptr || end < begin) return false;
+        std::size_t count = static_cast<std::size_t>(end - begin) / static_cast<std::size_t>(layout.stride);
+        if (count > kMaxSubChunks) count = kMaxSubChunks;
+        for (std::size_t i = 0; i < count && queued < room; ++i) {
+            std::uint8_t* const sub = begin + i * static_cast<std::size_t>(layout.stride);
+            if (*reinterpret_cast<volatile std::int32_t*>(sub + layout.status) != kAsking) continue;
+            ++pending;
+            const std::int32_t position[3] = {chunkX, static_cast<std::int8_t>(sub[layout.index]), chunkZ};
+            const bool first = layout.asked(list, &dimension, position);
+            const bool second = layout.askedBy(list, &dimension, position, owner);
+            if (first && second) continue;
+            layout.enqueue(list, &dimension, position, owner);
+            ++queued;
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 __declspec(noinline) bool revertSubChunk(const Layout& layout, std::uint8_t* chunk, std::int8_t index, std::int32_t original)
 {
     __try {
@@ -280,6 +308,11 @@ bool ready()
     return g_ready.load(std::memory_order_acquire);
 }
 
+std::int32_t subChunkStatusOffset()
+{
+    return ready() ? g_layout.status : 0;
+}
+
 bool start()
 {
     if (!ready()) return false;
@@ -302,11 +335,6 @@ bool start()
     g_sweep.centerZ = static_cast<int>(std::floor(view.z)) >> 4;
     g_sweep.startedAt = GetTickCount64();
     return true;
-}
-
-bool running()
-{
-    return g_sweep.active;
 }
 
 void pump()
@@ -360,6 +388,29 @@ void pump()
             ++result.faulted;
         g_marked.insert(g_marked.end(), marked, marked + markedCount);
     }
+}
+
+bool askPending(PendingChunk* chunks, std::size_t count, int budget)
+{
+    if (!ready()) return false;
+    void* const player = GameData::instance().player();
+    if (player == nullptr) return false;
+    std::int32_t dimension = -1;
+    void* owner = nullptr;
+    void* list = nullptr;
+    if (!dimensionOf(g_layout.dimensionId, player, dimension) || dimension < 0
+        || !ownerOf(player, g_layout.owner, owner, list) || owner == nullptr || list == nullptr) {
+        return false;
+    }
+    int queued = 0;
+    for (std::size_t i = 0; i < count && queued < budget; ++i) {
+        PendingChunk& c = chunks[i];
+        c.faulted = c.chunk == nullptr
+                    || !askChunk(g_layout, static_cast<std::uint8_t*>(c.chunk), owner, list, dimension, c.chunkX, c.chunkZ,
+                                 budget - queued, c.pending, c.queued);
+        queued += c.queued;
+    }
+    return true;
 }
 
 }

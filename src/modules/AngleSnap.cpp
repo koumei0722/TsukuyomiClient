@@ -2,7 +2,6 @@
 
 #include "config/Config.h"
 #include "core/Logger.h"
-#include "game/GameData.h"
 #include "input/Foreground.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
@@ -61,10 +60,6 @@ void AngleSnap::onUpdate()
     if (mode != m_mode.load(std::memory_order_acquire)) {
         m_pressSerial.fetch_add(1, std::memory_order_acq_rel);
         m_mode.store(mode, std::memory_order_release);
-        static constexpr const wchar_t* kNames[] = {L"free", L"snap", L"lock"};
-        const PlayerView view = GameData::instance().playerView();
-        log().info(L"AngleSnap: yaw {} / pitch {} (step {:.0f}; player yaw {:.2f} pitch {:.2f})", kNames[yaw],
-                   kNames[pitch], m_step.load(std::memory_order_acquire), view.yaw, view.pitch);
     }
 }
 

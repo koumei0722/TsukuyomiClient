@@ -3,12 +3,13 @@
 #include "BotCodec.h"
 #include "BotProtocol.h"
 #include "BotSignatures.h"
-#include "Crypto.h"
 #include "SkinSteal.h"
 #include "core/Logger.h"
 #include "core/Notice.h"
 #include "memory/Memory.h"
 #include "memory/Scanner.h"
+#include "replay/BedrockPackets.h"
+#include "replay/PacketTap.h"
 #include <Windows.h>
 #include <atomic>
 #include <cstddef>
@@ -31,7 +32,6 @@ std::atomic<bool> g_offsetsReady{false}, g_hooksReady{false};
 std::atomic<void*> g_cns{nullptr};
 std::mutex g_mutex;
 std::deque<Received> g_queue;
-std::array<Receipt, 1024> g_ids{};
 std::array<std::uint64_t, kSubCount> g_perSub{};
 std::uint64_t g_dropped = 0;
 bool g_dropLogged = false;
@@ -60,13 +60,11 @@ std::optional<std::pair<possess::Uuid, possess::Uuid>> g_relogUuids;
 std::uint8_t g_relogView = 1;
 std::string g_gameKey, g_userRequest, g_sentRequest;
 std::uint64_t g_loginCount = 0;
-int g_gameKeyLogged = 0;
 int g_disconnectLogs = 0;
 struct MainSwapArm { bool armed = false; std::string token, key; possess::Ids ids; std::string nonce; } g_mainSwapArm;
 possess::Ids g_mainSwap;
 bool g_mainSwapped = false;
 std::string g_mainSwapError;
-std::optional<std::int32_t> g_mainDimension;
 int g_terrainSub = -1;
 bool g_terrainMisses = false;
 std::deque<std::string> g_terrain;
@@ -99,7 +97,7 @@ std::uint64_t g_lastPump = 0;
 std::uint64_t nowMs() { return GetTickCount64(); }
 void resetRouting()
 {
-    g_headlessMask = 0; g_queue.clear(); g_ids = {}; g_perSub = {}; g_dropped = 0;
+    g_headlessMask = 0; g_queue.clear(); g_perSub = {}; g_dropped = 0;
     g_view = 0; g_swap = g_mainSwap; g_tickOffset = 0; g_timed.clear();
     g_relogRouted = false; g_viewStarted = false; g_heldForView.clear();
     for (std::uint8_t sub = 1; sub < kSubCount; ++sub) g_keepers[sub].reset();
@@ -334,12 +332,12 @@ int receive(ReceiveFn original, void* peer, void* out, void* context)
             if (const auto start = possess::readStartGameHead(protocol::bytes({headBytes + head->bodyOffset, peeked - head->bodyOffset}))) {
                 auto& keeper = g_keepers[head->recipient];
                 keeper.reset(); keeper.setSelf(start->runtimeId);
-                if (head->recipient == 0) { g_mainStart = start; if (start->dimension) g_mainDimension = start->dimension; }
+                if (head->recipient == 0) g_mainStart = start;
                 log().info(L"Bot: StartGame for sub {} unique={} runtime={} mode={}", head->recipient, start->uniqueId, start->runtimeId, start->gameMode);
             }
             if (head->recipient == 0 && g_relogArmed) {
                 g_relogArmed = false; g_relogRouted = true; g_viewStarted = false; g_heldForView.clear();
-                g_queue.clear(); g_ids = {}; g_perSub = {}; g_dropped = 0;
+                g_queue.clear(); g_perSub = {}; g_dropped = 0;
                 g_view = g_relogView; g_headlessMask = subBit(0); g_swap = {}; g_tickOffset = 0;
                 if (g_relogUuids) {
                     g_swap.active = true;
@@ -350,9 +348,6 @@ int receive(ReceiveFn original, void* peer, void* out, void* context)
                 log().info(L"Bot: rejoined; the main account's StartGame goes to the headless session, the bot's packets to the game");
             }
         }
-        if (head->recipient == 0 && head->id == 0x3d && peeked > head->bodyOffset)
-            if (const auto change = codec().readChangeDimension(protocol::bytes({headBytes + head->bodyOffset, peeked - head->bodyOffset})))
-                g_mainDimension = change->dimension;
         if (head->recipient == g_view && (head->id == 0x46 || head->id == 0x79) && peeked > head->bodyOffset) {
             protocol::Reader r(protocol::bytes({headBytes + head->bodyOffset, peeked - head->bodyOffset}));
             if (head->id == 0x46) { if (const auto radius = r.varInt32(); radius && *radius > 0) g_serverRadius = *radius; }
@@ -361,6 +356,12 @@ int receive(ReceiveFn original, void* peer, void* out, void* context)
         const bool keep = head->recipient < kSubCount && possess::StateKeeper::wants(head->id)
             && (head->recipient == 0 || headless(head->recipient) || g_view == head->recipient);
         const bool toView = head->recipient == g_view;
+        if (toView && replay::bedrock::wanted(head->id, false)) {
+            std::string tapped(length, '\0');
+            if (copyGuarded(out, tapped.data(), length) && length > head->bodyOffset)
+                replay::PacketTap::instance().push(false, head->id, reinterpret_cast<const std::uint8_t*>(tapped.data()) + head->bodyOffset,
+                                                   length - head->bodyOffset);
+        }
         const bool toHeadless = headless(head->recipient) && head->recipient != g_view;
         const bool rewriteView = toView && (g_view != 0 || g_swap.active || ((head->id == 0xa1 || head->id == 0x97) && g_tickOffset != 0));
         const bool readForHeadless = toHeadless && protocol::isReadPacket(head->id);
@@ -414,8 +415,7 @@ int receive(ReceiveFn original, void* peer, void* out, void* context)
             continue;
         }
         if (!toHeadless) return result;
-        auto& receipt = g_ids[head->id];
-        ++receipt.count; receipt.size = length; ++g_perSub[head->recipient];
+        ++g_perSub[head->recipient];
         if (!readForHeadless) continue;
         whole.erase(0, head->bodyOffset);
         if (g_queue.size() == 16384) {
@@ -426,24 +426,12 @@ int receive(ReceiveFn original, void* peer, void* out, void* context)
     }
 }
 namespace {
-std::wstring keyHash(const std::string& key)
-{
-    if (key.empty()) return L"unreadable";
-    const auto digest = crypto::sha256({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()});
-    std::wstring hex;
-    for (std::size_t i = 0; i < 6 && i < digest.size(); ++i) hex += std::format(L"{:02x}", digest[i]);
-    return hex;
-}
 std::optional<std::string> onGameLogin(const std::string& data, std::size_t bodyOffset)
 {
     ++g_loginCount;
     const auto body = protocol::bytes(data).subspan(bodyOffset);
     const auto parts = relog::splitLogin(body);
     const auto key = parts ? relog::clientDataKey(*parts) : std::string();
-    if (g_gameKeyLogged < 16) {
-        ++g_gameKeyLogged;
-        log().info(L"Bot: the game's login key {} ({})", keyHash(key), key.empty() ? L"unreadable" : key == g_gameKey ? L"same as before" : L"new");
-    }
     g_gameKey = key;
     if (parts && !(g_mainSwapArm.armed && !g_mainSwapArm.nonce.empty())) g_userRequest = parts->request;
     g_sentRequest = parts ? parts->request : std::string();
@@ -480,6 +468,8 @@ void sendInternal(SendInternalFn original, void* system, void* id, void* packet,
     {
         std::lock_guard lock(g_mutex);
         const auto body = protocol::bytes(*data).subspan(head->bodyOffset);
+        if (g_view == 0 && replay::bedrock::wanted(head->id, true) && !body.empty())
+            replay::PacketTap::instance().push(true, head->id, reinterpret_cast<const std::uint8_t*>(body.data()), body.size());
         if (head->id == 0xc1 || head->id == 0x01) {
             if (head->id == 0xc1) { g_mainSwap = {}; g_mainSwapped = false; g_swap = {}; }
             if (g_view != 0 || g_headlessMask) { resetRouting(); log().info(L"Bot: the game started a new connection; routing reset"); }
@@ -509,8 +499,8 @@ Incoming takeIncoming()
 {
     std::lock_guard lock(g_mutex);
     Incoming result;
-    result.ids = g_ids; result.perSub = g_perSub; result.dropped = g_dropped;
-    g_ids = {}; g_perSub = {}; g_dropped = 0;
+    result.perSub = g_perSub; result.dropped = g_dropped;
+    g_perSub = {}; g_dropped = 0;
     result.packets.reserve(g_queue.size());
     while (!g_queue.empty()) { result.packets.push_back(std::move(g_queue.front())); g_queue.pop_front(); }
     return result;
@@ -614,7 +604,6 @@ std::uint32_t peerReceiveSlot() { return g_offsets.receiveSlot; }
 void setReceiveOriginal(ReceiveFn original) { g_receiveOriginal.store(original, std::memory_order_release); }
 ReceiveFn receiveOriginal() { return g_receiveOriginal.load(std::memory_order_acquire); }
 bool assignToGameString(void* out, const std::string& bytes) { return assignGameString(out, bytes); }
-std::optional<std::int32_t> mainDimension() { std::lock_guard lock(g_mutex); return g_mainDimension; }
 void setTerrainRoute(int sub, bool copyMisses)
 {
     std::lock_guard lock(g_mutex);

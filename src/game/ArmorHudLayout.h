@@ -6,6 +6,10 @@ namespace tsukuyomi::armorhud {
 
 inline constexpr int kItems = 6;
 inline constexpr int kMainhand = 4, kOffhand = 5;
+inline constexpr bool kDefaultShown = true;
+inline constexpr int kHiddenSteps = kItems - 1;
+const wchar_t* itemLabel(int item);
+const char* itemConfigKey(int item);
 inline constexpr char kCollection[] = "tk_armor_items";
 static_assert(sizeof(kCollection) - 1 <= 15);
 
@@ -24,6 +28,7 @@ struct FormSize {
     int height;
 };
 FormSize formSize(int form);
+int itemStep(int form);
 
 inline constexpr int kDefaultOrientation = kVertical;
 inline constexpr int kDefaultAnchor = 3;
@@ -49,6 +54,9 @@ inline constexpr const char* kBindVBottom = "#tk_ahud_v_bottom";
 inline constexpr const char* kBindHMid = "#tk_ahud_h_mid";
 inline constexpr const char* kBindHRight = "#tk_ahud_h_right";
 inline constexpr const char* kBindBar = "#tk_ahud_bar";
+std::string shownBinding(int item);
+std::string midShiftBinding(int hidden);
+std::string endShiftBinding(int hidden);
 std::string formVisibleBinding(int form);
 std::string formXBinding(int form);
 std::string formYBinding(int form);

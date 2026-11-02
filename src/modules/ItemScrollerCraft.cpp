@@ -5,6 +5,7 @@
 #include "core/Paths.h"
 #include "core/Strings.h"
 #include "game/CraftAmount.h"
+#include "game/PlaceAmount.h"
 #include "game/ItemStackRequest.h"
 
 #include <Windows.h>
@@ -291,7 +292,7 @@ ItemScroller::Step ItemScroller::fillGridStep(const Recipe& recipe, bool fillSta
                 if (held <= need) {
                     leftClick(cell);
                 } else {
-                    rightClick(cell);
+                    placeFromCursor(cell, need);
                 }
                 const int placed = countIn(cell) - before;
                 if (placed <= 0) {
@@ -712,6 +713,16 @@ bool ItemScroller::leftClickOutput(const Slot& output)
     return ok;
 }
 
+bool ItemScroller::placeFromCursor(const Slot& slot, int items)
+{
+    if (items >= 2 && placeamount::available()) {
+        placeamount::setNext(items);
+    }
+    const bool ok = rightClick(slot);
+    placeamount::clear();
+    return ok;
+}
+
 void ItemScroller::endMassCraftSession()
 {
     m_harvestReady = false;
@@ -738,6 +749,11 @@ void ItemScroller::massCraftTick()
             notice::failOnce("ItemScroller.craftAmount",
                              L"ItemScroller: the craft-from-output hook (CraftFromOutput) is missing; mass craft makes one set per click",
                              "ItemScroller: mass craft is slower (one set per click)");
+        }
+        if (!placeamount::available()) {
+            notice::failOnce("ItemScroller.placeAmount",
+                             L"ItemScroller: the container transfer hook (ContainerTransfer) is missing; the grid is filled one item per click",
+                             "ItemScroller: filling the crafting grid is slower (one item per click)");
         }
     }
 

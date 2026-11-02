@@ -62,7 +62,6 @@ private:
     std::atomic<bool> m_buildHooked{false};
     unsigned long long m_lastSample = 0;
     bool m_sampleFailLogged = false;
-    bool m_platformLogged = false;
 };
 
 }

@@ -5,13 +5,13 @@
 #include <new>
 #include <Windows.h>
 
+#include "game/Inflate.h"
+#include "game/Litematic.h"
 #include "game/Nbt.h"
 
 namespace tsukuyomi::structure {
 
 namespace {
-
-const std::string kEmptyName;
 
 bool readTriple(const nbt::Value* value, std::int32_t& x, std::int32_t& y, std::int32_t& z)
 {
@@ -77,21 +77,10 @@ std::size_t Structure::indexOf(std::int32_t x, std::int32_t y, std::int32_t z) c
     return at < blocks.size() ? at : blocks.size();
 }
 
-const std::string& Structure::nameAt(std::int32_t x, std::int32_t y, std::int32_t z) const
-{
-    const std::size_t at = indexOf(x, y, z);
-    if (at >= blocks.size()) {
-        return kEmptyName;
-    }
-    const std::int32_t which = entryAt(at);
-    if (which < 0 || static_cast<std::size_t>(which) >= palette.size()) {
-        return kEmptyName;
-    }
-    return palette[static_cast<std::size_t>(which)].name;
-}
-
 LoadResult loadBytes(const char* bytes, std::size_t size)
 try {
+    if (inflate::isGzip(bytes, size)) return litematic::loadBytes(bytes, size);
+
     LoadResult result;
 
     const nbt::Result parsed = nbt::read(bytes, size);
@@ -241,8 +230,10 @@ LoadResult loadFile(const std::filesystem::path& path)
     mapped.view = static_cast<const char*>(MapViewOfFile(mapped.mapping, FILE_MAP_READ, 0, 0, 0));
     if (!mapped.view) { result.why = "could not map the file"; return result; }
     auto loaded = loadBytes(mapped.view, static_cast<std::size_t>(bytes));
-    loaded.requiredMemory = result.requiredMemory;
-    loaded.availableMemory = result.availableMemory;
+    if (loaded.requiredMemory < result.requiredMemory) {
+        loaded.requiredMemory = result.requiredMemory;
+        loaded.availableMemory = result.availableMemory;
+    }
     return loaded;
 }
 

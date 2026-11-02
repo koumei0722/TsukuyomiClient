@@ -8,6 +8,7 @@ namespace tsukuyomi::blockwrite {
 void noteRenderRegion(void* region);
 void* renderRegion();
 std::uint64_t regionGeneration();
+std::uint64_t worldGeneration();
 bool regionIsAlive(void* region);
 
 void* findChunk(void* region, int x, int z);

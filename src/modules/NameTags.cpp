@@ -283,15 +283,6 @@ void NameTags::samplePlatforms()
                 known.push_back({actor, raw[i].platform});
             }
         }
-        if (!m_platformLogged && count > 0) {
-
-            m_platformLogged = true;
-            std::wstring list;
-            for (int i = 0; i < count && i < 8; ++i) {
-                list += (i == 0 ? L"" : L", ") + std::to_wstring(raw[i].platform);
-            }
-            log().info(L"NameTags: player list platforms [{}] ({} of {} players loaded)", list, known.size(), count);
-        }
     } else if (!m_sampleFailLogged) {
         m_sampleFailLogged = true;
         log().warn(L"NameTags: the player list was unreadable; platforms are not shown until it can be read");

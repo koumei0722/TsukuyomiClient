@@ -156,6 +156,7 @@ private:
     Step dropCraftFromOutput(const Recipe& recipe);
     int craftItemsForEmptyHand(const Slot& output) const;
     bool leftClickOutput(const Slot& output);
+    bool placeFromCursor(const Slot& slot, int items);
     bool pendingStacks() const;
     bool craftPendingSettled();
     unsigned long long m_craftPendingSince = 0;

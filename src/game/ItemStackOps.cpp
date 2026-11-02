@@ -121,21 +121,6 @@ bool assignGuarded(StashPayload& p, const void** faultPc, const void** faultAddr
     }
 }
 
-bool restoreGuarded(StashPayload& p, const void** faultPc, const void** faultAddress)
-{
-    __try {
-        p.assign(p.other, p.stash);
-        void* field = p.other + p.netIdOffset;
-        p.netIdAssign(
-            static_cast<std::int64_t>(static_cast<std::uint8_t>(p.stash[p.netTagOffset])) + 1,
-            &field, p.stash + p.netIdOffset);
-        p.dtor(p.stash);
-        return true;
-    } __except (faultFilter(GetExceptionInformation(), faultPc, faultAddress)) {
-        return false;
-    }
-}
-
 bool discardGuarded(void (__fastcall* dtor)(void*), std::byte* stash, const void** faultPc,
                     const void** faultAddress)
 {
@@ -479,68 +464,6 @@ bool ItemStackOps::assignFrom(void* dst, const void* src)
         return false;
     }
     return true;
-}
-
-bool ItemStackOps::stash(const void* src)
-{
-    discard();
-    if (!cloneTo(m_stash, src)) {
-        return false;
-    }
-    m_hasStash = true;
-    return true;
-}
-
-bool ItemStackOps::restore(void* dst)
-{
-    if (!m_hasStash || !available() || dst == nullptr) {
-        return false;
-    }
-
-    auto* const target = static_cast<std::byte*>(dst);
-    if (!memory::isReadable(target, kStackSize)) {
-        return false;
-    }
-    void* const vtable = *reinterpret_cast<void* const*>(target);
-    if (vtable == nullptr || vtable != *reinterpret_cast<void* const*>(m_stash)) {
-        return false;
-    }
-
-    StashPayload payload{};
-    payload.copyCtor = m_copyCtor;
-    payload.assign = m_assign;
-    payload.dtor = m_dtor;
-    payload.netIdAssign = m_netIdAssign;
-    payload.stash = m_stash;
-    payload.other = target;
-    payload.netIdOffset = kNetIdOffset;
-    payload.netTagOffset = kNetTagOffset;
-
-    const void* faultPc = nullptr;
-    const void* faultAddress = nullptr;
-    const bool ok = restoreGuarded(payload, &faultPc, &faultAddress);
-    m_hasStash = false;
-    if (!ok) {
-        const ModuleRange& module = mainModule();
-        const auto rva = module.contains(faultPc)
-                             ? static_cast<std::size_t>(
-                                   static_cast<const std::byte*>(faultPc) - module.base)
-                             : 0;
-        log().error(L"ItemStackOps: putting a kept stack back faulted "
-                    L"(pc rva {:#x}, touched {:#x})",
-                    rva, reinterpret_cast<std::uintptr_t>(faultAddress));
-        return false;
-    }
-    return true;
-}
-
-void ItemStackOps::discard()
-{
-    if (!m_hasStash) {
-        return;
-    }
-    m_hasStash = false;
-    destroyClone(m_stash);
 }
 
 }

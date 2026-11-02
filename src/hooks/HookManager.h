@@ -9,6 +9,7 @@ namespace tsukuyomi {
 enum class HookGroup : int {
     Always = 0,
     Ghost,
+    BlockWrite,
     Fullbright,
     Ability,
     Tool,

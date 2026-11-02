@@ -22,7 +22,7 @@ constexpr std::size_t kBtCacheFlagsBytes = 0x3e80, kBtCacheBlockBytes = 0x1f400;
 constexpr std::size_t kBtWritable = kBtCacheTail + kBtCacheBlockBytes;
 constexpr std::ptrdiff_t kBlockClientPipeline = 0xa1;
 
-constexpr std::ptrdiff_t kCtxMatrices = 0x18, kCtxColor = 0x30, kCtxSingleBlock = 0x83, kCtxTess = 0xb0;
+constexpr std::ptrdiff_t kCtxMatrices = 0x18, kCtxColor = 0x30, kCtxSingleBlock = 0x7b, kCtxTess = 0xb0;
 constexpr std::ptrdiff_t kLrpCamera = 0x658, kLrpTessOwner = 0x1180, kOwnerAtlas = 0x1d0;
 constexpr std::size_t kTextureBytes = 0x20;
 constexpr std::size_t kRenderParamsBytes = 0x150, kRenderParamVariant = 0x28;

@@ -62,7 +62,6 @@ private:
     static void onHudCreated(void* ctrl);
     int miniIconOf(const void* stack, bool useCache = true);
     std::atomic<bool> m_forgetNames{false};
-    bool m_loggedHudMini = false;
     int idAuxOf(const std::string& name, int aux);
     int maxStackOfName(const std::string& name);
     void registerUiDefinitions();
@@ -82,7 +81,6 @@ private:
         }
     };
     std::unordered_map<MiniKey, int, MiniKeyHash> m_miniCache;
-    bool m_loggedMini = false;
 
     void resolveTooltip();
     static int currentSlot(void* ctrl, const std::string& coll, int index, std::uintptr_t arg);

@@ -166,10 +166,6 @@ bool hoverNameCallGuarded(const void* stack, void* out)
     }
 }
 
-std::atomic<bool> g_loggedAsk{false};
-std::atomic<bool> g_loggedCurrent{false};
-std::atomic<bool> g_loggedShow{false};
-
 }
 
 void ShulkerPreview::resolveTooltip()
@@ -426,9 +422,6 @@ int ShulkerPreview::currentSlot(void* ctrl, const std::string& coll, int index, 
         self.publishCurrent(stack, id);
         self.m_publishedBox = box;
     }
-    if (id != 0 && !g_loggedCurrent.exchange(true)) {
-        log().info(L"ShulkerPreview: the hovered cell {} #{} holds contents set {}", toUtf16(coll), index, id);
-    }
     return static_cast<int>(id);
 }
 
@@ -445,9 +438,6 @@ bool ShulkerPreview::gridVisible(std::uintptr_t)
     }
     if (current == 0 || self.m_tick > self.m_currentTick + 1) {
         return false;
-    }
-    if (!g_loggedShow.exchange(true)) {
-        log().info(L"ShulkerPreview: showing the contents grid of set {}", current);
     }
     return true;
 }
@@ -570,10 +560,6 @@ const void* ShulkerPreview::stackFor(const void* collectionName, int index)
         return nullptr;
     }
     ShulkerPreview& self = instance();
-    if (!g_loggedAsk.exchange(true)) {
-        log().info(L"ShulkerPreview: the screen asked for {} (answering with the hovered box's contents)",
-                   toUtf16(std::string(sp::kCollection)));
-    }
     if (!self.tooltipAvailable()) {
         return nullptr;
     }

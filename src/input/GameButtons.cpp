@@ -672,11 +672,6 @@ void GameButtons::onCallback(int packed)
             if (part >= 0 && part < 256) m_modifierUses[part].fetch_add(1, std::memory_order_release);
         }
     }
-    static std::atomic<int> s_told{0};
-    if (s_told.fetch_add(1, std::memory_order_relaxed) < 8) {
-        log().info(L"GameButtons: button slot {} (key {:#x}, chord {}) pressed", index, key,
-                   state.comboCount >= 2);
-    }
     if (mouseKey(key) && (!m_padInstalled.load(std::memory_order_acquire)
         || state.padCount.load(std::memory_order_relaxed) == 0)) return;
     state.held.store(true, std::memory_order_release);

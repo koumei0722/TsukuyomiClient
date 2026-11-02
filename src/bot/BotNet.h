@@ -13,10 +13,8 @@ namespace tsukuyomi::bot::net {
 using ReceiveFn = int(__fastcall*)(void* peer, void* out, void* context);
 inline constexpr std::uint8_t kSubCount = 4;
 struct Received { std::uint16_t id; std::uint8_t recipient; std::string body; };
-struct Receipt { std::uint64_t count = 0; std::size_t size = 0; };
 struct Incoming {
     std::vector<Received> packets;
-    std::array<Receipt, 1024> ids{};
     std::array<std::uint64_t, kSubCount> perSub{};
     std::uint64_t dropped = 0;
 };
@@ -70,7 +68,6 @@ bool timedPending();
 std::vector<std::uint64_t> gameCachedBlobs();
 void setTerrainRoute(int sub, bool copyMisses);
 std::vector<std::string> takeTerrainPackets();
-std::optional<std::int32_t> mainDimension();
 void* mainConnection();
 void* networkSystem();
 std::uint32_t connectionPeerOffset();

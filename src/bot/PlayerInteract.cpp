@@ -169,6 +169,7 @@ void readLayout()
     if (!g_categoryField) log().warn(L"Bot: the actor category field is unreadable; right-clicking players is unavailable");
 }
 bool available() { return g_hooked && g_layoutRead.load(std::memory_order_acquire) && g_categoryField != 0; }
+bool layoutReady() { return g_layoutRead.load(std::memory_order_acquire) && g_inventoryField != 0 && g_stackStride != 0; }
 void setEnabled(bool enabled)
 {
     g_enabled.store(enabled, std::memory_order_relaxed);

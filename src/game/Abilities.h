@@ -40,8 +40,6 @@ bool setBool(std::byte* layered, int index, bool wanted);
 
 bool readByte(const void* address, std::uint8_t& value);
 bool writeByte(void* address, std::uint8_t value);
-bool readFloat(const void* address, float& value);
-bool writeFloat(void* address, float value);
 
 class RestoreLedger {
 public:

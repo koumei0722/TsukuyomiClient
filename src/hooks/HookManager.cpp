@@ -37,6 +37,7 @@ const wchar_t* groupName(HookGroup group)
     switch (group) {
     case HookGroup::Always:     return L"always";
     case HookGroup::Ghost:      return L"ghost";
+    case HookGroup::BlockWrite: return L"blockwrite";
     case HookGroup::Fullbright: return L"fullbright";
     case HookGroup::Ability:    return L"ability";
     case HookGroup::Tool:       return L"tool";

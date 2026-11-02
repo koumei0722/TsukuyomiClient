@@ -42,6 +42,21 @@ unsigned long long GameData::msSinceView() const
     return now > at ? now - at : 0;
 }
 
+void GameData::noteClientSession()
+{
+    m_clientSessionAt.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
+unsigned long long GameData::msSinceClientSession() const
+{
+    const unsigned long long at = m_clientSessionAt.load(std::memory_order_relaxed);
+    if (at == 0) {
+        return ~0ULL;
+    }
+    const unsigned long long now = GetTickCount64();
+    return now > at ? now - at : 0;
+}
+
 PlayerView GameData::playerView() const
 {
     std::lock_guard lock(m_mutex);

@@ -5,7 +5,6 @@
 
 #include "config/Config.h"
 #include "config/WriteSwitches.h"
-#include "core/FreezeWatch.h"
 #include "core/Logger.h"
 #include "core/Notice.h"
 #include "core/Paths.h"
@@ -55,6 +54,7 @@
 #include "modules/OffhandSwap.h"
 #include "modules/Scaffold.h"
 #include "modules/Schematica.h"
+#include "modules/Replay.h"
 #include "modules/InventoryHUD.h"
 #include "modules/ArmorHUD.h"
 #include "modules/JavaUI.h"
@@ -125,6 +125,7 @@ void Client::registerModules()
     ModuleManager::instance().registerModule(&AngleSnap::instance());
     ModuleManager::instance().registerModule(&Bot::instance());
     ModuleManager::instance().registerModule(&PlayerInventory::instance());
+    ModuleManager::instance().registerModule(&Replay::instance());
 }
 
 void Client::startup()
@@ -174,8 +175,6 @@ void Client::startup()
     customguiscale::start();
 
     extendedstructuresize::start();
-
-    freezewatch::start();
 
     m_startupComplete = true;
     log().info(L"Settings are in Minecraft's settings screen under Tsukuyomi (END to unload)");
@@ -258,7 +257,6 @@ void Client::shutdown()
 {
     log().info(L"Shutting down");
 
-    freezewatch::stop();
     extendedfov::shutdown();
     customguiscale::shutdown();
     extendedstructuresize::shutdown();

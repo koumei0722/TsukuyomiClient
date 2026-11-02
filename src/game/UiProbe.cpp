@@ -1904,7 +1904,7 @@ size_t buildPageTexts()
         std::size_t shown=0;
         for (;shown<count && rows+5<kMaxPageRows;++shown) addFileRow(shown);
         if(shown<count) {char text[kPageTextBytes]{};std::snprintf(text,sizeof(text),"... and %u more (not shown)",static_cast<unsigned>(count-shown));addPlain(kRowLabel,text);}
-        if(count==0)addPlain(kRowLabel,"No schematics: use Import .mcstructure");
+        if(count==0)addPlain(kRowLabel,"No schematics: use Import schematic");
         addItem(0,0);
         addBottomNav("< Schematica menu",kScreenMenu);
         break;
@@ -8030,7 +8030,6 @@ struct DefExtension {
     std::vector<ExtBuild> history;
     std::uint64_t revision = 0;
     ArenaSize need;
-    int builds = 0;
     std::uint64_t windowStartMs = 0;
     int windowBuilds = 0;
     bool stopped = false;
@@ -8718,9 +8717,7 @@ void* extendDefinition(void* self, const void* space, const void* name, void* va
             return nullptr;
         }
         std::string err;
-        const auto buildStart = std::chrono::steady_clock::now();
         ExtBuild build = buildWithOwnArena(self, ext, vanilla, err);
-        const auto buildMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - buildStart).count();
         if (build.built == nullptr) {
             if (ext.failureLogs < 4) {
                 ++ext.failureLogs;
@@ -8730,7 +8727,6 @@ void* extendDefinition(void* self, const void* space, const void* name, void* va
             return nullptr;
         }
         ++ext.windowBuilds;
-        ++ext.builds;
         build.vanilla = vanilla;
         build.vanillaHead = head;
         build.revision = ext.revision;
@@ -8740,21 +8736,6 @@ void* extendDefinition(void* self, const void* space, const void* name, void* va
         ext.history.push_back(std::move(build));
         while (ext.history.size() > kKeptBuilds) {
             ext.history.erase(ext.history.begin());
-        }
-        static int slowLogged = 0;
-        if (buildMs >= 500 && slowLogged < 8) {
-            ++slowLogged;
-            log().warn(L"UiProbe: extending {}.{} took {} ms (build {})", toUtf16(ext.space), toUtf16(ext.name), buildMs, ext.builds);
-        }
-        if (ext.builds <= 4) {
-            log().info(L"UiProbe: extended {}.{} (+{} / +{} controls, {} array(s), {} value(s); build {}: "
-                       L"{} nodes / {} words / {} records / {} chars; {} kept; {} ms)",
-                       toUtf16(ext.space), toUtf16(ext.name), ext.front.size(), ext.back.size(),
-                       ext.appends.size(), ext.props.size(), ext.builds, ext.need.nodes, ext.need.words,
-                       ext.need.records, ext.need.text, ext.history.size(), buildMs);
-        } else if (ext.builds == 5) {
-            log().info(L"UiProbe: {}.{} was built 5 times; later builds are not logged (older builds are freed, "
-                       L"{} kept)", toUtf16(ext.space), toUtf16(ext.name), kKeptBuilds);
         }
         return built;
     }

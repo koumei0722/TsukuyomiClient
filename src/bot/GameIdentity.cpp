@@ -1,12 +1,9 @@
 #include "GameIdentity.h"
 #include "BotNet.h"
-#include "Crypto.h"
 #include "GameString.h"
-#include "Jwt.h"
 #include "core/Logger.h"
 #include "memory/Memory.h"
 #include <Windows.h>
-#include <format>
 #include <mutex>
 
 namespace tsukuyomi::bot::gameidentity {
@@ -21,7 +18,6 @@ std::mutex g_mutex;
 void* g_held = nullptr;
 std::string g_token;
 std::string g_swapToken;
-int g_logged = 0;
 
 constexpr std::ptrdiff_t kControlFromObject = 0x10;
 constexpr std::size_t kOptionalSize = 0x28;
@@ -72,21 +68,6 @@ bool assertGuarded(void* object, void* out, const std::string* contents)
         return true;
     } __except (callException(GetExceptionCode())) { return false; }
 }
-std::wstring shortHash(const std::string& text)
-{
-    if (text.empty()) return L"(empty)";
-    const auto digest = crypto::sha256({reinterpret_cast<const std::uint8_t*>(text.data()), text.size()});
-    std::wstring hex;
-    for (std::size_t i = 0; i < 6 && i < digest.size(); ++i) hex += std::format(L"{:02x}", digest[i]);
-    return hex;
-}
-std::wstring tokenExpiry(const std::string& token)
-{
-    const auto payload = jwt::readPayload(token);
-    if (!payload || !payload->contains("exp") || !(*payload)["exp"].is_number()) return L"?";
-    const auto exp = (*payload)["exp"].get<long long>();
-    return std::to_wstring(exp - static_cast<long long>(time(nullptr))) + L" s";
-}
 }
 
 bool initialize()
@@ -125,11 +106,6 @@ void* onConstruct(CtorFn original, void* self, void* key, void* token)
         std::lock_guard lock(g_mutex);
         previous = std::exchange(g_held, self);
         g_token = copied.value_or(std::string());
-        if (g_logged < 16) {
-            ++g_logged;
-            const auto publicKey = gamestring::read(static_cast<std::uint8_t*>(self) + 0x38).value_or(std::string());
-            log().info(L"Bot: holding the game's WebRTC identity (key {}, token {}, expires in {})", shortHash(publicKey), shortHash(g_token), tokenExpiry(g_token));
-        }
     }
     releaseObject(previous);
     return result;

@@ -32,6 +32,10 @@ public:
     int anchor() const { return m_anchor.load(std::memory_order_relaxed); }
     int offsetX() const { return m_offsetX.load(std::memory_order_relaxed); }
     int offsetY() const { return m_offsetY.load(std::memory_order_relaxed); }
+    bool shown(int item) const
+    {
+        return item >= 0 && item < armorhud::kItems && m_shown[item].load(std::memory_order_relaxed);
+    }
 
     static void* hudManager();
     static const void* stackFor(const void* collectionName, int index);
@@ -56,6 +60,9 @@ private:
     std::atomic<int> m_anchor{armorhud::kDefaultAnchor};
     std::atomic<int> m_offsetX{armorhud::kDefaultOffsetX};
     std::atomic<int> m_offsetY{armorhud::kDefaultOffsetY};
+    std::atomic<bool> m_shown[armorhud::kItems] = {
+        armorhud::kDefaultShown, armorhud::kDefaultShown, armorhud::kDefaultShown,
+        armorhud::kDefaultShown, armorhud::kDefaultShown, armorhud::kDefaultShown};
     std::atomic<bool> m_definitionRegistered{false};
     std::atomic<bool> m_shuttingDown{false};
 

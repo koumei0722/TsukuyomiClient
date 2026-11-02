@@ -72,7 +72,7 @@ RenderMeshFn g_render = nullptr;
 std::atomic<bool> g_installed{false};
 std::atomic<bool> g_teardown{false};
 
-constexpr auto kCtxColor = tesslayout::kCtxColor, kCtxMatrices = tesslayout::kCtxMatrices, kCtxTess = tesslayout::kCtxTess;
+constexpr auto kCtxColor = tesslayout::kCtxColor, kCtxTess = tesslayout::kCtxTess;
 constexpr auto kTessLimit = tesslayout::kLimit, kTessBuilding = tesslayout::kBuilding, kTessVoid = tesslayout::kVoid;
 constexpr auto kTessNoColor = tesslayout::kNoColor, kTessOffset = tesslayout::kOffset, kTessScale = tesslayout::kScale;
 constexpr auto kTessUseMatrix = tesslayout::kUseMatrix, kLrpCamera = tesslayout::kLrpCamera;

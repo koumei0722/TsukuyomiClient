@@ -1,6 +1,8 @@
 #include "game/Nbt.h"
 
+#include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 namespace tsukuyomi::nbt {
 
@@ -23,7 +25,8 @@ namespace {
 
 class Reader {
 public:
-    Reader(const char* bytes, std::size_t size) : m_bytes(bytes), m_size(size) {}
+    Reader(const char* bytes, std::size_t size, bool bigEndian)
+        : m_bytes(bytes), m_size(size), m_big(bigEndian) {}
 
     bool ok() const { return m_why == nullptr; }
     const char* why() const { return m_why; }
@@ -48,7 +51,10 @@ public:
             fail("truncated");
             return value;
         }
-        std::memcpy(&value, m_bytes + m_at, sizeof(T));
+        char raw[sizeof(T)];
+        std::memcpy(raw, m_bytes + m_at, sizeof(T));
+        if (m_big) std::reverse(raw, raw + sizeof(T));
+        std::memcpy(&value, raw, sizeof(T));
         m_at += sizeof(T);
         return value;
     }
@@ -59,6 +65,10 @@ public:
         out.resize(static_cast<std::size_t>(count));
         const std::size_t bytes = out.size() * sizeof(std::int32_t);
         if (bytes != 0) std::memcpy(out.data(), m_bytes + m_at, bytes);
+        if (m_big) {
+            for (auto& one : out)
+                one = static_cast<std::int32_t>(_byteswap_ulong(static_cast<unsigned long>(one)));
+        }
         m_at += bytes;
     }
 
@@ -99,6 +109,7 @@ private:
     std::size_t m_size = 0;
     std::size_t m_at = 0;
     const char* m_why = nullptr;
+    bool m_big = false;
 };
 
 constexpr int kMaxDepth = 64;
@@ -239,7 +250,7 @@ ValuePtr readPayload(Reader& reader, Tag tag, int depth)
 
 }
 
-Result read(const char* bytes, std::size_t size)
+Result read(const char* bytes, std::size_t size, Endian endian)
 {
     Result result;
     if (bytes == nullptr || size == 0) {
@@ -247,7 +258,7 @@ Result read(const char* bytes, std::size_t size)
         return result;
     }
 
-    Reader reader(bytes, size);
+    Reader reader(bytes, size, endian == Endian::Big);
     const auto tag = static_cast<Tag>(reader.fixed<std::uint8_t>());
     if (!reader.ok()) {
         result.why = reader.why();

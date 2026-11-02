@@ -3,7 +3,6 @@
 
 #include "config/WriteSwitches.h"
 
-#include "core/FreezeWatch.h"
 #include "core/Logger.h"
 #include "core/Notice.h"
 #include "game/BlockRegistry.h"
@@ -25,6 +24,7 @@
 #include "game/OreUiScript.h"
 #include "game/CustomGuiScale.h"
 #include "game/CraftAmount.h"
+#include "game/PlaceAmount.h"
 #include "input/GameButtons.h"
 #include "hooks/HookManager.h"
 #include "input/GameInput.h"
@@ -65,6 +65,8 @@
 #include "modules/Zoom.h"
 #include "modules/Scaffold.h"
 #include "modules/Schematica.h"
+#include "modules/Replay.h"
+#include "replay/ReplayCapture.h"
 #include "modules/FlexiblePlacement.h"
 #include "modules/IgnoreBlock.h"
 #include "modules/LightOverlay.h"
@@ -270,7 +272,6 @@ void tsukuyomiPlayerViewHook(void* viewBase)
     if (!isLeadingView(viewBase)) {
         return;
     }
-    const freezewatch::Scope freezeScope{"PlayerView (game thread)"};
     hooks::refreshHookGroups();
 
     blocks::setSimThread(GetCurrentThreadId());
@@ -333,6 +334,7 @@ void tsukuyomiPlayerViewHook(void* viewBase)
     if (generation != placementGeneration) { placementGeneration = generation; lookplace::cancel(); }
     lookplace::pump();
     Schematica::instance().onPlayerViewUpdate();
+    Replay::instance().onPlayerViewUpdate();
     FlexiblePlacement::instance().onPlayerViewUpdate();
     IgnoreBlock::instance().onPlayerViewUpdate();
     LightOverlay::instance().onPlayerViewUpdate();
@@ -419,6 +421,7 @@ using InventoryContentReadFn = void*(__fastcall*)(void*, void*, void*, void*);
 
 using HandleItemStackResponseFn = void(__fastcall*)(void*, void*, void*, void*);
 using CraftFromOutputFn = void*(__fastcall*)(void*, void*, void*, void*, void*);
+using ContainerTransferFn = std::uintptr_t(__fastcall*)(void*, std::uintptr_t, void*, void*, void*, std::uintptr_t, std::uintptr_t);
 
 using InventoryHoveredSlotFn = void*(__fastcall*)(void*, void*);
 
@@ -471,6 +474,7 @@ ContainerOpenHandleFn g_containerOpenHandle = nullptr;
 InventoryContentReadFn g_inventoryContentRead = nullptr;
 HandleItemStackResponseFn g_handleItemStackResponse = nullptr;
 CraftFromOutputFn g_craftFromOutput = nullptr;
+ContainerTransferFn g_containerTransfer = nullptr;
 InventoryHoveredSlotFn g_inventoryHoveredSlot = nullptr;
 containerui::SmHandleFn g_containerSm = nullptr;
 using ContainerScreenDtorFn = void*(__fastcall*)(void*);
@@ -597,6 +601,13 @@ void* __fastcall detourCraftFromOutput(void* ctrl, void* out, void* collection, 
     return g_craftFromOutput(ctrl, out, collection, amount, results);
 }
 
+std::uintptr_t __fastcall detourContainerTransfer(void* ctrl, std::uintptr_t direction, void* from, void* to, void* amount,
+                                                 std::uintptr_t flagA, std::uintptr_t flagB)
+{
+    placeamount::apply(amount);
+    return g_containerTransfer(ctrl, direction, from, to, amount, flagA, flagB);
+}
+
 void __fastcall detourHandleItemStackResponse(void* rcx, void* rdx, void* r8, void* r9)
 {
     ItemStackRequest::instance().onResponse(rdx);
@@ -691,6 +702,7 @@ void __fastcall detourSubChunkSetBlock(void* self, unsigned int layer, unsigned 
     if (dryRunActive()) { noteDryWrite(self, layer, index, block); return; }
     if (schematicworld::active()) schematicworld::onSubChunkWrite(self, layer, index);
     if (g_subChunkSetBlock != nullptr) g_subChunkSetBlock(self, layer, index, block);
+    replay::onSubChunkWrite(self, layer, index);
 }
 
 using BlockSourceGetBlockFn = const void*(__fastcall*)(void*, const void*);
@@ -1175,9 +1187,6 @@ std::byte* resolveLegacyParticleInsert()
     }
     g_legacyParticleSubmitBegin = submitBegin;
     g_legacyParticleSubmitEnd = submitEnd;
-    const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    log().info(L"NoRender: legacy particles are submitted by RVA {:#x} and inserted by RVA {:#x}",
-               submitBegin - exe, reinterpret_cast<std::uintptr_t>(insert) - exe);
     return insert;
 }
 
@@ -1460,13 +1469,6 @@ bool takeTradeScreen(void* scene)
     }
     g_offstack = OffstackScreen{object, counts, ctrl, tick, GetCurrentThreadId()};
     ItemScroller::instance().onTradeScreenHeldOffstack();
-    static int said = 0;
-    if (said < 4) {
-        ++said;
-        const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        log().info(L"Hooks: kept the trade screen off the scene stack (controller vtable slot at RVA {:#x}, thread {})",
-                   reinterpret_cast<std::uintptr_t>(tick) - base, g_offstack.thread);
-    }
     return true;
 }
 
@@ -1486,7 +1488,6 @@ void __fastcall detourSceneStackPush(void* stack, void* scene, void* a3, void* a
 
 std::uint32_t __fastcall detourContainerScreenTick(void* self)
 {
-    const freezewatch::Scope freezeScope{"ContainerScreenTick (UI thread)"};
     const std::uint32_t dirty = (g_containerScreenTick != nullptr) ? g_containerScreenTick(self) : 0;
     return dirty | containerui::onScreenTickHook(self);
 }
@@ -1630,7 +1631,6 @@ void runClientTick()
     if (lastView == 0 || GetTickCount64() - lastView > kViewFreshMs) {
         return;
     }
-    const freezewatch::Scope freezeScope{"ClientTick (game thread)"};
     flyspeed::onClientTick();
     FastBlockPlacement::instance().onClientTick();
     Scaffold::instance().onClientTick();
@@ -1656,6 +1656,9 @@ void __fastcall detourServerLevelTick(void* level)
 
 void finishSessionTick(void* session, int branch)
 {
+    if (session != nullptr && blocks::simThread() != 0 && GetCurrentThreadId() == blocks::simThread()) {
+        GameData::instance().noteClientSession();
+    }
     if (!g_sessionTicksReady || g_sessionTickBranch != branch) return;
     g_sessionTickBranch = 0;
     LARGE_INTEGER end{};
@@ -1997,12 +2000,6 @@ bool installLate()
                                reinterpret_cast<void**>(&g_blockSourceGetBlock),
                                L"BlockSourceGetBlock", HookGroup::Ghost);
             created = got || created;
-            if (got) {
-                const auto exe = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-                log().info(L"Hooks: BlockSource::getBlock at RVA {:#x} (from the {} BlockSource)",
-                           reinterpret_cast<std::uintptr_t>(fn) - exe,
-                           L"rendering");
-            }
         }
         if (got) {
             if (void* const extra = resolveBlockSourceGetExtra(); extra != nullptr) {
@@ -2090,6 +2087,7 @@ static void refreshHookGroups()
         bool on;
     } wants[] = {
         {HookGroup::Ghost, Schematica::instance().wantsGhostHooks() || schematicworld::active()},
+        {HookGroup::BlockWrite, Schematica::instance().wantsGhostHooks() || schematicworld::active() || Replay::instance().wantsBlockWriteHook()},
         {HookGroup::Fullbright, Fullbright::instance().enabled() || AntiEffect::instance().enabled()},
         {HookGroup::Ability,
          CreativeNoClip::instance().enabled()},
@@ -2159,7 +2157,7 @@ void installAll()
                  reinterpret_cast<void**>(&g_setSelectedSlot), L"SetSelectedSlot");
 
     hooks.create(scanner.address(Target::SubChunkSetBlock), &detourSubChunkSetBlock,
-                 reinterpret_cast<void**>(&g_subChunkSetBlock), L"SubChunkSetBlock", HookGroup::Ghost);
+                 reinterpret_cast<void**>(&g_subChunkSetBlock), L"SubChunkSetBlock", HookGroup::BlockWrite);
 
     installGhostChunkBuilder();
 
@@ -2313,6 +2311,10 @@ void installAll()
     if (hooks.create(scanner.address(Target::CraftFromOutput), &detourCraftFromOutput,
                      reinterpret_cast<void**>(&g_craftFromOutput), L"CraftFromOutput")) {
         craftamount::markAvailable();
+    }
+    if (hooks.create(scanner.address(Target::ContainerTransfer), &detourContainerTransfer,
+                     reinterpret_cast<void**>(&g_containerTransfer), L"ContainerTransfer")) {
+        placeamount::markAvailable();
     }
 
     if (hooks.create(scanner.address(Target::ContainerSmHandle), &detourContainerSm,

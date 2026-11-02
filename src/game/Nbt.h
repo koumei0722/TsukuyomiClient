@@ -50,6 +50,8 @@ struct Result {
     const char* why = nullptr;
 };
 
-Result read(const char* bytes, std::size_t size);
+enum class Endian { Little, Big };
+
+Result read(const char* bytes, std::size_t size, Endian endian = Endian::Little);
 
 }

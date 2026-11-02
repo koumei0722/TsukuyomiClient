@@ -20,7 +20,7 @@ json visibleBinding(const std::string& name)
             {"binding_condition", "always"}};
 }
 
-json spacer(const json& size, const char* binding)
+json spacer(const json& size, const std::string& binding)
 {
     return {{"type", "panel"},
             {"size", size},
@@ -117,7 +117,8 @@ json cell(int form, int item)
                  {"collection_index", item},
                  {"$item_collection_name", kCollection},
                  {"$stack_count_required", true},
-                 {"$durability_bar_required", true}};
+                 {"$durability_bar_required", true},
+                 {"bindings", json::array({visibleBinding(shownBinding(item))})}};
     const std::string suffix = std::to_string(form) + "_" + std::to_string(item);
     if (!isText(form)) {
         body["controls"] = itemParts();
@@ -169,26 +170,45 @@ json formTree(int form)
     const json slot = {{"type", "panel"},
                        {"size", {size.width, size.height}},
                        {"controls", json::array({named("tk_ahud_grid" + k, grid)})}};
+    const int step = itemStep(form);
+    json shifts = json::array();
+    for (int hidden = 1; hidden <= kHiddenSteps; ++hidden) {
+        const std::string h = k + "_" + std::to_string(hidden);
+        auto length = [&](int px) {
+            const std::string text = std::to_string(px) + "px";
+            return isVertical(form) ? json::array({"100%", text}) : json::array({text, "100%"});
+        };
+        shifts.push_back(named("tk_ahud_sm" + h, spacer(length(hidden * step / 2), midShiftBinding(hidden))));
+        shifts.push_back(named("tk_ahud_se" + h, spacer(length(hidden * step), endShiftBinding(hidden))));
+    }
+    json rowControls = json::array({
+        named("tk_ahud_hmid" + k, spacer(
+            {"50% - " + std::to_string(size.width / 2) + "px", "100%"}, kBindHMid)),
+        named("tk_ahud_hright" + k, spacer(
+            {"100% - " + std::to_string(size.width) + "px", "100%"}, kBindHRight))
+    });
+    if (!isVertical(form)) {
+        rowControls.insert(rowControls.end(), shifts.begin(), shifts.end());
+    }
+    rowControls.push_back(named("tk_ahud_slot" + k, slot));
     const json row = {{"type", "stack_panel"},
                       {"orientation", "horizontal"},
                       {"size", {"100%", size.height}},
-                      {"controls", json::array({
-                          named("tk_ahud_hmid" + k, spacer(
-                              {"50% - " + std::to_string(size.width / 2) + "px", "100%"}, kBindHMid)),
-                          named("tk_ahud_hright" + k, spacer(
-                              {"100% - " + std::to_string(size.width) + "px", "100%"}, kBindHRight)),
-                          named("tk_ahud_slot" + k, slot)
-                      })}};
+                      {"controls", rowControls}};
+    json columnControls = json::array({
+        named("tk_ahud_vmid" + k, spacer(
+            {"100%", "50% - " + std::to_string(size.height / 2) + "px"}, kBindVMid)),
+        named("tk_ahud_vbot" + k, spacer(
+            {"100%", "100% - " + std::to_string(size.height) + "px"}, kBindVBottom))
+    });
+    if (isVertical(form)) {
+        columnControls.insert(columnControls.end(), shifts.begin(), shifts.end());
+    }
+    columnControls.push_back(named("tk_ahud_row" + k, row));
     const json column = {{"type", "stack_panel"},
                          {"orientation", "vertical"},
                          {"size", {"100%", "100%"}},
-                         {"controls", json::array({
-                             named("tk_ahud_vmid" + k, spacer(
-                                 {"100%", "50% - " + std::to_string(size.height / 2) + "px"}, kBindVMid)),
-                             named("tk_ahud_vbot" + k, spacer(
-                                 {"100%", "100% - " + std::to_string(size.height) + "px"}, kBindVBottom)),
-                             named("tk_ahud_row" + k, row)
-                         })}};
+                         {"controls", columnControls}};
     return named("tk_ahud_f" + k, {{"type", "panel"},
                                    {"size", {"100%", "100%"}},
                                    {"bindings", json::array({visibleBinding(formVisibleBinding(form))})},
@@ -207,6 +227,26 @@ FormSize formSize(int form)
     const FormSize cellBox = cellSize(form);
     return isVertical(form) ? FormSize{cellBox.width, cellBox.height * kItems}
                             : FormSize{cellBox.width * kItems, cellBox.height};
+}
+
+int itemStep(int form)
+{
+    const FormSize cellBox = cellSize(form);
+    return isVertical(form) ? cellBox.height : cellBox.width;
+}
+
+const wchar_t* itemLabel(int item)
+{
+    static constexpr const wchar_t* labels[kItems] = {L"Helmet", L"Chestplate", L"Leggings",
+                                                      L"Boots",  L"Main hand",  L"Offhand"};
+    return item >= 0 && item < kItems ? labels[item] : L"";
+}
+
+const char* itemConfigKey(int item)
+{
+    static constexpr const char* keys[kItems] = {"showHelmet", "showChestplate", "showLeggings",
+                                                 "showBoots",  "showMainhand",   "showOffhand"};
+    return item >= 0 && item < kItems ? keys[item] : "";
 }
 
 int clampOrientation(int value)
@@ -279,6 +319,21 @@ std::string formYBinding(int form)
 std::string textBinding(int item)
 {
     return "#tk_ahud_t" + std::to_string(item);
+}
+
+std::string shownBinding(int item)
+{
+    return "#tk_ahud_s" + std::to_string(item);
+}
+
+std::string midShiftBinding(int hidden)
+{
+    return "#tk_ahud_m" + std::to_string(hidden);
+}
+
+std::string endShiftBinding(int hidden)
+{
+    return "#tk_ahud_e" + std::to_string(hidden);
 }
 
 std::string layoutJson()

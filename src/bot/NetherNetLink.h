@@ -17,7 +17,6 @@ bool available();
 bool isNetherNet(void* mainPeer);
 struct ServerId { std::uint64_t id = 0, extra = 0; std::uint8_t type = 0; };
 std::optional<ServerId> serverId(void* mainPeer);
-std::int32_t protocolVersion();
 
 #pragma warning(push)
 #pragma warning(disable: 4324)

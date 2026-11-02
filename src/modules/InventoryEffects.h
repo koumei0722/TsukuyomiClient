@@ -63,7 +63,6 @@ private:
     std::map<int, std::string> m_icons;
     std::string m_infinite;
     bool m_failLogged = false;
-    bool m_listLogged = false;
 };
 
 }

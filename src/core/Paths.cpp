@@ -7,6 +7,14 @@
 
 namespace tsukuyomi::paths {
 
+std::filesystem::path replaysDir()
+{
+    auto dir = dataDir() / "replays";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 namespace {
 
 std::filesystem::path executablePath()

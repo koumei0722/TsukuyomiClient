@@ -13,6 +13,5 @@ bool typeOf(Value value, Type& out);
 Value member(Value object, const char* name);
 Value element(Value array, std::uint32_t index);
 bool count(Value container, std::uint32_t& out);
-bool entry(Value object, std::uint32_t index, std::string& key, Value& value);
 bool asNumber(Value value, double& out);
 }

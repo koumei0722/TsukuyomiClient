@@ -70,7 +70,6 @@ private:
     bool m_columnsReady = false;
     std::atomic<int> m_textWidth{0};
     bool m_loggedShift = false;
-    bool m_loggedFrame = false;
     int m_failLogs = 0;
 };
 

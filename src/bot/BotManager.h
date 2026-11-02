@@ -198,8 +198,6 @@ private:
     const void* mainPlayer_ = nullptr;
     std::uint64_t mainLogin_ = 0;
     unsigned loggedRegrab_ = 0;
-    std::array<bool, 1024> receivedIds_{}, sentIds_{};
-    unsigned loggedReceived_ = 0, loggedSent_ = 0;
     std::atomic<bool> running_{false};
     std::atomic<bool> leaveRequested_{false}, leaveDone_{false};
     bool possessing_ = false;

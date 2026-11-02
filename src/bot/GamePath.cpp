@@ -34,7 +34,6 @@ const void* g_regionVtable = nullptr;
 std::uint32_t g_chunkSourceOffset = 0;
 DimensionIdFn g_dimensionId = nullptr;
 std::atomic<bool> g_ready{false};
-std::atomic<int> g_logs{0};
 
 constexpr std::size_t kFinderSize = 0x200, kDataSize = 0x200, kPathSize = 0x28, kNodeSize = 16;
 constexpr std::size_t kRegionSize = 0x300;
@@ -291,11 +290,7 @@ std::optional<Found> findWorld(const World* given, protocol::Vec3 feet, PathNode
     Raw raw{found.nodes.data(), found.nodes.size(), 0, 0, 0};
     const float from[3] = {feet.x, feet.y, feet.z};
     const float to[3] = {float(target.x) + 0.5f, float(target.y) + 0.05f, float(target.z) + 0.5f};
-    LARGE_INTEGER start{}, stop{}, frequency{};
-    QueryPerformanceCounter(&start);
     findGuarded(&world, actor, from, to, radius, inLiquid, &raw);
-    QueryPerformanceCounter(&stop); QueryPerformanceFrequency(&frequency);
-    found.ms = double(stop.QuadPart - start.QuadPart) * 1000.0 / double(frequency.QuadPart);
     if (raw.stage) {
         g_ready.store(false, std::memory_order_release);
         notice::failOnce("BotPathFinder", std::format(L"Bot: the game's pathfinder faulted (stage {}); walking along a path is disabled", raw.stage),
@@ -305,9 +300,6 @@ std::optional<Found> findWorld(const World* given, protocol::Vec3 feet, PathNode
     }
     found.nodes.resize(raw.count);
     found.complete = raw.completion == 2;
-    if (g_logs.fetch_add(1, std::memory_order_relaxed) < 48)
-        log().info(L"Bot: path from ({:.2f}, {:.2f}, {:.2f}){} to ({}, {}, {}) radius {:.0f}: {} nodes, completion {}, {:.2f} ms",
-            feet.x, feet.y, feet.z, inLiquid ? L" in liquid" : L"", target.x, target.y, target.z, radius, raw.count, raw.completion, found.ms);
     return found;
 }
 

@@ -10,6 +10,7 @@ namespace tsukuyomi::gameoptions {
 class Options {
 public:
     bool getInt(const char* key, int& out) const;
+    bool getString(const char* key, std::string& out) const;
 
 private:
     friend bool parseOptions(const char* text, std::size_t length, Options& out);
@@ -21,5 +22,6 @@ bool parseOptions(const char* text, std::size_t length, Options& out);
 
 bool reload();
 bool getInt(const char* key, int& out);
+bool getString(const char* key, std::string& out);
 
 }

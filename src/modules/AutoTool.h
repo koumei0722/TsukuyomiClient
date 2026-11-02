@@ -130,9 +130,7 @@ private:
         void* damageCalc = nullptr;
         std::ptrdiff_t inventory = -1;
         std::ptrdiff_t announced = -1;
-        std::ptrdiff_t category = -1;
         const void* localPlayerVtable = nullptr;
-        const void* armorStandVtable = nullptr;
         bool ready = false;
     };
     AttackApi m_attack;

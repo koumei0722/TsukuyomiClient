@@ -20,6 +20,7 @@ Loaded finishLoad(structure::LoadResult&& got)
     Loaded out;
     out.requiredMemory = got.requiredMemory;
     out.availableMemory = got.availableMemory;
+    out.note = got.note;
     out.sizeX = got.value.sizeX;
     out.sizeY = got.value.sizeY;
     out.sizeZ = got.value.sizeZ;

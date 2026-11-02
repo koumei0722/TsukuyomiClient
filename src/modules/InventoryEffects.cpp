@@ -221,13 +221,6 @@ void InventoryEffects::refresh()
         ids.push_back((e.id << 8) | (e.amplifier & 0xff) | (e.ambient ? 0x10000 : 0));
     }
     m_rows = std::move(rows);
-    if (!m_listLogged && !m_rows.empty()) {
-        m_listLogged = true;
-        for (const Row& row : m_rows) {
-            log().info(L"InventoryEffects: effect {} amplifier {} duration {} ambient {} -> \"{}\" / \"{}\" / {}", row.id,
-                       row.amplifier, row.duration, row.ambient, toUtf16(row.name), toUtf16(row.time), toUtf16(row.icon));
-        }
-    }
     const bool on = enabled() && !m_rows.empty();
     if (on != m_shownOn || ids != m_shownIds) {
         m_shownOn = on;

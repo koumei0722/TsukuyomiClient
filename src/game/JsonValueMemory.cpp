@@ -128,14 +128,6 @@ bool count(Value container, std::uint32_t& out)
     return true;
 }
 
-bool entry(Value object, std::uint32_t wanted, std::string& key, Value& value)
-{
-    std::vector<const void*> list;
-    if (!objectNodes(object, list) || wanted >= list.size() || !keyOf(list[wanted], key)) return false;
-    value = static_cast<const char*>(list[wanted]) + kNodeValue;
-    return true;
-}
-
 bool asNumber(Value value, double& out)
 {
     Type type{};

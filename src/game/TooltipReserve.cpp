@@ -54,11 +54,6 @@ bool readId(std::string_view text, std::size_t at, std::uint32_t& id, std::size_
 
 }
 
-std::string reserveText(int rows, int spaces, std::uint32_t id)
-{
-    return reserveText(kMarker, rows, spaces, id);
-}
-
 std::string reserveText(std::string_view marker, int rows, int spaces, std::uint32_t id)
 {
     rows = std::max(rows, 1);

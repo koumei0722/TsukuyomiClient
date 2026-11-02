@@ -805,21 +805,6 @@ std::uint64_t hashCells(const std::vector<Cell>& cells)
 
 }
 
-std::size_t RegionSet::update(const std::vector<Cell>& cells, bool xray)
-{
-    std::unordered_map<RegionKey, std::vector<Cell>, RegionKeyHash> own;
-    for (const Cell& c : cells) {
-        if (c.color >= 1 && c.color <= kMaxColor) own[regionOf(c.x, c.y, c.z)].push_back(c);
-    }
-    std::vector<RegionChange> changes;
-    changes.reserve(own.size() + own_.size());
-    for (auto& [key, list] : own) changes.push_back({key, std::move(list)});
-    for (const auto& [key, list] : own_) {
-        if (!own.contains(key)) changes.push_back({key, {}});
-    }
-    return apply(changes, false, xray);
-}
-
 std::size_t RegionSet::apply(const std::vector<RegionChange>& changes, bool reset, bool xray)
 {
     if (reset || xray != xray_) {

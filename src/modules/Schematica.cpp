@@ -95,7 +95,8 @@ void Schematica::scanFiles()
             if (!it->is_regular_file(fileEc) || fileEc) continue;
             auto ext = it->path().extension().wstring();
             std::transform(ext.begin(),ext.end(),ext.begin(),[](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
-            if (ext == L".mcstructure") names.emplace(it->path().stem().wstring(),it->path().filename().wstring());
+            if (ext == L".mcstructure") names.insert_or_assign(it->path().stem().wstring(),it->path().filename().wstring());
+            else if (ext == L".litematic") names.emplace(it->path().stem().wstring(),it->path().filename().wstring());
         }
     }
     std::lock_guard lock(m_filesMutex);
@@ -469,10 +470,6 @@ void Schematica::applyLayerFilter()
         m_layerFilter = {on, axis, lo, hi};
         ++m_layerGeneration;
     }
-    m_layerAppliedOn = on;
-    m_layerAppliedAxis = axis;
-    m_layerAppliedLo = lo;
-    m_layerAppliedHi = hi;
 }
 
 bool Schematica::deleteArmed() const
@@ -1165,6 +1162,7 @@ void Schematica::installPrepared(std::unique_ptr<PrepareJob> job)
         }
         log().info(L"Schematica: loaded {} ({}x{}x{}, {} palette entries, {} solid blocks)",
                    one.name, got.sizeX, got.sizeY, got.sizeZ, one.paletteSize, got.solid);
+        if (!got.note.empty()) log().warn(L"Schematica: {}: {}", one.name, toUtf16(got.note));
     }
 
     bool needLoad = false;
@@ -1625,10 +1623,12 @@ void Schematica::runImport(void* ownerWindow)
     OPENFILENAMEW ofn{};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = static_cast<HWND>(ownerWindow);
-    ofn.lpstrFilter = L"Structure (*.mcstructure)\0*.mcstructure\0All files (*.*)\0*.*\0\0";
+    ofn.lpstrFilter = L"Schematic (*.mcstructure;*.litematic)\0*.mcstructure;*.litematic\0"
+                      L"Structure (*.mcstructure)\0*.mcstructure\0Litematica (*.litematic)\0*.litematic\0"
+                      L"All files (*.*)\0*.*\0\0";
     ofn.lpstrFile = chosen;
     ofn.nMaxFile = MAX_PATH;
-    ofn.lpstrTitle = L"Tsukuyomi - import a .mcstructure";
+    ofn.lpstrTitle = L"Tsukuyomi - import a schematic (.mcstructure / .litematic)";
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
     bool stopping = false;
     {
@@ -1724,7 +1724,7 @@ void Schematica::onScansReady()
     scanFiles();
     std::lock_guard<std::mutex> guard(m_filesMutex);
     if (m_fileStems.empty()) {
-        log().info(L"Schematica: no .mcstructure found in {}",
+        log().info(L"Schematica: no .mcstructure / .litematic found in {}",
                    paths::schematicsDir().wstring());
         return;
     }
@@ -4061,7 +4061,7 @@ MenuItem Schematica::buildMenu()
         if (i->onPage && i->pageTab==3) { i->pageTab=0;pageKeys.push_back(std::move(*i)); i=children.erase(i); }
         else ++i;
     }
-    add(menu::action(L"Import .mcstructure",[this] { startImport(); }),0);
+    add(menu::action(L"Import schematic",[this] { startImport(); }),0);
     add(menu::number(L"Opacity",[this] { return static_cast<float>(m_alpha.load()); },
         [this](float v) { m_alpha.store(std::clamp(static_cast<int>(v),kMinAlpha,kMaxAlpha)); m_redrawPending.store(true); },true,kMinAlpha,kMaxAlpha),0);
     add(menu::number(L"Box opacity",[this] { return static_cast<float>(m_boxAlpha.load()); },

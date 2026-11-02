@@ -25,6 +25,7 @@ std::atomic<void*> g_renderRegion{nullptr};
 std::atomic<unsigned long long> g_renderRegionSeen{0};
 
 std::atomic<std::uint64_t> g_regionGeneration{0};
+std::atomic<std::uint64_t> g_worldGeneration{0};
 
 bool onCurrentStack(const void* address)
 {
@@ -67,6 +68,11 @@ void* renderRegion()
         return nullptr;
     }
     return g_renderRegion.load(std::memory_order_relaxed);
+}
+
+std::uint64_t worldGeneration()
+{
+    return g_worldGeneration.load(std::memory_order_acquire);
 }
 
 std::uint64_t regionGeneration()
@@ -397,6 +403,7 @@ void noteWorldChanged(bool leftAWorld)
     g_renderRegion.store(nullptr, std::memory_order_relaxed);
     g_renderRegionSeen.store(0, std::memory_order_relaxed);
     g_regionGeneration.fetch_add(1, std::memory_order_release);
+    if (leftAWorld) g_worldGeneration.fetch_add(1, std::memory_order_release);
 }
 
 namespace {
